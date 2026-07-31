@@ -76812,6 +76812,52 @@ class LauncherApp:
                 self._release_import_export_priority(session, action, generation)
                 return
             request_id, result, import_receipt, planned_name_snapshot = value
+
+            def record_blender_hierarchy_coverage(
+                hierarchy: dict[str, Any], imported_mesh_count: int
+            ) -> None:
+                """Keep hierarchy repair diagnostics without turning skipped Meshes into import errors."""
+                candidate_mesh_count = int(
+                    hierarchy.get("candidate_mesh_count", -1) or 0
+                )
+                routed_mesh_count = int(
+                    hierarchy.get("routed_mesh_count", 0) or 0
+                )
+                unchanged_mesh_count = int(
+                    hierarchy.get("unchanged_mesh_count", 0) or 0
+                )
+                missing_helper_count = int(
+                    hierarchy.get("missing_helper_count", 0) or 0
+                )
+                covered_mesh_count = routed_mesh_count + unchanged_mesh_count
+                complete = (
+                    candidate_mesh_count == imported_mesh_count
+                    and missing_helper_count == 0
+                    and covered_mesh_count == imported_mesh_count
+                )
+                hierarchy["coverage_complete"] = complete
+                hierarchy["covered_mesh_count"] = covered_mesh_count
+                hierarchy["unresolved_mesh_count"] = max(
+                    0, imported_mesh_count - covered_mesh_count
+                )
+                hierarchy["repair_outcome"] = (
+                    "COMPLETE" if complete else "PARTIAL_SKIPPED"
+                )
+                if not complete:
+                    # A Mesh lacking a complete RE6 Header or source parent proof
+                    # must remain where Blender imported it. Hierarchy repair is
+                    # best-effort after successful geometry import, never its gate.
+                    hierarchy["coverage_detail"] = (
+                        "Unmatched Meshes were left unchanged after import: "
+                        "candidate=%d, imported=%d, routed=%d, unchanged=%d, missing_helpers=%d"
+                        % (
+                            candidate_mesh_count,
+                            imported_mesh_count,
+                            routed_mesh_count,
+                            unchanged_mesh_count,
+                            missing_helper_count,
+                        )
+                    )
             contract = dict(result.get("scene_contract", {}))
             if isinstance(session, ManagedBlenderSession) and blender_direct:
                 if result.get("imported") is not True:
@@ -76839,17 +76885,7 @@ class LauncherApp:
                         f"expected Mesh={expected_mesh_count}, returned={imported_mesh_count}"
                     )
                 hierarchy = dict(result.get("hierarchy", {}) or {})
-                if (
-                    int(hierarchy.get("candidate_mesh_count", -1) or 0)
-                    != imported_mesh_count
-                    or int(hierarchy.get("missing_helper_count", -1) or 0) != 0
-                    or int(hierarchy.get("routed_mesh_count", 0) or 0)
-                    + int(hierarchy.get("unchanged_mesh_count", 0) or 0)
-                    != imported_mesh_count
-                ):
-                    raise ProtocolError(
-                        "Blender LOD hierarchy reconstruction did not cover every imported Mesh"
-                    )
+                record_blender_hierarchy_coverage(hierarchy, imported_mesh_count)
                 _reconcile_workspace_scene(workspace, contract)
                 workspace.slot_bindings = {
                     int(mesh["scene_node_handle"]): int(mesh["mesh_slot"])
@@ -77028,17 +77064,7 @@ class LauncherApp:
                         f"expected Mesh={expected_mesh_count}, returned={imported_mesh_count}"
                     )
                 hierarchy = dict(result.get("hierarchy", {}) or {})
-                if (
-                    int(hierarchy.get("candidate_mesh_count", -1) or 0)
-                    != imported_mesh_count
-                    or int(hierarchy.get("missing_helper_count", -1) or 0) != 0
-                    or int(hierarchy.get("routed_mesh_count", 0) or 0)
-                    + int(hierarchy.get("unchanged_mesh_count", 0) or 0)
-                    != imported_mesh_count
-                ):
-                    raise ProtocolError(
-                        "Blender FBX LOD hierarchy reconstruction did not cover every imported Mesh"
-                    )
+                record_blender_hierarchy_coverage(hierarchy, imported_mesh_count)
                 _reconcile_workspace_scene(workspace, contract)
                 workspace.slot_bindings = {
                     int(mesh["scene_node_handle"]): int(mesh["mesh_slot"])
