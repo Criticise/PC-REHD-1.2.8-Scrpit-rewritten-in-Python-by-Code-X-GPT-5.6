@@ -1,0 +1,7 @@
+# Preserve the byte form of the Launcher and vendor snapshots.
+* -text
+
+# Repository documentation stays readable in GitHub and consistent across hosts.
+*.md text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
