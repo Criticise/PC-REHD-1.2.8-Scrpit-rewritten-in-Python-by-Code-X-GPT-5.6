@@ -1,0 +1,29 @@
+# Include necessary source files
+include README.md
+include LICENSE
+include pyproject.toml
+include setup.py
+include sfs.py
+include sfs-deps.json
+include sfs-deps.json.lock
+
+# Include ufbx C source code
+recursive-include ufbx-c *.h *.c
+
+# Include generated binding code (including Cython sources and C wrapper)
+recursive-include ufbx *.py *.pyx *.h *.c *.pyi
+
+# Exclude unnecessary files
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude __pycache__
+global-exclude .DS_Store
+global-exclude *.so
+global-exclude *.dylib
+global-exclude *.dll
+recursive-exclude tests *
+recursive-exclude examples *
+recursive-exclude .github *
+recursive-exclude build *
+recursive-exclude dist *
+recursive-exclude *.egg-info *

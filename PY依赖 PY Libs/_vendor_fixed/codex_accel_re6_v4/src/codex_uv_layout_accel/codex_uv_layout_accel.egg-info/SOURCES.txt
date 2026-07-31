@@ -1,0 +1,8 @@
+setup.py
+codex_uv_layout_accel/__init__.py
+codex_uv_layout_accel/_uv_layout_core.c
+codex_uv_layout_accel.egg-info/PKG-INFO
+codex_uv_layout_accel.egg-info/SOURCES.txt
+codex_uv_layout_accel.egg-info/dependency_links.txt
+codex_uv_layout_accel.egg-info/not-zip-safe
+codex_uv_layout_accel.egg-info/top_level.txt

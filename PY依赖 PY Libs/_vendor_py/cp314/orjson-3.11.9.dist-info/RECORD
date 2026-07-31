@@ -1,0 +1,15 @@
+orjson-3.11.9.dist-info/INSTALLER,sha256=zuuue4knoyJ-UwPPXg8fezS7VCrXJQrAP7zeNuwvFQg,4
+orjson-3.11.9.dist-info/METADATA,sha256=U-ONslf2sXr5GTuxEw-Z2dEIQg3IPcE0cgVjEExGurA,43074
+orjson-3.11.9.dist-info/RECORD,,
+orjson-3.11.9.dist-info/REQUESTED,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+orjson-3.11.9.dist-info/WHEEL,sha256=z46beSXnsqAWuvlL-e7VW_vSJQ5jRzhFMclKzDUcS98,97
+orjson-3.11.9.dist-info/direct_url.json,sha256=tjsp69nuVqlqZE7BX6OJavUrfNljLeCvYK3qi05mVuI,486
+orjson-3.11.9.dist-info/licenses/LICENSE-APACHE,sha256=fP1zjFPWHHnwfjSPYiv3cHyQhCNwVNN_vgd4inX1iBw,11048
+orjson-3.11.9.dist-info/licenses/LICENSE-MIT,sha256=NlFq79yExdWh50hUJZE6ItvaaesZMMXoTWrklytRlLk,1046
+orjson-3.11.9.dist-info/licenses/LICENSE-MPL-2.0,sha256=kwPqHPvwSZRWUmaAiddT-xp-Hy5SxoBhXD0s6nUVwRg,17100
+orjson-3.11.9.dist-info/sboms/orjson.cyclonedx.json,sha256=VP9VxArEHx2RelharhLXxEt77KhmGE3b2iwE6m5jf6U,33099
+orjson/__init__.py,sha256=Z45X7GrgfAwam7kmKuCZzPGa0jrEp2xr1kD5JRBLpcQ,725
+orjson/__init__.pyi,sha256=CM5fFe4XUtbHLx5S9Dai_OHgg19xe0qK4u4981Zxd0g,912
+orjson/__pycache__/__init__.cpython-314.pyc,,
+orjson/orjson.cp314-win_amd64.pyd,sha256=CSIZKsJfS1Th6y2Ur4WOmnCERs44_etSv8-yzszutgA,223232
+orjson/py.typed,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0

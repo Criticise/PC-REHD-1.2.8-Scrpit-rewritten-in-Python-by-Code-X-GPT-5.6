@@ -1,0 +1,20 @@
+{
+    "dependencies": [
+        {
+            "name": "ufbx",
+            "url": "https://github.com/ufbx/ufbx",
+            "branch": "integration",
+            "files": [
+                {
+                    "root": "ufbx-c",
+                    "files": ["ufbx.h", "ufbx.c"]
+                },
+                {
+                    "root": "bindgen",
+                    "remoteRoot": "bindgen",
+                    "files": ["parsette.py", "ufbx_parser.py", "ufbx_ir.py"]
+                }
+            ]
+        }
+    ]
+}

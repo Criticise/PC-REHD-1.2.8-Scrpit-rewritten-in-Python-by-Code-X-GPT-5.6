@@ -1,0 +1,205 @@
+Metadata-Version: 2.1
+Name: pyfbx
+Version: 0.0.8
+Summary: Freebox thin client
+Home-page: https://framagit.org/sun/pyfbx
+Author-email: teebeenator@gmail.com
+License: MIT
+Platform: UNKNOWN
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Description-Content-Type: text/markdown
+Requires-Dist: zeroconf
+Requires-Dist: requests
+
+# Freebox client library
+
+## Features
+
+* Full API coverage
+* Https and Mdns discovery
+* Thin client wrapper library (<200 lines)
+* Small script to perform most tasks
+
+[![pipeline status](https://framagit.org/sun/pyfbx/badges/master/pipeline.svg)](https://framagit.org/sun/pyfbx/commits/master)
+[![coverage report](https://framagit.org/sun/pyfbx/badges/master/coverage.svg)](https://framagit.org/sun/pyfbx/commits/master)
+
+## Library usage
+
+The library is available to create your own scripts.
+The REST API is generated at runtime with the creation of class attributes for all Freebox subsystems.
+
+```python
+>>> from pyfbx import Fbx
+>>> f=Fbx()             # By default, this will perform MDNS discovery
+>>> f=Fbx(nomdns=True)  # Use faster http api discovery
+>>> f.<TAB>
+f.Airmedia         f.Download_Config  f.Lan              f.Rrd              f.Upnpav
+f.Call             f.Download_Feeds   f.Lcd              f.Share            f.Vpn
+f.Connection       f.Freeplug         f.Nat              f.Storage          f.Vpn_Client
+f.Contacts         f.Fs               f.Network_Share    f.Switch           f.Wifi
+f.Dhcp             f.Ftp              f.Parental         f.System           f.mksession(
+f.Download         f.Igd              f.Pvr              f.Upload           f.register(
+>>> f.Freeplug.<TAB>
+f.Freeplug.Get_a_particular_Freeplug_information(
+f.Freeplug.Reset_a_Freeplug(
+f.Freeplug.Get_the_current_Freeplugs_networks(
+
+# Register application to get app token. Physical access is required.
+>>> token = f.register("AppId", "My App", "PC")
+# Generate session token
+>>> f.mksession(app_id="AppId", token=token)
+
+>>> help(f.Lan.Update_the_current_Lan_configuration)
+Help on method Update_the_current_Lan_configuration:
+
+Update_the_current_Lan_configuration(post_data) method of pyfbx.client.Lan instance
+    Update the current Lan configuration
+
+    Url parameters:
+    Post data:PostData
+
+>>> help(f.Contacts.Access_a_given_contact_entry)
+Help on method Access_a_given_contact_entry:
+
+Access_a_given_contact_entry(id) method of pyfbx.client.Contacts instance
+    Access a given contact entry
+
+    Url parameters: id
+    Post data:
+
+>>> f.Lan.Get_the_current_Lan_configuration()
+{'name_dns': 'freebox-server', 'name': 'Freebox Server', 'name_mdns': 'Freebox-Server', 
+'mode': 'router', 'name_netbios': 'Freebox_Server', 'ip': '192.168.1.254'}
+
+# Any subsequent call to mksession will refresh the session token
+>>> f.mksession()
+```
+
+## Script
+
+The included script can perform a lot of tasks.
+
+### Basics
+
+```shell
+$ pyfbx -h
+usage: pyfbx [-h] [-a APP_ID] [-t TOKEN] [-v] [-n] [-j] [-d DELAY] [-u URL]
+             [-s SEND] [-c COMMAND]
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -a APP_ID, --app_id APP_ID
+                        application identifier
+  -t TOKEN, --token TOKEN
+                        token (or f:<filename>)
+  -v, --verbose         increase verbosity to INFO, use twice for DEBUG
+  -n, --http            disable MDNS and use http known address
+  -j, --json            json output
+  -d DELAY, --delay DELAY
+                        cylically send command (number of seconds)
+  -u URL, --url URL     specific url to query
+  -s SEND, --send SEND  url to send json to
+  -c COMMAND, --command COMMAND
+                        command, defaults to
+                        System.Get_the_current_system_info()
+```
+
+First, register the application:
+
+```shell
+$ pyfbx -a SuperAppId
+```
+Once registration is done on the device, write down the application token.
+You can also create a file with token as first line and application Id as second.
+
+Using this app token, acquire a session token to execute a test command.
+
+```shell
+$ pyfbx -t '<TOKEN>' -a SuperAppId
+
+$ cat token.txt
+2OUDy4hhM/KLQ7ru+70gfi83h5A4DUoOpDztOfqM4c2wuUiWJ+gXTHB1SbxHAFP7
+SuperAppId
+
+$ pyfbx -t f:token.txt -c 'Connection.Get_the_current_Connection_status()'
+{   'bandwidth_down': 1000000000,
+    [..]
+    'state': 'up',
+    'type': 'ethernet'}
+```
+
+_Note_ : Don't forget to escape token and command with quotes.
+
+### Advanced
+
+You can run any commands on the freebox and retrieve complete result or single value
+```shell
+$ pyfbx -t f:/home/foo/token.txt SuperAppId -c 'Contacts.Create_a_contact(\
+post_data={"display_name": "Sandy Kilo", "first_name": "Sandy", "last_name":"Kilo"})'
+{   'birthday': '',
+    [..]
+    'photo_url': ''}
+
+$ pyfbx -u https://0s2efr3i.fbxos.fr:15628 -c "Connection.Get_the_current_Connection_status()['rate_up']" -t f:token.txt
+1700
+```
+
+With the delay option, commands can be sent cyclically:
+
+```shell
+$ pyfbx -d 1 -c "Connection.Get_the_current_Connection_status()['rate_up']" -t f:token.txt
+42460
+50710
+53400
+```
+
+With the send option, result can be sent to a remote URL.
+In the following, the result is sent cyclically to example.com in json format.
+
+```shell
+pyfbx -j -s http://example.com/values -d 10 -c "Connection.Get_the_current_Connection_status()" -t f:token.txt
+```
+
+It's possible to execute several commands.
+Here, two commands are sent cyclically and results sent to an URL.
+
+```shell
+pyfbx -c 'System.Get_the_current_system_info()' -c 'Connection.Get_the_current_Connection_status()' -d 10 -j -s http://localhost:8182/telegraf -t f:token.txt
+```
+
+Telegraf http listener v2 input plugin with json format can be used to plot data in realtime.
+
+### Telegraf and Graphana plots
+
+You can use a telegraph configuration in /etc/telegraf/telegraf.d/freebox:
+
+```
+[[inputs.http_listener_v2]]
+    service_address = ":8182"
+    path = "/telegraf"
+    methods = ["POST"]
+    read_timeout = "10s"
+    write_timeout = "10s"
+    max_body_size = "5KB"
+    data_format = "json"
+    name_override = "pyfbx"
+```
+
+![Grafana](https://framagit.org/uploads/-/system/temp/7b198d06e9c27996b60708d470af96ae/debit.png "Grafana Dashboard")
+
+## Developpment
+
+### Testing
+
+You can run tests with
+
+```shell
+pip3 install -r requirements-dev.txt
+pytest tests
+```
+The library mechanisms are tested. To get 100% coverage, a Freebox on its default IP (192.168.1.254) is required.
+
+The API description is generated and thus not functionnaly tested.
+
+

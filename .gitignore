@@ -1,0 +1,21 @@
+# Python bytecode and local tooling output
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# The downloadable release is attached to GitHub Releases, not committed.
+*.7z
+*.zip
+release-assets/
+
+# These directories are intentionally excluded from the source repository.
+Python/
+V4备份 - 严重缺陷，V4会参与检测PYTHON/
+
+# Local launcher and diagnostic state
+*.log
+.vs/
+.idea/

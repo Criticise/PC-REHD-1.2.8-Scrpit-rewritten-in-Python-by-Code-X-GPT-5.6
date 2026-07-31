@@ -1,0 +1,8 @@
+setup.py
+codex_fbx_probe_accel/__init__.py
+codex_fbx_probe_accel/_fbx_geometry_core.c
+codex_fbx_probe_accel.egg-info/PKG-INFO
+codex_fbx_probe_accel.egg-info/SOURCES.txt
+codex_fbx_probe_accel.egg-info/dependency_links.txt
+codex_fbx_probe_accel.egg-info/not-zip-safe
+codex_fbx_probe_accel.egg-info/top_level.txt

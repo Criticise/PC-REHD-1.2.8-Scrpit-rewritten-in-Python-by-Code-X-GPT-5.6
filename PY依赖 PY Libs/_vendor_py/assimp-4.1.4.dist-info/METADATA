@@ -1,0 +1,14 @@
+Metadata-Version: 2.1
+Name: assimp
+Version: 4.1.4
+Summary: Python bindings for the Open Asset Import Library (ASSIMP)
+Home-page: https://github.com/mikedh/pyassimp
+Maintainer: Mike Dawson-Haggerty
+Maintainer-email: mikedh@kerfed.com
+License: ISC
+Platform: UNKNOWN
+Requires: numpy
+
+UNKNOWN
+
+
