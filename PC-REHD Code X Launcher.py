@@ -85,7 +85,9 @@ import time
 import traceback
 import types
 import unicodedata
+from urllib import request as urllib_request
 import uuid
+import webbrowser
 import zlib
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
@@ -1322,6 +1324,20 @@ validate_operation_response = validate_response
 
 APP_NAME = "PC-REHD Code X Launcher"
 APP_VERSION = 1
+LAUNCHER_WINDOW_TITLE = "CAPCOM MT FRAMEWORK Script v0.1.2.8 Codex Python"
+GITHUB_RELEASE_UPDATE_SUFFIX = " | 发现Github Release 新版本"
+GITHUB_LAUNCHER_RAW_URL = (
+    "https://raw.githubusercontent.com/Criticise/"
+    "PC-REHD-1.2.8-Scrpit-rewritten-in-Python-by-Code-X-GPT-5.6/"
+    "main/PC-REHD%20Code%20X%20Launcher.py"
+)
+GITHUB_RELEASE_PAGE_URL = (
+    "https://github.com/Criticise/"
+    "PC-REHD-1.2.8-Scrpit-rewritten-in-Python-by-Code-X-GPT-5.6/"
+    "releases/tag/v1.0.0"
+)
+GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS = 5.0
+GITHUB_UPDATE_SOURCE_MAX_BYTES = 16 * 1024 * 1024
 LAUNCHER_SUPPORTED_PYTHON_MINORS = ((3, 12), (3, 14))
 ISOLATED_PYTHON_ENVIRONMENT = {
     "PYTHONUTF8": "1",
@@ -8957,6 +8973,25 @@ WORK_AGENT_COMPONENT_REVISION = (
 )
 AGENT_COMPONENT_REVISION = WORK_AGENT_COMPONENT_REVISION
 LAUNCHER_BUILD_ID = f"{APP_VERSION}-{LAUNCHER_SOURCE_SHA256[:16]}"
+
+
+def _fetch_github_launcher_source_sha256(
+    *,
+    opener: Callable[..., Any] | None = None,
+) -> str:
+    """Return the SHA-256 of the public Launcher source without using GitHub REST."""
+    request = urllib_request.Request(
+        GITHUB_LAUNCHER_RAW_URL,
+        headers={"User-Agent": f"{APP_NAME}/{LAUNCHER_BUILD_ID}"},
+    )
+    open_request = opener or urllib_request.urlopen
+    with open_request(request, timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS) as response:
+        payload = response.read(GITHUB_UPDATE_SOURCE_MAX_BYTES + 1)
+    if len(payload) > GITHUB_UPDATE_SOURCE_MAX_BYTES:
+        raise ValueError("GitHub Launcher source exceeded the update-check size limit")
+    if not payload:
+        raise ValueError("GitHub returned an empty Launcher source")
+    return hashlib.sha256(payload).hexdigest().upper()
 
 
 class PolicyValidationRevisionChanged(RuntimeError):
@@ -45454,7 +45489,12 @@ class LauncherApp:
             if active_advanced_options_visible
             else "collapsed"
         )
-        self.root.title("CAPCOM MT FRAMEWORK Script v0.1.2.8 Codex Python")
+        self._github_update_check_started = False
+        self._github_update_available = False
+        self._github_remote_launcher_sha256 = ""
+        self._github_update_title_click_hook: dict[str, Any] | None = None
+        self._github_update_title_click_install_pending = False
+        self._refresh_launcher_window_title()
         _set_themed_window_geometry(
             self.root, "1x1", dark=bool(self.dark_mode_enabled)
         )
@@ -45848,6 +45888,7 @@ class LauncherApp:
         self._start_bootstrap_health_supervisor()
         self._schedule_background_callback_pump()
         self._schedule_max_executable_discovery()
+        self.root.after(500, self._start_github_launcher_update_check)
         self._refresh_agent_startup_hooks(time.monotonic(), force=True)
         self._start_importer_warmup()
         self._schedule_writer_warmup()
@@ -45872,6 +45913,208 @@ class LauncherApp:
             self.root.after(240, self._schedule_blender_hierarchy_message_position)
         if self._auto_launch_requested:
             self.root.after(180, self._auto_launch_max)
+
+    def _refresh_launcher_window_title(self) -> None:
+        suffix = GITHUB_RELEASE_UPDATE_SUFFIX if self._github_update_available else ""
+        try:
+            self.root.title(LAUNCHER_WINDOW_TITLE + suffix)
+        except self.tk.TclError:
+            return
+        if self._github_update_available:
+            self._schedule_github_update_title_click_hook()
+
+    def _schedule_github_update_title_click_hook(self) -> None:
+        """Make only the native update-title segment open the published Release."""
+        if (
+            os.name != "nt"
+            or self._github_update_title_click_install_pending
+            or self._close_in_progress
+        ):
+            return
+        self._github_update_title_click_install_pending = True
+
+        def install() -> None:
+            self._github_update_title_click_install_pending = False
+            self._install_github_update_title_click_hook()
+
+        try:
+            self.root.after_idle(install)
+        except self.tk.TclError:
+            self._github_update_title_click_install_pending = False
+
+    def _github_update_title_click_contains(
+        self,
+        hwnd_value: int,
+        screen_x: int,
+        screen_y: int,
+    ) -> bool:
+        """Return whether a screen point falls on the visible update suffix."""
+        if not self._github_update_available:
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            rect = wintypes.RECT()
+            if not bool(user32.GetWindowRect(wintypes.HWND(hwnd_value), ctypes.byref(rect))):
+                return False
+            client_top = int(self.root.winfo_rooty())
+            if not (int(rect.top) <= int(screen_y) < client_top):
+                return False
+            dpi = 96
+            get_dpi_for_window = getattr(user32, "GetDpiForWindow", None)
+            if get_dpi_for_window is not None:
+                get_dpi_for_window.argtypes = [wintypes.HWND]
+                get_dpi_for_window.restype = wintypes.UINT
+                dpi = max(96, int(get_dpi_for_window(wintypes.HWND(hwnd_value)) or 96))
+            scale = float(dpi) / 96.0
+            title_start = int(rect.left) + int(round(31 * scale))
+            update_start = title_start + self._measure_ui_text(LAUNCHER_WINDOW_TITLE)
+            update_end = update_start + self._measure_ui_text(GITHUB_RELEASE_UPDATE_SUFFIX)
+            caption_controls_start = int(rect.right) - int(round(94 * scale))
+            return update_start - 6 <= int(screen_x) < min(update_end + 8, caption_controls_start)
+        except Exception:
+            return False
+
+    def _install_github_update_title_click_hook(self) -> None:
+        """Subclass the main native frame without changing the normal title bar."""
+        if (
+            os.name != "nt"
+            or not self._github_update_available
+            or self._close_in_progress
+        ):
+            return
+        existing = self._github_update_title_click_hook
+        if existing is not None:
+            return
+        hwnds = _native_toplevel_hwnds(self.root)
+        if not hwnds:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            hwnd_value = int(hwnds[0])
+            user32 = ctypes.windll.user32
+            long_ptr = ctypes.c_ssize_t
+            wndproc_type = ctypes.WINFUNCTYPE(
+                long_ptr,
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            )
+            user32.SetWindowLongPtrW.argtypes = [
+                wintypes.HWND,
+                ctypes.c_int,
+                long_ptr,
+            ]
+            user32.SetWindowLongPtrW.restype = long_ptr
+            user32.CallWindowProcW.argtypes = [
+                long_ptr,
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            ]
+            user32.CallWindowProcW.restype = long_ptr
+            hook_state: dict[str, Any] = {"press": None}
+
+            def title_window_proc(hwnd: Any, message: Any, wparam: Any, lparam: Any) -> int:
+                try:
+                    message_value = int(message)
+                    if int(wparam) == 2:  # HTCAPTION
+                        packed = int(lparam)
+                        point_x = ctypes.c_short(packed & 0xFFFF).value
+                        point_y = ctypes.c_short((packed >> 16) & 0xFFFF).value
+                        if message_value == 0x00A1:  # WM_NCLBUTTONDOWN
+                            hook_state["press"] = (
+                                point_x,
+                                point_y,
+                            ) if self._github_update_title_click_contains(
+                                hwnd_value, point_x, point_y
+                            ) else None
+                        elif message_value == 0x00A2:  # WM_NCLBUTTONUP
+                            press = hook_state.get("press")
+                            hook_state["press"] = None
+                            if (
+                                press is not None
+                                and abs(point_x - int(press[0])) <= 6
+                                and abs(point_y - int(press[1])) <= 6
+                                and self._github_update_title_click_contains(
+                                    hwnd_value, point_x, point_y
+                                )
+                            ):
+                                self.root.after_idle(self._open_github_release_page)
+                except Exception:
+                    pass
+                try:
+                    return int(
+                        user32.CallWindowProcW(
+                            previous_window_proc,
+                            hwnd,
+                            message,
+                            wparam,
+                            lparam,
+                        )
+                    )
+                except Exception:
+                    return 0
+
+            callback = wndproc_type(title_window_proc)
+            ctypes.set_last_error(0)
+            previous_window_proc = user32.SetWindowLongPtrW(
+                wintypes.HWND(hwnd_value),
+                -4,  # GWLP_WNDPROC
+                ctypes.cast(callback, ctypes.c_void_p).value,
+            )
+            if not previous_window_proc:
+                error_code = ctypes.get_last_error()
+                if error_code:
+                    return
+            self._github_update_title_click_hook = {
+                "hwnd": hwnd_value,
+                "callback": callback,
+                "previous_window_proc": previous_window_proc,
+            }
+        except Exception:
+            return
+
+    def _open_github_release_page(self) -> None:
+        """Open the sole published Release only after the user clicks its title."""
+        if not self._github_update_available:
+            return
+        try:
+            webbrowser.open(GITHUB_RELEASE_PAGE_URL, new=2)
+        except Exception:
+            return
+
+    def _start_github_launcher_update_check(self) -> None:
+        if self._github_update_check_started or self._close_in_progress:
+            return
+        self._github_update_check_started = True
+
+        def receive(remote_sha256: Any) -> None:
+            if self._close_in_progress:
+                return
+            remote = str(remote_sha256 or "").strip().upper()
+            if len(remote) != 64 or not re.fullmatch(r"[0-9A-F]{64}", remote):
+                return
+            self._github_remote_launcher_sha256 = remote
+            self._github_update_available = not secrets.compare_digest(
+                remote, LAUNCHER_SOURCE_SHA256
+            )
+            self._refresh_launcher_window_title()
+
+        self._run_background(
+            _fetch_github_launcher_source_sha256,
+            receive,
+            label="GitHub update check",
+            on_error=lambda _error: None,
+            quiet=True,
+            track_busy=False,
+        )
 
     def _dispatch_operation(
         self,
