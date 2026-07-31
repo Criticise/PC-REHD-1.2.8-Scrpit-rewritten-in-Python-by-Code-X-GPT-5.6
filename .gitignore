@@ -19,3 +19,10 @@ V4备份 - 严重缺陷，V4会参与检测PYTHON/
 *.log
 .vs/
 .idea/
+
+# Rebuildable native-extension intermediates and developer-only CLI launchers.
+**/build/temp*/
+PY依赖 PY Libs/_vendor_fixed/codex_accel_re6_v4/src/codex_fbx_probe_accel/build/
+PY依赖 PY Libs/_vendor_fixed/codex_accel_re6_v4/src/codex_uv_layout_accel/build/
+PY依赖 PY Libs/_vendor_py/bin/
+PY依赖 PY Libs/_vendor_py/cp314/bin/

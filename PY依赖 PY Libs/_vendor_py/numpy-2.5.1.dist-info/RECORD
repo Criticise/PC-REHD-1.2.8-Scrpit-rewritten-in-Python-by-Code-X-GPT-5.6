@@ -1,5 +1,3 @@
-../../bin/f2py.exe,sha256=J7qPxIG4EJKpcQ5fF5Q8GeRLmYnlXTO4xyViDGjHnTM,108399
-../../bin/numpy-config.exe,sha256=QdMgP_CFfMaMHhF1O1MGsdldTPQx1WkLXEySZfaNOZk,108399
 numpy-2.5.1.dist-info/DELVEWHEEL,sha256=m_OxldzDP7l_Lk9V3nv2ragQdp0qZeJZSW6J6jiOo7E,462
 numpy-2.5.1.dist-info/INSTALLER,sha256=zuuue4knoyJ-UwPPXg8fezS7VCrXJQrAP7zeNuwvFQg,4
 numpy-2.5.1.dist-info/METADATA,sha256=auRRIu6XBQ5IhJQ4MgQw0F8BgU9y5m5py-7QJ9LGoeg,6584
