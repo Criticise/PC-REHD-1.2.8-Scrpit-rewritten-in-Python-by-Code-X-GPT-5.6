@@ -1365,6 +1365,7 @@ BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL = "PC-REHD Import Blender FBX"
 MRL_BIND_NATIVE_UNDO_LABEL = "PC-REHD MRL Auto Texture Bind"
 MESH_RENAME_NATIVE_UNDO_LABEL = "PC-REHD Mesh Rename"
 MESH_FILTER_NATIVE_UNDO_LABEL = "PC-REHD Mesh Filter"
+EXPORT_MAP2_NATIVE_UNDO_LABEL = "PC-REHD Collapse UV Map 2"
 _MAX_BLENDER_FBX_LOD_GROUP_IDS = frozenset((0, 1, 2, 3, 4, 5, 6, 249, 252, 254, 255))
 _MAX_BLENDER_FBX_IMPORT_SUFFIX_RE = re.compile(
     r"(?i)_Import_?(?P<ordinal>[2-9]|[1-9]\d+)(?:_(?P<duplicate>[1-9]\d*))?$"
@@ -4801,7 +4802,12 @@ PYMXS_EXPORT_ALLOWED_RUNTIME_CALLS = (
     "rt.Name",
     "rt.classOf",
     "rt.clearSelection",
+    "rt.collapse.getcollapseto",
+    "rt.collapse.getoutputtype",
+    "rt.collapse.setcollapseto",
+    "rt.collapse.setoutputtype",
     "rt.delete",
+    "rt.deleteModifier",
     "rt.exportFile",
     "rt.getAnimByHandle",
     "rt.gc",
@@ -4811,13 +4817,16 @@ PYMXS_EXPORT_ALLOWED_RUNTIME_CALLS = (
     "rt.getNumVerts",
     "rt.getUserProp",
     "rt.maxOps.getNodeByHandle",
+    "rt.maxOps.CollapseNodeTo",
     "rt.meshop.getMapSupport",
     "rt.pluginManager.loadClass",
     "rt.select",
+    "rt.addModifier",
     "rt.skinOps.GetBoneName",
     "rt.skinOps.GetNumberBones",
 )
 PYMXS_EXPORT_ALLOWED_RUNTIME_VALUES = (
+    "rt.Editable_Mesh",
     "rt.FBXEXP",
     "rt.objects",
     "rt.selection",
@@ -4832,6 +4841,7 @@ PYMXS_EXPORT_REQUIRED_FUNCTIONS = (
     "_max_export_mod",
     "_max_export_fbx",
     "_max_export_bone_fbx_scope",
+    "_max_prepare_export_map2_unwrap",
     "_max_export_scene_nodes_by_handle",
     "_max_export_nodes_from_handles",
     "_max_export_selection_handles",
@@ -4860,7 +4870,7 @@ PYMXS_EXPORT_FORBIDDEN_FUNCTIONS = (
     "_max_light_scene_selection_contract",
 )
 PYMXS_EXPORT_APPROVED_CALL_GRAPH_FINGERPRINT = (
-    "C3E74EA8B49C383DAF1F840E30CF4D4612684470AEE886CD12FBCD88B45DBF41"
+    "50A5EFDF23B382A66CEBD0F5ECBFCE3E49F1B51197A420C8DB0FE180F5C896A9"
 )
 PYMXS_EXPORT_AI_REVIEW_QUESTION = (
     "维护 AI 必须回答：为什么 _max_export_mod 可达调用图发生了变化；rt.objects 是否仍只在 "
@@ -4911,6 +4921,7 @@ _PYMXS_APPROVED_RUNTIME_CALLS = frozenset(
         "rt.copy",
         "rt.convertTo",
         "rt.delete",
+        "rt.deleteModifier",
         "rt.deleteUserProp",
         "rt.dotNetClass",
         "rt.execute",
@@ -5581,6 +5592,9 @@ def _max_restore_export_selection(rt):
 def _max_export_bone_fbx_scope(rt):
     return _max_export_nodes_from_handles(rt)
 
+def _max_prepare_export_map2_unwrap(rt, nodes):
+    return {"requested": True, "nodes": []}
+
 def _max_set_and_verify_fbx_export_param(rt, key, expected):
     rt.FBXExporterSetParam(key, expected)
     actual = rt.FBXExporterGetParam(key)
@@ -5620,6 +5634,7 @@ def _max_export_fbx(rt):
 def _max_export_mod(payload):
     _max_bucket_identity_receipt([])
     _max_export_bone_fbx_scope(_max_runtime())
+    _max_prepare_export_map2_unwrap(_max_runtime(), [])
     return _max_export_fbx(_max_runtime())
 
 MAX_SCENE_ACCESS_INTERFACES = {
@@ -16418,8 +16433,20 @@ def _max_scene_name_selection_snapshot(rt: Any) -> dict[str, Any]:
     }
 
 
-def _max_export_scene_node_cache(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the full-scene name index matching the Python export receipt."""
+def _max_export_scene_node_cache(
+    rt: Any,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve this export's approved Handles without a geometry or scene scan.
+
+    A preceding ``probe_scene_names`` request is useful as the authoritative
+    name/Handle contract, but a Rescue Worker replacement may occur between
+    that request and ``export_mod``.  The export command must therefore not
+    require a Python-module global from the preceding request.  It first uses
+    a matching resident cache when available; otherwise it resolves only the
+    already approved Bucket/selection Handles by ``getNodeByHandle`` and
+    checks each returned name against the snapshot carried by this request.
+    """
     snapshot = payload.get("scene_name_selection_snapshot")
     receipt = payload.get("prevalidated_bucket_receipt")
     if not isinstance(snapshot, Mapping) or not isinstance(receipt, Mapping):
@@ -16438,21 +16465,86 @@ def _max_export_scene_node_cache(payload: Mapping[str, Any]) -> dict[str, Any]:
         or receipt_digest != snapshot_digest
     ):
         return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
+    snapshot_nodes: dict[int, str] = {}
+    for raw_row in snapshot.get("nodes", []):
+        if not isinstance(raw_row, Mapping):
+            return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
+        try:
+            handle = int(raw_row.get("handle", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
+        name = str(raw_row.get("name", "") or "")
+        if handle <= 0 or handle in snapshot_nodes:
+            return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
+        snapshot_nodes[handle] = name
+
+    receipt_rows = receipt.get("rows", [])
+    if not isinstance(receipt_rows, list):
+        return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
+    target_handles: set[int] = set()
+    for raw_row in receipt_rows:
+        if not isinstance(raw_row, Mapping):
+            return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
+        if (
+            str(raw_row.get("lane", "") or "").casefold() != "modify"
+            or not bool(raw_row.get("requires_selected_fbx", False))
+        ):
+            continue
+        try:
+            handle = int(raw_row.get("scene_node_handle", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
+        if handle <= 0 or snapshot_nodes.get(handle) != str(
+            raw_row.get("scene_node", "") or ""
+        ):
+            return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
+        target_handles.add(handle)
+
+    selected_handles: list[int] = []
+    for raw_row in snapshot.get("selected_nodes", []):
+        if not isinstance(raw_row, Mapping):
+            continue
+        try:
+            handle = int(raw_row.get("handle", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if (
+            handle > 0
+            and snapshot_nodes.get(handle) == str(raw_row.get("name", "") or "")
+            and handle not in selected_handles
+        ):
+            selected_handles.append(handle)
+
     cached = _MAX_VALIDATED_SCENE_NODE_CACHE
     if (
         int(cached.get("max_process_id", 0) or 0) != snapshot_pid
         or str(cached.get("digest", "") or "").upper() != snapshot_digest
         or not isinstance(cached.get("nodes_by_handle"), dict)
     ):
-        return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
+        # Do not enumerate rt.objects here.  Only the Handles that were
+        # frozen in the current export receipt may be resolved on demand.
+        nodes_by_handle: dict[int, Any] = {}
+        for handle in sorted(target_handles):
+            try:
+                node = rt.maxOps.getNodeByHandle(handle)
+                actual_handle = _max_node_handle(rt, node)
+                actual_name = str(getattr(node, "name", "") or "")
+            except Exception:
+                return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
+            if actual_handle != handle or actual_name != snapshot_nodes[handle]:
+                return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
+            nodes_by_handle[handle] = node
+        if not target_handles.issubset(nodes_by_handle):
+            return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
+        return {
+            "hit": True,
+            "nodes_by_handle": nodes_by_handle,
+            "selected_handles": [],
+        }
     return {
         "hit": True,
         "nodes_by_handle": dict(cached["nodes_by_handle"]),
-        "selected_handles": [
-            int(value)
-            for value in cached.get("selected_handles", [])
-            if int(value or 0) > 0
-        ],
+        "selected_handles": selected_handles,
     }
 
 
@@ -20046,6 +20138,169 @@ def role_needs_geometry(kind: str, role: str) -> bool:
     )
 
 
+def _max_is_unwrap_uvw_modifier(rt: Any, modifier: Any) -> bool:
+    class_name = _max_class_name(rt, modifier).replace(" ", "_").casefold()
+    return class_name in {"unwrap_uvw", "unwrapuvw"}
+
+
+def _max_prepare_export_map2_unwrap(
+    rt: Any,
+    nodes: list[Any],
+) -> dict[str, Any]:
+    """Bake only selected Unwrap UVW modifiers into Editable Mesh bases.
+
+    Max's FBX exporter drops channel 2 when it exists only in an Unwrap UVW
+    modifier.  The caller supplies the already validated Modify Mesh nodes;
+    this helper must not inspect geometry, UV arrays, or the wider scene.
+    """
+    receipt: dict[str, Any] = {
+        "requested": True,
+        "target_handles": [],
+        "unwrap_found": 0,
+        "moved_to_editable_mesh": 0,
+        "collapsed": 0,
+        "skipped_no_unwrap": [],
+        "failed": [],
+        "nodes": [],
+    }
+    previous_output_type = rt.collapse.getoutputtype()
+    previous_collapse_to = rt.collapse.getcollapseto()
+    try:
+        # This is the native "Collapse To" configuration used by the existing
+        # isolated stack proof.  It preserves modifiers above the chosen level.
+        rt.collapse.setoutputtype(rt.Name("mesh"))
+        rt.collapse.setcollapseto(rt.Name("multiple"))
+        for node in nodes:
+            handle = _max_node_handle(rt, node)
+            node_name = str(getattr(node, "name", "") or "")
+            node_receipt: dict[str, Any] = {
+                "handle": handle,
+                "name": node_name,
+                "unwrap_count": 0,
+                "moved": 0,
+                "collapsed": 0,
+                "status": "pending",
+            }
+            receipt["target_handles"].append(handle)
+            receipt["nodes"].append(node_receipt)
+            unwrap_count = sum(
+                1 for modifier in _max_modifiers(node)
+                if _max_is_unwrap_uvw_modifier(rt, modifier)
+            )
+            node_receipt["unwrap_count"] = unwrap_count
+            receipt["unwrap_found"] += unwrap_count
+            if not unwrap_count:
+                node_receipt["status"] = "skipped_no_unwrap"
+                receipt["skipped_no_unwrap"].append(handle)
+                continue
+            if not _max_is_editable_mesh_node(rt, node):
+                detail = (
+                    "UV Map 2 export requires an Editable Mesh base before "
+                    f"collapsing Unwrap UVW: {node_name or handle}"
+                )
+                node_receipt["status"] = "failed_not_editable_mesh"
+                node_receipt["detail"] = detail
+                receipt["failed"].append(detail)
+                raise RuntimeError(detail)
+
+            # Process the current bottom-most Unwrap first. Each collapse keeps
+            # higher modifiers, including Skin, intact for the later FBX export.
+            while True:
+                modifiers = _max_modifiers(node)
+                unwrap_index = next(
+                    (
+                        index
+                        for index in range(len(modifiers), 0, -1)
+                        if _max_is_unwrap_uvw_modifier(rt, modifiers[index - 1])
+                    ),
+                    0,
+                )
+                if not unwrap_index:
+                    break
+                modifier_count = len(modifiers)
+                unwrap_modifier = modifiers[unwrap_index - 1]
+                expected_upper_modifiers = (
+                    modifiers[: unwrap_index - 1] + modifiers[unwrap_index:]
+                )
+                if unwrap_index != modifier_count:
+                    # Max 2026 exposes no setModifierIndex runtime function.
+                    # Reinsert the same modifier at the stack bottom, then prove
+                    # that every modifier above it retained its original order.
+                    try:
+                        rt.deleteModifier(node, unwrap_index)
+                        # After removal the old count is the append position.
+                        rt.addModifier(node, unwrap_modifier, before=modifier_count)
+                    except Exception as exc:
+                        detail = (
+                            "3ds Max could not move Unwrap UVW above Editable Mesh: "
+                            f"{node_name or handle} ({type(exc).__name__}: {exc})"
+                        )
+                        node_receipt["status"] = "failed_move"
+                        node_receipt["detail"] = detail
+                        receipt["failed"].append(detail)
+                        raise RuntimeError(detail) from exc
+                    repositioned_modifiers = _max_modifiers(node)
+                    if (
+                        len(repositioned_modifiers) != modifier_count
+                        or repositioned_modifiers[-1] != unwrap_modifier
+                        or repositioned_modifiers[:-1] != expected_upper_modifiers
+                    ):
+                        detail = (
+                            "3ds Max changed the modifier stack while moving Unwrap UVW: "
+                            f"{node_name or handle}"
+                        )
+                        node_receipt["status"] = "failed_move_validation"
+                        node_receipt["detail"] = detail
+                        receipt["failed"].append(detail)
+                        raise RuntimeError(detail)
+                    node_receipt["moved"] += 1
+                    receipt["moved_to_editable_mesh"] += 1
+                if not bool(rt.maxOps.CollapseNodeTo(node, modifier_count, True)):
+                    detail = (
+                        "3ds Max did not collapse Unwrap UVW to Editable Mesh: "
+                        f"{node_name or handle}"
+                    )
+                    node_receipt["status"] = "failed_collapse"
+                    node_receipt["detail"] = detail
+                    receipt["failed"].append(detail)
+                    raise RuntimeError(detail)
+                node_receipt["collapsed"] += 1
+                receipt["collapsed"] += 1
+                remaining_modifiers = _max_modifiers(node)
+                if remaining_modifiers != expected_upper_modifiers:
+                    detail = (
+                        "Unwrap UVW collapse changed modifiers above Editable Mesh: "
+                        f"{node_name or handle}"
+                    )
+                    node_receipt["status"] = "failed_upper_stack_validation"
+                    node_receipt["detail"] = detail
+                    receipt["failed"].append(detail)
+                    raise RuntimeError(detail)
+                if not _max_is_editable_mesh_node(rt, node):
+                    detail = (
+                        "Unwrap UVW collapse did not retain an Editable Mesh base: "
+                        f"{node_name or handle}"
+                    )
+                    node_receipt["status"] = "failed_output_type"
+                    node_receipt["detail"] = detail
+                    receipt["failed"].append(detail)
+                    raise RuntimeError(detail)
+            node_receipt["status"] = "collapsed"
+    finally:
+        try:
+            rt.collapse.setoutputtype(previous_output_type)
+            rt.collapse.setcollapseto(previous_collapse_to)
+        except Exception as exc:
+            # A settings restore failure must stop the export instead of leaking
+            # a changed global Collapse configuration back to the user.
+            receipt["failed"].append(
+                f"Collapse settings restore failed: {type(exc).__name__}: {exc}"
+            )
+    if receipt["failed"]:
+        raise RuntimeError(" | ".join(str(detail) for detail in receipt["failed"]))
+    return receipt
+
+
 def _max_export_mod(payload: dict[str, Any]) -> dict[str, Any]:
     bucket_rows = [row for row in payload.get("bucket_rows", []) if isinstance(row, dict)]
     bucket_receipt = _max_bucket_identity_receipt(
@@ -20053,11 +20308,10 @@ def _max_export_mod(payload: dict[str, Any]) -> dict[str, Any]:
         prevalidated_receipt=payload.get("prevalidated_bucket_receipt"),
     )
     requested_full_scene = bool(payload.get("export_all_scene", False))
-    scene_node_cache = (
-        _max_export_scene_node_cache(payload)
-        if not requested_full_scene
-        else {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
-    )
+    # The Launcher hands this exact name/Handle cache to every export route.
+    # Map 2 preparation must resolve only the selected Modify Meshes from it;
+    # it must never add a fresh scene traversal before FBX export.
+    scene_node_cache = _max_export_scene_node_cache(_max_runtime(), payload)
     cached_nodes_by_handle = (
         scene_node_cache["nodes_by_handle"]
         if bool(scene_node_cache.get("hit"))
@@ -20079,6 +20333,43 @@ def _max_export_mod(payload: dict[str, Any]) -> dict[str, Any]:
     ]
     geometry_rows = [row for row in modify_rows if bool(row.get("requires_selected_fbx", False))]
     modify_handles = sorted({int(row["scene_node_handle"]) for row in geometry_rows})
+    export_map2 = bool(payload.get("export_map2", False))
+    uv2_collapse_receipt: dict[str, Any] = {
+        "requested": export_map2,
+        "target_handles": [],
+        "unwrap_found": 0,
+        "moved_to_editable_mesh": 0,
+        "collapsed": 0,
+        "skipped_no_unwrap": [],
+        "failed": [],
+        "nodes": [],
+    }
+    if export_map2 and modify_handles:
+        if cached_nodes_by_handle is None:
+            raise ProtocolError(
+                "UV Map 2 export requires the prevalidated Max name/Handle cache; "
+                "retry the export after the scene snapshot is refreshed"
+            )
+        modify_names = {
+            int(row["scene_node_handle"]): str(row.get("scene_node", "") or "")
+            for row in geometry_rows
+        }
+        map2_nodes = _max_export_nodes_from_handles(
+            _max_runtime(),
+            modify_handles,
+            fallback_names=modify_names,
+            cached_nodes_by_handle=cached_nodes_by_handle,
+        )
+        resolved_map2_handles = {_max_node_handle(_max_runtime(), node) for node in map2_nodes}
+        missing_map2_handles = sorted(set(modify_handles) - resolved_map2_handles)
+        if missing_map2_handles:
+            raise RuntimeError(
+                "UV Map 2 export could not resolve the selected Modify Mesh handles: "
+                + ", ".join(str(handle) for handle in missing_map2_handles)
+            )
+        uv2_collapse_receipt = _max_prepare_export_map2_unwrap(
+            _max_runtime(), map2_nodes
+        )
     bone_export_mode = str(payload.get("bone_edit_export_mode", "disabled") or "disabled").strip().lower()
     if bone_export_mode not in {"disabled", "bones_only", "bones_plus_mesh"}:
         raise ValueError(f"Unsupported Bones Edit export mode: {bone_export_mode!r}")
@@ -20246,6 +20537,9 @@ def _max_export_mod(payload: dict[str, Any]) -> dict[str, Any]:
             fbx_receipt["bone_node_handles"] = bone_handles
             fbx_receipt["bone_matrix_authority"] = "max_selected_fbx"
 
+    fbx_receipt["export_map2"] = export_map2
+    fbx_receipt["uv2_collapse"] = uv2_collapse_receipt
+
     receipt_pid = int(bucket_receipt.get("max_process_id", 0) or 0)
     if receipt_pid <= 0:
         raise ProtocolError("Prevalidated export Bucket receipt has no target Max PID")
@@ -20406,6 +20700,15 @@ def _execute_max_command(command: str, payload: dict[str, Any]) -> dict[str, Any
     if command == "export_embedded_fbx":
         return _max_export_embedded_fbx(payload)
     if command == "export_mod":
+        if bool(payload.get("export_map2", False)):
+            result = _max_execute_with_native_undo(
+                EXPORT_MAP2_NATIVE_UNDO_LABEL,
+                _max_export_mod,
+                payload,
+            )
+            result["native_undo"] = True
+            result["native_undo_label"] = EXPORT_MAP2_NATIVE_UNDO_LABEL
+            return result
         return _max_export_mod(payload)
     if command == "apply_mesh_rename_plan":
         result = _max_execute_with_native_undo(
@@ -49166,7 +49469,7 @@ class LauncherApp:
             model,
             text=self._tr("导出 UV Map 2", "Export UV Map 2"),
             variable=self.export_map2_var,
-            command=self._persist_model_option_preferences,
+            command=self._commit_export_map2,
         )
         export_map2.grid(row=6, column=0, sticky="w", padx=8, pady=2)
         ttk.Button(model, text="?", width=3, command=lambda: self._show_help("map2")).grid(row=6, column=1, sticky="e", padx=(2, 8), pady=2)
@@ -51684,6 +51987,27 @@ class LauncherApp:
             return
         self.launcher_state["model_option_preferences"] = preferences
         self._queue_launcher_state_write()
+
+    def _export_map2_unwrap_notice_text(self) -> str:
+        return self._tr(
+            "由于 3ds MAX导出FBX 不支持Unwrap UVW 修改器写入FBX，为了让UV MAP 2生效，脚本会安全地将Unwrap UVW 放到Editable Mesh 上方，再塌陷到Editable Mesh，使UV MAP 2 对 Mesh 永久生效。",
+            "Because 3ds Max FBX export does not write an Unwrap UVW modifier into the FBX, the script safely moves Unwrap UVW directly above Editable Mesh and collapses it into Editable Mesh so UV Map 2 becomes permanent on the Mesh.",
+        )
+
+    def _commit_export_map2(self) -> None:
+        self._persist_model_option_preferences()
+        if self.blender_mode_enabled or not bool(self.export_map2_var.get()):
+            return
+        ChoiceDialog(
+            self.root,
+            title=self._tr("导出 UV Map 2", "Export UV Map 2"),
+            message=self._tr(
+                "已开启 导出 UV Map 2。",
+                "Export UV Map 2 is enabled.",
+            ),
+            orange_banner_message=self._export_map2_unwrap_notice_text(),
+            choices=[(self._tr("关闭", "Close"), "close")],
+        ).show()
 
     def _persist_mrl_texture_preferences(
         self,
@@ -69644,6 +69968,9 @@ class LauncherApp:
                 "Blender .blend files do not depend on external texture folders and are unaffected.",
             ),
         }
+        orange_banner_messages = {
+            "map2": self._export_map2_unwrap_notice_text(),
+        }
         titles = {
             "import_textures": self._tr("导入贴图", "Import Textures"),
             "blender_import_normals": self._tr(
@@ -69663,6 +69990,7 @@ class LauncherApp:
             detail_message=detail_messages.get(topic, ""),
             warning_message=warning_messages.get(topic, ""),
             warning_before_detail=(topic == "import_textures"),
+            orange_banner_message=orange_banner_messages.get(topic, ""),
             message_bottom_padding=6 if topic == "import_textures" else 16,
             choices=[(self._tr("关闭", "Close"), "close")],
         ).show()
@@ -78514,14 +78842,6 @@ class LauncherApp:
         ]
         requires_current_fbx = bool(modify_handles) or resolved_bone_mode != "disabled"
         cached_scene_contract = copy.deepcopy(workspace.scene_contract)
-        cached_export_scene_snapshot = (
-            {}
-            if blender_export
-            else _cached_export_scene_name_snapshot(
-                workspace,
-                session.pid,
-            )
-        )
         header_mode = int(workspace.header_mode)
         force_named_fvf_once = bool(self._force_named_fvf_once)
         options = {
@@ -78798,7 +79118,7 @@ class LauncherApp:
             )
             queue_export_progress(
                 "正在使用已确认的导出分组和场景快照",
-                "Using the confirmed Export Sets and cached scene snapshot",
+                "Using the confirmed Export Sets and scene snapshot",
                 24,
             )
             operation_scene_contract = copy.deepcopy(cached_scene_contract)
@@ -78822,13 +79142,26 @@ class LauncherApp:
                     session.pid,
                 )
             else:
+                # Export UV Map 2 must use the Agent's current resident
+                # name/Handle cache.  This name-only preflight refreshes that
+                # cache before Bucket 3 is resolved for Unwrap UVW preparation
+                # and supplies the exact snapshot that the export command will
+                # later verify.  It intentionally does not inspect geometry.
+                queue_export_progress(
+                    "MAX Agent 正在验证 Bucket 3 名称和 Handle",
+                    "Max Agent is validating Bucket 3 names and Handles",
+                    28,
+                )
+                _snapshot_request_id, scene_name_selection_snapshot = (
+                    self._request_max_scene_interface(
+                        session,
+                        "export.scene_names",
+                    )
+                )
                 operation_scene_contract, _compatibility_receipt = (
                     _apply_scene_export_compatibility_contract(
                         operation_scene_contract,
                     )
-                )
-                scene_name_selection_snapshot = copy.deepcopy(
-                    cached_export_scene_snapshot
                 )
             prevalidated_bucket_receipt = _max_bucket_identity_receipt(
                 operation_bucket_rows,
@@ -78944,12 +79277,16 @@ class LauncherApp:
                     "bucket_rows": planned_bucket_rows,
                     "fbx_path": str(fbx_path) if requires_current_fbx else "",
                     "bone_edit_export_mode": resolved_bone_mode,
+                    "export_map2": bool(options["export_map2"]),
                     "bone_scope_bone_handles": list(bone_scope_payload["bone_handles"]),
                     "bone_scope_node_handles": list(bone_scope_payload["node_handles"]),
                     "bone_scope_node_names": dict(bone_scope_payload["node_names"]),
                     "source_sha256": source_sha,
                     "export_all_scene": requires_current_fbx,
                     "export_scene_rows": copy.deepcopy(scene_name_selection_snapshot["nodes"]),
+                    "scene_name_selection_snapshot": copy.deepcopy(
+                        scene_name_selection_snapshot
+                    ),
                     "prevalidated_bucket_receipt": prevalidated_bucket_receipt,
                 }
                 request_id, max_result = self._request_max_scene_interface(
@@ -79018,6 +79355,25 @@ class LauncherApp:
             ]
             fbx_receipt = max_result.get("fbx_receipt")
             fbx_receipt = dict(fbx_receipt) if isinstance(fbx_receipt, dict) else {}
+            if not blender_export:
+                if fbx_receipt.get("export_map2") is not bool(options["export_map2"]):
+                    raise ProtocolError(
+                        "Max FBX export reversed the UV Map 2 request"
+                    )
+                if bool(options["export_map2"]) and live_modify_handles:
+                    uv2_collapse = fbx_receipt.get("uv2_collapse")
+                    if not isinstance(uv2_collapse, Mapping):
+                        raise ProtocolError(
+                            "Max FBX export did not return the UV Map 2 collapse receipt"
+                        )
+                    if uv2_collapse.get("requested") is not True:
+                        raise ProtocolError(
+                            "Max FBX export did not acknowledge the UV Map 2 collapse request"
+                        )
+                    if list(uv2_collapse.get("failed", [])):
+                        raise ProtocolError(
+                            "Max FBX export reported a UV Map 2 collapse failure"
+                        )
             fbx_receipt_path = str(
                 fbx_receipt.get("path") or max_result.get("fbx_path") or (fbx_path if requires_current_fbx else "")
             ).strip()

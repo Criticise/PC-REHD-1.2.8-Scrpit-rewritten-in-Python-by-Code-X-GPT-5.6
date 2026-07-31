@@ -16813,7 +16813,7 @@ def _apply_export_uv_layout(job: dict[str, Any], contract: dict[str, Any]) -> in
     failed_reasons: list[str] = []
     map2_fallback_meshes: list[dict[str, Any]] = []
     effective_channels_by_slot: dict[int, int] = {}
-    max_map2_by_slot: dict[int, bool] = {}
+    fbx_map2_by_slot: dict[int, bool] = {}
     row_keys = (
         "positions",
         "max_positions",
@@ -16851,25 +16851,14 @@ def _apply_export_uv_layout(job: dict[str, Any], contract: dict[str, Any]) -> in
         eligible_slots.append(mesh_slot)
         map1_channel = _select_exact_fbx_uv_channel(mesh, 1)
         map2_channel = _select_exact_fbx_uv_channel(mesh, 2)
+        fbx_has_valid_map2 = _is_valid_uv_risk_channel(map2_channel, len(geometry_indices))
         if requested_uv_channel == 2:
-            if not isinstance(mesh.get("has_map2"), bool):
-                raise RuntimeError(
-                    f"Bucket 3 Mesh {_format_uv_risk_mesh_name(mesh)} has no live Max Map 2 fact"
-                )
-            max_has_map2 = bool(mesh["has_map2"])
-            max_map2_by_slot[mesh_slot] = max_has_map2
-        else:
-            max_has_map2 = False
+            # The collapsed stack can add Map 2 after the scene snapshot has
+            # already been captured.  The exported FBX is the only UV authority
+            # at this point, so an older Max `has_map2` fact must not veto it.
+            fbx_map2_by_slot[mesh_slot] = fbx_has_valid_map2
 
-        if requested_uv_channel == 2 and max_has_map2:
-            if not _is_valid_uv_risk_channel(map2_channel, len(geometry_indices)):
-                reason = f"{_format_uv_risk_mesh_name(mesh)}: live Max reports Map 2 but FBX channel 2 is unreadable"
-                if _mesh_allows_source_geometry_fallback(mesh):
-                    _mark_mesh_source_passthrough(mesh, reason)
-                    continue
-                failed_slots.append(mesh_slot)
-                failed_reasons.append(reason)
-                continue
+        if requested_uv_channel == 2 and fbx_has_valid_map2:
             effective_uv_channel = 2
         elif _is_valid_uv_risk_channel(map1_channel, len(geometry_indices)):
             effective_uv_channel = 1
@@ -16880,7 +16869,7 @@ def _apply_export_uv_layout(job: dict[str, Any], contract: dict[str, Any]) -> in
                         "mesh_name": _format_uv_risk_mesh_name(mesh),
                         "requested_uv_channel": 2,
                         "effective_uv_channel": 1,
-                        "reason": "max_scene_has_no_map2",
+                        "reason": "fbx_map2_missing_or_unreadable",
                     }
                 )
         else:
@@ -17021,7 +17010,7 @@ def _apply_export_uv_layout(job: dict[str, Any], contract: dict[str, Any]) -> in
         "applied_mesh_slots": applied_slots,
         "applied_mesh_count": applied_count,
         "effective_channels_by_mesh_slot": effective_channels_by_slot,
-        "max_map2_by_mesh_slot": max_map2_by_slot,
+        "fbx_map2_by_mesh_slot": fbx_map2_by_slot,
         "map2_fallback_meshes": map2_fallback_meshes,
         "map2_fallback_count": len(map2_fallback_meshes),
     }
@@ -17033,6 +17022,72 @@ def _apply_export_uv_layout(job: dict[str, Any], contract: dict[str, Any]) -> in
             + "; ".join(failed_reasons[:24])
         )
     return applied_count
+
+
+def _run_fbx_map2_authority_regression_guard() -> dict[str, Any]:
+    """Keep Map 2 selection bound to the exported FBX, not a stale scene snapshot."""
+
+    def make_mesh(*, fbx_has_map2: bool, max_has_map2: bool) -> dict[str, Any]:
+        uv_channels = [
+            {
+                "channel": 1,
+                "values": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                "corner_indices": [0, 1, 2],
+            }
+        ]
+        if fbx_has_map2:
+            uv_channels.append(
+                {
+                    "channel": 2,
+                    "values": [[0.2, 0.3], [0.8, 0.3], [0.2, 0.9]],
+                    "corner_indices": [0, 1, 2],
+                }
+            )
+        return {
+            "lane": "modify",
+            "mesh_slot": 7,
+            "scene_node": "Map2AuthorityRegressionMesh",
+            "has_map2": max_has_map2,
+            "positions": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            "source_vertex_indices": [0, 1, 2],
+            "fbx_geom_face_indices": [0, 1, 2],
+            "fbx_uv_channels": uv_channels,
+        }
+
+    def apply(mesh: dict[str, Any]) -> dict[str, Any]:
+        job = {
+            "meshes": [mesh],
+            "export_rules": {"export_map2": True, "uv_half_safe": False},
+        }
+        contract = {"meshes": [mesh]}
+        _apply_export_uv_layout(job, contract)
+        return job["uv_export_layout_receipt"]
+
+    fbx_map2_mesh = make_mesh(fbx_has_map2=True, max_has_map2=False)
+    fbx_map2_receipt = apply(fbx_map2_mesh)
+    if (
+        _int_or_default(fbx_map2_mesh.get("selected_uv_channel"), 0) != 2
+        or fbx_map2_mesh.get("uvs") != [[0.2, 0.3], [0.8, 0.3], [0.2, 0.9]]
+        or _int_or_default(fbx_map2_receipt.get("map2_fallback_count"), -1) != 0
+    ):
+        raise RuntimeError("FBX Map 2 was incorrectly vetoed by stale Max Map 2 state")
+
+    no_map2_mesh = make_mesh(fbx_has_map2=False, max_has_map2=True)
+    no_map2_receipt = apply(no_map2_mesh)
+    fallback_records = no_map2_receipt.get("map2_fallback_meshes")
+    if (
+        _int_or_default(no_map2_mesh.get("selected_uv_channel"), 0) != 1
+        or not isinstance(fallback_records, list)
+        or len(fallback_records) != 1
+        or fallback_records[0].get("reason") != "fbx_map2_missing_or_unreadable"
+    ):
+        raise RuntimeError("FBX Map 2 fallback no longer requires missing FBX channel 2")
+
+    return {
+        "status": "PASS",
+        "fbx_map2_authoritative": True,
+        "fbx_missing_map2_fallback": True,
+    }
 
 
 def _show_map2_fallback_notice(records: list[dict[str, Any]]) -> None:
@@ -24993,6 +25048,9 @@ def _max_restore_export_selection(rt):
 def _max_export_bone_fbx_scope(rt):
     return _max_export_nodes_from_handles(rt)
 
+def _max_prepare_export_map2_unwrap(rt, nodes):
+    return {"requested": True, "nodes": []}
+
 def _max_set_and_verify_fbx_export_param(rt, key, expected):
     return None
 
@@ -25019,6 +25077,8 @@ def _max_export_fbx(rt, *, export_all_scene=False):
 
 def _max_export_mod(payload):
     _max_bucket_identity_receipt([])
+    if bool(payload.get("export_map2", False)):
+        _max_prepare_export_map2_unwrap(_max_runtime(), [])
     export_all_scene = bool(payload.get("export_all_scene", False))
     if export_all_scene:
         return _max_export_fbx(_max_runtime(), export_all_scene=True)
@@ -29853,6 +29913,7 @@ if bool(globals().get("__codex_trusted_runtime_fast_load__", False)):
         "DELETE_SELECTED_STABLE_SLOT_REGRESSION_STATUS",
         "UINT16_VERTEX_GROUP_ROLLOVER_REGRESSION_STATUS",
         "PYMXS_GEOMETRY_BOUNDARY_REGRESSION_STATUS",
+        "FBX_MAP2_AUTHORITY_REGRESSION_STATUS",
         "BONES_PLUS_MESH_BINDING_REGRESSION_STATUS",
         "BONE_ADD_DELETE_V4_PARITY_REGRESSION_STATUS",
         "MEMORY_SCENE_CONTRACT_REGRESSION_STATUS",
@@ -29898,6 +29959,7 @@ else:
         DELETE_SELECTED_STABLE_SLOT_REGRESSION_STATUS = _run_delete_selected_stable_slot_regression_guard()
         UINT16_VERTEX_GROUP_ROLLOVER_REGRESSION_STATUS = _run_uint16_vertex_group_rollover_regression_guard()
         PYMXS_GEOMETRY_BOUNDARY_REGRESSION_STATUS = _run_pymxs_geometry_boundary_regression_guard()
+        FBX_MAP2_AUTHORITY_REGRESSION_STATUS = _run_fbx_map2_authority_regression_guard()
         BONES_PLUS_MESH_BINDING_REGRESSION_STATUS = _run_bones_plus_mesh_binding_regression_guard()
         BONE_ADD_DELETE_V4_PARITY_REGRESSION_STATUS = _run_bone_add_delete_v4_parity_regression_guard()
         MEMORY_SCENE_CONTRACT_REGRESSION_STATUS = _run_memory_scene_contract_regression_guard()
