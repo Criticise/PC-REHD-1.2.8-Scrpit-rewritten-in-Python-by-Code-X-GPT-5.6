@@ -15560,11 +15560,25 @@ def _max_instance_copy_execute(payload: dict[str, Any]) -> dict[str, Any]:
     batch_nodes: dict[int, Any] = {}
     try:
         for group_index, source, source_row, targets in resolved_groups:
+            # This action must match Max's native Instance clone: right-side
+            # rows supply names and optional later arrangement targets only.
+            # They must never replace the source node's world transform or parent.
+            try:
+                source_parent = source.parent
+            except Exception:
+                source_parent = None
+            source_transform = _max_matrix3_from_rows(
+                rt,
+                _matrix3(getattr(source, "transform", None)),
+            )
+            source_parent_handle = (
+                _max_node_handle(rt, source_parent)
+                if source_parent is not None
+                else 0
+            )
             for target, target_row in targets:
-                placement_node = target if target is not None else source
-                target_transform = placement_node.transform
                 try:
-                    target_parent = placement_node.parent
+                    target_parent = target.parent if target is not None else source_parent
                 except Exception:
                     target_parent = None
                 new_node = rt.instance(source)
@@ -15572,8 +15586,26 @@ def _max_instance_copy_execute(payload: dict[str, Any]) -> dict[str, Any]:
                 history_id = f"{copy_batch_id}:{len(created_rows)}"
                 desired_name = str(target_row.get("desired_name", "") or "").strip()
                 new_node.name = desired_name or rt.uniqueName(f"{source_row['name']}_Instance_")
-                new_node.parent = None
-                new_node.transform = target_transform
+                new_node.parent = source_parent
+                new_node.transform = source_transform
+                try:
+                    actual_parent = new_node.parent
+                except Exception:
+                    actual_parent = None
+                actual_parent_handle = (
+                    _max_node_handle(rt, actual_parent)
+                    if actual_parent is not None
+                    else 0
+                )
+                if actual_parent_handle != source_parent_handle:
+                    raise RuntimeError(
+                        "Instance clone did not preserve the source parent: "
+                        f"expected={source_parent_handle}, actual={actual_parent_handle}"
+                    )
+                if not _max_matrix3_close(new_node.transform, source_transform):
+                    raise RuntimeError(
+                        "Instance clone did not preserve the source world transform"
+                    )
                 batch_identity_persisted = False
                 history_identity_persisted = False
                 try:
@@ -15606,6 +15638,7 @@ def _max_instance_copy_execute(payload: dict[str, Any]) -> dict[str, Any]:
                         "batch_identity_persisted": batch_identity_persisted,
                         "history_identity_persisted": history_identity_persisted,
                         "placement_basis": str(target_row.get("placement_basis", "")),
+                        "transform_basis": "source_transform",
                         "source_handle": int(source_row["handle"]),
                         "source_name": str(source_row["name"]),
                         "target_handle": int(target_row["handle"]),
