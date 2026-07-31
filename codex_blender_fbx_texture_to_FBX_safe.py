@@ -455,6 +455,7 @@ def detect_material(material, report):
         "source_blend_method": material_enum_value(material, "blend_method", "OPAQUE"),
         "source_shadow_method": material_enum_value(material, "shadow_method", None),
         "unclassified_image_count": 0,
+        "sourceio_eye": None,
     }
 
     if not material:
@@ -524,6 +525,14 @@ def detect_material(material, report):
                 "Material '%s' has %d unclassified image textures; refusing to guess the base texture."
                 % (material.name, len(unclassified))
             )
+
+    sourceio_eye = detect_sourceio_eye_material(material)
+    if sourceio_eye:
+        # The SourceIO eye shader is not representable by an FBX material. Its
+        # iris and sclera must be baked together instead of being classified as
+        # unrelated generic texture channels.
+        result["sourceio_eye"] = sourceio_eye
+        result["base_color"] = sourceio_eye["base_image"]
 
     if not result["base_color"]:
         report.warn("Material '%s' has no detected base texture; keeping diffuse color only." % material.name)
@@ -672,6 +681,191 @@ def copy_material_metadata(source, target):
             pass
 
 
+def detect_sourceio_eye_material(material):
+    """Return SourceIO's two-texture eye layout only when its controls exist."""
+    if not material or not material.use_nodes or not material.node_tree:
+        return None
+
+    base_image = None
+    iris_image = None
+    controls = set()
+    for node in material.node_tree.nodes:
+        node_name = (getattr(node, "name", "") + " " + getattr(node, "label", "")).casefold()
+        if node_name.startswith("!eye_"):
+            controls.add(node_name.split()[0])
+        if node.bl_idname != "ShaderNodeTexImage" or not getattr(node, "image", None):
+            continue
+        image_name = str(node.image.name or "").casefold()
+        if "$basetexture" in node_name or "eyeball" in image_name:
+            base_image = node.image
+        if "$iris" in node_name or "pupil" in image_name:
+            iris_image = node.image
+
+    required_controls = {"!eye_loc", "!eye_rot"}
+    if base_image and iris_image and required_controls.issubset(controls):
+        return {
+            "base_image": base_image,
+            "iris_image": iris_image,
+        }
+    return None
+
+
+def _bake_override():
+    """Prefer a View 3D override when the script was run from the Text Editor."""
+    windows = []
+    context_window = getattr(bpy.context, "window", None)
+    if context_window is not None:
+        windows.append(context_window)
+    window_manager = getattr(bpy.context, "window_manager", None)
+    for window in getattr(window_manager, "windows", ()):
+        if window not in windows:
+            windows.append(window)
+    for window in windows:
+        screen = getattr(window, "screen", None)
+        if screen is None:
+            continue
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            region = next((item for item in area.regions if item.type == "WINDOW"), None)
+            if region:
+                return {
+                    "window": window,
+                    "screen": screen,
+                    "area": area,
+                    "region": region,
+                    "scene": window.scene,
+                    "view_layer": window.view_layer,
+                }
+    return None
+
+
+def bake_sourceio_eye_base_color(source_material, eye_layout, objects, directory, report):
+    """Bake SourceIO's procedural iris+sclera shader into one FBX-safe image."""
+    bake_objects = [
+        obj for obj in objects
+        if obj and obj.type == "MESH"
+        and any(slot.material == source_material for slot in obj.material_slots)
+    ]
+    if not bake_objects:
+        report.warn("SourceIO eye '%s' has no Mesh object to bake." % source_material.name)
+        return None
+
+    width, height = tuple(eye_layout["base_image"].size)
+    width = max(1, int(width or 512))
+    height = max(1, int(height or 512))
+    image_name = sanitize_name("%s_FBX_baked" % source_material.name, "fbx_eye")
+    image = bpy.data.images.new(image_name, width=width, height=height, alpha=True)
+    set_image_colorspace(image, "base_color")
+    target_path = unique_path(directory, "%s_base_color" % image_name, ".png")
+
+    scene = bpy.context.scene
+    tree = source_material.node_tree
+    previous_engine = scene.render.engine
+    override = _bake_override()
+    view_layer = override["view_layer"] if override else bpy.context.view_layer
+    previous_active = view_layer.objects.active
+    previous_selected = [obj for obj in scene.objects if obj.select_get()]
+    previous_hidden = {obj: bool(obj.hide_get()) for obj in bake_objects}
+    previous_active_node = tree.nodes.active
+    bake_target = None
+    completed = False
+    try:
+        bake_target = tree.nodes.new("ShaderNodeTexImage")
+        bake_target.name = "__codex_fbx_eye_bake_target__"
+        bake_target.label = "Codex FBX Eye Bake Target"
+        bake_target.image = image
+        bake_target.select = True
+        tree.nodes.active = bake_target
+
+        for obj in bpy.context.scene.objects:
+            obj.select_set(False)
+        for obj in bake_objects:
+            obj.hide_set(False)
+            obj.select_set(True)
+        view_layer.objects.active = bake_objects[0]
+        scene.render.engine = "CYCLES"
+        try:
+            scene.cycles.samples = 1
+        except Exception:
+            pass
+
+        bake_kwargs = {
+            "type": "DIFFUSE",
+            "pass_filter": {"COLOR"},
+            "target": "IMAGE_TEXTURES",
+            "use_clear": True,
+            "margin": 2,
+        }
+        if override:
+            with bpy.context.temp_override(**override):
+                bpy.ops.object.bake(**bake_kwargs)
+        else:
+            bpy.ops.object.bake(**bake_kwargs)
+
+        image.filepath_raw = target_path
+        image.file_format = "PNG"
+        image.save()
+        completed = True
+        report.fix("Baked SourceIO eye shader to FBX texture: %s" % target_path)
+        return image
+    except Exception as exc:
+        report.warn("Could not bake SourceIO eye '%s': %s" % (source_material.name, exc))
+        return None
+    finally:
+        if bake_target is not None and bake_target.name in tree.nodes:
+            tree.nodes.remove(bake_target)
+        tree.nodes.active = previous_active_node
+        scene.render.engine = previous_engine
+        for obj in bpy.context.scene.objects:
+            obj.select_set(False)
+        for obj in previous_selected:
+            if obj and obj.name in bpy.context.scene.objects:
+                obj.select_set(True)
+        view_layer.objects.active = previous_active
+        for obj, hidden in previous_hidden.items():
+            if obj and obj.name in bpy.context.scene.objects:
+                obj.hide_set(hidden)
+        if not completed:
+            bpy.data.images.remove(image)
+
+
+def build_sourceio_eye_material(source_material, detected, eye_layout, objects, directory, image_cache, report):
+    baked_image = bake_sourceio_eye_base_color(
+        source_material, eye_layout, objects, directory, report
+    )
+    if baked_image is None:
+        # A blank sclera is less deceptive than assigning the iris to the
+        # entire eyeball. The warning tells the user that baking was skipped.
+        baked_image = externalize_image(
+            eye_layout["base_image"], "base_color", directory, image_cache, report
+        )
+        report.warn(
+            "SourceIO eye '%s' used its sclera fallback because the iris bake failed."
+            % source_material.name
+        )
+
+    stable_detected = dict(detected)
+    stable_detected.update(
+        {
+            "base_color": baked_image,
+            "normal": None,
+            "roughness": None,
+            "metallic": None,
+            "alpha": None,
+            "emission": None,
+            "roughness_value": 0.35,
+            "metallic_value": 0.0,
+            "alpha_value": 1.0,
+            "source_blend_method": "OPAQUE",
+            "source_shadow_method": None,
+        }
+    )
+    return rebuild_principled_material(
+        source_material, stable_detected, {"base_color": baked_image}, report
+    )
+
+
 def rebuild_principled_material(source_material, detected, exported_maps, report):
     new_material = bpy.data.materials.new(make_unique_material_name(source_material.name if source_material else "Material"))
     new_material.use_nodes = True
@@ -764,7 +958,13 @@ def copy_only_material(source_material, exported_maps, directory, image_cache, r
     return new_material
 
 
-def build_fbx_material(source_material, detected, directory, image_cache, report):
+def build_fbx_material(source_material, detected, directory, image_cache, report, objects):
+    eye_layout = detected.get("sourceio_eye")
+    if eye_layout:
+        return build_sourceio_eye_material(
+            source_material, detected, eye_layout, objects, directory, image_cache, report
+        )
+
     exported_maps = {}
     for semantic in ["base_color", "normal", "roughness", "metallic", "alpha", "emission", "toon", "sphere"]:
         image = detected.get(semantic)
@@ -804,7 +1004,7 @@ def assign_repaired_materials(objects, report):
                 slot.material = material_cache[source]
                 continue
             detected = detect_material(source, report)
-            repaired = build_fbx_material(source, detected, directory, image_cache, report)
+            repaired = build_fbx_material(source, detected, directory, image_cache, report, objects)
             material_cache[source] = repaired
             slot.material = repaired
 
@@ -819,9 +1019,24 @@ def export_fbx(objects, report):
     try:
         if bpy.context.object and bpy.context.object.mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
+        export_objects = set(objects)
+        for obj in objects:
+            parent = obj.parent
+            while parent is not None:
+                export_objects.add(parent)
+                parent = parent.parent
+            for modifier in obj.modifiers:
+                if modifier.type == "ARMATURE" and modifier.object is not None:
+                    armature = modifier.object
+                    export_objects.add(armature)
+                    parent = armature.parent
+                    while parent is not None:
+                        export_objects.add(parent)
+                        parent = parent.parent
+
         for obj in bpy.context.scene.objects:
             obj.select_set(False)
-        for obj in objects:
+        for obj in export_objects:
             obj.select_set(True)
         bpy.context.view_layer.objects.active = objects[0] if objects else None
         bpy.ops.export_scene.fbx(
