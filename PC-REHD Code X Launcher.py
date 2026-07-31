@@ -1326,10 +1326,10 @@ APP_NAME = "PC-REHD Code X Launcher"
 APP_VERSION = 1
 LAUNCHER_WINDOW_TITLE = "CAPCOM MT FRAMEWORK Script v0.1.2.8 Codex Python"
 GITHUB_RELEASE_UPDATE_SUFFIX = " | 发现Github Release 新版本"
-GITHUB_LAUNCHER_RAW_URL = (
-    "https://raw.githubusercontent.com/Criticise/"
+GITHUB_LAUNCHER_UPDATE_MANIFEST_URL = (
+    "https://api.github.com/repos/Criticise/"
     "PC-REHD-1.2.8-Scrpit-rewritten-in-Python-by-Code-X-GPT-5.6/"
-    "main/PC-REHD%20Code%20X%20Launcher.py"
+    "contents/PC-REHD-Code-X-Launcher.sha256"
 )
 GITHUB_RELEASE_PAGE_URL = (
     "https://github.com/Criticise/"
@@ -1337,7 +1337,7 @@ GITHUB_RELEASE_PAGE_URL = (
     "releases/tag/v1.0.0"
 )
 GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS = 20.0
-GITHUB_UPDATE_SOURCE_MAX_BYTES = 16 * 1024 * 1024
+GITHUB_UPDATE_MANIFEST_MAX_BYTES = 8 * 1024
 LAUNCHER_SUPPORTED_PYTHON_MINORS = ((3, 12), (3, 14))
 ISOLATED_PYTHON_ENVIRONMENT = {
     "PYTHONUTF8": "1",
@@ -8979,14 +8979,17 @@ def _fetch_github_launcher_source_sha256(
     *,
     opener: Callable[..., Any] | None = None,
 ) -> str:
-    """Return the SHA-256 of the public Launcher source without using GitHub REST."""
+    """Return the published normalized Launcher SHA-256 from a small manifest."""
     request = urllib_request.Request(
-        GITHUB_LAUNCHER_RAW_URL,
-        headers={"User-Agent": f"{APP_NAME}/{LAUNCHER_BUILD_ID}"},
+        GITHUB_LAUNCHER_UPDATE_MANIFEST_URL,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"{APP_NAME}/{LAUNCHER_BUILD_ID}",
+        },
     )
     if opener is not None:
         with opener(request, timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS) as response:
-            payload = response.read(GITHUB_UPDATE_SOURCE_MAX_BYTES + 1)
+            payload = response.read(GITHUB_UPDATE_MANIFEST_MAX_BYTES + 1)
     else:
         # curl.exe reaches GitHub even when urllib inherits a stopped local VPN.
         curl_path = shutil.which("curl.exe") or shutil.which("curl")
@@ -9013,7 +9016,11 @@ def _fetch_github_launcher_source_sha256(
                     "10",
                     "--max-time",
                     str(int(GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS)),
-                    GITHUB_LAUNCHER_RAW_URL,
+                    "--max-filesize",
+                    str(GITHUB_UPDATE_MANIFEST_MAX_BYTES),
+                    "--header",
+                    "Accept: application/vnd.github+json",
+                    GITHUB_LAUNCHER_UPDATE_MANIFEST_URL,
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -9032,12 +9039,25 @@ def _fetch_github_launcher_source_sha256(
             with open_request(
                 request, timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS
             ) as response:
-                payload = response.read(GITHUB_UPDATE_SOURCE_MAX_BYTES + 1)
-    if len(payload) > GITHUB_UPDATE_SOURCE_MAX_BYTES:
-        raise ValueError("GitHub Launcher source exceeded the update-check size limit")
+                payload = response.read(GITHUB_UPDATE_MANIFEST_MAX_BYTES + 1)
+    if len(payload) > GITHUB_UPDATE_MANIFEST_MAX_BYTES:
+        raise ValueError("GitHub Launcher update manifest exceeded the size limit")
     if not payload:
-        raise ValueError("GitHub returned an empty Launcher source")
-    return hashlib.sha256(payload).hexdigest().upper()
+        raise ValueError("GitHub returned an empty Launcher update manifest")
+    try:
+        metadata = json.loads(payload.decode("utf-8"))
+        if str(metadata.get("encoding", "")).casefold() != "base64":
+            raise ValueError("GitHub Launcher update manifest is not Base64 encoded")
+        encoded_manifest = "".join(str(metadata.get("content", "")).split())
+        manifest = base64.b64decode(
+            encoded_manifest, validate=True
+        ).decode("ascii")
+    except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"GitHub Launcher update manifest is invalid: {exc}") from exc
+    remote_sha256 = manifest.strip().upper()
+    if not re.fullmatch(r"[0-9A-F]{64}", remote_sha256):
+        raise ValueError("GitHub Launcher update manifest has no SHA-256 value")
+    return remote_sha256
 
 
 class PolicyValidationRevisionChanged(RuntimeError):

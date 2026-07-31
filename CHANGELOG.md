@@ -15,4 +15,4 @@ First public source and binary release of PC-REHD Code X.
 - Fixed MAX `Export UV Map 2` on 3ds Max 2026: selected Bucket 3 Meshes safely move `Unwrap UVW` immediately above `Editable Mesh`, collapse it into the base, and verify that all upper modifiers remain in order.
 - Export UV2 selection now follows the exported FBX, so a stale scene snapshot cannot reject a valid Map 2 created by the safe collapse step.
 - Added bilingual orange warning text to the MAX UV Map 2 help and enable dialog.
-- The Launcher now checks the public GitHub Launcher SHA-256 once in the background. When it differs, the native title bar shows `发现Github Release 新版本`; clicking that text opens this existing Release page. Network failures leave the Launcher unchanged.
+- The Launcher now checks the published GitHub Launcher SHA-256 manifest once in the background. When it differs, the native title bar shows `发现Github Release 新版本`; clicking that text opens this existing Release page. Network failures leave the Launcher unchanged.
