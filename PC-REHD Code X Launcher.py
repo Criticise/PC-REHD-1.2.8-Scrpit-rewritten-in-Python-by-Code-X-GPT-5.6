@@ -1336,7 +1336,7 @@ GITHUB_RELEASE_PAGE_URL = (
     "PC-REHD-1.2.8-Scrpit-rewritten-in-Python-by-Code-X-GPT-5.6/"
     "releases/tag/v1.0.0"
 )
-GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS = 5.0
+GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS = 20.0
 GITHUB_UPDATE_SOURCE_MAX_BYTES = 16 * 1024 * 1024
 LAUNCHER_SUPPORTED_PYTHON_MINORS = ((3, 12), (3, 14))
 ISOLATED_PYTHON_ENVIRONMENT = {
@@ -8984,9 +8984,55 @@ def _fetch_github_launcher_source_sha256(
         GITHUB_LAUNCHER_RAW_URL,
         headers={"User-Agent": f"{APP_NAME}/{LAUNCHER_BUILD_ID}"},
     )
-    open_request = opener or urllib_request.urlopen
-    with open_request(request, timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS) as response:
-        payload = response.read(GITHUB_UPDATE_SOURCE_MAX_BYTES + 1)
+    if opener is not None:
+        with opener(request, timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS) as response:
+            payload = response.read(GITHUB_UPDATE_SOURCE_MAX_BYTES + 1)
+    else:
+        # curl.exe reaches GitHub even when urllib inherits a stopped local VPN.
+        curl_path = shutil.which("curl.exe") or shutil.which("curl")
+        if curl_path is not None:
+            curl_environment = os.environ.copy()
+            for proxy_name in (
+                "ALL_PROXY",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "all_proxy",
+                "http_proxy",
+                "https_proxy",
+            ):
+                curl_environment.pop(proxy_name, None)
+            completed = subprocess.run(
+                [
+                    curl_path,
+                    "--noproxy",
+                    "*",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--connect-timeout",
+                    "10",
+                    "--max-time",
+                    str(int(GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS)),
+                    GITHUB_LAUNCHER_RAW_URL,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS + 2.0,
+                env=curl_environment,
+            )
+            if completed.returncode != 0:
+                detail = completed.stderr.decode("utf-8", "replace").strip()
+                raise ConnectionError(f"GitHub Launcher check failed: {detail}")
+            payload = completed.stdout
+        else:
+            open_request = urllib_request.build_opener(
+                urllib_request.ProxyHandler({})
+            ).open
+            with open_request(
+                request, timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS
+            ) as response:
+                payload = response.read(GITHUB_UPDATE_SOURCE_MAX_BYTES + 1)
     if len(payload) > GITHUB_UPDATE_SOURCE_MAX_BYTES:
         raise ValueError("GitHub Launcher source exceeded the update-check size limit")
     if not payload:
