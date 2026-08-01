@@ -8,6 +8,16 @@ PC-REHD Code X is a Windows desktop workflow tool for Resident Evil 6 / PC-REHD 
 
 This repository contains the source and dependency snapshot for the current Code X release. Download the ready-to-run package from the GitHub Releases page.
 
+### Tested Platforms
+
+- Blender 5.0+ with the modern FBX importer.
+- Autodesk 3ds Max 2026: tested and passed.
+
+### Compatibility Limits
+
+- **Blender explicitly unsupported:** versions that do not provide the modern FBX importer and can only use `FBX Legacy`. Their FBX import path truncates long `.MOD` mesh names, which breaks the name-based RE6 workflow rules.
+- **3ds Max support policy:** 3ds Max 2026 is the only tested platform. Other versions are only potentially usable when the Agent can inject and establish communication; their compatibility is not tested or guaranteed. A version where the Agent cannot inject is unsupported.
+
 ### Included
 
 - Python Launcher and the Python import/export bridge.
@@ -64,7 +74,9 @@ Get-FileHash .\RE6-PC-REHD-Code-X-v1.0.0.7z -Algorithm SHA256
 
 ### License and Third-Party Components
 
-The repository owner has not selected a project license. Public source visibility does not grant permission to redistribute, relicense, or use the project commercially.
+Project-authored Code X source was generated with AI assistance, then released after human review confirmed that the design and results met the intended expectations. It is released under the [Unlicense](LICENSE): anyone may use, modify, republish, redistribute, or otherwise use the project-authored code without restriction.
+
+Users are responsible for evaluating whether the script is suitable for their own work and for validating generated output. The software is provided without warranty.
 
 Third-party components retain their own licenses. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
@@ -75,6 +87,16 @@ Third-party components retain their own licenses. See [THIRD_PARTY_NOTICES.md](T
 PC-REHD Code X 是一个面向 Windows 的 Resident Evil 6 / PC-REHD 工作流工具，用于处理 `.MOD`、`.MRL` 与 FBX 文件，并支持 3ds Max 和 Blender 的导入、导出及往返编辑流程。
 
 本仓库发布当前版本的源码和依赖快照；可直接运行的完整程序包请从 GitHub Releases 页面下载。
+
+### 已测试平台
+
+- Blender 5.0+，使用现代 FBX 导入器。
+- Autodesk 3ds Max 2026：已完成测试并通过。
+
+### 兼容性限制
+
+- **Blender 明确不支持：** 没有现代 FBX 导入命令、只能使用 `FBX Legacy` 的版本。其 FBX 导入路径会截断 `.MOD` 的超长 Mesh 名称，从而破坏 RE6 依赖名称字段的一系列工作流规则。
+- **3ds Max 支持策略：** 仅 3ds Max 2026 为已测试平台。其他版本只有在 Agent 能成功注入并建立通信时才可能使用，项目不负责测试或保证其兼容性；Agent 无法注入的版本即为不支持。
 
 ### 发布内容
 
@@ -132,7 +154,9 @@ Get-FileHash .\RE6-PC-REHD-Code-X-v1.0.0.7z -Algorithm SHA256
 
 ### 许可证与第三方组件
 
-项目所有者目前尚未为本项目选择许可证。源码公开不代表获得再发布、重新授权或商业使用许可。
+Code X 项目自有源码由 AI 协助生成，并经过人工审核确认设计与结果符合预期后发布。项目采用 [Unlicense](LICENSE)：任何人均可自由使用、修改、再发布、再分发或以其他方式使用项目自有代码，不受限制。
+
+使用者需自行评估脚本是否适合自己的工作，并自行验证生成结果；软件按现状提供，不提供任何保证。
 
 第三方组件仍适用各自的许可证，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 

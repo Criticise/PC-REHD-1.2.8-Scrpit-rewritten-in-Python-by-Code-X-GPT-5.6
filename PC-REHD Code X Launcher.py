@@ -1324,8 +1324,12 @@ validate_operation_response = validate_response
 
 APP_NAME = "PC-REHD Code X Launcher"
 APP_VERSION = 1
+# Leave the network update UI off while this local build is under active testing.
+# Release builds may enable it after their source SHA has been published.
+GITHUB_RELEASE_UPDATE_CHECK_ENABLED = False
 LAUNCHER_WINDOW_TITLE = "CAPCOM MT FRAMEWORK Script v0.1.2.8 Codex Python"
-GITHUB_RELEASE_UPDATE_SUFFIX = " | 发现Github Release 新版本"
+GITHUB_RELEASE_UPDATE_TITLE_CN = "发现Github Release 新版本"
+GITHUB_RELEASE_UPDATE_TITLE_EN = "New GitHub Release Available"
 GITHUB_LAUNCHER_UPDATE_MANIFEST_URL = (
     "https://api.github.com/repos/Criticise/"
     "PC-REHD-1.2.8-Scrpit-rewritten-in-Python-by-Code-X-GPT-5.6/"
@@ -8991,55 +8995,14 @@ def _fetch_github_launcher_source_sha256(
         with opener(request, timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS) as response:
             payload = response.read(GITHUB_UPDATE_MANIFEST_MAX_BYTES + 1)
     else:
-        # curl.exe reaches GitHub even when urllib inherits a stopped local VPN.
-        curl_path = shutil.which("curl.exe") or shutil.which("curl")
-        if curl_path is not None:
-            curl_environment = os.environ.copy()
-            for proxy_name in (
-                "ALL_PROXY",
-                "HTTP_PROXY",
-                "HTTPS_PROXY",
-                "all_proxy",
-                "http_proxy",
-                "https_proxy",
-            ):
-                curl_environment.pop(proxy_name, None)
-            completed = subprocess.run(
-                [
-                    curl_path,
-                    "--noproxy",
-                    "*",
-                    "--fail",
-                    "--silent",
-                    "--show-error",
-                    "--connect-timeout",
-                    "10",
-                    "--max-time",
-                    str(int(GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS)),
-                    "--max-filesize",
-                    str(GITHUB_UPDATE_MANIFEST_MAX_BYTES),
-                    "--header",
-                    "Accept: application/vnd.github+json",
-                    GITHUB_LAUNCHER_UPDATE_MANIFEST_URL,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS + 2.0,
-                env=curl_environment,
-            )
-            if completed.returncode != 0:
-                detail = completed.stderr.decode("utf-8", "replace").strip()
-                raise ConnectionError(f"GitHub Launcher check failed: {detail}")
-            payload = completed.stdout
-        else:
-            open_request = urllib_request.build_opener(
-                urllib_request.ProxyHandler({})
-            ).open
-            with open_request(
-                request, timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS
-            ) as response:
-                payload = response.read(GITHUB_UPDATE_MANIFEST_MAX_BYTES + 1)
+        # Bypass a stale local VPN proxy without creating a helper CLI process.
+        open_request = urllib_request.build_opener(
+            urllib_request.ProxyHandler({})
+        ).open
+        with open_request(
+            request, timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS
+        ) as response:
+            payload = response.read(GITHUB_UPDATE_MANIFEST_MAX_BYTES + 1)
     if len(payload) > GITHUB_UPDATE_MANIFEST_MAX_BYTES:
         raise ValueError("GitHub Launcher update manifest exceeded the size limit")
     if not payload:
@@ -20244,6 +20207,26 @@ def _max_is_unwrap_uvw_modifier(rt: Any, modifier: Any) -> bool:
     return class_name in {"unwrap_uvw", "unwrapuvw"}
 
 
+def _max_node_has_map2(rt: Any, node: Any) -> bool:
+    """Check the evaluated Map Channel 2 flag without reading UV arrays."""
+    try:
+        return bool(rt.meshop.getMapSupport(node, 2))
+    except Exception:
+        return False
+
+
+def _max_unwrap_map_channel(modifier: Any) -> int | None:
+    """Return the explicit Unwrap UVW channel when pymxs exposes it."""
+    for property_name in ("mapChannel", "map_channel"):
+        try:
+            value = int(getattr(modifier, property_name))
+        except Exception:
+            continue
+        if value > 0:
+            return value
+    return None
+
+
 def _max_prepare_export_map2_unwrap(
     rt: Any,
     nodes: list[Any],
@@ -20260,6 +20243,7 @@ def _max_prepare_export_map2_unwrap(
         "unwrap_found": 0,
         "moved_to_editable_mesh": 0,
         "collapsed": 0,
+        "map2_verified": 0,
         "skipped_no_unwrap": [],
         "failed": [],
         "nodes": [],
@@ -20267,8 +20251,9 @@ def _max_prepare_export_map2_unwrap(
     previous_output_type = rt.collapse.getoutputtype()
     previous_collapse_to = rt.collapse.getcollapseto()
     try:
-        # This is the native "Collapse To" configuration used by the existing
-        # isolated stack proof.  It preserves modifiers above the chosen level.
+        # Match the manual Collapse To workflow: every selected Mesh keeps its
+        # own result. ``single`` can collapse shared instances through one
+        # evaluated Geometry and corrupt their distinct Map 2 payloads.
         rt.collapse.setoutputtype(rt.Name("mesh"))
         rt.collapse.setcollapseto(rt.Name("multiple"))
         for node in nodes:
@@ -20278,6 +20263,8 @@ def _max_prepare_export_map2_unwrap(
                 "handle": handle,
                 "name": node_name,
                 "unwrap_count": 0,
+                "map2_before": _max_node_has_map2(rt, node),
+                "map2_after": False,
                 "moved": 0,
                 "collapsed": 0,
                 "status": "pending",
@@ -20291,6 +20278,17 @@ def _max_prepare_export_map2_unwrap(
             node_receipt["unwrap_count"] = unwrap_count
             receipt["unwrap_found"] += unwrap_count
             if not unwrap_count:
+                node_receipt["map2_after"] = _max_node_has_map2(rt, node)
+                if not node_receipt["map2_after"]:
+                    detail = (
+                        "UV Map 2 export target has no Map Channel 2: "
+                        f"{node_name or handle}"
+                    )
+                    node_receipt["status"] = "failed_missing_map2"
+                    node_receipt["detail"] = detail
+                    receipt["failed"].append(detail)
+                    raise RuntimeError(detail)
+                receipt["map2_verified"] += 1
                 node_receipt["status"] = "skipped_no_unwrap"
                 receipt["skipped_no_unwrap"].append(handle)
                 continue
@@ -20320,6 +20318,21 @@ def _max_prepare_export_map2_unwrap(
                     break
                 modifier_count = len(modifiers)
                 unwrap_modifier = modifiers[unwrap_index - 1]
+                unwrap_channel = _max_unwrap_map_channel(unwrap_modifier)
+                node_receipt["unwrap_channel"] = unwrap_channel
+                # Max 2026's pymxs wrapper can omit ``mapChannel`` even when
+                # the modifier evaluates Channel 2 correctly.  Only a known
+                # non-2 value is a contradiction; post-collapse Map2 support
+                # remains the authoritative verification below.
+                if unwrap_channel is not None and unwrap_channel != 2:
+                    detail = (
+                        "UV Map 2 export found Unwrap UVW on the wrong channel "
+                        f"({unwrap_channel}): {node_name or handle}"
+                    )
+                    node_receipt["status"] = "failed_unwrap_channel"
+                    node_receipt["detail"] = detail
+                    receipt["failed"].append(detail)
+                    raise RuntimeError(detail)
                 expected_upper_modifiers = (
                     modifiers[: unwrap_index - 1] + modifiers[unwrap_index:]
                 )
@@ -20386,6 +20399,17 @@ def _max_prepare_export_map2_unwrap(
                     node_receipt["detail"] = detail
                     receipt["failed"].append(detail)
                     raise RuntimeError(detail)
+            node_receipt["map2_after"] = _max_node_has_map2(rt, node)
+            if not node_receipt["map2_after"]:
+                detail = (
+                    "Unwrap UVW collapse completed but Map Channel 2 is absent: "
+                    f"{node_name or handle}"
+                )
+                node_receipt["status"] = "failed_missing_map2"
+                node_receipt["detail"] = detail
+                receipt["failed"].append(detail)
+                raise RuntimeError(detail)
+            receipt["map2_verified"] += 1
             node_receipt["status"] = "collapsed"
     finally:
         try:
@@ -45558,8 +45582,8 @@ class LauncherApp:
         self._github_update_check_started = False
         self._github_update_available = False
         self._github_remote_launcher_sha256 = ""
-        self._github_update_title_click_hook: dict[str, Any] | None = None
-        self._github_update_title_click_install_pending = False
+        self._github_update_click_surface: Any | None = None
+        self._github_update_click_surface_after: str | None = None
         self._refresh_launcher_window_title()
         _set_themed_window_geometry(
             self.root, "1x1", dark=bool(self.dark_mode_enabled)
@@ -45981,175 +46005,276 @@ class LauncherApp:
             self.root.after(180, self._auto_launch_max)
 
     def _refresh_launcher_window_title(self) -> None:
-        suffix = GITHUB_RELEASE_UPDATE_SUFFIX if self._github_update_available else ""
         try:
-            self.root.title(LAUNCHER_WINDOW_TITLE + suffix)
+            update_title = self._github_release_update_title()
+            title = (
+                update_title + " | " + LAUNCHER_WINDOW_TITLE
+                if self._github_update_available
+                else LAUNCHER_WINDOW_TITLE
+            )
+            self.root.title(title)
         except self.tk.TclError:
             return
-        if self._github_update_available:
-            self._schedule_github_update_title_click_hook()
+        self._schedule_github_update_title_click_surface()
 
-    def _schedule_github_update_title_click_hook(self) -> None:
-        """Make only the native update-title segment open the published Release."""
-        if (
-            os.name != "nt"
-            or self._github_update_title_click_install_pending
-            or self._close_in_progress
-        ):
-            return
-        self._github_update_title_click_install_pending = True
+    def _github_release_update_title(self) -> str:
+        return self._tr(
+            GITHUB_RELEASE_UPDATE_TITLE_CN,
+            GITHUB_RELEASE_UPDATE_TITLE_EN,
+        )
 
-        def install() -> None:
-            self._github_update_title_click_install_pending = False
-            self._install_github_update_title_click_hook()
-
-        try:
-            self.root.after_idle(install)
-        except self.tk.TclError:
-            self._github_update_title_click_install_pending = False
-
-    def _github_update_title_click_contains(
-        self,
-        hwnd_value: int,
-        screen_x: int,
-        screen_y: int,
-    ) -> bool:
-        """Return whether a screen point falls on the visible update suffix."""
-        if not self._github_update_available:
+    def _github_update_click_surface_enabled(self) -> bool:
+        """Only expose the title-bar link while the advanced page is active."""
+        if not self._github_update_available or self._close_in_progress:
             return False
+        advanced_visible = getattr(self, "advanced_visible_var", None)
+        if advanced_visible is None:
+            return True
+        try:
+            return bool(advanced_visible.get())
+        except (AttributeError, TypeError, self.tk.TclError):
+            return False
+
+    def _measure_native_caption_text(self, text: str, dpi: int) -> int:
+        """Measure title text with Windows' own caption font when available."""
+        fallback = max(1, self._measure_ui_text(text))
+        if os.name != "nt":
+            return fallback
         try:
             import ctypes
             from ctypes import wintypes
 
+            class LOGFONTW(ctypes.Structure):
+                _fields_ = [
+                    ("lfHeight", wintypes.LONG),
+                    ("lfWidth", wintypes.LONG),
+                    ("lfEscapement", wintypes.LONG),
+                    ("lfOrientation", wintypes.LONG),
+                    ("lfWeight", wintypes.LONG),
+                    ("lfItalic", wintypes.BYTE),
+                    ("lfUnderline", wintypes.BYTE),
+                    ("lfStrikeOut", wintypes.BYTE),
+                    ("lfCharSet", wintypes.BYTE),
+                    ("lfOutPrecision", wintypes.BYTE),
+                    ("lfClipPrecision", wintypes.BYTE),
+                    ("lfQuality", wintypes.BYTE),
+                    ("lfPitchAndFamily", wintypes.BYTE),
+                    ("lfFaceName", ctypes.c_wchar * 32),
+                ]
+
+            class NONCLIENTMETRICSW(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.UINT),
+                    ("iBorderWidth", ctypes.c_int),
+                    ("iScrollWidth", ctypes.c_int),
+                    ("iScrollHeight", ctypes.c_int),
+                    ("iCaptionWidth", ctypes.c_int),
+                    ("iCaptionHeight", ctypes.c_int),
+                    ("lfCaptionFont", LOGFONTW),
+                    ("iSmCaptionWidth", ctypes.c_int),
+                    ("iSmCaptionHeight", ctypes.c_int),
+                    ("lfSmCaptionFont", LOGFONTW),
+                    ("iMenuWidth", ctypes.c_int),
+                    ("iMenuHeight", ctypes.c_int),
+                    ("lfMenuFont", LOGFONTW),
+                    ("lfStatusFont", LOGFONTW),
+                    ("lfMessageFont", LOGFONTW),
+                    ("iPaddedBorderWidth", ctypes.c_int),
+                ]
+
             user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+            metrics = NONCLIENTMETRICSW()
+            metrics.cbSize = ctypes.sizeof(metrics)
+            user32.SystemParametersInfoW.argtypes = [
+                wintypes.UINT,
+                wintypes.UINT,
+                ctypes.c_void_p,
+                wintypes.UINT,
+            ]
+            user32.SystemParametersInfoW.restype = wintypes.BOOL
+            if not bool(
+                user32.SystemParametersInfoW(
+                    0x0029, metrics.cbSize, ctypes.byref(metrics), 0
+                )
+            ):
+                return fallback
+            user32.GetDC.argtypes = [wintypes.HWND]
+            user32.GetDC.restype = wintypes.HDC
+            user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+            user32.ReleaseDC.restype = ctypes.c_int
+            gdi32.CreateFontIndirectW.argtypes = [ctypes.POINTER(LOGFONTW)]
+            gdi32.CreateFontIndirectW.restype = wintypes.HFONT
+            gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+            gdi32.SelectObject.restype = wintypes.HGDIOBJ
+            gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+            gdi32.DeleteObject.restype = wintypes.BOOL
+            gdi32.GetTextExtentPoint32W.argtypes = [
+                wintypes.HDC,
+                wintypes.LPCWSTR,
+                ctypes.c_int,
+                ctypes.POINTER(wintypes.SIZE),
+            ]
+            gdi32.GetTextExtentPoint32W.restype = wintypes.BOOL
+            hdc = user32.GetDC(None)
+            if not hdc:
+                return fallback
+            font_handle = None
+            previous_font = None
+            try:
+                font_handle = gdi32.CreateFontIndirectW(
+                    ctypes.byref(metrics.lfCaptionFont)
+                )
+                if not font_handle:
+                    return fallback
+                previous_font = gdi32.SelectObject(hdc, font_handle)
+                size = wintypes.SIZE()
+                if not bool(
+                    gdi32.GetTextExtentPoint32W(
+                        hdc, text, len(text), ctypes.byref(size)
+                    )
+                ):
+                    return fallback
+                return max(1, int(size.cx))
+            finally:
+                if previous_font:
+                    gdi32.SelectObject(hdc, previous_font)
+                if font_handle:
+                    gdi32.DeleteObject(font_handle)
+                user32.ReleaseDC(None, hdc)
+        except Exception:
+            return fallback
+
+    def _github_update_click_surface_geometry(self) -> str | None:
+        """Return the native caption bounds for the visible update text only."""
+        if not self._github_update_click_surface_enabled():
+            return None
+        try:
+            if str(self.root.state()).casefold() in {"iconic", "withdrawn"}:
+                return None
+            self.root.update_idletasks()
+            if os.name != "nt":
+                return None
+            import ctypes
+            from ctypes import wintypes
+
+            hwnds = _native_toplevel_hwnds(self.root)
+            if not hwnds:
+                return None
+            hwnd = wintypes.HWND(int(hwnds[0]))
+            user32 = ctypes.windll.user32
+            user32.GetWindowRect.argtypes = [
+                wintypes.HWND, ctypes.POINTER(wintypes.RECT)
+            ]
+            user32.GetWindowRect.restype = wintypes.BOOL
             rect = wintypes.RECT()
-            if not bool(user32.GetWindowRect(wintypes.HWND(hwnd_value), ctypes.byref(rect))):
-                return False
-            client_top = int(self.root.winfo_rooty())
-            if not (int(rect.top) <= int(screen_y) < client_top):
-                return False
+            if not bool(user32.GetWindowRect(hwnd, ctypes.byref(rect))):
+                return None
             dpi = 96
             get_dpi_for_window = getattr(user32, "GetDpiForWindow", None)
             if get_dpi_for_window is not None:
                 get_dpi_for_window.argtypes = [wintypes.HWND]
                 get_dpi_for_window.restype = wintypes.UINT
-                dpi = max(96, int(get_dpi_for_window(wintypes.HWND(hwnd_value)) or 96))
+                dpi = max(96, int(get_dpi_for_window(hwnd) or 96))
             scale = float(dpi) / 96.0
+            edge = max(2, int(round(2 * scale)))
             title_start = int(rect.left) + int(round(31 * scale))
-            update_start = title_start + self._measure_ui_text(LAUNCHER_WINDOW_TITLE)
-            update_end = update_start + self._measure_ui_text(GITHUB_RELEASE_UPDATE_SUFFIX)
+            text_width = self._measure_native_caption_text(
+                self._github_release_update_title(), dpi
+            )
             caption_controls_start = int(rect.right) - int(round(94 * scale))
-            return update_start - 6 <= int(screen_x) < min(update_end + 8, caption_controls_start)
+            left = title_start - edge
+            right = min(
+                title_start + text_width + edge,
+                caption_controls_start - edge,
+            )
+            if right <= left:
+                return None
+            caption_height = max(
+                int(round(20 * scale)), int(self.root.winfo_rooty()) - int(rect.top)
+            )
+            return f"{right - left}x{caption_height}{left:+d}{int(rect.top):+d}"
         except Exception:
-            return False
+            return None
 
-    def _install_github_update_title_click_hook(self) -> None:
-        """Subclass the main native frame without changing the normal title bar."""
-        if (
-            os.name != "nt"
-            or not self._github_update_available
-            or self._close_in_progress
-        ):
-            return
-        existing = self._github_update_title_click_hook
-        if existing is not None:
-            return
-        hwnds = _native_toplevel_hwnds(self.root)
-        if not hwnds:
+    def _schedule_github_update_title_click_surface(self) -> None:
+        """Coalesce native-caption geometry updates through the Tk event queue."""
+        if self._github_update_click_surface_after is not None:
             return
         try:
-            import ctypes
-            from ctypes import wintypes
-
-            hwnd_value = int(hwnds[0])
-            user32 = ctypes.windll.user32
-            long_ptr = ctypes.c_ssize_t
-            wndproc_type = ctypes.WINFUNCTYPE(
-                long_ptr,
-                wintypes.HWND,
-                wintypes.UINT,
-                wintypes.WPARAM,
-                wintypes.LPARAM,
+            self._github_update_click_surface_after = self.root.after_idle(
+                self._sync_github_update_title_click_surface
             )
-            user32.SetWindowLongPtrW.argtypes = [
-                wintypes.HWND,
-                ctypes.c_int,
-                long_ptr,
-            ]
-            user32.SetWindowLongPtrW.restype = long_ptr
-            user32.CallWindowProcW.argtypes = [
-                long_ptr,
-                wintypes.HWND,
-                wintypes.UINT,
-                wintypes.WPARAM,
-                wintypes.LPARAM,
-            ]
-            user32.CallWindowProcW.restype = long_ptr
-            hook_state: dict[str, Any] = {"press": None}
+        except self.tk.TclError:
+            self._github_update_click_surface_after = None
 
-            def title_window_proc(hwnd: Any, message: Any, wparam: Any, lparam: Any) -> int:
-                try:
-                    message_value = int(message)
-                    if int(wparam) == 2:  # HTCAPTION
-                        packed = int(lparam)
-                        point_x = ctypes.c_short(packed & 0xFFFF).value
-                        point_y = ctypes.c_short((packed >> 16) & 0xFFFF).value
-                        if message_value == 0x00A1:  # WM_NCLBUTTONDOWN
-                            hook_state["press"] = (
-                                point_x,
-                                point_y,
-                            ) if self._github_update_title_click_contains(
-                                hwnd_value, point_x, point_y
-                            ) else None
-                        elif message_value == 0x00A2:  # WM_NCLBUTTONUP
-                            press = hook_state.get("press")
-                            hook_state["press"] = None
-                            if (
-                                press is not None
-                                and abs(point_x - int(press[0])) <= 6
-                                and abs(point_y - int(press[1])) <= 6
-                                and self._github_update_title_click_contains(
-                                    hwnd_value, point_x, point_y
-                                )
-                            ):
-                                self.root.after_idle(self._open_github_release_page)
-                except Exception:
-                    pass
-                try:
-                    return int(
-                        user32.CallWindowProcW(
-                            previous_window_proc,
-                            hwnd,
-                            message,
-                            wparam,
-                            lparam,
-                        )
-                    )
-                except Exception:
-                    return 0
+    def _dispose_github_update_title_click_surface(self) -> None:
+        pending = self._github_update_click_surface_after
+        self._github_update_click_surface_after = None
+        if pending is not None:
+            try:
+                self.root.after_cancel(pending)
+            except self.tk.TclError:
+                pass
+        window = self._github_update_click_surface
+        self._github_update_click_surface = None
+        if window is not None:
+            _managed_window_scheduler(self.root).dispose(window)
 
-            callback = wndproc_type(title_window_proc)
-            ctypes.set_last_error(0)
-            previous_window_proc = user32.SetWindowLongPtrW(
-                wintypes.HWND(hwnd_value),
-                -4,  # GWLP_WNDPROC
-                ctypes.cast(callback, ctypes.c_void_p).value,
-            )
-            if not previous_window_proc:
-                error_code = ctypes.get_last_error()
-                if error_code:
-                    return
-            self._github_update_title_click_hook = {
-                "hwnd": hwnd_value,
-                "callback": callback,
-                "previous_window_proc": previous_window_proc,
-            }
-        except Exception:
+    def _sync_github_update_title_click_surface(self) -> None:
+        """Keep a transparent managed click surface exactly over the update title."""
+        self._github_update_click_surface_after = None
+        geometry = self._github_update_click_surface_geometry()
+        window = self._github_update_click_surface
+        if geometry is None:
+            if window is not None:
+                _managed_window_scheduler(self.root).hide(window)
             return
+        try:
+            if window is None or not bool(window.winfo_exists()):
+                window = _create_managed_toplevel(self.root, activate=False)
+                window.wm_overrideredirect(True)
+                window.wm_resizable(False, False)
+                window.configure(
+                    background=self.colors["panel"],
+                    borderwidth=0,
+                    highlightthickness=0,
+                    cursor="hand2",
+                )
+                window.transient(self.root)
+                # A keyed-transparent Tk Toplevel is opaque on some Windows
+                # title-bar compositions. A 1% alpha owned surface is invisible
+                # in practice and still receives the click reliably.
+                try:
+                    window.attributes("-alpha", 0.01)
+                    setattr(window, "_pc_rehd_themed_target_alpha", 0.01)
+                except self.tk.TclError:
+                    pass
+                setattr(window, "_pc_rehd_stack_layer", MANAGED_WINDOW_TOOLTIP_LAYER)
+                setattr(window, "_pc_rehd_force_front", True)
+                window.bind(
+                    "<ButtonRelease-1>",
+                    lambda _event: self._open_github_release_page(),
+                    add="+",
+                )
+                self._github_update_click_surface = window
+            was_visible = bool(window.winfo_viewable()) and (
+                getattr(window, "_pc_rehd_window_state", "")
+                == MANAGED_WINDOW_VISIBLE
+            )
+            _set_themed_window_geometry(
+                window, geometry, dark=bool(getattr(self, "_theme_dark", False))
+            )
+            if not was_visible:
+                _show_managed_toplevel(
+                    window, self.root, activate=False, force_front=True
+                )
+        except (AttributeError, TypeError, ValueError, self.tk.TclError):
+            self._dispose_github_update_title_click_surface()
 
     def _open_github_release_page(self) -> None:
         """Open the sole published Release only after the user clicks its title."""
-        if not self._github_update_available:
+        if not self._github_update_click_surface_enabled():
             return
         try:
             webbrowser.open(GITHUB_RELEASE_PAGE_URL, new=2)
@@ -46157,7 +46282,11 @@ class LauncherApp:
             return
 
     def _start_github_launcher_update_check(self) -> None:
-        if self._github_update_check_started or self._close_in_progress:
+        if (
+            not GITHUB_RELEASE_UPDATE_CHECK_ENABLED
+            or self._github_update_check_started
+            or self._close_in_progress
+        ):
             return
         self._github_update_check_started = True
 
@@ -46990,6 +47119,7 @@ class LauncherApp:
         if scheduler.floating_ball_active():
             scheduler.enforce_floating_ball()
             return
+        self._schedule_github_update_title_click_surface()
         if not self._main_window_layout_finalized:
             self._main_window_layout_finalized = True
             try:
@@ -48257,12 +48387,9 @@ class LauncherApp:
         target_width = min(
             int(self.root.winfo_screenwidth()), max(minimum_width, target_width)
         )
-        if normalized_mode == "collapsed" and not bool(self.blender_mode_enabled):
-            target_height = max(minimum_height, int(natural_height))
-        else:
-            target_height = min(
-                int(self.root.winfo_screenheight()), max(minimum_height, target_height)
-            )
+        target_height = min(
+            int(self.root.winfo_screenheight()), max(minimum_height, target_height)
+        )
         desired_resizable = (True, True)
         self._cancel_pending_main_window_size()
         self._main_window_programmatic_until = time.monotonic() + 0.5
@@ -48333,12 +48460,24 @@ class LauncherApp:
 
     def _capture_main_window_size(self, mode: str | None = None) -> None:
         pending = self._main_window_pending_size
-        if pending is None:
-            return
         normalized_mode = mode or self._main_window_size_mode
-        if pending[0] != normalized_mode:
+        if pending is not None:
+            if pending[0] != normalized_mode:
+                return
+            self._flush_main_window_size()
             return
-        self._flush_main_window_size()
+        try:
+            if str(self.root.state()).casefold() != "normal":
+                return
+            self.root.update_idletasks()
+            self._store_main_window_size(
+                normalized_mode,
+                max(1, int(self.root.winfo_width())),
+                max(1, int(self.root.winfo_height())),
+                default_size=False,
+            )
+        except (self.tk.TclError, TypeError, ValueError):
+            return
 
     def _restore_main_window_size(
         self, mode: str, *, reset: bool = False, center: bool = False
@@ -48370,8 +48509,6 @@ class LauncherApp:
             cached_width, cached_height = int(cached[0]), int(cached[1])
         except (IndexError, TypeError, ValueError):
             cached_width, cached_height = natural_width, natural_height
-        if normalized_mode == "collapsed" and not bool(self.blender_mode_enabled):
-            cached_height = natural_height
         if normalized_mode == "expanded":
             minimum_width = min(natural_width, MAIN_WINDOW_ADVANCED_MIN_WIDTH)
             minimum_height = min(natural_height, MAIN_WINDOW_ADVANCED_MIN_HEIGHT)
@@ -48563,6 +48700,7 @@ class LauncherApp:
     def _on_main_window_configure(self, event: Any) -> None:
         if event.widget is not self.root:
             return
+        self._schedule_github_update_title_click_surface()
         try:
             width, height = int(event.width), int(event.height)
         except (self.tk.TclError, TypeError, ValueError):
@@ -52298,21 +52436,56 @@ class LauncherApp:
         self._queue_launcher_state_write()
 
     def _export_map2_unwrap_notice_text(self) -> str:
+        if bool(getattr(self, "blender_mode_enabled", False)):
+            return self._tr(
+                "Blender UV Layer 编辑建议：\n"
+                "Blender 会按 UV Maps 列表顺序把 UV 写入 FBX。第一层是 FBX UV1，第二层是 FBX UV2；层名不是重点，列表顺序才是。\n\n"
+                "操作：选择需要修改的 Mesh -> 右侧绿色三角形“对象数据属性” -> “UV Maps”。保留第一层为原始 UV，点击第二层（常见名为 UVMap.001）后进入 UV Editing，再进行 Unwrap、移动 UV 岛或 Pack Islands。\n\n"
+                "开启本开关后，脚本只把最终 FBX 的 UV2 写入 .mod。若要使用别的 UV Layer，请先让它成为 UV Maps 列表第二层；第三层及之后不会被当作 FBX UV2。",
+                "Blender UV Layer guide:\n"
+                "Blender writes UV Maps to the FBX in list order. The first layer is FBX UV1 and the second layer is FBX UV2; layer order matters, not its name.\n\n"
+                "Steps: select the Mesh to edit -> Object Data Properties (green triangle) -> UV Maps. Keep the first layer as the original UV, select the second layer (commonly UVMap.001), then enter UV Editing to unwrap, move islands, or Pack Islands.\n\n"
+                "With this option enabled, the script writes only final-FBX UV2 into the .mod. To use another UV Layer, place it second in the UV Maps list; a third or later layer is not treated as FBX UV2.",
+            )
         return self._tr(
             "由于 3ds MAX导出FBX 不支持Unwrap UVW 修改器写入FBX，为了让UV MAP 2生效，脚本会安全地将Unwrap UVW 放到Editable Mesh 上方，再塌陷到Editable Mesh，使UV MAP 2 对 Mesh 永久生效。",
             "Because 3ds Max FBX export does not write an Unwrap UVW modifier into the FBX, the script safely moves Unwrap UVW directly above Editable Mesh and collapses it into Editable Mesh so UV Map 2 becomes permanent on the Mesh.",
         )
 
+    def _export_map2_help_text(self) -> str:
+        if bool(getattr(self, "blender_mode_enabled", False)):
+            return self._tr(
+                "这个开关只作用于第3栏“修改 Mesh”，不会影响 Header 覆写栏或删除栏。\n\n"
+                "Blender 可以把多个 UV Layer 一起导出到 FBX，但本功能只看最终 FBX 的 UV2。开启后，Python 只把 FBX UV2 写入 .mod 的唯一 UV 流；它不会创建真正的第二套 .mod UV。\n\n"
+                "脚本不判断哪套 UV 岛更正确，也不把 Blender 当前选中的 UV Layer 直接写入 .mod。请按下方橘色步骤，把你编辑过的 UV Layer 放在 UV Maps 列表第二层，然后再导出。\n\n"
+                "若最终 FBX 没有 UV2，现有兼容判断和回退逻辑保持不变：该 Mesh 自动使用 FBX UV1，并在导出结果中列出。不会等待用户选择，也不会中止其它 Mesh 的导出。\n\n"
+                "Code X 5.6 Terra 最高推理提供建议，仅供参考。",
+                "This option applies only to Lane 3, Modified Meshes. It does not affect Header Override or Delete Meshes.\n\n"
+                "Blender can export multiple UV Layers into an FBX, but this option reads only final-FBX UV2. When enabled, Python writes FBX UV2 into the .mod's single UV stream; it does not create a real second .mod UV set.\n\n"
+                "The script does not decide which UV island layout is correct and does not write Blender's currently selected UV Layer directly into the .mod. Follow the orange steps below: put the edited UV Layer second in the UV Maps list, then export.\n\n"
+                "If the final FBX has no UV2, the existing compatibility and fallback logic remains unchanged: that Mesh automatically uses FBX UV1 and is listed in the export result. The exporter does not wait for a user choice and does not stop the other Meshes.\n\n"
+                "Code X 5.6 Terra highest-reasoning guidance, for reference only.",
+            )
+        return self._tr(
+            "这个开关只作用于第3栏“修改 Mesh”，不会影响 Header 覆写栏或删除栏。开启后，Launcher 以当前绑定 Max PID 的场景为标尺，逐个记录第3栏 Mesh 是否存在 Map 2；几何和 UV 数据仍由本次选中 Mesh 的 FBX 交给 Python，不会让 PYMXS 读取顶点或面数组。\n\n有 Map 2 的 Mesh 会把 FBX 的 UV2 写入 .mod 的 UV1 流；没有 Map 2 的 Mesh 会自动使用 UV1。导出器会弹一次提示，列出所有回退 Mesh，但不会等待用户选择，也不会中止其余 Mesh 的导出。\n\n.mod 仍然只有一套 UV 流，本功能不会创建真正的第二套 .mod UV。Python 会核对 Max 的 Map 2 事实和 FBX 载体一致性，最终完成弹窗会继续报告 Verify 与 UV RISK。\n\nCode X 5.6 Terra 最高推理提供建议，仅供参考。",
+            "This option applies only to Lane 3, Modified Meshes. It does not affect Header Override or Delete Meshes. When enabled, Launcher uses the live scene in the bound Max PID as authority and records whether each Lane 3 Mesh has Map 2. Geometry and UV data still travel through the one selected-Mesh FBX; PYMXS never reads vertex or face arrays.\n\nA Mesh with Map 2 writes FBX UV2 into the .mod UV1 stream. A Mesh without Map 2 automatically uses UV1. The writer shows one notice listing every fallback Mesh, but it does not wait for a user decision and does not abort the remaining export.\n\nThe .mod still has only one UV stream; this feature does not create a real second .mod UV set. Python checks agreement between the live Max Map 2 fact and the FBX carrier, and the final completion dialog still reports Verify and UV RISK.\n\nCode X 5.6 Terra highest-reasoning guidance, for reference only.",
+        )
+
     def _commit_export_map2(self) -> None:
         self._persist_model_option_preferences()
-        if self.blender_mode_enabled or not bool(self.export_map2_var.get()):
+        if not bool(self.export_map2_var.get()):
             return
+        is_blender_mode = bool(getattr(self, "blender_mode_enabled", False))
         ChoiceDialog(
             self.root,
             title=self._tr("导出 UV Map 2", "Export UV Map 2"),
-            message=self._tr(
-                "已开启 导出 UV Map 2。",
-                "Export UV Map 2 is enabled.",
+            message=(
+                self._export_map2_help_text()
+                if is_blender_mode
+                else self._tr(
+                    "已开启 导出 UV Map 2。",
+                    "Export UV Map 2 is enabled.",
+                )
             ),
             orange_banner_message=self._export_map2_unwrap_notice_text(),
             choices=[(self._tr("关闭", "Close"), "close")],
@@ -55269,6 +55442,7 @@ class LauncherApp:
             self.bone_edit_tooltip = None
             self._configure_theme()
             self._build_ui()
+            self._refresh_launcher_window_title()
             self._refresh_backend_mode_status_badge()
             self._populate_max_executables()
             self._refresh_pid_combo()
@@ -70244,10 +70418,7 @@ class LauncherApp:
                 "有源 .MOD：从 .MOD 直接导入时，Python 会记住源文件身份；这种情况下检查可信度较高，并会用源文件身份和 Mesh 特征进行比对。\n\n若场景来自 Max、没有 Python 源文件记录，检查可信度较低，只分析进入 Bucket 的 Mesh 名字：如果场景中有这个 Mesh 名字，但所选 .MOD 中找不到对应 Mesh，说明可能选错了源 .MOD。Bucket 1 和 Bucket 2 依赖原始 .MOD 的匹配；Bucket 3 情况特殊，没有源记录时只按 Mesh 名字检查。\n\n这项检查遇到差异只会弹出 8 秒提醒，可提前关闭，不会阻止导出，也不需要确认后再次导出。真正的导出失败来自所选 Mesh 与导出规则的冲突，例如 Bucket 1/2 引用了源文件不存在的槽位；请按错误弹窗处理。",
                 "With a source .MOD: when Python imported the scene directly from a .MOD, it remembers the source identity. This is the high-confidence path and compares the source identity and Mesh features.\n\nFor a Max-origin scene with no Python source record, confidence is low and the check only examines Mesh names in the Buckets. If a Mesh name exists in Max but cannot be found in the selected .MOD, the source .MOD may be wrong. Buckets 1 and 2 depend on matching the original .MOD; Bucket 3 is special and uses only Mesh-name checking when no source record exists.\n\nDifferences show an 8-second advisory that can be closed early. This check never blocks export and never asks for confirmation. A real export failure comes from a conflict between the selected Mesh and the export rules, such as Bucket 1/2 referencing a slot absent from the source file; follow that error dialog.",
             ),
-            "map2": self._tr(
-                "这个开关只作用于第3栏“修改 Mesh”，不会影响 Header 覆写栏或删除栏。开启后，Launcher 以当前绑定 Max PID 的场景为标尺，逐个记录第3栏 Mesh 是否存在 Map 2；几何和 UV 数据仍由本次选中 Mesh 的 FBX 交给 Python，不会让 PYMXS 读取顶点或面数组。\n\n有 Map 2 的 Mesh 会把 FBX 的 UV2 写入 .mod 的 UV1 流；没有 Map 2 的 Mesh 会自动使用 UV1。导出器会弹一次提示，列出所有回退 Mesh，但不会等待用户选择，也不会中止其余 Mesh 的导出。\n\n.mod 仍然只有一套 UV 流，本功能不会创建真正的第二套 .mod UV。Python 会核对 Max 的 Map 2 事实和 FBX 载体一致性，最终完成弹窗会继续报告 Verify 与 UV RISK。",
-                "This option applies only to Lane 3, Modified Meshes. It does not affect Header Override or Delete Meshes. When enabled, Launcher uses the live scene in the bound Max PID as authority and records whether each Lane 3 Mesh has Map 2. Geometry and UV data still travel through the one selected-Mesh FBX; PYMXS never reads vertex or face arrays.\n\nA Mesh with Map 2 writes FBX UV2 into the .mod UV1 stream. A Mesh without Map 2 automatically uses UV1. The writer shows one notice listing every fallback Mesh, but it does not wait for a user decision and does not abort the remaining export.\n\nThe .mod still has only one UV stream; this feature does not create a real second .mod UV set. Python checks agreement between the live Max Map 2 fact and the FBX carrier, and the final completion dialog still reports Verify and UV RISK.",
-            ),
+            "map2": self._export_map2_help_text(),
             "uv_half": self._tr(
                 "默认开启半精度 UV 保护。\n\n它用于处理这类情况：UV 没有执行 Pack / Normalize，且部分 UV 岛边缘存在极小、肉眼难以察觉的误差。当 UV 以 RE6 使用的 half-float 半精度格式写入后，这类边缘误差可能在游戏内放大成 Mesh 贴图上的异常色块或斑块。\n\n开启后，Python Writer 会在第3栏 Mesh 的最终写出 UV 上应用半精度安全处理，尽量降低量化造成的贴图伪影。它不会改变第1栏 Header-only Mesh，也不会让第2栏已删除 Mesh 重新产生 UV。\n\n最终完成弹窗中的 UV RISK 是独立的只读检测结果：它报告导出 UV 三角形的真实面积重叠，只供参考，不阻止导出。请在 Unwrap UVW 中确认；若确实重叠，可使用 Pack - Normalize 后重新烘焙贴图。最终以 RE6 游戏内效果为准。",
                 "Half-float UV safety is enabled by default.\n\nIt targets UVs that were not packed or normalized and contain extremely small, hard-to-see errors along UV-island edges. When RE6 stores those UVs as half-floats, the quantization error can become visible in game as unusual color blocks or blotches.\n\nWhen enabled, the Python writer applies half-float safety processing to the final exported UVs of Lane 3 Meshes. It does not alter Lane 1 header-only Meshes and cannot recreate UVs for Meshes deleted by Lane 2.\n\nUV RISK in the final completion dialog is a separate read-only check. It reports positive-area overlap between exported UV triangles, is advisory only, and never blocks export. Confirm the result in Unwrap UVW; if overlap is real, use Pack - Normalize and rebake the texture. The actual RE6 in-game result remains authoritative.",
@@ -71401,6 +71572,12 @@ class LauncherApp:
         if not hasattr(self, "right_area") or not hasattr(self, "advanced_toggle"):
             return
         visible = bool(self.advanced_visible_var.get())
+        if not visible:
+            window = self._github_update_click_surface
+            if window is not None:
+                _managed_window_scheduler(self.root).hide(window)
+        else:
+            self._schedule_github_update_title_click_surface()
         self.advanced_toggle.state(["!disabled"])
         self._apply_collapsible_section_policy(visible)
         toolbar_widgets = getattr(self, "toolbar_advanced_widgets", ())
@@ -80720,6 +80897,7 @@ class LauncherApp:
         if self._close_in_progress:
             return
         self._close_in_progress = True
+        self._dispose_github_update_title_click_surface()
         self._hide_rename_selection_notice()
         self._hide_mesh_rename_failure_notice()
         try:
