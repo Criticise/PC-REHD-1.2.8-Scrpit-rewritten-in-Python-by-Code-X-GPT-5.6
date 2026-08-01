@@ -15,8 +15,10 @@ This repository contains the source and dependency snapshot for the current Code
 
 ### Compatibility Limits
 
-- **Blender explicitly unsupported:** versions that do not provide the modern FBX importer and can only use `FBX Legacy`. Their FBX import path truncates long `.MOD` mesh names, which breaks the name-based RE6 workflow rules.
-- **3ds Max support policy:** 3ds Max 2026 is the only tested platform. Other versions are only potentially usable when the Agent can inject and establish communication; their compatibility is not tested or guaranteed. A version where the Agent cannot inject is unsupported.
+- **Blender explicitly unsupported: Blender 4.5 LTS and every older release**, including 4.4 and older 4.x releases, and all 3.x releases. These versions use the legacy FBX import path. Blender 5.0 made the faster C++ FBX importer the default, as documented in the [Blender 5.0 release notes](https://www.blender.org/download/releases/5-0/). The legacy path truncates long `.MOD` Mesh names, which breaks the name-based RE6 workflow rules.
+- **3ds Max runtime evaluation:** the Launcher examines every installed `20xx - 64bit` profile. It matches the profile to its installed `3dsmax.exe`, runs that installation's embedded Python in a background capability probe, and only installs the startup Agent when the exact Agent module loads successfully. No 3ds Max year is hard-blocked.
+- **3ds Max theoretically unsupported by the current Agent:** an installation whose embedded Python is older than 3.10, cannot load the exact Agent module, or cannot start the Agent and establish communication. Known old-runtime examples include 3ds Max 2020 (Python 2.7.15) and 2021/2022 (Python 3.7). A 2023 or 2024 installation is not rejected by its year; it is evaluated by the same runtime test.
+- **3ds Max potentially supported:** any version whose embedded Python is 3.10 or newer and passes the module-load, startup, injection, and communication checks. This is a capability condition, not a compatibility guarantee. 3ds Max 2026 is the only tested and passed Max platform.
 
 ### Included
 
@@ -63,7 +65,7 @@ Every GitHub Release includes `SHA256SUMS.txt` beside the downloadable archive. 
 Current SHA-256 for `RE6-PC-REHD-Code-X-v1.0.0.7z`:
 
 ```text
-7FAE2ABCF45E92B0353B5A659336C41F24914833BFA8F5A5A7F989343384A42A
+09A2B22C36CC988EF965090BCB4975971D76AEBD0EF6971396071AD310BE8EBC
 ```
 
 Verify it in PowerShell:
@@ -95,8 +97,10 @@ PC-REHD Code X 是一个面向 Windows 的 Resident Evil 6 / PC-REHD 工作流�
 
 ### 兼容性限制
 
-- **Blender 明确不支持：** 没有现代 FBX 导入命令、只能使用 `FBX Legacy` 的版本。其 FBX 导入路径会截断 `.MOD` 的超长 Mesh 名称，从而破坏 RE6 依赖名称字段的一系列工作流规则。
-- **3ds Max 支持策略：** 仅 3ds Max 2026 为已测试平台。其他版本只有在 Agent 能成功注入并建立通信时才可能使用，项目不负责测试或保证其兼容性；Agent 无法注入的版本即为不支持。
+- **Blender 明确不支持：Blender 4.5 LTS 及更早版本**，包括 4.4 与更早的 4.x，以及全部 3.x。它们只能走旧 FBX 导入链路。Blender 官方在 [5.0 发布说明](https://www.blender.org/download/releases/5-0/) 中确认 5.0 起默认使用更快的 C++ FBX 导入器；旧导入链会截断 `.MOD` 的超长 Mesh 名称，从而破坏 RE6 依赖名称字段的一系列工作流规则。
+- **3ds Max 运行时评估：** Launcher 会检查每一个已安装的 `20xx - 64bit` 配置，匹配其对应的 `3dsmax.exe`，并在后台使用该安装目录内嵌的 Python 运行能力探测。只有当前 Agent 源码模块能完整加载时，才会安装启动 Agent。没有任何 3ds Max 年份会被硬性拦截。
+- **当前 Agent 理论不支持的 3ds Max：** 内嵌 Python 低于 3.10、无法加载当前 Agent 源码模块，或无法启动 Agent 并建立通信的安装。已知旧运行时示例包括 3ds Max 2020（Python 2.7.15）与 2021/2022（Python 3.7）。2023 或 2024 不会因为年份被拒绝，而是走同一套运行时检测。
+- **3ds Max 可能支持：** 内嵌 Python 为 3.10 或更高，并且通过模块加载、启动、注入与通信检查的任意版本。这只是能力条件，不是兼容性保证；目前唯一已测试并通过的 Max 平台仍为 3ds Max 2026。
 
 ### 发布内容
 
@@ -143,7 +147,7 @@ PC-REHD Code X 是一个面向 Windows 的 Resident Evil 6 / PC-REHD 工作流�
 当前 `RE6-PC-REHD-Code-X-v1.0.0.7z` 的 SHA-256：
 
 ```text
-7FAE2ABCF45E92B0353B5A659336C41F24914833BFA8F5A5A7F989343384A42A
+09A2B22C36CC988EF965090BCB4975971D76AEBD0EF6971396071AD310BE8EBC
 ```
 
 在 PowerShell 中可使用以下命令校验：

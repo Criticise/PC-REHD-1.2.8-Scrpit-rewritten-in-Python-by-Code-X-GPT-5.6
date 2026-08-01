@@ -16,5 +16,5 @@ First public source and binary release of PC-REHD Code X.
 - Export UV2 selection now follows the exported FBX, so a stale scene snapshot cannot reject a valid Map 2 created by the safe collapse step.
 - Added bilingual orange warning text to the MAX UV Map 2 help and enable dialog.
 - The GitHub SHA-256 update-check UI is disabled in this active local-testing build, so it makes no background network request and shows no test update indicator.
-- Documented the tested Blender 5.0+ and 3ds Max 2026 platforms, plus the explicit Blender Legacy-FBX and Agent-injection compatibility limits.
+- Documented exact Blender boundaries: Blender 4.5 LTS and older are unsupported because Blender 5.0 changed the default to the C++ FBX importer. Replaced the former Max year cutoff with a per-installation Agent capability probe: every `20xx - 64bit` profile is checked against its matching embedded Python, and only Python 3.10+ installations that can load the exact Agent module are admitted. Max 2026 remains the tested and passed platform.
 - Released project-authored code under the Unlicense: it may be freely used, modified, republished, and redistributed; users evaluate the script and generated results for their own work.

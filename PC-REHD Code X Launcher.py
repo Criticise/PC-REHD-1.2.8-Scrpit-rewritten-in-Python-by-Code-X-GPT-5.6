@@ -1849,6 +1849,9 @@ EXPORT_SETS_ORIGINAL_SIZE = (600, 997)
 LEGACY_AGENT_REGISTRY_DIR = DEFAULT_LOG_DIR / "agents"
 AGENT_STARTUP_LOADER = "PC_REHD_Code_X_Agent.py"
 AGENT_STARTUP_MS_LOADER = "PC_REHD_Code_X_Agent.ms"
+MAX_AGENT_MINIMUM_PYTHON = (3, 10)
+MAX_AGENT_RUNTIME_PROBE_TIMEOUT_SECONDS = 30.0
+MAX_AGENT_RUNTIME_PROBE_CACHE_SECONDS = 300.0
 MAX_PROCESS_NAME = "3dsmax.exe"
 BLENDER_PROCESS_NAME = "blender.exe"
 BLENDER_WORKER_PROTOCOL_NAME = "pc-rehd-code-x-blender-worker"
@@ -11515,7 +11518,133 @@ def _ensure_rescue_worker_for_pid(
     return dict(result) if isinstance(result, Mapping) else {}
 
 
-def _max_startup_directories() -> list[Path]:
+@dataclass(frozen=True, slots=True)
+class MaxAgentRuntimeProbe:
+    startup_directory: Path
+    max_version: str
+    python_executable: Path | None
+    python_version: tuple[int, int] | None
+    agent_module_loads: bool
+    supported: bool
+    reason: str
+
+
+_MAX_AGENT_RUNTIME_PROBE_LOCK = threading.Lock()
+_MAX_AGENT_RUNTIME_PROBE_CACHE: dict[str, tuple[float, tuple[int, int] | None, bool]] = {}
+_MAX_AGENT_EXECUTABLE_CACHE: tuple[float, dict[str, Path]] = (0.0, {})
+
+
+def _max_agent_python_version_from_output(output: object) -> tuple[int, int] | None:
+    match = re.search(r"(?im)^VERSION=(\d+)\.(\d+)$|Python\s+(\d+)\.(\d+)", str(output or ""))
+    if match is None:
+        return None
+    major = match.group(1) or match.group(3)
+    minor = match.group(2) or match.group(4)
+    try:
+        return int(major), int(minor)
+    except (TypeError, ValueError):
+        return None
+
+
+def _max_agent_python_runtime_supported(version: tuple[int, int] | None) -> bool:
+    return version is not None and tuple(version) >= MAX_AGENT_MINIMUM_PYTHON
+
+
+def _max_startup_profile_version(directory: Path) -> str:
+    for candidate in (directory, *directory.parents):
+        match = re.fullmatch(r"(20\d{2})\s*-\s*64bit", candidate.name, flags=re.IGNORECASE)
+        if match is not None:
+            return str(match.group(1))
+    return ""
+
+
+def _max_agent_executables_by_version() -> dict[str, Path]:
+    global _MAX_AGENT_EXECUTABLE_CACHE
+    now = time.monotonic()
+    with _MAX_AGENT_RUNTIME_PROBE_LOCK:
+        cached_at, cached = _MAX_AGENT_EXECUTABLE_CACHE
+        if now - cached_at < MAX_AGENT_RUNTIME_PROBE_CACHE_SECONDS:
+            return dict(cached)
+    discovered: dict[str, Path] = {}
+    for executable in discover_3dsmax_executables():
+        match = re.search(r"(?i)3ds\s*max\s*(20\d{2})", str(executable))
+        if match is not None:
+            discovered.setdefault(str(match.group(1)), Path(executable))
+    with _MAX_AGENT_RUNTIME_PROBE_LOCK:
+        _MAX_AGENT_EXECUTABLE_CACHE = (now, dict(discovered))
+    return discovered
+
+
+def _max_embedded_python_candidates(max_executable: Path) -> list[Path]:
+    install_root = Path(max_executable).resolve(strict=False).parent
+    candidates = [install_root / "Python" / "python.exe"]
+    try:
+        candidates.extend(install_root.glob("Python*/python.exe"))
+    except OSError:
+        pass
+    unique: dict[str, Path] = {}
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError:
+            resolved = candidate
+        if resolved.is_file():
+            unique[str(resolved).casefold()] = resolved
+    return sorted(unique.values(), key=lambda value: str(value).casefold())
+
+
+def _max_agent_runtime_probe(python_executable: Path) -> tuple[tuple[int, int] | None, bool]:
+    try:
+        resolved = python_executable.resolve(strict=False)
+    except OSError:
+        resolved = python_executable
+    cache_key = str(resolved).casefold()
+    now = time.monotonic()
+    with _MAX_AGENT_RUNTIME_PROBE_LOCK:
+        cached = _MAX_AGENT_RUNTIME_PROBE_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < MAX_AGENT_RUNTIME_PROBE_CACHE_SECONDS:
+            return cached[1], cached[2]
+    # Startup executes this exact module, so compilation alone is insufficient.
+    # Reproduce the startup loader's module construction to verify declarations
+    # and imports without starting Max, the UI, or any scene operation.
+    probe_code = (
+        "import sys,types; "
+        "print('VERSION=%d.%d' % (sys.version_info[0], sys.version_info[1])); "
+        "source_path=sys.argv[1]; "
+        "module_name='_pc_rehd_agent_compat_probe'; "
+        "module=types.ModuleType(module_name); "
+        "module.__file__=source_path; "
+        "module.__package__=''; "
+        "sys.modules[module_name]=module; "
+        "exec(compile(open(source_path, 'rb').read(), source_path, 'exec'), module.__dict__); "
+        "print('AGENT_MODULE_LOADS=1')"
+    )
+    version: tuple[int, int] | None = None
+    agent_module_loads = False
+    try:
+        completed = subprocess.run(
+            [str(resolved), "-c", probe_code, str(LAUNCHER_SOURCE_PATH)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=MAX_AGENT_RUNTIME_PROBE_TIMEOUT_SECONDS,
+            check=False,
+            creationflags=_low_priority_subprocess_creation_flags(),
+        )
+        output = str(completed.stdout or "")
+        version = _max_agent_python_version_from_output(output)
+        agent_module_loads = completed.returncode == 0 and "AGENT_MODULE_LOADS=1" in output
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    with _MAX_AGENT_RUNTIME_PROBE_LOCK:
+        _MAX_AGENT_RUNTIME_PROBE_CACHE[cache_key] = (now, version, agent_module_loads)
+    return version, agent_module_loads
+
+
+def _max_agent_startup_probes() -> list[MaxAgentRuntimeProbe]:
     local_app_data = str(os.environ.get("LOCALAPPDATA", "") or "").strip()
     if not local_app_data:
         return []
@@ -11524,10 +11653,59 @@ def _max_startup_directories() -> list[Path]:
         return []
     directories: dict[str, Path] = {}
     for candidate in root.glob("20* - 64bit/*/scripts/startup"):
-        version_match = re.match(r"(20\d{2})", candidate.parents[2].name)
-        if candidate.is_dir() and version_match and int(version_match.group(1)) >= 2024:
+        if candidate.is_dir() and _max_startup_profile_version(candidate):
             directories[str(candidate).casefold()] = candidate
-    return sorted(directories.values(), key=lambda value: str(value).casefold())
+    executables = _max_agent_executables_by_version()
+    probes: list[MaxAgentRuntimeProbe] = []
+    for directory in sorted(directories.values(), key=lambda value: str(value).casefold()):
+        max_version = _max_startup_profile_version(directory)
+        max_executable = executables.get(max_version)
+        if max_executable is None:
+            probes.append(
+                MaxAgentRuntimeProbe(
+                    directory, max_version, None, None, False, False, "max_executable_not_found"
+                )
+            )
+            continue
+        candidates = _max_embedded_python_candidates(max_executable)
+        if not candidates:
+            probes.append(
+                MaxAgentRuntimeProbe(
+                    directory, max_version, None, None, False, False, "embedded_python_not_found"
+                )
+            )
+            continue
+        python_executable = candidates[0]
+        python_version, agent_module_loads = _max_agent_runtime_probe(python_executable)
+        supported = agent_module_loads and _max_agent_python_runtime_supported(python_version)
+        if supported:
+            reason = "supported"
+        elif python_version is None:
+            reason = "embedded_python_probe_failed"
+        elif not _max_agent_python_runtime_supported(python_version):
+            reason = "python_3_10_required"
+        else:
+            reason = "agent_module_load_failed"
+        probes.append(
+            MaxAgentRuntimeProbe(
+                directory,
+                max_version,
+                python_executable,
+                python_version,
+                agent_module_loads,
+                supported,
+                reason,
+            )
+        )
+    return probes
+
+
+def _max_startup_directories() -> list[Path]:
+    return [
+        probe.startup_directory
+        for probe in _max_agent_startup_probes()
+        if probe.supported
+    ]
 
 
 def install_agent_startup_hooks(directories: list[Path] | None = None) -> list[Path]:
