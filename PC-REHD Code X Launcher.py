@@ -12993,6 +12993,19 @@ def _max_modifiers(node: Any) -> list[Any]:
             return []
 
 
+def _max_modifier_stack_signature(rt: Any, modifiers: list[Any]) -> tuple[str, ...]:
+    """Return a stable modifier-stack signature by class name only.
+
+    3ds Max can rebuild Python wrapper identities while the visual modifier
+    stack is still the correct one.  For stack-shape validation we only care
+    about order and class identity, not the transient wrapper objects.
+    """
+    return tuple(
+        _max_class_name(rt, modifier).replace(" ", "_").casefold()
+        for modifier in modifiers
+    )
+
+
 def _max_skin_bone_rows(rt: Any, modifier: Any) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     try:
@@ -20480,21 +20493,32 @@ def _max_prepare_export_map2_unwrap(
                 receipt["failed"].append(detail)
                 raise RuntimeError(detail)
 
-            # Process the current bottom-most Unwrap first. Each collapse keeps
-            # higher modifiers, including Skin, intact for the later FBX export.
-            while True:
+            # Snapshot the original modifiers once. The source Unwrap UVW is
+            # deliberately retained; rescanning the live stack after baking a
+            # copy would find that same source again and loop forever.
+            initial_modifiers = _max_modifiers(node)
+            original_unwrap_indices = [
+                index
+                for index in range(len(initial_modifiers), 0, -1)
+                if _max_is_unwrap_uvw_modifier(rt, initial_modifiers[index - 1])
+            ]
+            for unwrap_index in original_unwrap_indices:
                 modifiers = _max_modifiers(node)
-                unwrap_index = next(
-                    (
-                        index
-                        for index in range(len(modifiers), 0, -1)
-                        if _max_is_unwrap_uvw_modifier(rt, modifiers[index - 1])
-                    ),
-                    0,
-                )
-                if not unwrap_index:
-                    break
                 modifier_count = len(modifiers)
+                if (
+                    unwrap_index > modifier_count
+                    or not _max_is_unwrap_uvw_modifier(
+                        rt, modifiers[unwrap_index - 1]
+                    )
+                ):
+                    detail = (
+                        "3ds Max changed the original Unwrap UVW stack position: "
+                        f"{node_name or handle}"
+                    )
+                    node_receipt["status"] = "failed_source_stack_changed"
+                    node_receipt["detail"] = detail
+                    receipt["failed"].append(detail)
+                    raise RuntimeError(detail)
                 unwrap_modifier = modifiers[unwrap_index - 1]
                 unwrap_channel = _max_unwrap_map_channel(unwrap_modifier)
                 node_receipt["unwrap_channel"] = unwrap_channel
@@ -20511,45 +20535,53 @@ def _max_prepare_export_map2_unwrap(
                     node_receipt["detail"] = detail
                     receipt["failed"].append(detail)
                     raise RuntimeError(detail)
-                expected_upper_modifiers = (
-                    modifiers[: unwrap_index - 1] + modifiers[unwrap_index:]
+                expected_original_signature = _max_modifier_stack_signature(
+                    rt, modifiers
                 )
-                if unwrap_index != modifier_count:
-                    # Max 2026 exposes no setModifierIndex runtime function.
-                    # Reinsert the same modifier at the stack bottom, then prove
-                    # that every modifier above it retained its original order.
-                    try:
-                        rt.deleteModifier(node, unwrap_index)
-                        # After removal the old count is the append position.
-                        rt.addModifier(node, unwrap_modifier, before=modifier_count)
-                    except Exception as exc:
-                        detail = (
-                            "3ds Max could not move Unwrap UVW above Editable Mesh: "
-                            f"{node_name or handle} ({type(exc).__name__}: {exc})"
-                        )
-                        node_receipt["status"] = "failed_move"
-                        node_receipt["detail"] = detail
-                        receipt["failed"].append(detail)
-                        raise RuntimeError(detail) from exc
-                    repositioned_modifiers = _max_modifiers(node)
-                    if (
-                        len(repositioned_modifiers) != modifier_count
-                        or repositioned_modifiers[-1] != unwrap_modifier
-                        or repositioned_modifiers[:-1] != expected_upper_modifiers
-                    ):
-                        detail = (
-                            "3ds Max changed the modifier stack while moving Unwrap UVW: "
-                            f"{node_name or handle}"
-                        )
-                        node_receipt["status"] = "failed_move_validation"
-                        node_receipt["detail"] = detail
-                        receipt["failed"].append(detail)
-                        raise RuntimeError(detail)
-                    node_receipt["moved"] += 1
-                    receipt["moved_to_editable_mesh"] += 1
-                if not bool(rt.maxOps.CollapseNodeTo(node, modifier_count, True)):
+                # `addModifier()` drops modifier local data. UVW edits live in
+                # that local data, so always use the local-data copy path. The
+                # source modifier is never removed; only the new bottom copy is
+                # collapsed for FBX baking.
+                try:
+                    unwrap_copy = rt.copy(unwrap_modifier)
+                    rt.addModifierWithLocalData(
+                        node,
+                        unwrap_copy,
+                        node,
+                        unwrap_modifier,
+                        before=modifier_count + 1,
+                    )
+                except Exception as exc:
                     detail = (
-                        "3ds Max did not collapse Unwrap UVW to Editable Mesh: "
+                        "3ds Max could not insert the Unwrap UVW copy with local data preserved: "
+                        f"{node_name or handle} ({type(exc).__name__}: {exc})"
+                    )
+                    node_receipt["status"] = "failed_move"
+                    node_receipt["detail"] = detail
+                    receipt["failed"].append(detail)
+                    raise RuntimeError(detail) from exc
+                current_modifiers = _max_modifiers(node)
+                current_signature = _max_modifier_stack_signature(
+                    rt, current_modifiers
+                )
+                if (
+                    len(current_modifiers) != modifier_count + 1
+                    or current_signature[:-1] != expected_original_signature
+                    or not _max_is_unwrap_uvw_modifier(rt, current_modifiers[-1])
+                ):
+                    detail = (
+                        "3ds Max changed the modifier stack while inserting the Unwrap UVW copy: "
+                        f"{node_name or handle}"
+                    )
+                    node_receipt["status"] = "failed_move_validation"
+                    node_receipt["detail"] = detail
+                    receipt["failed"].append(detail)
+                    raise RuntimeError(detail)
+                node_receipt["moved"] += 1
+                receipt["moved_to_editable_mesh"] += 1
+                if not bool(rt.maxOps.CollapseNodeTo(node, modifier_count + 1, True)):
+                    detail = (
+                        "3ds Max did not collapse the Unwrap UVW copy to Editable Mesh: "
                         f"{node_name or handle}"
                     )
                     node_receipt["status"] = "failed_collapse"
@@ -20559,9 +20591,9 @@ def _max_prepare_export_map2_unwrap(
                 node_receipt["collapsed"] += 1
                 receipt["collapsed"] += 1
                 remaining_modifiers = _max_modifiers(node)
-                if remaining_modifiers != expected_upper_modifiers:
+                if _max_modifier_stack_signature(rt, remaining_modifiers) != expected_original_signature:
                     detail = (
-                        "Unwrap UVW collapse changed modifiers above Editable Mesh: "
+                        "Unwrap UVW copy collapse changed the preserved original modifier stack: "
                         f"{node_name or handle}"
                     )
                     node_receipt["status"] = "failed_upper_stack_validation"
@@ -52626,8 +52658,8 @@ class LauncherApp:
                 "With this option enabled, the script writes only final-FBX UV2 into the .mod. To use another UV Layer, place it second in the UV Maps list; a third or later layer is not treated as FBX UV2.",
             )
         return self._tr(
-            "由于 3ds MAX导出FBX 不支持Unwrap UVW 修改器写入FBX，为了让UV MAP 2生效，脚本会安全地将Unwrap UVW 放到Editable Mesh 上方，再塌陷到Editable Mesh，使UV MAP 2 对 Mesh 永久生效。",
-            "Because 3ds Max FBX export does not write an Unwrap UVW modifier into the FBX, the script safely moves Unwrap UVW directly above Editable Mesh and collapses it into Editable Mesh so UV Map 2 becomes permanent on the Mesh.",
+            "由于 3ds MAX 导出 FBX 不支持把 Unwrap UVW 修改器直接写入 FBX，为了让 UV MAP 2 生效，脚本会安全地将 Unwrap UVW 修改器复制品放到 Editable Mesh 上方，再塌陷到 Editable Mesh，使 UV MAP 2 对 Mesh 永久生效。",
+            "Because 3ds Max FBX export does not write an Unwrap UVW modifier directly into the FBX, the script safely moves a copied Unwrap UVW modifier above Editable Mesh and collapses it into Editable Mesh so UV Map 2 becomes permanent on the Mesh.",
         )
 
     def _export_map2_help_text(self) -> str:
@@ -52645,8 +52677,8 @@ class LauncherApp:
                 "Code X 5.6 Terra highest-reasoning guidance, for reference only.",
             )
         return self._tr(
-            "这个开关只作用于第3栏“修改 Mesh”，不会影响 Header 覆写栏或删除栏。开启后，Launcher 以当前绑定 Max PID 的场景为标尺，逐个记录第3栏 Mesh 是否存在 Map 2；几何和 UV 数据仍由本次选中 Mesh 的 FBX 交给 Python，不会让 PYMXS 读取顶点或面数组。\n\n有 Map 2 的 Mesh 会把 FBX 的 UV2 写入 .mod 的 UV1 流；没有 Map 2 的 Mesh 会自动使用 UV1。导出器会弹一次提示，列出所有回退 Mesh，但不会等待用户选择，也不会中止其余 Mesh 的导出。\n\n.mod 仍然只有一套 UV 流，本功能不会创建真正的第二套 .mod UV。Python 会核对 Max 的 Map 2 事实和 FBX 载体一致性，最终完成弹窗会继续报告 Verify 与 UV RISK。\n\nCode X 5.6 Terra 最高推理提供建议，仅供参考。",
-            "This option applies only to Lane 3, Modified Meshes. It does not affect Header Override or Delete Meshes. When enabled, Launcher uses the live scene in the bound Max PID as authority and records whether each Lane 3 Mesh has Map 2. Geometry and UV data still travel through the one selected-Mesh FBX; PYMXS never reads vertex or face arrays.\n\nA Mesh with Map 2 writes FBX UV2 into the .mod UV1 stream. A Mesh without Map 2 automatically uses UV1. The writer shows one notice listing every fallback Mesh, but it does not wait for a user decision and does not abort the remaining export.\n\nThe .mod still has only one UV stream; this feature does not create a real second .mod UV set. Python checks agreement between the live Max Map 2 fact and the FBX carrier, and the final completion dialog still reports Verify and UV RISK.\n\nCode X 5.6 Terra highest-reasoning guidance, for reference only.",
+            "这个开关只作用于第3栏“修改 Mesh”，不会影响 Header 覆写栏或删除栏。开启后，Launcher 以当前绑定 Max PID 的场景为标尺，逐个记录第3栏 Mesh 是否存在 Map 2；几何和 UV 数据仍由本次选中 Mesh 的 FBX 交给 Python，不会让 PYMXS 读取顶点或面数组。\n\n有 Map 2 的 Mesh 会把 FBX 的 UV2 写入 .mod 的 UV1 流；没有 Map 2 的 Mesh 会自动使用 UV1。导出器会弹一次提示，列出所有回退 Mesh，但不会等待用户选择，也不会中止其余 Mesh 的导出。\n\n.mod 仍然只有一套 UV 流，本功能不会创建真正的第二套 .mod UV。Python 会核对 Max 的 Map 2 事实和 FBX 载体一致性，最终完成弹窗会继续报告 Verify 与 UV RISK。\n\nCode X 5.6 Terra 最高推理提供建议，仅供参考。\n\n当前 MAX 处理方式是把 Unwrap UVW 修改器放到 Editable Mesh 上方，再塌陷到 Editable Mesh。",
+            "This option applies only to Lane 3, Modified Meshes. It does not affect Header Override or Delete Meshes. When enabled, Launcher uses the live scene in the bound Max PID as authority and records whether each Lane 3 Mesh has Map 2. Geometry and UV data still travel through the one selected-Mesh FBX; PYMXS never reads vertex or face arrays.\n\nA Mesh with Map 2 writes FBX UV2 into the .mod UV1 stream. A Mesh without Map 2 automatically uses UV1. The writer shows one notice listing every fallback Mesh, but it does not wait for a user decision and does not abort the remaining export.\n\nThe .mod still has only one UV stream; this feature does not create a real second .mod UV set. Python checks agreement between the live Max Map 2 fact and the FBX carrier, and the final completion dialog still reports Verify and UV RISK.\n\nCode X 5.6 Terra highest-reasoning guidance, for reference only.\n\nCurrent MAX handling places an Unwrap UVW modifier above Editable Mesh and then collapses it into Editable Mesh.",
         )
 
     def _commit_export_map2(self) -> None:
@@ -52657,14 +52689,14 @@ class LauncherApp:
         ChoiceDialog(
             self.root,
             title=self._tr("导出 UV Map 2", "Export UV Map 2"),
-            message=(
-                self._export_map2_help_text()
-                if is_blender_mode
-                else self._tr(
-                    "已开启 导出 UV Map 2。",
-                    "Export UV Map 2 is enabled.",
-                )
-            ),
+                message=(
+                    self._export_map2_help_text()
+                    if is_blender_mode
+                    else self._tr(
+                        "已开启 导出 UV Map 2。脚本会把 Unwrap UVW 修改器复制品放到 Editable Mesh 上方，再塌陷到 Editable Mesh。",
+                        "Export UV Map 2 is enabled. The script places a copied Unwrap UVW modifier above Editable Mesh and collapses it into Editable Mesh.",
+                    )
+                ),
             orange_banner_message=self._export_map2_unwrap_notice_text(),
             choices=[(self._tr("关闭", "Close"), "close")],
         ).show()
