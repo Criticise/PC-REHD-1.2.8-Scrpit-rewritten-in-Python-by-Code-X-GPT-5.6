@@ -1324,9 +1324,9 @@ validate_operation_response = validate_response
 
 APP_NAME = "PC-REHD Code X Launcher"
 APP_VERSION = 1
-# Leave the network update UI off while this local build is under active testing.
-# Release builds may enable it after their source SHA has been published.
-GITHUB_RELEASE_UPDATE_CHECK_ENABLED = False
+# Only the published manifest comparison can show an update. There is no
+# release-build test override that forces the update indicator on.
+GITHUB_RELEASE_UPDATE_CHECK_ENABLED = True
 LAUNCHER_WINDOW_TITLE = "CAPCOM MT FRAMEWORK Script v0.1.2.8 Codex Python"
 GITHUB_RELEASE_UPDATE_TITLE_CN = "发现Github Release 新版本"
 GITHUB_RELEASE_UPDATE_TITLE_EN = "New GitHub Release Available"
@@ -8975,6 +8975,9 @@ LAUNCHER_SOURCE_PATH = Path(__file__).resolve()
 # identity with disk first, so mixed old-Launcher/new-component runs are blocked.
 _LAUNCHER_SOURCE_BYTES = LAUNCHER_SOURCE_PATH.read_bytes()
 LAUNCHER_SOURCE_SHA256 = _launcher_source_sha256(_LAUNCHER_SOURCE_BYTES)
+# Accept the old raw-file manifest during the identity-SHA migration. The
+# identity SHA remains the canonical value for new manifests.
+LAUNCHER_SOURCE_RAW_SHA256 = hashlib.sha256(_LAUNCHER_SOURCE_BYTES).hexdigest().upper()
 WORK_AGENT_COMPONENT_REVISION = (
     f"{WORK_AGENT_COMPONENT_REVISION_PREFIX}{LAUNCHER_SOURCE_SHA256[:24]}"
 )
@@ -9024,6 +9027,14 @@ def _fetch_github_launcher_source_sha256(
     if not re.fullmatch(r"[0-9A-F]{64}", remote_sha256):
         raise ValueError("GitHub Launcher update manifest has no SHA-256 value")
     return remote_sha256
+
+
+def _github_launcher_sha_matches_current(remote_sha256: str) -> bool:
+    """Match canonical identity manifests and the pre-identity raw format."""
+    return any(
+        secrets.compare_digest(remote_sha256, candidate)
+        for candidate in (LAUNCHER_SOURCE_SHA256, LAUNCHER_SOURCE_RAW_SHA256)
+    )
 
 
 class PolicyValidationRevisionChanged(RuntimeError):
@@ -46507,8 +46518,8 @@ class LauncherApp:
             if len(remote) != 64 or not re.fullmatch(r"[0-9A-F]{64}", remote):
                 return
             self._github_remote_launcher_sha256 = remote
-            self._github_update_available = not secrets.compare_digest(
-                remote, LAUNCHER_SOURCE_SHA256
+            self._github_update_available = not _github_launcher_sha_matches_current(
+                remote
             )
             self._refresh_launcher_window_title()
 
