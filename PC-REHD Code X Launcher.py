@@ -20417,6 +20417,16 @@ def _max_node_has_map2(rt: Any, node: Any) -> bool:
         return False
 
 
+def _uv2_missing_map2_detail_is_nonblocking(detail: Any) -> bool:
+    """Missing Map 2 is an advisory fallback; structural collapse errors are not."""
+    text = str(detail or "").casefold()
+    return (
+        "no map channel 2" in text
+        or "map channel 2 is absent" in text
+        or "no valid uv 2" in text
+    )
+
+
 def _max_unwrap_map_channel(modifier: Any) -> int | None:
     """Return the explicit Unwrap UVW channel when pymxs exposes it."""
     for property_name in ("mapChannel", "map_channel"):
@@ -20447,6 +20457,7 @@ def _max_prepare_export_map2_unwrap(
         "collapsed": 0,
         "map2_verified": 0,
         "skipped_no_unwrap": [],
+        "fallback_no_map2": [],
         "failed": [],
         "nodes": [],
     }
@@ -20486,10 +20497,11 @@ def _max_prepare_export_map2_unwrap(
                         "UV Map 2 export target has no Map Channel 2: "
                         f"{node_name or handle}"
                     )
-                    node_receipt["status"] = "failed_missing_map2"
+                    node_receipt["status"] = "fallback_no_map2"
                     node_receipt["detail"] = detail
-                    receipt["failed"].append(detail)
-                    raise RuntimeError(detail)
+                    receipt["fallback_no_map2"].append(handle)
+                    receipt["skipped_no_unwrap"].append(handle)
+                    continue
                 receipt["map2_verified"] += 1
                 node_receipt["status"] = "skipped_no_unwrap"
                 receipt["skipped_no_unwrap"].append(handle)
@@ -20626,10 +20638,10 @@ def _max_prepare_export_map2_unwrap(
                     "Unwrap UVW collapse completed but Map Channel 2 is absent: "
                     f"{node_name or handle}"
                 )
-                node_receipt["status"] = "failed_missing_map2"
+                node_receipt["status"] = "fallback_no_map2"
                 node_receipt["detail"] = detail
-                receipt["failed"].append(detail)
-                raise RuntimeError(detail)
+                receipt["fallback_no_map2"].append(handle)
+                continue
             receipt["map2_verified"] += 1
             node_receipt["status"] = "collapsed"
     finally:
@@ -20687,6 +20699,7 @@ def _max_export_mod(payload: dict[str, Any]) -> dict[str, Any]:
         "moved_to_editable_mesh": 0,
         "collapsed": 0,
         "skipped_no_unwrap": [],
+        "fallback_no_map2": [],
         "failed": [],
         "nodes": [],
     }
@@ -44107,12 +44120,30 @@ class ChoiceDialog:
                 return
             message_text = str(message)
             if self._message_uses_text:
+                # Deferred receipts poll repeatedly; do not redraw identical text.
+                if str(widget.get("1.0", "end-1c")) == message_text:
+                    return
                 first_visible = float(widget.yview()[0])
                 widget.configure(state="normal")
                 widget.delete("1.0", "end")
                 widget.insert("1.0", message_text)
                 if self._message_first_line_warning:
                     widget.tag_add("PC_REHD_LEADING_WARNING", "1.0", "1.end")
+                if self._inline_warning_message:
+                    inline_warning_start = widget.search(
+                        self._inline_warning_message,
+                        "1.0",
+                        stopindex="end",
+                    )
+                    if inline_warning_start:
+                        inline_warning_end = widget.index(
+                            f"{inline_warning_start}+{len(self._inline_warning_message)}c"
+                        )
+                        widget.tag_add(
+                            "PC_REHD_INLINE_WARNING",
+                            inline_warning_start,
+                            inline_warning_end,
+                        )
                 widget.configure(state="disabled")
                 widget.yview_moveto(first_visible)
                 if self._message_layout_refresh is not None:
@@ -80062,6 +80093,9 @@ class LauncherApp:
             ]
             fbx_receipt = max_result.get("fbx_receipt")
             fbx_receipt = dict(fbx_receipt) if isinstance(fbx_receipt, dict) else {}
+            uv2_agent_fallback = False
+            if blender_export:
+                uv2_agent_fallback = bool(fbx_receipt.get("map2_missing_meshes", []))
             if not blender_export:
                 if fbx_receipt.get("export_map2") is not bool(options["export_map2"]):
                     raise ProtocolError(
@@ -80077,9 +80111,18 @@ class LauncherApp:
                         raise ProtocolError(
                             "Max FBX export did not acknowledge the UV Map 2 collapse request"
                         )
-                    if list(uv2_collapse.get("failed", [])):
+                    uv2_agent_fallback = bool(
+                        uv2_collapse.get("fallback_no_map2", [])
+                    )
+                    uv2_failures = [
+                        detail
+                        for detail in uv2_collapse.get("failed", [])
+                        if not _uv2_missing_map2_detail_is_nonblocking(detail)
+                    ]
+                    if uv2_failures:
                         raise ProtocolError(
-                            "Max FBX export reported a UV Map 2 collapse failure"
+                            "Max FBX export reported a UV Map 2 collapse failure: "
+                            + " | ".join(str(detail) for detail in uv2_failures)
                         )
             fbx_receipt_path = str(
                 fbx_receipt.get("path") or max_result.get("fbx_path") or (fbx_path if requires_current_fbx else "")
@@ -80654,6 +80697,11 @@ class LauncherApp:
                     for row in uv_layout_receipt.get("map2_fallback_meshes", [])
                     if isinstance(row, dict)
                 ]
+                map2_fallback_detected = bool(map2_fallback_meshes) or uv2_agent_fallback
+                map2_fallback_banner = self._tr(
+                    "场景没有发现有效 UV 2 通道，已经回退用 UV 1 通道导出到 MOD",
+                    "No valid UV Map 2 channel was found in the scene; export fell back to UV Map 1 for the MOD",
+                )
                 check_source_pass_text_cn = (
                     "检查源文件：PASS（Python 导入源身份与当前源 .MOD 一致）"
                     if check_source_confidence == "HIGH"
@@ -80952,6 +81000,17 @@ class LauncherApp:
                     receipt_button = "OK"
                     receipt_open_folder_button = "Open Output Folder"
 
+                if map2_fallback_detected:
+                    elapsed_line = (
+                        f"导出写入已完成，用时 {elapsed:.2f} 秒，可自行去查看 NEW MOD。"
+                        if self.ui_language == "CN"
+                        else f"Export writing completed in {elapsed:.2f} seconds."
+                    )
+                    receipt_lines.insert(
+                        receipt_lines.index(elapsed_line) + 1,
+                        map2_fallback_banner,
+                    )
+
                 base_receipt_lines = tuple(receipt_lines)
 
                 def compose_uv_receipt(uv_lines: list[str]) -> str:
@@ -81005,6 +81064,9 @@ class LauncherApp:
                         (receipt_open_folder_button, "open_output_folder"),
                     ],
                     non_closing_actions={"open_output_folder": open_output_folder},
+                    inline_warning_message=(
+                        map2_fallback_banner if map2_fallback_detected else ""
+                    ),
                     callout=self._tr(
                         "如果发现游戏内贴图和 MAX 场景中的不一样，请检查 UV 是否重叠。\n\n"
                         "若有重叠，请使用：\n"
