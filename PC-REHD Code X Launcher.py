@@ -79411,6 +79411,9 @@ class LauncherApp:
         bone_mode: str | None = None,
         legacy_bucket_plan: LegacyExportBucketPlan | None = None,
     ) -> None:
+        # operation() records the Agent receipt; finish_writer() consumes it later.
+        uv2_agent_fallback = False
+
         def release_legacy_bucket_plan() -> None:
             self._release_legacy_export_bucket_plan(legacy_bucket_plan)
 
@@ -79835,7 +79838,7 @@ class LauncherApp:
             return result
 
         def operation() -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]:
-            nonlocal writer_source_mod, source_sha, source_snapshot
+            nonlocal writer_source_mod, source_sha, source_snapshot, uv2_agent_fallback
             export_interface_id = (
                 "export.bone_edit"
                 if resolved_bone_mode != "disabled"
