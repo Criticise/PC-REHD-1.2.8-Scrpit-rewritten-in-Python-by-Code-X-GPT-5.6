@@ -1324,16 +1324,16 @@ validate_operation_response = validate_response
 
 APP_NAME = "PC-REHD Code X Launcher"
 APP_VERSION = 1
-# Only the published manifest comparison can show an update. There is no
+# Only the GitHub source-file comparison can show an update. There is no
 # release-build test override that forces the update indicator on.
-GITHUB_RELEASE_UPDATE_CHECK_ENABLED = True
+GITHUB_SOURCE_UPDATE_CHECK_ENABLED = True
 LAUNCHER_WINDOW_TITLE = "CAPCOM MT FRAMEWORK Script v0.1.2.8 Codex Python"
-GITHUB_RELEASE_UPDATE_TITLE_CN = "发现Github Release 新版本"
-GITHUB_RELEASE_UPDATE_TITLE_EN = "New GitHub Release Available"
-GITHUB_LAUNCHER_UPDATE_MANIFEST_URL = (
+GITHUB_SOURCE_UPDATE_TITLE_CN = "发现Github 源代码更新"
+GITHUB_SOURCE_UPDATE_TITLE_EN = "GitHub Source Update Available"
+GITHUB_LAUNCHER_SOURCE_METADATA_URL = (
     "https://api.github.com/repos/Criticise/"
     "PC-REHD-1.2.8-Scrpit-rewritten-in-Python-by-Code-X-GPT-5.6/"
-    "contents/PC-REHD-Code-X-Launcher.sha256"
+    "contents/PC-REHD%20Code%20X%20Launcher.py?ref=main"
 )
 GITHUB_RELEASE_PAGE_URL = (
     "https://github.com/Criticise/"
@@ -1341,7 +1341,7 @@ GITHUB_RELEASE_PAGE_URL = (
     "releases/tag/v1.0.0"
 )
 GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS = 20.0
-GITHUB_UPDATE_MANIFEST_MAX_BYTES = 8 * 1024
+GITHUB_SOURCE_METADATA_MAX_BYTES = 32 * 1024
 LAUNCHER_SUPPORTED_PYTHON_MINORS = ((3, 12), (3, 14))
 ISOLATED_PYTHON_ENVIRONMENT = {
     "PYTHONUTF8": "1",
@@ -8975,9 +8975,12 @@ LAUNCHER_SOURCE_PATH = Path(__file__).resolve()
 # identity with disk first, so mixed old-Launcher/new-component runs are blocked.
 _LAUNCHER_SOURCE_BYTES = LAUNCHER_SOURCE_PATH.read_bytes()
 LAUNCHER_SOURCE_SHA256 = _launcher_source_sha256(_LAUNCHER_SOURCE_BYTES)
-# Accept the old raw-file manifest during the identity-SHA migration. The
-# identity SHA remains the canonical value for new manifests.
-LAUNCHER_SOURCE_RAW_SHA256 = hashlib.sha256(_LAUNCHER_SOURCE_BYTES).hexdigest().upper()
+LAUNCHER_SOURCE_GIT_BLOB_SHA1 = hashlib.sha1(
+    b"blob "
+    + str(len(_LAUNCHER_SOURCE_BYTES)).encode("ascii")
+    + b"\0"
+    + _LAUNCHER_SOURCE_BYTES
+).hexdigest()
 WORK_AGENT_COMPONENT_REVISION = (
     f"{WORK_AGENT_COMPONENT_REVISION_PREFIX}{LAUNCHER_SOURCE_SHA256[:24]}"
 )
@@ -8985,13 +8988,13 @@ AGENT_COMPONENT_REVISION = WORK_AGENT_COMPONENT_REVISION
 LAUNCHER_BUILD_ID = f"{APP_VERSION}-{LAUNCHER_SOURCE_SHA256[:16]}"
 
 
-def _fetch_github_launcher_source_sha256(
+def _fetch_github_launcher_source_blob_sha(
     *,
     opener: Callable[..., Any] | None = None,
 ) -> str:
-    """Return the published normalized Launcher SHA-256 from a small manifest."""
+    """Return the Git blob SHA of the published Launcher source file."""
     request = urllib_request.Request(
-        GITHUB_LAUNCHER_UPDATE_MANIFEST_URL,
+        GITHUB_LAUNCHER_SOURCE_METADATA_URL,
         headers={
             "Accept": "application/vnd.github+json",
             "User-Agent": f"{APP_NAME}/{LAUNCHER_BUILD_ID}",
@@ -8999,7 +9002,7 @@ def _fetch_github_launcher_source_sha256(
     )
     if opener is not None:
         with opener(request, timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS) as response:
-            payload = response.read(GITHUB_UPDATE_MANIFEST_MAX_BYTES + 1)
+            payload = response.read(GITHUB_SOURCE_METADATA_MAX_BYTES + 1)
     else:
         # Bypass a stale local VPN proxy without creating a helper CLI process.
         open_request = urllib_request.build_opener(
@@ -9008,33 +9011,24 @@ def _fetch_github_launcher_source_sha256(
         with open_request(
             request, timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS
         ) as response:
-            payload = response.read(GITHUB_UPDATE_MANIFEST_MAX_BYTES + 1)
-    if len(payload) > GITHUB_UPDATE_MANIFEST_MAX_BYTES:
-        raise ValueError("GitHub Launcher update manifest exceeded the size limit")
+            payload = response.read(GITHUB_SOURCE_METADATA_MAX_BYTES + 1)
+    if len(payload) > GITHUB_SOURCE_METADATA_MAX_BYTES:
+        raise ValueError("GitHub Launcher source metadata exceeded the size limit")
     if not payload:
-        raise ValueError("GitHub returned an empty Launcher update manifest")
+        raise ValueError("GitHub returned empty Launcher source metadata")
     try:
         metadata = json.loads(payload.decode("utf-8"))
-        if str(metadata.get("encoding", "")).casefold() != "base64":
-            raise ValueError("GitHub Launcher update manifest is not Base64 encoded")
-        encoded_manifest = "".join(str(metadata.get("content", "")).split())
-        manifest = base64.b64decode(
-            encoded_manifest, validate=True
-        ).decode("ascii")
     except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"GitHub Launcher update manifest is invalid: {exc}") from exc
-    remote_sha256 = manifest.strip().upper()
-    if not re.fullmatch(r"[0-9A-F]{64}", remote_sha256):
-        raise ValueError("GitHub Launcher update manifest has no SHA-256 value")
-    return remote_sha256
+        raise ValueError(f"GitHub Launcher source metadata is invalid: {exc}") from exc
+    remote_blob_sha = str(metadata.get("sha", "")).strip().casefold()
+    if not re.fullmatch(r"[0-9a-f]{40}", remote_blob_sha):
+        raise ValueError("GitHub Launcher source metadata has no Git blob SHA")
+    return remote_blob_sha
 
 
-def _github_launcher_sha_matches_current(remote_sha256: str) -> bool:
-    """Match canonical identity manifests and the pre-identity raw format."""
-    return any(
-        secrets.compare_digest(remote_sha256, candidate)
-        for candidate in (LAUNCHER_SOURCE_SHA256, LAUNCHER_SOURCE_RAW_SHA256)
-    )
+def _github_launcher_blob_matches_current(remote_blob_sha: str) -> bool:
+    """Match GitHub's source-file blob identifier against this local source file."""
+    return secrets.compare_digest(remote_blob_sha, LAUNCHER_SOURCE_GIT_BLOB_SHA1)
 
 
 class PolicyValidationRevisionChanged(RuntimeError):
@@ -45833,7 +45827,7 @@ class LauncherApp:
         )
         self._github_update_check_started = False
         self._github_update_available = False
-        self._github_remote_launcher_sha256 = ""
+        self._github_remote_launcher_blob_sha = ""
         self._github_update_click_surface: Any | None = None
         self._github_update_click_surface_after: str | None = None
         self._refresh_launcher_window_title()
@@ -46258,7 +46252,7 @@ class LauncherApp:
 
     def _refresh_launcher_window_title(self) -> None:
         try:
-            update_title = self._github_release_update_title()
+            update_title = self._github_source_update_title()
             title = (
                 update_title + " | " + LAUNCHER_WINDOW_TITLE
                 if self._github_update_available
@@ -46269,10 +46263,10 @@ class LauncherApp:
             return
         self._schedule_github_update_title_click_surface()
 
-    def _github_release_update_title(self) -> str:
+    def _github_source_update_title(self) -> str:
         return self._tr(
-            GITHUB_RELEASE_UPDATE_TITLE_CN,
-            GITHUB_RELEASE_UPDATE_TITLE_EN,
+            GITHUB_SOURCE_UPDATE_TITLE_CN,
+            GITHUB_SOURCE_UPDATE_TITLE_EN,
         )
 
     def _github_update_click_surface_enabled(self) -> bool:
@@ -46432,7 +46426,7 @@ class LauncherApp:
             edge = max(2, int(round(2 * scale)))
             title_start = int(rect.left) + int(round(31 * scale))
             text_width = self._measure_native_caption_text(
-                self._github_release_update_title(), dpi
+                self._github_source_update_title(), dpi
             )
             caption_controls_start = int(rect.right) - int(round(94 * scale))
             left = title_start - edge
@@ -46535,27 +46529,27 @@ class LauncherApp:
 
     def _start_github_launcher_update_check(self) -> None:
         if (
-            not GITHUB_RELEASE_UPDATE_CHECK_ENABLED
+            not GITHUB_SOURCE_UPDATE_CHECK_ENABLED
             or self._github_update_check_started
             or self._close_in_progress
         ):
             return
         self._github_update_check_started = True
 
-        def receive(remote_sha256: Any) -> None:
+        def receive(remote_blob_sha: Any) -> None:
             if self._close_in_progress:
                 return
-            remote = str(remote_sha256 or "").strip().upper()
-            if len(remote) != 64 or not re.fullmatch(r"[0-9A-F]{64}", remote):
+            remote = str(remote_blob_sha or "").strip().casefold()
+            if len(remote) != 40 or not re.fullmatch(r"[0-9a-f]{40}", remote):
                 return
-            self._github_remote_launcher_sha256 = remote
-            self._github_update_available = not _github_launcher_sha_matches_current(
+            self._github_remote_launcher_blob_sha = remote
+            self._github_update_available = not _github_launcher_blob_matches_current(
                 remote
             )
             self._refresh_launcher_window_title()
 
         self._run_background(
-            _fetch_github_launcher_source_sha256,
+            _fetch_github_launcher_source_blob_sha,
             receive,
             label="GitHub update check",
             on_error=lambda _error: None,
