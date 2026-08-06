@@ -4842,6 +4842,8 @@ PYMXS_EXPORT_ALLOWED_RUNTIME_CALLS = (
     "rt.pluginManager.loadClass",
     "rt.select",
     "rt.addModifier",
+    "rt.addModifierWithLocalData",
+    "rt.copy",
     "rt.skinOps.GetBoneName",
     "rt.skinOps.GetNumberBones",
 )

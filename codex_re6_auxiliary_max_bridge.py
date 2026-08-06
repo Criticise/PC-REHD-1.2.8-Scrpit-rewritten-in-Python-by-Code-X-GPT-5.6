@@ -16,6 +16,18 @@ def _point3(value: Any) -> list[float]:
     return [float(value.x), float(value.y), float(value.z)]
 
 
+def _release_transient_runtime(rt: Any) -> None:
+    try:
+        rt.gc(light=True)
+        return
+    except Exception:
+        pass
+    try:
+        rt.gc()
+    except Exception:
+        pass
+
+
 def read_auxiliary_mesh_geometry(
     rt: Any,
     node: Any,
@@ -65,10 +77,8 @@ def read_auxiliary_mesh_geometry(
             "faces": faces,
         }
     finally:
-        # Drop the Python wrapper reference only. Forcing MaxScript GC while
-        # snapshotAsMesh wrappers are being released can invalidate native
-        # objects still owned by pymxs.
         converted = None
+        _release_transient_runtime(rt)
 
 
 def _auxiliary_failure_classification(exc: Exception) -> dict[str, Any]:

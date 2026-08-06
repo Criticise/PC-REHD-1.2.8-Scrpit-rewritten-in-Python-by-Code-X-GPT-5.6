@@ -8758,12 +8758,12 @@ def _parse_scene_bone_id_from_name(name: Any, default_value: int | None = None) 
     text = str(name or "").strip()
     if text == "":
         return default_value
-    match = re.match(r"(?i)^b_.+_(\d+)$", text)
+    match = re.match(r"(?i)^b_(\d+)_(\d+)", text)
     if match is None:
         return default_value
     try:
-        parsed = int(match.group(1)) - 1
-    except Exception:
+        parsed = int(match.group(2)) - 1
+    except (TypeError, ValueError, OverflowError):
         return default_value
     return parsed if parsed >= 0 else default_value
 
@@ -8777,8 +8777,11 @@ def _normalize_scene_bone_entries(bones: Any) -> list[dict[str, Any]]:
             continue
         name = str(raw_bone.get("name", "") or "")
         parent_name = str(raw_bone.get("parent_name", "") or "")
+        canonical_bone_id = _parse_scene_bone_id_from_name(name, default_value=None)
         parsed_bone_id = raw_bone.get("parsed_bone_id")
-        if parsed_bone_id in {None, ""}:
+        if canonical_bone_id is not None:
+            parsed_bone_id = canonical_bone_id
+        elif parsed_bone_id in {None, ""}:
             parsed_bone_id = _parse_scene_bone_id_from_name(name)
         else:
             parsed_bone_id = _int_or_default(parsed_bone_id, -1)
@@ -8786,8 +8789,11 @@ def _normalize_scene_bone_entries(bones: Any) -> list[dict[str, Any]]:
                 parsed_bone_id = _parse_scene_bone_id_from_name(name)
         world_matrix = _clone_matrix_values(raw_bone.get("world_matrix"))
         local_matrix = _clone_matrix_values(raw_bone.get("local_matrix"))
+        canonical_parent_bone_id = _parse_scene_bone_id_from_name(parent_name, default_value=None)
         parent_parsed_bone_id = raw_bone.get("parent_parsed_bone_id")
-        if parent_parsed_bone_id in {None, ""}:
+        if canonical_parent_bone_id is not None:
+            parent_parsed_bone_id = canonical_parent_bone_id
+        elif parent_parsed_bone_id in {None, ""}:
             parent_parsed_bone_id = _parse_scene_bone_id_from_name(parent_name)
         else:
             parent_parsed_bone_id = _int_or_default(parent_parsed_bone_id, -1)

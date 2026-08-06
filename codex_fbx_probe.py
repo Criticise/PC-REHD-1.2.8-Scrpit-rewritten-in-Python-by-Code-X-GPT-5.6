@@ -1885,19 +1885,21 @@ def _extract_mesh_geometry(mesh: Any, instance_node: Any | None = None) -> dict[
 
 
 def parse_bone_id_from_name(bone_name: str | None, default_value: int | None = None) -> int | None:
-    result = default_value
+    """Read the RE6 bone ID from the stable ``b_<parent>_<id>`` prefix.
+
+    FBX importers append physical-instance suffixes such as ``_Import2``.
+    Those suffixes are not part of the skeleton identity and must never alter
+    the ID used by Skin influences.
+    """
+    name_text = str(bone_name or "").strip()
+    match = re.match(r"(?i)^b_(\d+)_(\d+)", name_text)
+    if match is None:
+        return default_value
     try:
-        name_text = str(bone_name or "")
-        lower_name = name_text.lower()
-        if lower_name.startswith("b_") and lower_name.count("_") >= 2:
-            parts = name_text.split("_")
-            if len(parts) >= 3:
-                parsed = int(parts[-1]) - 1
-                if parsed >= 0:
-                    result = parsed
-    except Exception:
-        pass
-    return result
+        parsed = int(match.group(2)) - 1
+    except (TypeError, ValueError, OverflowError):
+        return default_value
+    return parsed if parsed >= 0 else default_value
 
 
 def _enum_name_upper(value: Any) -> str:
@@ -1968,9 +1970,13 @@ def _extract_source_skin_rows(mesh: Any, source_vertex_count: int) -> tuple[list
         bone_name = str(getattr(cluster, "bone_name", "") or getattr(cluster, "name", "") or "")
         if bone_name != "":
             bone_names.append(bone_name)
-        game_bone = parse_bone_id_from_name(bone_name, default_value=0)
+        game_bone = parse_bone_id_from_name(bone_name, default_value=None)
         if game_bone is None:
-            game_bone = cluster_index
+            mesh_name = str(getattr(mesh, "name", "") or "<unnamed mesh>")
+            raise ValueError(
+                "FBX Skin cluster cannot be mapped to an RE6 bone ID: "
+                f"mesh={mesh_name}; cluster={cluster_index}; bone={bone_name or '<unnamed>'}"
+            )
         vertices = _safe_list(getattr(cluster, "vertices", None))
         weights = _safe_list(getattr(cluster, "weights", None))
         row_count = min(len(vertices), len(weights))
