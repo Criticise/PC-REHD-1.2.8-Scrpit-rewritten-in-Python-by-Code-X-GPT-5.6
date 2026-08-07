@@ -7783,10 +7783,22 @@ def _run_ui_quality_policy_guard() -> dict[str, Any]:
             "self._schedule_main_window_geometry_commit(",
         ),
         "_commit_main_window_geometry": (
+            "fit_to_content",
+            "self._fit_main_window_to_content()",
+            "self._apply_main_window_geometry(",
             "self._refresh_main_viewport_layout(",
             "_redraw_native_window_after_geometry(self.root)",
         ),
+        "_schedule_main_window_geometry_commit": (
+            "fit_to_content",
+            "self._commit_main_window_geometry(",
+        ),
         "_toggle_collapsible_section": (
+            "fit_to_content=True",
+            "self._schedule_main_window_geometry_commit(",
+        ),
+        "_toggle_compact_mode_panel": (
+            "fit_to_content=True",
             "self._schedule_main_window_geometry_commit(",
         ),
         "_apply_advanced_visibility": (
@@ -48544,9 +48556,13 @@ class LauncherApp:
     def _main_window_layout_signature(self, mode: str) -> str:
         if mode == "expanded":
             return "advanced-scroll-v3"
-        return "simple-scroll-v7|" + ";".join(
+        section_signature = ";".join(
             f"{key}={int(bool(self._section_collapsed_preferences.get(key, False)))}"
             for key in ("model", "rename", "filter")
+        )
+        return (
+            "simple-scroll-v8|"
+            f"{section_signature};compact={int(bool(self._compact_mode_panel_collapsed))}"
         )
 
     def _main_window_layout_signature_matches(
@@ -48880,7 +48896,11 @@ class LauncherApp:
             self._on_close()
 
     def _schedule_main_window_geometry_commit(
-        self, mode: str, *, reset_origin: bool
+        self,
+        mode: str,
+        *,
+        reset_origin: bool,
+        fit_to_content: bool = False,
     ) -> None:
         pending_after = self._main_window_geometry_commit_after
         self._main_window_geometry_commit_after = None
@@ -48892,27 +48912,42 @@ class LauncherApp:
         try:
             self._main_window_geometry_commit_after = self.root.after_idle(
                 lambda: self._commit_main_window_geometry(
-                    mode, reset_origin=reset_origin
+                    mode,
+                    reset_origin=reset_origin,
+                    fit_to_content=fit_to_content,
                 )
             )
         except self.tk.TclError:
             pass
 
     def _commit_main_window_geometry(
-        self, mode: str, *, reset_origin: bool
+        self,
+        mode: str,
+        *,
+        reset_origin: bool,
+        fit_to_content: bool = False,
     ) -> None:
         self._main_window_geometry_commit_after = None
+        normalized_mode = "expanded" if mode == "expanded" else "collapsed"
         try:
             if not bool(self.root.winfo_exists()):
                 return
+            if fit_to_content and normalized_mode == "collapsed":
+                target_width, target_height = self._fit_main_window_to_content()
+                self._apply_main_window_geometry(
+                    normalized_mode,
+                    target_width,
+                    target_height,
+                    persist=True,
+                    center=False,
+                    default_size=True,
+                )
             self.root.update_idletasks()
             width = max(1, int(self.root.winfo_width()))
             height = max(1, int(self.root.winfo_height()))
         except (self.tk.TclError, TypeError, ValueError):
             return
-        self._main_window_size_mode = (
-            "expanded" if mode == "expanded" else "collapsed"
-        )
+        self._main_window_size_mode = normalized_mode
         self._main_window_last_viewport_size = (width, height)
         self._main_viewport_layout_signature = None
         self._refresh_main_viewport_layout(
@@ -50740,31 +50775,15 @@ class LauncherApp:
                         float(saved_view[0]),
                         float(saved_view[1]),
                     )
-        try:
-            current_width = max(1, int(self.root.winfo_width()))
-            current_height = max(1, int(self.root.winfo_height()))
-        except (self.tk.TclError, TypeError, ValueError):
-            current_width, current_height = self._main_window_natural_sizes.get(
-                self._main_window_natural_size_cache_key("collapsed"),
-                (
-                    MAIN_WINDOW_COLLAPSED_MIN_WIDTH,
-                    MAIN_WINDOW_COLLAPSED_MIN_HEIGHT,
-                ),
-            )
         self._section_collapsed_preferences[key] = collapsed
         if self._persist_active_ui_page_preferences():
             self._queue_launcher_state_write()
         self._set_collapsible_section_state(key, collapsed)
         self._reflow_left_sections(flush_layout=False)
-        self._fit_main_window_to_content(flush_layout=False)
-        self._store_main_window_size(
-            "collapsed",
-            current_width,
-            current_height,
-            default_size=False,
-        )
         self._schedule_main_window_geometry_commit(
-            "collapsed", reset_origin=False
+            "collapsed",
+            reset_origin=False,
+            fit_to_content=True,
         )
         if canvas is not None and restore_view is not None:
             scheduler.schedule_scroll_view_restore(
@@ -50783,10 +50802,10 @@ class LauncherApp:
         if self._persist_active_ui_page_preferences():
             self._queue_launcher_state_write()
         self._reflow_left_sections(flush_layout=False)
-        self._fit_main_window_to_content(flush_layout=False)
         self._schedule_main_window_geometry_commit(
             "collapsed",
             reset_origin=False,
+            fit_to_content=True,
         )
         self.root.focus_set()
 
