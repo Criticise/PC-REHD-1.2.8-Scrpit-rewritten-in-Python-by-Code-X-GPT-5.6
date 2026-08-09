@@ -238,7 +238,6 @@ LOCAL_ORJSON_BUNDLE_DIR = FIXED_VENDOR_ROOT_DIR / "orjson_re6_v4"
 UPGRADE_ORJSON_BUNDLE_DIR = UPGRADE_VENDOR_ROOT_DIR / "orjson_re6_v4"
 LOCAL_ACCELERATOR_BUNDLE_DIR = FIXED_VENDOR_ROOT_DIR / "codex_accel_re6_v4"
 UPGRADE_ACCELERATOR_BUNDLE_DIR = UPGRADE_VENDOR_ROOT_DIR / "codex_accel_re6_v4"
-LOCAL_PYTHON_BUNDLE_DIR = FIXED_VENDOR_ROOT_DIR / "python_runtime_re6_v4"
 LOCAL_PYTHON_BUILD_TOOLS_DIR = FIXED_VENDOR_ROOT_DIR / "python_build_tools_re6_v4"
 LOCAL_ONLY_RUNTIME_INSTALL = False
 NETWORK_REPAIR_ENABLED = True
@@ -1232,66 +1231,6 @@ def _format_supported_python_minors() -> str:
     return ", ".join(f"{major}.{minor}" for major, minor in SUPPORTED_PYTHON_MINORS)
 
 
-def _find_local_python_bundle_candidates(version_info: object | None = None) -> tuple[str, ...]:
-    major, minor = _coerce_version_info(version_info)
-    if LOCAL_PYTHON_BUNDLE_DIR.exists() is not True:
-        return tuple()
-    patterns = (
-        f"python-{major}.{minor}*-embed-amd64.zip",
-        f"python-{major}.{minor}*-amd64.exe",
-        f"python-{major}.{minor}*-amd64.msi",
-    )
-    candidates: list[Path] = []
-    for pattern in patterns:
-        candidates.extend(sorted(LOCAL_PYTHON_BUNDLE_DIR.glob(pattern)))
-    candidates = sorted(
-        {candidate.resolve() for candidate in candidates},
-        key=lambda candidate: (_version_key(_extract_candidate_version(candidate.name)), candidate.name.lower()),
-        reverse=True,
-    )
-    return tuple(str(candidate) for candidate in candidates)
-
-
-def _is_local_python_bundle_candidate_valid(candidate_path: str | Path) -> bool:
-    path = Path(candidate_path)
-    if path.exists() is not True:
-        return False
-    suffix_text = path.suffix.lower()
-    if suffix_text == ".zip":
-        if zipfile.is_zipfile(path) is not True:
-            return False
-        try:
-            with zipfile.ZipFile(path) as bundle_zip:
-                names = set(bundle_zip.namelist())
-            return "python.exe" in names and any(name.endswith("._pth") for name in names)
-        except Exception:
-            return False
-    return suffix_text in {".exe", ".msi"}
-
-
-def get_local_python_bundle_report() -> dict[str, object]:
-    supported_versions: list[dict[str, object]] = []
-    for version_info in SUPPORTED_PYTHON_MINORS:
-        candidates = _find_local_python_bundle_candidates(version_info)
-        version_text = f"{version_info[0]}.{version_info[1]}"
-        valid_candidates = [candidate for candidate in candidates if _is_local_python_bundle_candidate_valid(candidate) is True]
-        invalid_candidates = [candidate for candidate in candidates if candidate not in valid_candidates]
-        supported_versions.append(
-            {
-                "python": version_text,
-                "available": len(valid_candidates) > 0,
-                "candidates": list(candidates),
-                "valid_candidates": valid_candidates,
-                "invalid_candidates": invalid_candidates,
-            }
-        )
-    return {
-        "bundle_dir": str(LOCAL_PYTHON_BUNDLE_DIR),
-        "recommended_python": f"{RECOMMENDED_PYTHON[0]}.{RECOMMENDED_PYTHON[1]}",
-        "supported_versions": supported_versions,
-    }
-
-
 def get_managed_import_bundle_report(import_name: str) -> dict[str, object]:
     refresh_package_candidates()
     candidates = list(PACKAGE_BY_IMPORT_NAME.get(import_name, ()))
@@ -1327,7 +1266,6 @@ def get_runtime_bundle_report() -> dict[str, object]:
     refresh_package_candidates()
     managed_imports = list(dict.fromkeys((*APPROVED_IMPORTS, *LOCAL_ACCELERATOR_IMPORTS)))
     return {
-        "python_bundles": get_local_python_bundle_report(),
         "managed_imports": [get_managed_import_bundle_report(import_name) for import_name in managed_imports],
         "dependency_contract": get_dependency_bundle_contract_report(include_runtime_health=False),
         "runtime_state": get_runtime_state_report(),
@@ -1617,7 +1555,6 @@ def get_runtime_support_report(version_info: object | None = None) -> dict[str, 
         "vendor_dir": str(VENDOR_PY_DIR),
         "packaged_vendor_dir": str(PACKAGED_VENDOR_PY_DIR),
         "runtime_root": str(RUNTIME_ROOT_DIR),
-        "python_bundle_dir": str(LOCAL_PYTHON_BUNDLE_DIR),
     }
 
 
@@ -2263,13 +2200,6 @@ def _discover_python_paths_from_common_locations() -> tuple[Path, ...]:
             for candidate_path in sorted(root_path.glob(pattern)):
                 add_candidate(candidate_path)
 
-    if LOCAL_PYTHON_BUNDLE_DIR.exists() is True:
-        try:
-            for candidate_path in sorted(LOCAL_PYTHON_BUNDLE_DIR.glob("**/python.exe")):
-                add_candidate(candidate_path)
-        except Exception:
-            pass
-
     return tuple(candidates)
 
 
@@ -2443,8 +2373,13 @@ def _find_exact_python_runtime_patch_candidate(
     return None
 
 
+def _required_python_installer_hint() -> str:
+    version_text = _python_runtime_version_text(REQUIRED_PYTHON_RUNTIME)
+    return str(BASE_DIR / f"python-{version_text}-amd64.exe")
+
+
 def _build_runtime_restart_error_message(report: dict[str, object]) -> str:
-    bundle_report = get_local_python_bundle_report()
+    installer_hint = _required_python_installer_hint()
     if runtime_ui_is_chinese():
         lines = [
             "当前 Python 运行时不受支持：" + str(report.get("current_python", "未知")) + "。",
@@ -2453,7 +2388,7 @@ def _build_runtime_restart_error_message(report: dict[str, object]) -> str:
             "V4 本地桥接支持版本：" + _format_supported_python_minors() + "。",
             "Python 已尝试使用受支持的解释器重新启动，但没有找到可用版本。",
             "请确认 py launcher 能找到受支持的 Python 3.14；其他版本必须先通过 Bootstrap A/B 合同。",
-            "如果本机只有随附安装包，请先从这里安装：" + str(bundle_report.get("bundle_dir", LOCAL_PYTHON_BUNDLE_DIR)),
+            "如果本机没有可用的 Python，请从发布目录安装：" + installer_hint,
         ]
     else:
         lines = [
@@ -2463,7 +2398,7 @@ def _build_runtime_restart_error_message(report: dict[str, object]) -> str:
             "Supported local V4 bridge runtimes: " + _format_supported_python_minors() + ".",
             "Python tried to relaunch itself under a supported interpreter, but none was found.",
             "Check that the py launcher can see supported Python 3.14; other versions must pass the Bootstrap A/B contract first.",
-            "If this machine only has the bundled installer, install it first from: " + str(bundle_report.get("bundle_dir", LOCAL_PYTHON_BUNDLE_DIR)),
+            "If this machine has no usable Python, install it from the release directory: " + installer_hint,
         ]
     return " ".join(lines)
 
@@ -2473,7 +2408,7 @@ def _build_exact_runtime_restart_error_message(
     *,
     context_label: str,
 ) -> str:
-    bundle_report = get_local_python_bundle_report()
+    installer_hint = _required_python_installer_hint()
     required_text = f"{required_version[0]}.{required_version[1]}"
     current_text = f"{sys.version_info.major}.{sys.version_info.minor}"
     if runtime_ui_is_chinese():
@@ -2482,7 +2417,7 @@ def _build_exact_runtime_restart_error_message(
             "当前 Python：" + current_text + "。",
             "V4 本地桥接支持版本：" + _format_supported_python_minors() + "。",
             "Python 已尝试使用要求的解释器重新启动，但没有找到该版本。",
-            "请先从这里安装本地运行时：" + str(bundle_report.get("bundle_dir", LOCAL_PYTHON_BUNDLE_DIR)),
+            "请先从发布目录安装本地运行时：" + installer_hint,
         ]
     else:
         lines = [
@@ -2490,7 +2425,7 @@ def _build_exact_runtime_restart_error_message(
             "Current Python: " + current_text + ".",
             "Supported local V4 bridge runtimes: " + _format_supported_python_minors() + ".",
             "Python tried to relaunch itself under the required interpreter, but none was found.",
-            "Install the local bundle first from: " + str(bundle_report.get("bundle_dir", LOCAL_PYTHON_BUNDLE_DIR)),
+            "Install the local runtime from the release directory: " + installer_hint,
         ]
     return " ".join(lines)
 
@@ -11474,7 +11409,6 @@ def _runtime_ab_local_installer_inventory() -> list[dict[str, object]]:
     for root, source, recursive in (
         (RUNTIME_INTERPRETER_DOWNLOAD_DIR, "bootstrap-download-cache", False),
         (BASE_DIR, "release-root", False),
-        (LOCAL_PYTHON_BUNDLE_DIR, "fixed-runtime-bundle", True),
     ):
         if root.is_dir() is not True:
             continue

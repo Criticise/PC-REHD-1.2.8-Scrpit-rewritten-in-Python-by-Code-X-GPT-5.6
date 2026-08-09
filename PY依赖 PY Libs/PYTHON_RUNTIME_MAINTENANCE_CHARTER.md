@@ -62,7 +62,6 @@ _vendor_fixed/
   numpy_re6_v4/
     numpy-2.5.1-cp314-cp314-win_amd64.whl
   pyufbx_re6_v4/
-  python_runtime_re6_v4/
   pillow_re6_v4/
   orjson_re6_v4/
   codex_accel_re6_v4/

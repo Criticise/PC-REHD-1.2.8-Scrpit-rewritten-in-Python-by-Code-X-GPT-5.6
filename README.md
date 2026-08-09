@@ -82,6 +82,45 @@ Users are responsible for evaluating whether the script is suitable for their ow
 
 Third-party components retain their own licenses. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
+### Acknowledgements
+
+<details>
+<summary>Show the historical PC_REHD maintenance record and acknowledgements</summary>
+
+The record below is transcribed from the comments in the archived `PC_REHD-v1_2_8.ms` reference script. It documents the maintenance history of the upstream MaxScript line; it is historical context, not a claim that every old feature remains in the current Python implementation.
+
+#### Historical maintenance record
+
+- **RER Mod Tool v0.2 — maliwei777:** original RER mod tool baseline.
+- **June 11, 2013 — mariokart64n:** added the RER and RE6 version switch.
+- **v0.21 — Sectus:** corrected the material ID width from a byte to a short.
+- **2015 — Codeman:** modified and fixed the script for Resident Evil HD Remaster, Revelations 1, Revelations 2, and RE6.
+- **v1.1.0:** added vertex-definition support.
+- **v1.1.1:** fixed vertex-definition import and export.
+- **v1.1.2:** added MaxScript functions.
+- **v1.1.3:** fixed weighting-data import and export issues.
+- **v1.1.5:** applied various fixes and improvements to FVF support.
+- **v1.1.6:** added static geometry loading/exporting, new FVF support, SBC collision loading for REHD, and GUI/versioning improvements.
+- **v1.1.7:** fixed weighting import, expanded static geometry and FVF support, added EMS/ADR loading for REHD, dynamic LOD filtering, bone-assignment fixes, and advanced GUI options.
+- **v1.1.8:** fixed weighting and RE6 FVF issues, added material/FVF display filters, degenerate-line visibility control, and a larger heap for bigger models.
+- **v1.1.9:** added static loading support for many RE6 stages.
+- **v1.2.0:** fixed meshes using more than 128 bones and filtering when no mesh was loaded.
+- **v1.2.1:** fixed duplicated bone IDs and zero-weight rigging problems.
+- **v1.2.2:** added level FVF export for Revelations 2 and RE6, fixed no-bone level export crashes, and added GUI/REHD EMS-editor groundwork. The no-bone export issue was reported by ZombieAli.
+- **v1.2.3:** fixed cutscene head export, removed LOD 0 from filter lists, and fixed filtering errors.
+- **v1.2.4:** added the LOD 0 export behavior and corrected export-list conditions. The condition fix credits EvilLord.
+- **v1.2.5:** added DMC4SE PC support.
+
+#### Acknowledgements
+
+- Thanks to the original RER Mod Tool authors and maintainers: **maliwei777**, **mariokart64n**, and **Sectus**.
+- Thanks to **Codeman** for the 2015 REHD, Revelations, and RE6 maintenance work.
+- Thanks to **ZombieAli** and **EvilLord** for the issue report and correction credit recorded in the upstream script.
+- Thanks to the RE6 modding community for testing, reports, reverse-engineering notes, and practical workflow feedback.
+- Final thanks to **OpenAI** and the Codex/GPT models that assisted with the Code X Python modernization and documentation, followed by human review and testing.
+
+</details>
+
 ---
 
 ## 中文
@@ -163,6 +202,45 @@ Code X 项目自有源码由 AI 协助生成，并经过人工审核确认设计
 使用者需自行评估脚本是否适合自己的工作，并自行验证生成结果；软件按现状提供，不提供任何保证。
 
 第三方组件仍适用各自的许可证，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+### 鸣谢
+
+<details>
+<summary>展开查看 PC_REHD 历史维护记录与鸣谢</summary>
+
+下面的记录整理自备份参考脚本 `PC_REHD-v1_2_8.ms` 的注释区。它记录的是上游 MaxScript 维护历史，属于历史背景说明，并不表示每一个旧功能都仍存在于当前 Python 实现中。
+
+#### 历史维护记录
+
+- **RER Mod Tool v0.2 — maliwei777：** 原始 RER MOD 工具基础版本。
+- **2013 年 6 月 11 日 — mariokart64n：** 加入 RER 与 RE6 版本切换。
+- **v0.21 — Sectus：** 修正材质 ID 的数据宽度，从 byte 改为 short。
+- **2015 年 — Codeman：** 修改并修复脚本，使其支持《生化危机》高清版、启示录 1、启示录 2 与 RE6。
+- **v1.1.0：** 增加顶点定义支持。
+- **v1.1.1：** 修复顶点定义的导入与导出。
+- **v1.1.2：** 增加 MaxScript 函数。
+- **v1.1.3：** 修复权重数据导入与导出问题。
+- **v1.1.5：** 修复并改进 FVF 支持。
+- **v1.1.6：** 增加静态几何加载/导出、新 FVF 支持、REHD 的 SBC 碰撞加载，以及 GUI 与版本管理改进。
+- **v1.1.7：** 修复权重导入，扩展静态几何和 FVF 支持，增加 REHD 的 EMS/ADR 加载、动态 LOD 筛选、骨骼分配修复和高级 GUI 选项。
+- **v1.1.8：** 修复权重与 RE6 FVF 问题，增加材质/FVF 显示筛选、退化线显示控制，并增大堆内存以支持更大模型。
+- **v1.1.9：** 增加大量 RE6 场景的静态几何加载支持。
+- **v1.2.0：** 修复超过 128 根骨骼的网格问题，以及未加载网格时的筛选问题。
+- **v1.2.1：** 修复重复骨骼 ID 与零权重导致的绑定问题。
+- **v1.2.2：** 增加启示录 2 与 RE6 关卡 FVF 导出，修复无骨骼关卡导出崩溃，并加入 REHD EMS 编辑器的 GUI/代码基础；无骨骼导出问题由 ZombieAli 报告。
+- **v1.2.3：** 修复过场头部模型导出，移除筛选列表中的 LOD 0，并修复筛选错误。
+- **v1.2.4：** 加入 LOD 0 导出处理，并修正导出列表条件；条件修复记录鸣谢 EvilLord。
+- **v1.2.5：** 增加 DMC4SE PC 支持。
+
+#### 鸣谢
+
+- 感谢 RER Mod Tool 的原始作者与维护者：**maliwei777**、**mariokart64n**、**Sectus**。
+- 感谢 **Codeman** 在 2015 年对 REHD、启示录和 RE6 的维护工作。
+- 感谢 **ZombieAli** 与 **EvilLord**，他们的报告与修复贡献被记录在上游脚本中。
+- 感谢 RE6 MOD 社区提供测试、问题报告、逆向记录和实际工作流反馈。
+- 最后感谢 **OpenAI** 以及协助完成 Code X Python 现代化和文档整理的 Codex/GPT 模型；所有结果均经过人工复核与测试。
+
+</details>
 
 ```text
 .. / .-.. --- ...- . / -.-- --- ..- / --. .-. .- -. -.. .--. .- --..--
