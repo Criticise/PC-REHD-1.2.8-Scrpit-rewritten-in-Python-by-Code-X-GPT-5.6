@@ -537,7 +537,7 @@ try {
         }
         $failedPython = $bootstrapAttempt.Python
         $pythonStatus = if ($recoveryUsed) { 'REPAIRED' } else { 'PASS' }
-        Add-Check 'python_runtime' 'Python x64 runtime' $pythonStatus ("Python $($failedPython.Major).$($failedPython.Minor).$($failedPython.Micro) x64 starts correctly | $($failedPython.Path)") | Out-Null
+        Add-Check 'python_runtime' 'Python x64 runtime' $pythonStatus ("Python $($failedPython.Major).$($failedPython.Minor) x64 starts correctly | $($failedPython.Path)") | Out-Null
         if ($null -ne $bootstrapAttempt.Payload) {
             foreach ($row in @($bootstrapAttempt.Payload.checks)) {
                 Add-Check ([string]$row.id) ([string]$row.label) ([string]$row.status) ([string]$row.detail) ([string]$row.repair) | Out-Null

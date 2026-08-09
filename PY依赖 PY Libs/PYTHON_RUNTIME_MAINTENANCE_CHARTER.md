@@ -46,12 +46,6 @@ Allowlisted for local-first, online-fallback upgrades:
 - `Pillow`
 - `orjson`
 
-Transitive security payload:
-
-- `certifi` is shipped with `requests` as a pure-Python CA bundle. Refreshes
-  must keep the package ABI-neutral and pass `certifi.where()` plus an HTTPS
-  import-health check. The current release payload is `certifi 2026.7.22`.
-
 The two `codex_*_accel` packages may still advance from a newer local prebuilt
 or source candidate. Their names must never be resolved from a public index.
 

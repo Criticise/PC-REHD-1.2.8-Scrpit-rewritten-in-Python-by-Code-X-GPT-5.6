@@ -21,6 +21,7 @@ codex_blender_restore_original_materials.py first, then run this safer script.
 import os
 import re
 import shutil
+import tempfile
 from mathutils import Vector
 
 import bpy
@@ -46,6 +47,7 @@ COPY_MMD_TOON_AND_SPHERE_TEXTURES = True
 
 AUTO_EXPORT_FBX = False
 FBX_EXPORT_FILENAME = "fbx_repaired_export.fbx"
+AGENT_TEMP_DIR_NAME = "PC_REHD_Code_X"
 
 
 ALLOWED_EXTENSIONS = {".png", ".tga", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".dds"}
@@ -95,10 +97,55 @@ def sanitize_name(value, fallback="asset"):
     return value or fallback
 
 
+def _directory_is_writable(path):
+    """Check the directory with the same file operation the tool needs later."""
+    candidate = str(path or "").strip()
+    if not candidate:
+        return False
+    try:
+        candidate = os.path.abspath(os.path.expanduser(candidate))
+        os.makedirs(candidate, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            prefix=".codex_write_probe_",
+            dir=candidate,
+            delete=True,
+        ):
+            pass
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _agent_temporary_directory():
+    """Return a writable directory owned by Blender's Agent runtime."""
+    candidates = []
+    try:
+        blender_tempdir = str(bpy.app.tempdir or "").strip()
+    except Exception:
+        blender_tempdir = ""
+    if blender_tempdir:
+        candidates.append(blender_tempdir)
+    system_tempdir = tempfile.gettempdir()
+    if system_tempdir and system_tempdir not in candidates:
+        candidates.append(system_tempdir)
+
+    for root in candidates:
+        runtime_directory = os.path.join(root, AGENT_TEMP_DIR_NAME)
+        if _directory_is_writable(runtime_directory):
+            return runtime_directory
+    raise OSError(
+        "Blender Agent could not find a writable temporary directory for "
+        "the unsaved scene"
+    )
+
+
 def blend_directory():
-    if bpy.data.filepath:
-        return os.path.dirname(bpy.path.abspath("//"))
-    return os.getcwd()
+    """Choose a writable scene/output directory without using process CWD."""
+    if str(getattr(bpy.data, "filepath", "") or "").strip():
+        scene_directory = os.path.dirname(bpy.path.abspath("//"))
+        if _directory_is_writable(scene_directory):
+            return scene_directory
+    return _agent_temporary_directory()
 
 
 def texture_directory():
@@ -880,45 +927,18 @@ def rebuild_principled_material(source_material, detected, exported_maps, report
 
     output = tree.nodes.new("ShaderNodeOutputMaterial")
     output.location = (420, 0)
-    principled = tree.nodes.new("ShaderNodeBsdfPrincipled")
-    principled.location = (120, 0)
-    link_safely(tree, get_output(principled, ["BSDF"]), get_input(output, ["Surface"]))
+    emission = tree.nodes.new("ShaderNodeEmission")
+    emission.location = (120, 0)
+    set_input_default(emission, ["Color"], detected["base_color_value"])
+    set_input_default(emission, ["Strength"], 1.0)
+    link_safely(tree, get_output(emission, ["Emission"]), get_input(output, ["Surface"]))
 
-    set_input_default(principled, ["Base Color"], detected["base_color_value"])
-    set_input_default(principled, ["Roughness"], detected["roughness_value"])
-    set_input_default(principled, ["Metallic"], detected["metallic_value"])
-    set_input_default(principled, ["Alpha"], detected["alpha_value"])
-    set_input_default(principled, ["Emission Strength"], detected["emission_strength"])
-
-    if exported_maps.get("base_color"):
-        tex = make_texture_node(tree, exported_maps["base_color"], "base_color", (-420, 160))
-        link_safely(tree, get_output(tex, ["Color"]), get_input(principled, ["Base Color"]))
-
-    if exported_maps.get("roughness"):
-        tex = make_texture_node(tree, exported_maps["roughness"], "roughness", (-420, -40))
-        link_safely(tree, get_output(tex, ["Color"]), get_input(principled, ["Roughness"]))
-
-    if exported_maps.get("metallic"):
-        tex = make_texture_node(tree, exported_maps["metallic"], "metallic", (-420, -220))
-        link_safely(tree, get_output(tex, ["Color"]), get_input(principled, ["Metallic"]))
-
-    if exported_maps.get("alpha"):
-        tex = make_texture_node(tree, exported_maps["alpha"], "alpha", (-420, -400))
-        link_safely(tree, get_output(tex, ["Alpha"]) or get_output(tex, ["Color"]), get_input(principled, ["Alpha"]))
-        new_material.blend_method = detected["source_blend_method"] if detected["source_blend_method"] != "OPAQUE" else "BLEND"
-
-    if exported_maps.get("normal"):
-        tex = make_texture_node(tree, exported_maps["normal"], "normal", (-420, -600))
-        normal_map = tree.nodes.new("ShaderNodeNormalMap")
-        normal_map.location = (-120, -580)
-        link_safely(tree, get_output(tex, ["Color"]), get_input(normal_map, ["Color"]))
-        link_safely(tree, get_output(normal_map, ["Normal"]), get_input(principled, ["Normal"]))
-
-    if exported_maps.get("emission"):
-        tex = make_texture_node(tree, exported_maps["emission"], "emission", (-420, -760))
-        link_safely(tree, get_output(tex, ["Color"]), get_input(principled, ["Emission Color", "Emission"]))
-        if detected["emission_strength"] <= 0.0:
-            set_input_default(principled, ["Emission Strength"], 1.0)
+    # A bake-safe material intentionally exposes only the color image. Normal,
+    # roughness, alpha, and metallic maps must not reintroduce a lit shader.
+    base_image = exported_maps.get("base_color") or exported_maps.get("emission")
+    if base_image:
+        tex = make_texture_node(tree, base_image, "base_color", (-420, 160))
+        link_safely(tree, get_output(tex, ["Color"]), get_input(emission, ["Color"]))
 
     if detected["source_shadow_method"]:
         try:

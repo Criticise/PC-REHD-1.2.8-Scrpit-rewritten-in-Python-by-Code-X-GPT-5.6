@@ -63,7 +63,7 @@ from codex_re6_scene_compatibility import describe_import_skin_compatibility
 # not increase it merely to bypass a failing regression.  A revision change
 # requires a real parser/route/FBX contract change and new regression proof.
 # ============================================================================
-IMPORT_MODULE_CONTRACT_REVISION = 11
+IMPORT_MODULE_CONTRACT_REVISION = 12
 IMPORT_ROUTE_SCHEMA = "codex-re6-mod-import-route-v1"
 IMPORT_MANIFEST_SCHEMA = "codex-re6-mod-import-manifest-v1"
 BLENDER_SCENE_DATA_SCHEMA = "pc-rehd-code-x-blender-scene-data-v1"
@@ -71,6 +71,7 @@ BLENDER_SCENE_DATA_REVISION = 1
 FBX_BINARY_VERSION = 7400
 FBX_UNIT_METERS = 0.01
 FBX_CREATOR = "Codex RE6 MOD Import FBX Builder"
+FBX_MAX_BITMAP_COMPATIBILITY_POLICY = "DiffuseColor"
 FBX_NORMAL_PROFILE_MAX = "max"
 FBX_NORMAL_PROFILE_BLENDER_SAFE = "blender_safe"
 FBX_NORMAL_PROFILES = frozenset(
@@ -2922,61 +2923,6 @@ def _fbx_property_connection(
     )
 
 
-FBX_MAX_PHYSICAL_MATERIAL_BINDING_ENTRIES = (
-    ("3dsMax|Parameters|notes", "notes"),
-    ("3dsMax|Parameters|base_weight", "base_weight"),
-    ("3dsMax|Parameters|base_color", "base_color"),
-    ("3dsMax|Parameters|base_metalness", "base_metalness"),
-    ("3dsMax|Parameters|base_diffuse_roughness", "base_diffuse_roughness"),
-    # Max's OpenPBR binding maps the Bitmap map to the Base Color semantic,
-    # not to a standalone generic FBX diffuse channel.
-    ("3dsMax|Parameters|base_color_map", "base_color"),
-    ("3dsMax|Parameters|base_color_map_on", "base_color_map_on"),
-)
-
-
-def _fbx_add_max_physical_material_binding(
-    objects: _FbxNode,
-    *,
-    material_id: int,
-    implementation_id: int,
-    binding_table_id: int,
-    material_name: str,
-) -> None:
-    """Emit Max's OpenPBR binding graph for a Physical Material Base Color map."""
-    implementation = objects.add(
-        "Implementation",
-        ("L", implementation_id),
-        ("S", _fbx_class_name(f"{material_name}_Implementation", "Implementation")),
-        ("S", ""),
-    )
-    implementation.add("Version", ("I", 100))
-    implementation_props = _fbx_properties70(implementation)
-    _fbx_property70(implementation_props, "ShaderLanguage", "KString", "", "", ["OpenPbrSL"])
-    _fbx_property70(implementation_props, "ShaderLanguageVersion", "KString", "", "", ["1.1"])
-    _fbx_property70(implementation_props, "RenderAPI", "KString", "", "", ["MaterialX"])
-    _fbx_property70(implementation_props, "RootBindingName", "KString", "", "", ["root"])
-
-    binding_table = objects.add(
-        "BindingTable",
-        ("L", binding_table_id),
-        ("S", _fbx_class_name("root 1", "BindingTable")),
-        ("S", ""),
-    )
-    binding_table.add("Version", ("I", 100))
-    binding_props = _fbx_properties70(binding_table)
-    _fbx_property70(binding_props, "TargetName", "KString", "", "", ["root"])
-    _fbx_property70(binding_props, "TargetType", "KString", "", "", ["shader"])
-    for property_name, semantic_name in FBX_MAX_PHYSICAL_MATERIAL_BINDING_ENTRIES:
-        binding_table.add(
-            "Entry",
-            ("S", property_name),
-            ("S", "FbxPropertyEntry"),
-            ("S", semantic_name),
-            ("S", "FbxSemanticEntry"),
-        )
-
-
 def _fbx_add_embedded_base_color_bundle(
     objects: _FbxNode,
     *,
@@ -2989,12 +2935,12 @@ def _fbx_add_embedded_base_color_bundle(
     embedded_content: bytes | None,
     emit_media: bool,
 ) -> str:
-    """Add the same Physical-Material Base Color route used by the Max reference FBX.
+    """Add the StandardMaterial graph verified from the exported TEST V2 FBX.
 
-    ``DiffuseColor`` is retained as the portable FBX fallback.  The 3ds Max
-    Physical Material identity and ``base_color_map`` connection are also
-    emitted so an FBX re-import recreates the Bitmap in Material Editor > Base
-    Color instead of degrading the binding to an untyped diffuse texture.
+    The FBX importer recognizes this ordinary ``phong`` Material as a
+    3ds Max StandardMaterial.  Keeping the bitmap on the standard
+    ``DiffuseColor`` property is what makes the texture arrive in Max's
+    ``diffuseMap`` slot without a MAX Script material conversion pass.
     """
     material_name = f"MRLStruct_{mesh_name}_001"
     material = objects.add(
@@ -3004,39 +2950,23 @@ def _fbx_add_embedded_base_color_bundle(
         ("S", ""),
     )
     material.add("Version", ("I", 102))
-    material.add("ShadingModel", ("S", "unknown"))
+    material.add("ShadingModel", ("S", "phong"))
     material.add("MultiLayer", ("I", 0))
     material_props = _fbx_properties70(material)
-    _fbx_property70(material_props, "ShadingModel", "KString", "", "", ["unknown"])
-    _fbx_property70(material_props, "MultiLayer", "bool", "", "", [0])
-    _fbx_property70(material_props, "AmbientColor", "ColorRGB", "Color", "", [0.8, 0.8, 0.8])
-    _fbx_property70(material_props, "DiffuseColor", "ColorRGB", "Color", "", [0.8, 0.8, 0.8])
-    _fbx_property70(material_props, "SpecularColor", "ColorRGB", "Color", "", [1.0, 1.0, 1.0])
-    _fbx_property70(material_props, "SpecularFactor", "double", "Number", "", [1.4])
-    _fbx_property70(material_props, "ShininessExponent", "double", "Number", "", [128.0])
-    _fbx_property70(material_props, "TransparencyFactor", "double", "Number", "", [0.0])
-    _fbx_property70(material_props, "EmissiveColor", "ColorRGB", "Color", "", [0.0, 0.0, 0.0])
-    _fbx_property70(material_props, "EmissiveFactor", "double", "Number", "", [0.0])
-    _fbx_property70(material_props, "3dsMax", "Compound", "", "", [])
-    # Autodesk Physical Material Class_ID (0xF153F424, 0x37F35A37).
-    _fbx_property70(material_props, "3dsMax|ClassIDa", "int", "Integer", "", [-246079949])
-    _fbx_property70(material_props, "3dsMax|ClassIDb", "int", "Integer", "", [939201335])
-    _fbx_property70(material_props, "3dsMax|SuperClassID", "int", "Integer", "", [3072])
-    _fbx_property70(material_props, "3dsMax|Parameters", "Compound", "", "", [])
-    _fbx_property70(material_props, "3dsMax|Parameters|notes", "KString", "", "A", [""])
-    _fbx_property70(material_props, "3dsMax|Parameters|base_weight", "Float", "", "A", [1.0])
-    _fbx_property70(
-        material_props,
-        "3dsMax|Parameters|base_color",
-        "ColorAndAlpha",
-        "",
-        "A",
-        [0.8, 0.8, 0.8, 1.0],
-    )
-    _fbx_property70(material_props, "3dsMax|Parameters|base_metalness", "Float", "", "A", [0.0])
-    _fbx_property70(material_props, "3dsMax|Parameters|base_diffuse_roughness", "Float", "", "A", [0.0])
-    _fbx_property70(material_props, "3dsMax|Parameters|base_color_map", "Reference", "", "A", [])
-    _fbx_property70(material_props, "3dsMax|Parameters|base_color_map_on", "Bool", "", "A", [1])
+    _fbx_property70(material_props, "ShadingModel", "KString", "", "", ["phong"])
+    _fbx_property70(material_props, "AmbientColor", "Color", "", "A", [0.8, 0.8, 0.8])
+    _fbx_property70(material_props, "DiffuseColor", "Color", "", "A", [0.8, 0.8, 0.8])
+    _fbx_property70(material_props, "TransparentColor", "Color", "", "A", [1.0, 1.0, 1.0])
+    _fbx_property70(material_props, "SpecularColor", "Color", "", "A", [0.9, 0.9, 0.9])
+    _fbx_property70(material_props, "SpecularFactor", "Number", "", "A", [0.0])
+    _fbx_property70(material_props, "ShininessExponent", "Number", "", "A", [1.0717734098434448])
+    _fbx_property70(material_props, "Emissive", "Vector3D", "Vector", "", [0.0, 0.0, 0.0])
+    _fbx_property70(material_props, "Ambient", "Vector3D", "Vector", "", [0.8, 0.8, 0.8])
+    _fbx_property70(material_props, "Diffuse", "Vector3D", "Vector", "", [0.8, 0.8, 0.8])
+    _fbx_property70(material_props, "Specular", "Vector3D", "Vector", "", [0.0, 0.0, 0.0])
+    _fbx_property70(material_props, "Shininess", "double", "Number", "", [1.0717734098434448])
+    _fbx_property70(material_props, "Opacity", "double", "Number", "", [1.0])
+    _fbx_property70(material_props, "Reflectivity", "double", "Number", "", [0.0])
 
     if emit_media:
         # A Video owns the embedded DDS bytes. Reusing a new, empty Video for
@@ -3290,8 +3220,6 @@ def _build_fbx_roots(
         "Material": 0,
         "Texture": 0,
         "Video": 0,
-        "Implementation": 0,
-        "BindingTable": 0,
     }
     bone_count = len(scene.get("bones", []))
     mesh_cluster_contracts: dict[int, tuple[list[int], dict[int, tuple[list[int], list[float]]]]] = {}
@@ -3553,8 +3481,6 @@ def _build_fbx_roots(
             image_sha256 = str(mrl_binding["image_sha256"])
             media_content = embedded_media_by_sha256[image_sha256]
             material_id = allocator.get(f"material:mesh:{slot}")
-            implementation_id = allocator.get(f"implementation:mesh:{slot}")
-            binding_table_id = allocator.get(f"binding-table:mesh:{slot}")
             media_node = embedded_media_nodes.get(image_sha256)
             media_created = media_node is None
             if media_node is None:
@@ -3572,7 +3498,7 @@ def _build_fbx_roots(
                 )
                 embedded_media_nodes[image_sha256] = media_node
             texture_id, video_id, media_name, relative_filename = media_node
-            material_name = _fbx_add_embedded_base_color_bundle(
+            _fbx_add_embedded_base_color_bundle(
                 objects,
                 material_id=material_id,
                 texture_id=texture_id,
@@ -3583,31 +3509,14 @@ def _build_fbx_roots(
                 embedded_content=media_content if media_created else None,
                 emit_media=media_created,
             )
-            _fbx_add_max_physical_material_binding(
-                objects,
-                material_id=material_id,
-                implementation_id=implementation_id,
-                binding_table_id=binding_table_id,
-                material_name=material_name,
-            )
             _fbx_connection(connections, material_id, model_id)
             _fbx_property_connection(connections, texture_id, material_id, "DiffuseColor")
-            _fbx_property_connection(
-                connections,
-                texture_id,
-                material_id,
-                "3dsMax|Parameters|base_color_map",
-            )
-            _fbx_connection(connections, material_id, implementation_id)
-            _fbx_connection(connections, binding_table_id, implementation_id)
             if media_created:
                 _fbx_connection(connections, video_id, texture_id)
             object_counts["Material"] += 1
             if media_created:
                 object_counts["Texture"] += 1
                 object_counts["Video"] += 1
-            object_counts["Implementation"] += 1
-            object_counts["BindingTable"] += 1
 
     # Max's own export writes one scene BindPose, not one Pose per Mesh.  The
     # golden FBX omitted two non-deforming bone ancestors and every skinned
@@ -4916,7 +4825,7 @@ def _run_import_module_regression_guard() -> dict[str, Any]:
             fix_processing_mode=FIX_PROCESSING_MODE_CODEX,
         )
         fixture_request_sha256 = _request_contract_digest(request_identity)
-        if fixture_request_sha256 != "9658eef353da5890468efbaab191039fd3532992488e1fce344fde0731a5d40a":
+        if fixture_request_sha256 != "65aa8cc7ac9470eb3756e11d06da8f32e90fbc0c2ed5f09fc522fe31ab61365c":
             raise AssertionError("canonical import request contract SHA-256 regression")
         changed_request_identity = dict(request_identity)
         changed_request_identity["fix_dmc"] = True
@@ -5256,10 +5165,8 @@ def _run_import_module_regression_guard() -> dict[str, Any]:
         if reachability["reachable_model_count"] != reachability["model_count"]:
             raise AssertionError("FBX Model reachability gate accepted a disconnected scene")
         fixture_objects = next(root for root in reachability_roots if root.name == b"Objects")
-        # The MRL route must write the same Max Physical Material graph as the
-        # reference: Bitmap -> Base Color, plus OpenPBR implementation and
-        # binding-table objects. A generic DiffuseColor-only texture is not a
-        # substitute for this Material Editor path.
+        # The MRL route must remain portable: one StandardMaterial, one
+        # Texture/Video media owner, and one standard DiffuseColor property edge.
         with tempfile.TemporaryDirectory(prefix="codex-re6-mrl-embedded-fbx-") as material_temp:
             fixture_dds = Path(material_temp) / "fixture_bm.dds"
             fixture_dds_bytes = b"DDS " + bytes(range(32))
@@ -5279,17 +5186,19 @@ def _run_import_module_regression_guard() -> dict[str, Any]:
         material_by_id, material_oo_edges = _guard_fbx_objects_and_edges(material_roots)
         material_node = next(node for node in material_objects.children if node.name == b"Material")
         texture_node = next(node for node in material_objects.children if node.name == b"Texture")
-        implementation_node = next(node for node in material_objects.children if node.name == b"Implementation")
-        binding_table_node = next(node for node in material_objects.children if node.name == b"BindingTable")
+        video_node = next(node for node in material_objects.children if node.name == b"Video")
         material_id = int(material_node.props[0][1])
         texture_id = int(texture_node.props[0][1])
-        implementation_id = int(implementation_node.props[0][1])
-        binding_table_id = int(binding_table_node.props[0][1])
-        if (material_id, implementation_id) not in material_oo_edges or (
-            binding_table_id,
-            implementation_id,
-        ) not in material_oo_edges:
-            raise AssertionError("Max Physical Material implementation/binding-table graph is disconnected")
+        video_id = int(video_node.props[0][1])
+        if (material_id, int(next(
+            node.props[0][1]
+            for node in material_objects.children
+            if node.name == b"Model"
+            and _guard_fbx_object_name(node) == "Mesh_001_REACHABILITY_FIXTURE"
+        ))) not in material_oo_edges:
+            raise AssertionError("MRL Material is not connected to its Mesh")
+        if (video_id, texture_id) not in material_oo_edges:
+            raise AssertionError("MRL Video is not connected to its Texture")
         material_connections = next(root for root in material_roots if root.name == b"Connections")
         material_property_edges = {
             (int(node.props[1][1]), int(node.props[2][1]), str(node.props[3][1]))
@@ -5298,40 +5207,33 @@ def _run_import_module_regression_guard() -> dict[str, Any]:
             and len(node.props) == 4
             and node.props[0] == ("S", "OP")
         }
-        required_material_edges = {
-            (texture_id, material_id, "DiffuseColor"),
-            (texture_id, material_id, "3dsMax|Parameters|base_color_map"),
+        material_edges = {
+            edge for edge in material_property_edges if edge[1] == material_id
         }
-        if not required_material_edges.issubset(material_property_edges):
-            raise AssertionError("MRL Bitmap is not connected to both FBX diffuse and Max Base Color")
+        if material_edges != {(texture_id, material_id, "DiffuseColor")}:
+            raise AssertionError("MRL Texture must use the standard DiffuseColor edge")
         material_props = next(child for child in material_node.children if child.name == b"Properties70")
-        material_property_names = {
-            str(node.props[0][1])
+        material_properties = {
+            str(node.props[0][1]): node.props
             for node in material_props.children
             if node.name == b"P" and node.props
         }
-        if not {
-            "3dsMax|Parameters|base_color",
-            "3dsMax|Parameters|base_color_map",
-            "3dsMax|Parameters|base_color_map_on",
-        }.issubset(material_property_names):
-            raise AssertionError("MRL Material is missing Max Base Color properties")
-        binding_entries = {
-            tuple(str(prop[1]) for prop in node.props)
-            for node in binding_table_node.children
-            if node.name == b"Entry"
-        }
+        if "ShadingModel" not in material_properties:
+            raise AssertionError("portable MRL Material is missing ShadingModel")
+        if material_properties["ShadingModel"][-1] != ("S", "phong"):
+            raise AssertionError("portable MRL Material is not the verified StandardMaterial phong route")
+        for property_name in ("SpecularFactor", "ShininessExponent", "Opacity"):
+            if property_name not in material_properties:
+                raise AssertionError(f"portable MRL Material is missing {property_name}")
+        if material_properties["SpecularFactor"][-1] != ("D", 0.0):
+            raise AssertionError("portable MRL Material must use SpecularFactor=0")
         if (
-            "3dsMax|Parameters|base_color_map",
-            "FbxPropertyEntry",
-            "base_color",
-            "FbxSemanticEntry",
-        ) not in binding_entries:
-            raise AssertionError("Max Base Color Bitmap semantic binding is missing")
-        if material_by_id[texture_id].name != b"Texture" or material_by_id[implementation_id].name != b"Implementation":
-            raise AssertionError("MRL material graph object identity regression")
+            material_by_id[texture_id].name != b"Texture"
+            or material_by_id[video_id].name != b"Video"
+        ):
+            raise AssertionError("MRL portable media object identity regression")
         checks["mrl_embedded_base_color_contract"] = (
-            "Bitmap+DiffuseFallback+PhysicalMaterial+OpenPBR+BindingTable"
+            FBX_MAX_BITMAP_COMPATIBILITY_POLICY
         )
 
         # A real RE6 model commonly has many Meshes sharing just a few Base
@@ -5452,19 +5354,13 @@ def _run_import_module_regression_guard() -> dict[str, Any]:
             and node.props[0] == ("S", "OP")
         }
         for shared_material_id in shared_material_ids:
-            for property_name in (
-                "DiffuseColor",
-                "3dsMax|Parameters|base_color_map",
-            ):
-                if not any(
-                    source in shared_texture_ids
-                    and target == shared_material_id
-                    and property_name == property_value
-                    for source, target, property_value in shared_property_edges
-                ):
-                    raise AssertionError(
-                        "MRL shared Texture is not connected to every Material Base Color"
-                    )
+            material_edges = {
+                property_value
+                for source, target, property_value in shared_property_edges
+                if source in shared_texture_ids and target == shared_material_id
+            }
+            if ("DiffuseColor" not in material_edges):
+                raise AssertionError("MRL shared Texture is missing its DiffuseColor edge")
         checks["mrl_embedded_shared_video_media_contract"] = (
             "unique-video-content-plus-shared-texture-links"
         )

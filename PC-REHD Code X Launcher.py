@@ -584,6 +584,10 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
         "manual_texture", "texture", CommandAccess.SCENE_WRITE,
         QueuePolicy.SINGLE_FLIGHT, 900.0, 10,
     ),
+    "normalize_scene_materials": _spec(
+        "normalize_scene_materials", "texture", CommandAccess.SCENE_WRITE,
+        QueuePolicy.SINGLE_FLIGHT, 900.0, 10,
+    ),
     "import_auxiliary": _spec(
         "import_auxiliary", "auxiliary", CommandAccess.SCENE_WRITE,
         QueuePolicy.SINGLE_FLIGHT, 900.0, 10,
@@ -1381,8 +1385,6 @@ INSTANCE_COPY_NATIVE_UNDO_LABELS = {
     "undo": "PC-REHD Undo Instance Copy",
     "restore": "PC-REHD Restore Instance Copy",
 }
-IMPORT_MOD_NATIVE_UNDO_LABEL = "PC-REHD Import MOD"
-BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL = "PC-REHD Import Blender FBX"
 MRL_BIND_NATIVE_UNDO_LABEL = "PC-REHD MRL Auto Texture Bind"
 MESH_RENAME_NATIVE_UNDO_LABEL = "PC-REHD Mesh Rename"
 MESH_FILTER_NATIVE_UNDO_LABEL = "PC-REHD Mesh Filter"
@@ -4846,7 +4848,6 @@ PYMXS_EXPORT_ALLOWED_RUNTIME_CALLS = (
     "rt.deleteModifier",
     "rt.exportFile",
     "rt.getAnimByHandle",
-    "rt.gc",
     "rt.getHandleByAnim",
     "rt.getNodeByName",
     "rt.getNumFaces",
@@ -4964,8 +4965,6 @@ _PYMXS_APPROVED_RUNTIME_CALLS = frozenset(
         "rt.dotNetClass",
         "rt.execute",
         "rt.exportFile",
-        "rt.fetchMaxFile",
-        "rt.gc",
         "rt.getAnimByHandle",
         "rt.getFace",
         "rt.getFaceMatID",
@@ -4979,9 +4978,9 @@ _PYMXS_APPROVED_RUNTIME_CALLS = frozenset(
         "rt.getSubMtl",
         "rt.getUserProp",
         "rt.getUserPropBuffer",
-        "rt.holdMaxFile",
         "rt.importFile",
         "rt.instance",
+        "rt.inverse",
         "rt.isValidNode",
         "rt.isProperty",
         "rt.matrix3",
@@ -5128,7 +5127,29 @@ def _run_pymxs_runtime_api_policy_guard() -> dict[str, Any]:
     unreviewed = sorted(effective_paths - reviewed_paths)
     stale = sorted(_PYMXS_APPROVED_RUNTIME_CALLS - effective_paths)
     stale_optional = sorted(_PYMXS_OPTIONAL_RUNTIME_CALLS - effective_paths)
-    if unreviewed or stale or stale_optional or dynamic_runtime_getattrs:
+    lifetime_violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        runtime_path = _runtime_attribute_path(node.func)
+        if runtime_path == "rt.gc":
+            lifetime_violations.append(f"forced-MaxScript-GC@{node.lineno}")
+        if runtime_path != "rt.importFile":
+            continue
+        current: ast.AST | None = node
+        while current is not None:
+            if isinstance(current, ast.With):
+                for item in current.items:
+                    context_expr = item.context_expr
+                    context_path = _runtime_attribute_path(
+                        context_expr.func
+                    ) if isinstance(context_expr, ast.Call) else ""
+                    if context_path == "pymxs.undo":
+                        lifetime_violations.append(
+                            f"FBX-import-inside-pymxs.undo@{node.lineno}"
+                        )
+            current = parents.get(current)
+    if unreviewed or stale or stale_optional or dynamic_runtime_getattrs or lifetime_violations:
         detail: list[str] = []
         if unreviewed:
             detail.append("unreviewed=" + ",".join(unreviewed))
@@ -5139,6 +5160,10 @@ def _run_pymxs_runtime_api_policy_guard() -> dict[str, Any]:
         if dynamic_runtime_getattrs:
             detail.append(
                 "dynamic_getattr=" + ",".join(str(line) for line in dynamic_runtime_getattrs)
+            )
+        if lifetime_violations:
+            detail.append(
+                "wrapper_lifetime=" + ",".join(sorted(set(lifetime_violations)))
             )
         raise RuntimeError(
             "PYMXS runtime API policy violation; review every direct runtime call: "
@@ -10220,8 +10245,16 @@ def _run_agent_compatibility_policy_guard() -> dict[str, Any]:
         )
         if route not in dispatcher_source:
             violations.append(f"_execute_max_command:missing-native-undo-{label_key}")
-    if "IMPORT_MOD_NATIVE_UNDO_LABEL, _max_import_mod, payload" not in dispatcher_source:
-        violations.append("_execute_max_command:missing-native-undo-import")
+    # Max 2026's native FBX importer must not run inside pymxs.undo(). Its
+    # plug-in transaction and pymxs MXSWrapper lifetime are independent.
+    if "IMPORT_MOD_NATIVE_UNDO_LABEL, _max_import_mod, payload" in dispatcher_source:
+        violations.append("_execute_max_command:forbidden-native-undo-around-fbx-import")
+    if "result = _max_import_mod(payload)" not in dispatcher_source:
+        violations.append("_execute_max_command:missing-direct-native-fbx-import-route")
+    if "BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL, _max_import_blender_fbx, payload" in dispatcher_source:
+        violations.append("_execute_max_command:forbidden-native-undo-around-blender-fbx-import")
+    if "return _max_import_blender_fbx(payload)" not in dispatcher_source:
+        violations.append("_execute_max_command:missing-direct-blender-fbx-import-route")
     import_start = dispatcher_source.find('if command == "import_mod":')
     import_selection_clear = dispatcher_source.find("rt.clearSelection()", import_start)
     import_focus = dispatcher_source.find("_max_focus_imported_model", import_start)
@@ -13229,6 +13262,51 @@ def _max_is_mesh(rt: Any, node: Any, name: str) -> bool:
     return _max_is_editable_mesh_node(rt, node)
 
 
+def _max_seam_activate_skin_modifier(rt: Any, node: Any, modifier: Any) -> None:
+    """Put a Skin modifier in Max's active modifier context before skinOps calls.
+
+    skinOps is a MAXScript interface and several builds resolve its vertex
+    selection/weight methods against the currently active node/modifier.  The
+    legacy MAXScript tool explicitly selected the node and entered its Skin
+    modifier before every read/write; mirror that contract here while keeping
+    protocol-smoke runtimes optional.
+    """
+    try:
+        rt.select(node)
+    except Exception:
+        pass
+    for command in (
+        lambda: rt.max_modify_mode(),
+        lambda: rt.setCommandPanelTaskMode(rt.name("modify")),
+    ):
+        try:
+            command()
+            break
+        except Exception:
+            continue
+    try:
+        rt.subObjectLevel = 1
+    except Exception:
+        pass
+    # skinOps resolves vertex selection and weight methods against the
+    # modifier shown in Max's Modify panel. Selecting the node alone is not
+    # sufficient when the scene contains several Skin stacks.
+    try:
+        rt.modPanel.setCurrentObject(modifier)
+    except TypeError:
+        try:
+            rt.modPanel.setCurrentObject(modifier, node=node)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _max_seam_activate_skin_context(rt: Any, node: Any, modifier: Any) -> None:
+    """Named contract used by capture/apply paths and regression checks."""
+    _max_seam_activate_skin_modifier(rt, node, modifier)
+
+
 def _max_seam_skin_modifier(rt: Any, node: Any) -> Any:
     candidates: list[Any] = []
     for modifier in _max_modifiers(node):
@@ -13250,6 +13328,7 @@ def _max_seam_skin_modifier(rt: Any, node: Any) -> Any:
 
 
 def _max_seam_vertex_count(rt: Any, node: Any, modifier: Any) -> int:
+    _max_seam_activate_skin_modifier(rt, node, modifier)
     try:
         count = int(rt.skinOps.GetNumberVertices(modifier) or 0)
     except Exception:
@@ -13290,6 +13369,7 @@ def _max_seam_bit_indices(value: Any, limit: int) -> list[int]:
 
 
 def _max_seam_selected_vertex_indices(rt: Any, node: Any, modifier: Any, count: int) -> list[int]:
+    _max_seam_activate_skin_modifier(rt, node, modifier)
     selected: Any = None
     try:
         selected = rt.skinOps.GetSelectedVertices(modifier, node=node)
@@ -13355,7 +13435,10 @@ def _max_seam_world_positions(rt: Any, node: Any, indices: list[int]) -> dict[in
         snapshot = rt.snapshotAsMesh(node)
         if snapshot is None:
             raise RuntimeError(f"Seam tool could not evaluate Mesh: {getattr(node, 'name', '<unnamed>')}")
-        transform = node.objectTransform
+        # RE6's imported Skin Mesh snapshots are expressed in the inverse
+        # node-transform space; using the forward matrix puts seam vertices
+        # tens of thousands of units away from their visible location.
+        transform = rt.inverse(node.objectTransform)
         positions: dict[int, tuple[float, float, float]] = {}
         for index in indices:
             local_point = rt.getVert(snapshot, int(index))
@@ -13368,10 +13451,6 @@ def _max_seam_world_positions(rt: Any, node: Any, indices: list[int]) -> dict[in
         return positions
     finally:
         snapshot = None
-        try:
-            rt.gc(light=True)
-        except Exception:
-            pass
 
 
 def _max_seam_record(
@@ -13445,6 +13524,7 @@ def _max_seam_capture_selection(rt: Any, payload: dict[str, Any]) -> dict[str, A
             + (f": {names}" if names else "")
         )
     node, modifier = candidates[0]
+    _max_seam_activate_skin_context(rt, node, modifier)
     count = _max_seam_vertex_count(rt, node, modifier)
     indices = _max_seam_selected_vertex_indices(rt, node, modifier, count)
     if not indices:
@@ -13485,6 +13565,7 @@ def _max_seam_resolve_record(rt: Any, raw_record: Any, label: str) -> dict[str, 
     if actual_handle != handle:
         raise ValueError(f"{label} changed its Max AnimHandle; record it again")
     modifier = _max_seam_skin_modifier(rt, node)
+    _max_seam_activate_skin_context(rt, node, modifier)
     count = _max_seam_vertex_count(rt, node, modifier)
     raw_indices = record.get("indices", [])
     if not isinstance(raw_indices, list):
@@ -13564,6 +13645,23 @@ def _max_seam_bone_name(rt: Any, modifier: Any, bone_id: int) -> str:
 
 def _max_seam_bone_key(rt: Any, modifier: Any, bone_id: int) -> str:
     name = _max_seam_bone_name(rt, modifier, bone_id)
+    if not name:
+        # GetBoneName consumes list IDs on some Max versions, while vertex
+        # rows expose the separate bone IDs. Resolve that inverse explicitly.
+        try:
+            bone_count = int(rt.skinOps.GetNumberBones(modifier) or 0)
+        except Exception:
+            bone_count = 0
+        for list_id in range(1, min(512, bone_count) + 1):
+            try:
+                actual_id = int(rt.skinOps.GetBoneIDByListID(modifier, list_id) or 0)
+            except Exception:
+                continue
+            if actual_id != int(bone_id):
+                continue
+            name = _max_seam_bone_name(rt, modifier, list_id)
+            if name:
+                break
     if name:
         try:
             bone = rt.getNodeByName(name, exact=True)
@@ -13647,6 +13745,7 @@ def _max_seam_write_vertex(
     weights: dict[str, float],
     bone_ids: dict[str, int],
 ) -> bool:
+    _max_seam_activate_skin_modifier(rt, node, modifier)
     converted = [
         (int(bone_ids[key]), float(value))
         for key, value in weights.items()
@@ -13662,16 +13761,21 @@ def _max_seam_write_vertex(
         return False
     values = [value / total for value in values]
     try:
+        ids_arg = rt.Array(*ids)
+    except Exception:
+        ids_arg = ids
+    try:
+        values_arg = rt.Array(*values)
+    except Exception:
+        values_arg = values
+    try:
         rt.skinOps.unNormalizeVertex(modifier, int(vertex_index), True)
     except Exception:
         pass
     try:
-        try:
-            rt.skinOps.ReplaceVertexWeights(
-                modifier, int(vertex_index), ids, values, node=node
-            )
-        except TypeError:
-            rt.skinOps.ReplaceVertexWeights(modifier, int(vertex_index), ids, values)
+        rt.skinOps.ReplaceVertexWeights(
+            modifier, int(vertex_index), ids_arg, values_arg
+        )
     finally:
         try:
             rt.skinOps.unNormalizeVertex(modifier, int(vertex_index), False)
@@ -13689,10 +13793,13 @@ def _max_seam_highlight(rt: Any, contexts: list[dict[str, Any]]) -> dict[str, in
         pass
     highlighted = 0
     for context in contexts:
+        _max_seam_activate_skin_modifier(rt, context["node"], context["modifier"])
         bits = rt.BitArray()
         for index in context["indices"]:
             try:
-                bits[int(index)] = True
+                # PyMXS maps BitArray through Python's zero-based indexing,
+                # while Skin vertices are numbered from one in 3ds Max.
+                bits[int(index) - 1] = True
             except Exception:
                 continue
         try:
@@ -13729,13 +13836,19 @@ def _max_seam_apply_pairs(
 ) -> dict[str, Any]:
     left_weight_cache: dict[int, dict[str, float]] = {}
     right_weight_cache: dict[int, dict[str, float]] = {}
+    _max_seam_activate_skin_context(rt, left["node"], left["modifier"])
+    _max_seam_activate_skin_context(rt, right["node"], right["modifier"])
+    _max_seam_activate_skin_modifier(rt, left["node"], left["modifier"])
     left_bones = _max_seam_bone_id_map(rt, left["modifier"])
+    _max_seam_activate_skin_modifier(rt, right["node"], right["modifier"])
     right_bones = _max_seam_bone_id_map(rt, right["modifier"])
     plans: list[tuple[dict[str, Any], int, dict[str, float], dict[str, int]]] = []
     for left_index, right_index, _distance in pairs:
+        _max_seam_activate_skin_modifier(rt, left["node"], left["modifier"])
         own_left = left_weight_cache.setdefault(
             left_index, _max_seam_read_weights(rt, left["modifier"], left_index)
         )
+        _max_seam_activate_skin_modifier(rt, right["node"], right["modifier"])
         own_right = right_weight_cache.setdefault(
             right_index, _max_seam_read_weights(rt, right["modifier"], right_index)
         )
@@ -17332,9 +17445,31 @@ def _max_postprocess_import(
                 node.isFrozen = True
             except Exception:
                 pass
+    # Import textures are prepared in the FBX builder before FBXIMP runs.  Do
+    # not replace the imported materials here: doing so can erase a valid
+    # embedded StandardMaterial graph, create one material per slot, or turn a failed
+    # image read into a misleading gray Max material.  MRL/manual scene
+    # bindings intentionally use the MAX scene-material toolbox separately.
+    material_normalization = {
+        "status": "PREBUILT",
+        "target_count": len(nodes),
+        "changed_count": 0,
+        "skipped_count": 0,
+        "preserved_count": len(nodes),
+        "texture_extraction_failed_count": 0,
+        "rows": [],
+        "material_policy": "prebuilt_standard_material_fbx",
+        "detail": "FBX import material was prepared before scene import; no post-import replacement was run.",
+    }
+    normalized_material_count = 0
+    material_normalization_errors: list[str] = []
     return {
         "restored_bone_matrices": restored_bones,
         "skin_limits": skin_limits,
+        "normalized_material_count": normalized_material_count,
+        "material_normalization_errors": material_normalization_errors[:32],
+        "material_normalization": material_normalization,
+        "material_import_contract": "prebuilt_standard_material",
     }
 
 
@@ -18149,7 +18284,14 @@ def _max_import_mod(payload: dict[str, Any]) -> dict[str, Any]:
     # only validates the immutable handoff snapshot so its main thread can
     # begin the actual import without a second full-file digest pass.
     actual_fbx_sha = expected_fbx_sha
-    before_nodes_by_handle = _max_scene_nodes_by_handle(rt)
+    # Resetting the scene invalidates every pre-reset node wrapper. Do not
+    # retain those wrappers across resetMaxFile; only the non-reset import
+    # path needs the pre-import identity snapshot.
+    before_nodes_by_handle = (
+        {}
+        if reset_scene
+        else _max_scene_nodes_by_handle(rt)
+    )
     # The FBX importer and post-import viewport framing both use Max's native
     # selection internally. Import MOD deliberately ends with an empty
     # selection: imported Meshes must never be mistaken for a user's later
@@ -18164,10 +18306,10 @@ def _max_import_mod(payload: dict[str, Any]) -> dict[str, Any]:
     previous_settings: dict[str, Any] = {}
     settings_restored = False
     try:
-        # ``_max_execute_with_native_undo()`` owns this entire operation. A
-        # second holdMaxFile snapshot duplicates the whole pre-import scene,
-        # including its native import state, and can exhaust Max memory/temp
-        # storage during repeated textured imports.
+        # FBXIMP must remain outside pymxs.undo(). Max 2026 can invalidate
+        # pymxs MXSWrapper objects when the FBX plug-in is entered inside a
+        # Python undo transaction. The importer owns its native transaction;
+        # do not add a duplicate holdMaxFile snapshot around it.
         if reset_scene:
             rt.resetMaxFile(rt.Name("noPrompt"))
         previous_settings = _max_configure_fbx_import(rt)
@@ -18201,9 +18343,9 @@ def _max_import_mod(payload: dict[str, Any]) -> dict[str, Any]:
         _max_verify_import_binding_scope(contract)
         _max_restore_fbx_import(rt, previous_settings)
         settings_restored = True
-        # A pymxs node wrapper is not valid across the native Undo commit.
-        # Handoff only the validated physical-Mesh Handles, then resolve fresh
-        # wrappers after the Import MOD undo node has committed.
+        # FBXIMP may invalidate pre-import pymxs node wrappers. Handoff only
+        # validated physical-Mesh Handles and resolve fresh wrappers after the
+        # importer has completed.
         post_undo_focus_handles = sorted(
             {
                 int(row.get("scene_node_handle", 0) or 0)
@@ -18217,8 +18359,8 @@ def _max_import_mod(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "action": "import_mod",
             "imported": True,
-            "native_undo": True,
-            "native_undo_label": IMPORT_MOD_NATIVE_UNDO_LABEL,
+            "native_undo": False,
+            "native_undo_reason": "fbx_importer_owns_native_transaction",
             "mod_path": str(payload.get("mod_path", "")),
             "source_sha256": expected_source_sha,
             "fbx_sha256": actual_fbx_sha,
@@ -18574,8 +18716,8 @@ def _max_import_blender_fbx(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "action": "import_blender_fbx",
             "imported": True,
-            "native_undo": True,
-            "native_undo_label": BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL,
+            "native_undo": False,
+            "native_undo_reason": "fbx_importer_owns_native_transaction",
             "fbx_path": str(fbx_path),
             "max_process_id": os.getpid(),
             "imported_node_count": 0,
@@ -18892,13 +19034,638 @@ def _max_bitmap_texture(rt: Any, path: str) -> Any:
     return texture
 
 
-def _max_standard_texture_material(rt: Any, node_name: str, path: str) -> Any:
+_MAX_MATERIAL_GRAPH_PROPERTIES = (
+    "diffuseMap",
+    "base_color_map",
+    "basecolor_map",
+    "albedoMap",
+    "baseColorMap",
+    "texmap",
+    "textureMap",
+    "texture_map",
+    "map",
+    "maps",
+    "texmaps",
+    "subMaterials",
+    "materialList",
+    "baseMaterial",
+    "base_material",
+    "shader",
+    "surface",
+    "node_tree",
+    "nodes",
+)
+
+
+def _max_material_graph_children(rt: Any, value: Any) -> Iterable[Any]:
+    """Yield known material-graph containers without walking arbitrary Max state."""
+    if value is None:
+        return
+    if isinstance(value, Mapping):
+        for child in value.values():
+            if child is not None:
+                yield child
+        return
+    if isinstance(value, (list, tuple, set)):
+        for child in value:
+            if child is not None:
+                yield child
+        return
+    for property_name in _MAX_MATERIAL_GRAPH_PROPERTIES:
+        child = _max_get_material_property(rt, value, property_name)
+        if child is not None and child is not value:
+            yield child
+
+
+def _max_is_bitmap_texture_candidate(rt: Any, value: Any) -> bool:
+    if value is None or isinstance(value, (str, bytes, bytearray)):
+        return False
+    class_name = _max_class_name(rt, value).replace(" ", "").casefold()
+    if "bitmaptexture" in class_name:
+        return True
+    # Some Max wrappers do not expose classOf consistently, but still expose
+    # a filename property. Treat those as bitmap candidates when readable.
+    if "texture" in class_name and "material" not in class_name:
+        return any(
+            bool(str(getattr(value, property_name, "") or "").strip())
+            for property_name in ("filename", "fileName")
+        )
+    return False
+
+
+def _max_material_bitmap_scan(
+    rt: Any,
+    material: Any,
+    owner_node: Any | None = None,
+) -> dict[str, Any]:
+    """Use MaxScript to scan a material, falling back to its Mesh owner handle."""
+    material_handle = _max_node_handle(rt, material)
+    owner_handle = _max_node_handle(rt, owner_node) if owner_node is not None else 0
+    executor = getattr(rt, "execute", None)
+    result: dict[str, Any] = {
+        "attempted": bool(
+            callable(executor) and (material_handle > 0 or owner_handle > 0)
+        ),
+        "rows": [],
+        "error": "",
+    }
+    if not result["attempted"]:
+        return result
+    target_blocks: list[str] = []
+    if material_handle > 0:
+        target_blocks.append(
+            f"""
+    local codexMaterialTarget = undefined
+    try (codexMaterialTarget = getAnimByHandle {material_handle}) catch ()
+    if codexMaterialTarget != undefined do append codexTargets codexMaterialTarget
+"""
+        )
+    if owner_handle > 0:
+        target_blocks.append(
+            f"""
+    local codexNodeTarget = undefined
+    try (codexNodeTarget = getAnimByHandle {owner_handle}) catch ()
+    if codexNodeTarget != undefined do append codexTargets codexNodeTarget
+"""
+        )
+    script = f"""
+(
+    local codexTargets = #()
+{''.join(target_blocks)}
+    local codexRows = #()
+    local codexSeenMaterialHandles = #()
+    for codexTarget in codexTargets do
+    (
+        local codexMaterial = undefined
+        try (codexMaterial = codexTarget.material) catch ()
+        if codexMaterial == undefined do codexMaterial = codexTarget
+        local codexMaterialHandle = 0
+        try (codexMaterialHandle = getHandleByAnim codexMaterial) catch ()
+        if codexMaterial != undefined and (findItem codexSeenMaterialHandles codexMaterialHandle) == 0 do
+        (
+            append codexSeenMaterialHandles codexMaterialHandle
+        local codexFound = #()
+        try (codexFound = getClassInstances Bitmaptexture target:codexMaterial) catch ()
+        for codexMap in codexFound do
+        (
+            local codexHandle = 0
+            local codexPath = ""
+            local codexName = ""
+            try (codexHandle = getHandleByAnim codexMap) catch ()
+            try (codexPath = codexMap.filename as string) catch ()
+            try (codexName = codexMap.name as string) catch ()
+            append codexRows #(codexHandle, codexPath, codexName)
+        )
+        )
+    )
+    codexRows
+)
+"""
+    try:
+        raw_rows = executor(script)
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+    rows: list[dict[str, Any]] = []
+    for row in _maxscript_table_rows(raw_rows):
+        if len(row) < 3:
+            continue
+        try:
+            handle = int(row[0] or 0)
+        except (TypeError, ValueError, OverflowError):
+            handle = 0
+        rows.append(
+            {
+                "handle": handle,
+                "path": str(row[1] or "").strip(),
+                "name": str(row[2] or ""),
+            }
+        )
+    result["rows"] = rows
+    return result
+
+
+def _max_texture_role_score(path: str, name: str = "") -> int:
+    """Prefer Base Color bitmaps and reject maps that would tint the bake."""
+    filename = str(path or "").replace("\\", "/").rsplit("/", 1)[-1]
+    text = f"{filename} {name}".casefold()
+    tokens = {token for token in re.split(r"[^a-z0-9]+", text) if token}
+    score = 0
+    if tokens & {"bm", "base", "basecolor", "albedo", "diffuse", "color", "colour", "col"}:
+        score += 10
+    if any(text.endswith(suffix) for suffix in ("_bm.dds", "_bm.png", "_bm.jpg", "_albedo.dds")):
+        score += 4
+    if tokens & {"normal", "nrm", "norm", "spec", "rough", "roughness", "metal", "metallic", "mask", "ao", "occlusion", "gloss"}:
+        score -= 20
+    return score
+
+
+def _max_material_texture_info(
+    rt: Any,
+    material: Any,
+    owner_node: Any | None = None,
+) -> dict[str, Any]:
+    """Resolve one real Bitmaptexture from direct or nested material slots."""
+    info: dict[str, Any] = {
+        "texture": None,
+        "path": "",
+        "found_bitmap": False,
+        "source": "",
+        "failure_reason": "",
+    }
+    if material is None:
+        info["failure_reason"] = "missing_material"
+        return info
+
+    seen: set[int] = set()
+
+    def accept(candidate: Any, source: str, hinted_path: str = "") -> bool:
+        if candidate is None:
+            return False
+        marker = id(candidate)
+        if marker in seen:
+            return False
+        seen.add(marker)
+        is_bitmap = _max_is_bitmap_texture_candidate(rt, candidate)
+        actual_path = _max_texture_filename(candidate)
+        if not is_bitmap and not actual_path and not hinted_path:
+            return False
+        info["found_bitmap"] = True
+        path = actual_path or hinted_path.strip()
+        if not path:
+            info["failure_reason"] = "bitmap_filename_empty"
+            return False
+        info.update({"texture": candidate, "path": path, "source": source})
+        return True
+
+    # Direct slots are cheap and cover StandardMaterial plus older importers.
+    direct_values: list[Any] = []
+    direct_candidates: list[tuple[int, Any, str, str]] = []
+    for property_name in _MAX_MATERIAL_GRAPH_PROPERTIES:
+        value = _max_get_material_property(rt, material, property_name)
+        if value is None:
+            continue
+        direct_values.append(value)
+        path = _max_texture_filename(value)
+        if _max_is_bitmap_texture_candidate(rt, value) or path:
+            info["found_bitmap"] = True
+            if path:
+                direct_candidates.append(
+                    (
+                        100 + _max_texture_role_score(path, property_name),
+                        value,
+                        f"property:{property_name}",
+                        path,
+                    )
+                )
+            else:
+                info["failure_reason"] = "bitmap_filename_empty"
+    for _score, value, source, path in sorted(
+        direct_candidates, key=lambda item: item[0], reverse=True
+    ):
+        if accept(value, source, path):
+            return info
+
+    # OpenPBR/Physical maps are often hidden several levels below the material.
+    scan = _max_material_bitmap_scan(rt, material, owner_node)
+    scan_rows = sorted(
+        scan["rows"],
+        key=lambda row: _max_texture_role_score(
+            str(row.get("path", "") or ""), str(row.get("name", "") or "")
+        ),
+        reverse=True,
+    )
+    for row in scan_rows:
+        info["found_bitmap"] = True
+        path = str(row.get("path", "") or "").strip()
+        if not path:
+            info["failure_reason"] = "bitmap_filename_empty"
+            continue
+        texture = None
+        handle = int(row.get("handle", 0) or 0)
+        if handle > 0:
+            try:
+                texture = rt.getAnimByHandle(handle)
+            except Exception:
+                texture = None
+        if texture is None:
+            try:
+                texture = _max_bitmap_texture(rt, path)
+            except Exception as exc:
+                info["failure_reason"] = f"bitmap_create_failed:{type(exc).__name__}"
+                continue
+        if _max_texture_role_score(path, str(row.get("name", "") or "")) < 0:
+            info["failure_reason"] = "base_color_bitmap_not_identified"
+            continue
+        if accept(texture, "maxscript", path):
+            return info
+
+    # Keep a bounded Python fallback for test doubles and Max versions where
+    # getClassInstances cannot target a material wrapper.
+    pending = [(value, 0) for value in direct_values]
+    pending.append((material, 0))
+    while pending:
+        value, depth = pending.pop(0)
+        if depth > 12 or value is None:
+            continue
+        path = _max_texture_filename(value)
+        if path and _max_texture_role_score(path, _max_class_name(rt, value)) < 0:
+            info["failure_reason"] = "base_color_bitmap_not_identified"
+            continue
+        if accept(value, "python_graph", path):
+            return info
+        for child in _max_material_graph_children(rt, value):
+            pending.append((child, depth + 1))
+
+    if info["found_bitmap"] and not info["failure_reason"]:
+        info["failure_reason"] = "bitmap_not_readable"
+    return info
+
+
+def _max_texture_paths_equal(left: str, right: str) -> bool:
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    if not left_text or not right_text:
+        return False
+    try:
+        return Path(left_text).resolve(strict=False) == Path(right_text).resolve(strict=False)
+    except OSError:
+        return os.path.normcase(left_text) == os.path.normcase(right_text)
+
+
+def _max_verify_standard_material_texture(
+    rt: Any,
+    material: Any,
+    texture: Any,
+    expected_path: str | None = None,
+) -> bool:
+    """Set StandardMaterial's diffuse slot and require a matching read-back."""
+    expected = str(expected_path or _max_texture_filename(texture) or "").strip()
+    if not expected:
+        return False
+    for property_name, toggle_name in (("diffuseMap", "diffuseMapEnable"),):
+        if not _max_is_material_property(rt, material, property_name):
+            continue
+        if not _max_set_material_property(rt, material, property_name, texture):
+            continue
+        if _max_is_material_property(rt, material, toggle_name):
+            _max_set_material_property(rt, material, toggle_name, True)
+        readback = _max_get_material_property(rt, material, property_name)
+        readback_path = _max_texture_filename(readback)
+        if _max_texture_paths_equal(readback_path, expected):
+            return True
+    return False
+
+
+def _max_bake_safe_standard_material(
+    rt: Any,
+    node_name: str,
+    path: str | None = None,
+    *,
+    texture: Any | None = None,
+    diffuse: Any | None = None,
+    verify_texture: bool = False,
+    texture_path: str | None = None,
+) -> Any:
+    """Build the single unlit Max material used by every RE6 texture route."""
     material = rt.StandardMaterial(name=rt.uniqueName(f"RE6Tex_{node_name}_"))
-    material.diffuseMap = _max_bitmap_texture(rt, path)
-    material.diffuseMapEnable = True
-    material.showInViewport = True
-    material.diffuse = rt.color(180, 180, 180)
+    if texture is None and path:
+        texture = _max_bitmap_texture(rt, path)
+    expected_texture_path = str(
+        texture_path or path or _max_texture_filename(texture) or ""
+    ).strip()
+    if texture is not None:
+        material.diffuseMap = texture
+        material.diffuseMapEnable = True
+        try:
+            material.showInViewport = True
+        except Exception:
+            pass
+        if verify_texture and not _max_verify_standard_material_texture(
+            rt, material, texture, expected_texture_path
+        ):
+            raise RuntimeError("StandardMaterial Bitmap diffuseMap read-back failed")
+    if diffuse is not None:
+        try:
+            material.diffuse = diffuse
+        except Exception:
+            pass
+    elif not hasattr(material, "diffuse"):
+        try:
+            material.diffuse = rt.color(180, 180, 180)
+        except Exception:
+            pass
+    # Scanline baking must not evaluate a lit shader.  Keep these assignments
+    # explicit because Max versions expose some of them through setProperty.
+    for property_name, value in (
+        ("selfIllumAmount", 100.0),
+        ("specularLevel", 0.0),
+        ("glossiness", 0.0),
+        ("twoSided", True),
+    ):
+        _max_set_material_property(rt, material, property_name, value)
     return material
+
+
+def _max_material_texture(rt: Any, material: Any) -> Any | None:
+    """Return the first verified Bitmaptexture in an arbitrary material graph."""
+    return _max_material_texture_info(rt, material).get("texture")
+
+
+def _max_material_diffuse(rt: Any, material: Any) -> Any | None:
+    for property_name in ("diffuse", "base_color", "baseColor"):
+        value = _max_get_material_property(rt, material, property_name)
+        if value is not None:
+            return value
+    return None
+
+
+def _max_material_slot_count(rt: Any, material: Any) -> int:
+    if material is None:
+        return 0
+    material_class = _max_class_name(rt, material).replace(" ", "").casefold()
+    # OpenPBR/Physical expose graph/list properties that are not material
+    # slots. Only a real MultiMaterial may enter the slot-conversion branch.
+    if "multimaterial" not in material_class and material_class not in {
+        "multimaterialmtl",
+        "multimaterialclass",
+    }:
+        return 0
+    for property_name in ("numsubs", "materialListCount"):
+        value = _max_get_material_property(rt, material, property_name)
+        try:
+            count = int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            count = 0
+        if count > 0:
+            try:
+                first_submaterial = rt.getSubMtl(material, 1)
+            except Exception:
+                first_submaterial = None
+            if first_submaterial is None:
+                return 0
+            return min(count, 256)
+    return 0
+
+
+def _max_prepare_bake_safe_material(
+    rt: Any,
+    node_name: str,
+    source: Any,
+    owner_node: Any | None = None,
+) -> tuple[Any | None, dict[str, Any]]:
+    """Build one replacement only when its source color can be proven."""
+    if source is None:
+        return None, {
+            "status": "preserved",
+            "preserved": True,
+            "failure_reason": "missing_submaterial",
+        }
+    texture_info = _max_material_texture_info(rt, source, owner_node)
+    texture = texture_info.get("texture")
+    diffuse = _max_material_diffuse(rt, source)
+    if texture_info.get("found_bitmap") and texture is None:
+        return None, {
+            "status": "preserved",
+            "preserved": True,
+            "texture_extraction_failed": True,
+            "failure_reason": str(
+                texture_info.get("failure_reason") or "bitmap_not_readable"
+            ),
+            "texture_source": str(texture_info.get("source", "") or ""),
+        }
+    if texture is None and diffuse is None:
+        return None, {
+            "status": "preserved",
+            "preserved": True,
+            "texture_extraction_failed": True,
+            "failure_reason": "no_readable_base_color",
+        }
+    try:
+        replacement = _max_bake_safe_standard_material(
+            rt,
+            node_name,
+            texture=texture,
+            diffuse=diffuse,
+            verify_texture=texture is not None,
+            texture_path=str(texture_info.get("path", "") or ""),
+        )
+    except Exception as exc:
+        return None, {
+            "status": "preserved",
+            "preserved": True,
+            "texture_extraction_failed": texture is not None,
+            "failure_reason": f"replacement_material_failed:{type(exc).__name__}",
+            "error": str(exc),
+        }
+    return replacement, {
+        "status": "changed",
+        "changed": True,
+        "texture_extraction_failed": False,
+        "texture_path": str(texture_info.get("path", "") or ""),
+        "texture_source": str(texture_info.get("source", "") or ""),
+    }
+
+
+def _max_normalize_import_material(
+    rt: Any,
+    node: Any,
+    *,
+    details: dict[str, Any] | None = None,
+) -> bool:
+    """Replace a source graph only after every color input is verified."""
+    material = getattr(node, "material", None)
+    if material is None:
+        if details is not None:
+            details.update({"status": "preserved", "preserved": True, "failure_reason": "missing_material"})
+        return False
+    name = str(getattr(node, "name", "") or "Mesh")
+    slot_count = _max_material_slot_count(rt, material)
+    if slot_count > 0:
+        normalized = rt.MultiMaterial(numsubs=slot_count)
+        normalized.name = rt.uniqueName(f"RE6TexMulti_{name}_")
+        prepared: list[tuple[int, Any]] = []
+        for index in range(1, slot_count + 1):
+            try:
+                source = rt.getSubMtl(material, index)
+            except Exception:
+                source = None
+            sub, sub_details = _max_prepare_bake_safe_material(
+                rt,
+                f"{name}_ID{index}",
+                source,
+                node,
+            )
+            if sub is None:
+                if details is not None:
+                    details.update(sub_details)
+                    details["material_slot"] = index
+                return False
+            prepared.append((index, sub))
+        try:
+            for index, sub in prepared:
+                rt.setSubMtl(normalized, index, sub)
+            node.material = normalized
+        except Exception as exc:
+            if details is not None:
+                details.update(
+                    {
+                        "status": "preserved",
+                        "preserved": True,
+                        "failure_reason": f"multimaterial_assignment_failed:{type(exc).__name__}",
+                        "error": str(exc),
+                    }
+                )
+            return False
+        if details is not None:
+            details.update(
+                {
+                    "status": "changed",
+                    "changed": True,
+                    "material_slot_count": slot_count,
+                }
+            )
+    else:
+        replacement, replacement_details = _max_prepare_bake_safe_material(
+            rt, name, material, node
+        )
+        if replacement is None:
+            if details is not None:
+                details.update(replacement_details)
+            return False
+        try:
+            node.material = replacement
+        except Exception as exc:
+            if details is not None:
+                details.update(
+                    {
+                        "status": "preserved",
+                        "preserved": True,
+                        "failure_reason": f"material_assignment_failed:{type(exc).__name__}",
+                        "error": str(exc),
+                    }
+                )
+            return False
+        if details is not None:
+            details.update(replacement_details)
+    try:
+        rt.showTextureMap(node.material, True)
+    except Exception:
+        pass
+    return True
+
+
+def _max_normalize_scene_materials(rt: Any, nodes: list[Any] | None = None) -> dict[str, Any]:
+    """Normalize every scene Mesh without destroying unverified source colors."""
+    if nodes is None:
+        try:
+            nodes = [node for node in list(rt.objects) if _max_is_editable_mesh_node(rt, node)]
+        except Exception:
+            nodes = []
+    targets = list(nodes or [])
+    applied = 0
+    skipped = 0
+    preserved = 0
+    texture_extraction_failed = 0
+    rows: list[dict[str, Any]] = []
+    for node in targets:
+        try:
+            if not _max_is_editable_mesh_node(rt, node):
+                continue
+            detail: dict[str, Any] = {}
+            changed = _max_normalize_import_material(rt, node, details=detail)
+            material = getattr(node, "material", None)
+            for property_name, value in (
+                ("selfIllumAmount", 100.0),
+                ("specularLevel", 0.0),
+                ("glossiness", 0.0),
+                ("twoSided", True),
+            ):
+                if material is not None and _max_material_slot_count(rt, material) <= 0:
+                    _max_set_material_property(rt, material, property_name, value)
+            if changed:
+                applied += 1
+            if bool(detail.get("preserved", False)):
+                preserved += 1
+            if bool(detail.get("texture_extraction_failed", False)):
+                texture_extraction_failed += 1
+            rows.append(
+                {
+                    "scene_node": str(getattr(node, "name", "") or ""),
+                    "changed": bool(changed),
+                    "status": str(detail.get("status", "") or ""),
+                    "failure_reason": str(detail.get("failure_reason", "") or ""),
+                    "texture_path": str(detail.get("texture_path", "") or ""),
+                    "material_slot": detail.get("material_slot"),
+                }
+            )
+        except Exception as exc:
+            skipped += 1
+            rows.append(
+                {
+                    "scene_node": str(getattr(node, "name", "") or ""),
+                    "changed": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    try:
+        rt.completeRedraw()
+    except Exception:
+        pass
+    return {
+        "status": "PASS" if skipped == 0 else "PARTIAL",
+        "target_count": len(targets),
+        "changed_count": applied,
+        "skipped_count": skipped,
+        "preserved_count": preserved,
+        "texture_extraction_failed_count": texture_extraction_failed,
+        "rows": rows[:512],
+        "material_policy": "StandardMaterial+selfIllumAmount=100+specularLevel=0+glossiness=0+twoSided",
+    }
+
+
+def _max_standard_texture_material(rt: Any, node_name: str, path: str) -> Any:
+    return _max_bake_safe_standard_material(rt, node_name, path)
 
 
 def _max_manual_texture(payload: dict[str, Any]) -> dict[str, Any]:
@@ -18936,6 +19703,7 @@ def _max_manual_texture(payload: dict[str, Any]) -> dict[str, Any]:
             skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
             continue
         applied += 1
+    normalization = _max_normalize_scene_materials(rt, selected)
     try:
         rt.completeRedraw()
     except Exception:
@@ -18949,6 +19717,7 @@ def _max_manual_texture(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "applied": applied, "skipped": skipped, "selected": len(selected),
         "skipped_reasons": skipped_reasons, "zero_reason": reason,
+        "material_normalization": normalization,
     }
 
 
@@ -19347,10 +20116,11 @@ def _max_import_auxiliary_fbx(payload: dict[str, Any]) -> dict[str, Any]:
     before_handles = {_max_node_handle(rt, node) for node in list(rt.objects)}
     previous_selection = _max_selection_handles(rt)
     previous_settings: dict[str, Any] = {}
-    held = False
     try:
-        rt.holdMaxFile()
-        held = True
+        # FBXIMP owns its native transaction. A Max Hold/Fetch snapshot around
+        # the importer retains a second scene graph and can invalidate every
+        # wrapper when an error path fetches it. It also leaves a hold buffer
+        # behind after a successful import. Keep this route transaction-free.
         previous_settings = _max_configure_fbx_import(rt)
         imported = rt.importFile(str(fbx_path), rt.Name("noPrompt"), using=rt.FBXIMP)
         new_nodes = [
@@ -19400,8 +20170,6 @@ def _max_import_auxiliary_fbx(payload: dict[str, Any]) -> dict[str, Any]:
             )
         rt.select([row_node for row_node in new_nodes if _max_node_handle(rt, row_node) in used_handles])
         rt.completeRedraw()
-        if held:
-            held = False
         return {
             "kind": kind,
             "created": len(identities),
@@ -19411,13 +20179,6 @@ def _max_import_auxiliary_fbx(payload: dict[str, Any]) -> dict[str, Any]:
             "nodes": identities,
             "carrier": "python_fbx",
         }
-    except Exception:
-        if held:
-            try:
-                rt.fetchMaxFile(quiet=True)
-            except Exception:
-                pass
-        raise
     finally:
         try:
             _max_restore_fbx_import(rt, previous_settings)
@@ -19631,17 +20392,12 @@ def _max_mrl_material(rt: Any, node_name: str, binding: Any) -> tuple[Any | None
         result["failure_reason"] = "missing_base_color_bitmap"
         return None, result
 
-    material = None
-    for constructor_name in ("OpenPBR_Material", "OpenPBRMaterial"):
-        try:
-            material = getattr(rt, constructor_name)(name=rt.uniqueName(f"MRLStruct_{node_name}_"))
-        except Exception:
-            material = None
-        if material is not None:
-            break
-    if material is None:
-        material = rt.StandardMaterial(name=rt.uniqueName(f"MRLStruct_{node_name}_"))
     texture = _max_bitmap_texture(rt, str(image))
+    material = _max_bake_safe_standard_material(
+        rt,
+        f"MRLStruct_{node_name}",
+        texture=texture,
+    )
     verification = _max_set_base_color_bitmap(rt, material, texture, image)
     if verification is None:
         result["failure_reason"] = "base_color_bitmap_readback_failed"
@@ -19755,6 +20511,7 @@ def _max_apply_mrl_bind(payload: dict[str, Any]) -> dict[str, Any]:
                 **material_result,
             }
         )
+    normalization = _max_normalize_scene_materials(rt, targets)
     try:
         rt.completeRedraw()
     except Exception:
@@ -19771,6 +20528,7 @@ def _max_apply_mrl_bind(payload: dict[str, Any]) -> dict[str, Any]:
         "native_undo_label": MRL_BIND_NATIVE_UNDO_LABEL,
         "mrl_path": str(payload.get("mrl_path", "") or ""),
         "mod_path": str(payload.get("mod_path", "") or ""),
+        "material_normalization": normalization,
     }
 
 
@@ -20988,11 +21746,9 @@ def _execute_max_command(command: str, payload: dict[str, Any]) -> dict[str, Any
             ),
         }
     if command == "import_mod":
-        result = _max_execute_with_native_undo(
-            IMPORT_MOD_NATIVE_UNDO_LABEL,
-            _max_import_mod,
-            payload,
-        )
+        # FBXIMP owns its native transaction. Do not place it inside
+        # pymxs.undo(), which can invalidate Max's MXSWrapper state on Max 2026.
+        result = _max_import_mod(payload)
         # FBX import selects its created nodes internally. Clear that transient
         # selection before this command can hand control back to any Bucket or
         # Quick Select request; viewport framing below has its own temporary
@@ -21072,11 +21828,8 @@ def _execute_max_command(command: str, payload: dict[str, Any]) -> dict[str, Any
     if command == "import_blender_fbx":
         # The Launcher has already repaired a disposable FBX copy. This route
         # must not inspect, select, focus, rename, or re-parent Max scene nodes.
-        return _max_execute_with_native_undo(
-            BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL,
-            _max_import_blender_fbx,
-            payload,
-        )
+        # The native FBX importer must not run inside pymxs.undo().
+        return _max_import_blender_fbx(payload)
     if command == "export_embedded_fbx":
         return _max_export_embedded_fbx(payload)
     if command == "export_mod":
@@ -21110,6 +21863,21 @@ def _execute_max_command(command: str, payload: dict[str, Any]) -> dict[str, Any
         return result
     if command == "manual_texture":
         return _max_manual_texture(payload)
+    if command == "normalize_scene_materials":
+        targets = _max_resolve_scene_interface_nodes(
+            rt,
+            payload,
+            require_mesh=True,
+        )
+        receipt = _max_normalize_scene_materials(rt, targets)
+        receipt.update(
+            {
+                "action": "normalize_scene_materials",
+                "max_process_id": os.getpid(),
+                "scene_interface_id": str(payload.get("scene_interface_id", "") or ""),
+            }
+        )
+        return receipt
     if command == "import_auxiliary":
         return _max_import_auxiliary(payload)
     if command == "import_auxiliary_fbx":
@@ -25491,6 +26259,7 @@ import time
 import traceback
 import uuid
 import zlib
+from typing import Any
 
 _VERSION = 1
 _RESCUE_REVISION = "__PC_REHD_BLENDER_RESCUE_REVISION__"
@@ -26915,6 +27684,30 @@ def _pointer(value):
         return int(id(value))
 
 
+def _blender_rna_same(left, right):
+    """Compare Blender RNA values across Python proxy wrappers."""
+    if left is right:
+        return True
+    if left is None or right is None:
+        return False
+    try:
+        left_pointer = int(left.as_pointer())
+        right_pointer = int(right.as_pointer())
+        if left_pointer > 0 and right_pointer > 0:
+            return left_pointer == right_pointer
+    except Exception:
+        pass
+    for attribute in ("name_full", "name"):
+        try:
+            left_name = str(getattr(left, attribute, "") or "")
+            right_name = str(getattr(right, attribute, "") or "")
+        except Exception:
+            continue
+        if left_name and right_name and left_name == right_name:
+            return True
+    return False
+
+
 _HIDDEN_SELECTION_HANDLES_BY_SCENE = {}
 
 
@@ -27439,6 +28232,53 @@ def _focus_imported_viewport(payload):
         return receipt
     targets = []
     target_handles = set()
+    scene_objects = getattr(scene, "objects", ())
+
+    def scene_object_by_name(name: str) -> Any | None:
+        normalized = str(name or "").strip()
+        if not normalized:
+            return None
+        try:
+            getter = getattr(scene_objects, "get", None)
+            if callable(getter):
+                return getter(normalized)
+        except Exception:
+            pass
+        for candidate in scene_objects:
+            if str(getattr(candidate, "name", "") or "") == normalized:
+                return candidate
+        return None
+
+    def resolve_scene_mesh(raw_ref: dict[str, Any], handle: int) -> Any | None:
+        # The handle is the stable identity. Names are only lookup hints because
+        # Blender 5.2 may suffix an imported datablock after a name collision.
+        names: list[str] = []
+        for key in ("blender_object_name", "name", "authority_name"):
+            value = str(raw_ref.get(key, "") or "").strip()
+            if value and value not in names:
+                names.append(value)
+        candidates = [scene_object_by_name(value) for value in names]
+        candidates.extend(scene_objects)
+        seen_candidates: set[int] = set()
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            marker = id(candidate)
+            if marker in seen_candidates:
+                continue
+            seen_candidates.add(marker)
+            try:
+                candidate_handle = _pointer(candidate)
+            except Exception:
+                continue
+            if (
+                candidate_handle == handle
+                and str(getattr(candidate, "type", "") or "") == "MESH"
+                and not _is_re6_bound_sphere(candidate)
+            ):
+                return candidate
+        return None
+
     for raw_ref in raw_refs:
         if not isinstance(raw_ref, dict):
             continue
@@ -27450,14 +28290,8 @@ def _focus_imported_viewport(payload):
         if handle <= 0 or not name or handle in target_handles:
             continue
         receipt["requested_mesh_count"] += 1
-        node = bpy.data.objects.get(name)
-        if (
-            node is None
-            or scene.objects.get(str(getattr(node, "name", "") or "")) is not node
-            or _pointer(node) != handle
-            or str(getattr(node, "type", "") or "") != "MESH"
-            or _is_re6_bound_sphere(node)
-        ):
+        node = resolve_scene_mesh(raw_ref, handle)
+        if node is None:
             receipt["missing_mesh_count"] += 1
             continue
         target_handles.add(handle)
@@ -27525,19 +28359,84 @@ def _focus_imported_viewport(payload):
         receipt["detail"] = "all_imported_meshes_hidden"
         return receipt
 
+    def imported_bounds() -> tuple[Any, float] | None:
+        """Return a world-space frame target for operator/API fallbacks."""
+        try:
+            from mathutils import Vector
+        except Exception:
+            return None
+        points = []
+        for node in visible_targets:
+            corners = getattr(node, "bound_box", ())
+            matrix = getattr(node, "matrix_world", None)
+            if not corners:
+                continue
+            for corner in corners:
+                try:
+                    point = Vector(corner)
+                    if matrix is not None:
+                        point = matrix @ point
+                    points.append(point)
+                except Exception:
+                    continue
+        if not points:
+            return None
+        minimum = Vector(
+            (
+                min(point.x for point in points),
+                min(point.y for point in points),
+                min(point.z for point in points),
+            )
+        )
+        maximum = Vector(
+            (
+                max(point.x for point in points),
+                max(point.y for point in points),
+                max(point.z for point in points),
+            )
+        )
+        center = (minimum + maximum) * 0.5
+        radius = max((maximum - minimum).length * 0.5, 0.001)
+        return center, radius
+
+    frame_bounds = imported_bounds()
+    space_data = None
+    region_data = None
+    try:
+        space_data = getattr(getattr(area, "spaces", None), "active", None)
+        region_data = getattr(space_data, "region_3d", None)
+    except Exception:
+        space_data = None
+        region_data = None
+    override_kwargs = {
+        "window": window,
+        "screen": screen,
+        "area": area,
+        "region": region,
+        "scene": scene,
+        "view_layer": view_layer,
+    }
+    if space_data is not None:
+        override_kwargs["space_data"] = space_data
+    if region_data is not None:
+        override_kwargs["region_data"] = region_data
+
+    def viewport_override():
+        try:
+            return bpy.context.temp_override(**override_kwargs)
+        except TypeError:
+            # Blender builds that do not accept region_data still work with the
+            # explicit SpaceView3D override and the same stable target handles.
+            fallback_kwargs = dict(override_kwargs)
+            fallback_kwargs.pop("region_data", None)
+            return bpy.context.temp_override(**fallback_kwargs)
+
     previous_selected = []
     previous_active = None
     previous_hidden_selection_handles = _hidden_selection_handles(scene)
     selection_changed = False
     try:
-        with bpy.context.temp_override(
-            window=window,
-            screen=screen,
-            area=area,
-            region=region,
-            scene=scene,
-            view_layer=view_layer,
-        ):
+        with viewport_override():
             if str(getattr(bpy.context, "mode", "") or "") != "OBJECT":
                 receipt["detail"] = "object_mode_required"
                 return receipt
@@ -27561,11 +28460,18 @@ def _focus_imported_viewport(payload):
             if "FINISHED" not in set(axis_result):
                 raise RuntimeError("VIEW_AXIS_%s" % ",".join(sorted(axis_result)))
             try:
-                frame_result = bpy.ops.view3d.view_selected(use_all_regions=False)
+                frame_result = bpy.ops.view3d.view_selected(use_all_regions=True)
             except TypeError:
                 frame_result = bpy.ops.view3d.view_selected()
             if "FINISHED" not in set(frame_result):
                 raise RuntimeError("VIEW_SELECTED_%s" % ",".join(sorted(frame_result)))
+            # Blender 5.2 can report FINISHED while a newly-created area has
+            # not consumed the selection frame yet.  Apply the same frame
+            # directly to RegionView3D so the visible result is deterministic.
+            if frame_bounds is not None and region_data is not None:
+                center, radius = frame_bounds
+                region_data.view_location = center
+                region_data.view_distance = max(float(radius) * 2.4, 0.1)
             receipt["status"] = "FOCUSED"
             receipt["detail"] = "front_view_framed_imported_meshes"
     except Exception as exc:
@@ -27573,14 +28479,7 @@ def _focus_imported_viewport(payload):
     finally:
         if selection_changed:
             try:
-                with bpy.context.temp_override(
-                    window=window,
-                    screen=screen,
-                    area=area,
-                    region=region,
-                    scene=scene,
-                    view_layer=view_layer,
-                ):
+                with viewport_override():
                     bpy.ops.object.select_all(action="DESELECT")
                     for node in previous_selected:
                         if (
@@ -29107,15 +30006,19 @@ def _blender_mrl_material_for_image(image, image_sha256):
     if tree is None:
         raise RuntimeError("Blender did not create a node tree for the MRL material")
     tree.nodes.clear()
-    principled = tree.nodes.new("ShaderNodeBsdfPrincipled")
-    principled.location = (260.0, 0.0)
+    emission = tree.nodes.new("ShaderNodeEmission")
+    emission.location = (260.0, 0.0)
+    try:
+        emission.inputs["Strength"].default_value = 1.0
+    except Exception:
+        pass
     output = tree.nodes.new("ShaderNodeOutputMaterial")
     output.location = (520.0, 0.0)
     texture = tree.nodes.new("ShaderNodeTexImage")
     texture.location = (0.0, 0.0)
     texture.image = image
-    tree.links.new(texture.outputs["Color"], principled.inputs["Base Color"])
-    tree.links.new(principled.outputs["BSDF"], output.inputs["Surface"])
+    tree.links.new(texture.outputs["Color"], emission.inputs["Color"])
+    tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
     material["PC_REHD_MRL_MATERIAL_SCHEMA"] = _BLENDER_MRL_MATERIAL_SCHEMA
     material["PC_REHD_MRL_IMAGE_SHA256"] = image_sha256
     return material
@@ -29127,12 +30030,12 @@ def _blender_mrl_material_has_image(material, image_sha256):
     tree = getattr(material, "node_tree", None)
     if tree is None:
         return False
-    principled = next(
-        (node for node in tree.nodes if node.type == "BSDF_PRINCIPLED"), None
+    emission = next(
+        (node for node in tree.nodes if node.type == "EMISSION"), None
     )
-    if principled is None:
+    if emission is None:
         return False
-    socket = principled.inputs.get("Base Color")
+    socket = emission.inputs.get("Color")
     if socket is None:
         return False
     for link in socket.links:
@@ -29152,16 +30055,16 @@ def _blender_base_color_material_has_image(material, image):
     tree = getattr(material, "node_tree", None)
     if tree is None:
         return False
-    principled = next(
-        (node for node in tree.nodes if node.type == "BSDF_PRINCIPLED"), None
+    emission = next(
+        (node for node in tree.nodes if node.type == "EMISSION"), None
     )
-    if principled is None:
+    if emission is None:
         return False
-    socket = principled.inputs.get("Base Color")
+    socket = emission.inputs.get("Color")
     if socket is None:
         return False
     return any(
-        getattr(link.from_node, "image", None) is image
+        _blender_rna_same(getattr(link.from_node, "image", None), image)
         and _blender_mrl_image_is_available(image)
         for link in socket.links
     )
@@ -29175,15 +30078,19 @@ def _blender_create_base_color_material(name, image):
     if tree is None:
         raise RuntimeError("Blender did not create a node tree for the material")
     tree.nodes.clear()
-    principled = tree.nodes.new("ShaderNodeBsdfPrincipled")
-    principled.location = (260.0, 0.0)
+    emission = tree.nodes.new("ShaderNodeEmission")
+    emission.location = (260.0, 0.0)
+    try:
+        emission.inputs["Strength"].default_value = 1.0
+    except Exception:
+        pass
     output = tree.nodes.new("ShaderNodeOutputMaterial")
     output.location = (520.0, 0.0)
     texture = tree.nodes.new("ShaderNodeTexImage")
     texture.location = (0.0, 0.0)
     texture.image = image
-    tree.links.new(texture.outputs["Color"], principled.inputs["Base Color"])
-    tree.links.new(principled.outputs["BSDF"], output.inputs["Surface"])
+    tree.links.new(texture.outputs["Color"], emission.inputs["Color"])
+    tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
     return material
 
 
@@ -29226,6 +30133,41 @@ def _blender_replace_mesh_material(mesh, material):
         polygon.material_index = 0
 
 
+def _blender_assign_verified_material(mesh, material, verifier, verifier_arg):
+    """Assign one unlit image material transactionally and verify its image.
+
+    Blender can accept a material-slot write while still leaving a malformed
+    node graph behind. Keep the old slots and polygon indices until the
+    verifier succeeds, so a failed bind never leaves a half-applied BSDF or a
+    blank material in the scene.
+    """
+    mesh_data = getattr(mesh, "data", None)
+    if mesh_data is None:
+        raise ValueError("Blender Mesh has no writable mesh data")
+    previous_slots = list(mesh_data.materials)
+    previous_indices = [
+        int(getattr(polygon, "material_index", 0) or 0)
+        for polygon in getattr(mesh_data, "polygons", ())
+    ]
+    try:
+        _blender_replace_mesh_material(mesh, material)
+        if not bool(verifier(material, verifier_arg)):
+            raise RuntimeError("Blender unlit material image verification failed")
+    except Exception:
+        try:
+            mesh_data.materials.clear()
+            for previous in previous_slots:
+                mesh_data.materials.append(previous)
+            for polygon, material_index in zip(
+                getattr(mesh_data, "polygons", ()), previous_indices
+            ):
+                polygon.material_index = material_index
+        except Exception:
+            pass
+        raise
+    return True
+
+
 def _blender_re6_meshes_by_slot():
     meshes = {}
     duplicate_slots = []
@@ -29243,6 +30185,273 @@ def _blender_re6_meshes_by_slot():
             continue
         meshes[slot] = node
     return meshes, sorted(set(duplicate_slots))
+
+
+def _blender_material_image(material):
+    if material is None or not bool(getattr(material, "use_nodes", False)):
+        return None
+    tree = getattr(material, "node_tree", None)
+    if tree is None:
+        return None
+    for node in tree.nodes:
+        image = getattr(node, "image", None)
+        if image is not None and _blender_mrl_image_is_available(image):
+            return image
+    return None
+
+
+def _blender_material_image_failure(material):
+    """Return a reason when a material advertises an unreadable image input."""
+    if material is None or not bool(getattr(material, "use_nodes", False)):
+        return ""
+    tree = getattr(material, "node_tree", None)
+    if tree is None:
+        return ""
+    for node in tree.nodes:
+        image = getattr(node, "image", None)
+        if image is not None and not _blender_mrl_image_is_available(image):
+            return "image_data_unavailable"
+    return ""
+
+
+def _blender_material_has_bsdf(material):
+    if material is None or not bool(getattr(material, "use_nodes", False)):
+        return False
+    tree = getattr(material, "node_tree", None)
+    if tree is None:
+        return False
+    return any("BSDF" in str(getattr(node, "type", "") or "").upper() for node in tree.nodes)
+
+
+def _blender_unlit_material_is_verified(material, image=None):
+    """Prove that Surface is driven by Emission and never by a BSDF node."""
+    if material is None or not bool(getattr(material, "use_nodes", False)):
+        return False
+    tree = getattr(material, "node_tree", None)
+    if tree is None:
+        return False
+    emission = next(
+        (node for node in tree.nodes if getattr(node, "type", "") == "EMISSION"),
+        None,
+    )
+    output = next(
+        (node for node in tree.nodes if getattr(node, "type", "") == "OUTPUT_MATERIAL"),
+        None,
+    )
+    if emission is None or output is None:
+        return False
+    if any("BSDF" in str(getattr(node, "type", "") or "").upper() for node in tree.nodes):
+        return False
+    surface = output.inputs.get("Surface")
+    if surface is None or not any(
+        _blender_rna_same(link.from_node, emission) for link in surface.links
+    ):
+        return False
+    if image is None:
+        return True
+    color = emission.inputs.get("Color")
+    if color is None:
+        return False
+    return any(
+        _blender_rna_same(getattr(link.from_node, "image", None), image)
+        and getattr(link.from_node, "type", "") == "TEX_IMAGE"
+        for link in color.links
+    )
+
+
+def _blender_create_unlit_material(name, *, image=None, color=None):
+    """Create and verify the one Emission graph used by the Blender toolbox."""
+    material = bpy.data.materials.new(str(name))
+    material.use_nodes = True
+    tree = material.node_tree
+    if tree is None:
+        raise RuntimeError("Blender did not create a node tree for the unlit material")
+    tree.nodes.clear()
+    emission = tree.nodes.new("ShaderNodeEmission")
+    emission.location = (260.0, 0.0)
+    try:
+        emission.inputs["Strength"].default_value = 1.0
+    except Exception:
+        pass
+    output = tree.nodes.new("ShaderNodeOutputMaterial")
+    output.location = (520.0, 0.0)
+    if image is not None:
+        texture = tree.nodes.new("ShaderNodeTexImage")
+        texture.location = (0.0, 0.0)
+        texture.image = image
+        tree.links.new(texture.outputs["Color"], emission.inputs["Color"])
+    elif color is not None:
+        try:
+            emission.inputs["Color"].default_value = tuple(color)
+        except Exception:
+            pass
+    tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
+    material["PC_REHD_BAKE_SAFE_MATERIAL"] = True
+    material["PC_REHD_UNLIT_POLICY"] = "Emission->MaterialOutput"
+    if not _blender_unlit_material_is_verified(material, image):
+        raise RuntimeError("Blender unlit material graph verification failed")
+    return material
+
+
+def _blender_normalize_scene_materials(objects=None):
+    """Atomically convert scene material slots to verified unlit Emission."""
+    targets = list(objects) if objects is not None else [
+        node for node in bpy.context.scene.objects if node.type == "MESH"
+    ]
+    cache = {}
+    created_materials = []
+    plans = []
+    failure_rows = []
+
+    def record_failure(mesh, slot_index, exc):
+        failure_rows.append(
+            {
+                "mesh": str(getattr(mesh, "name", "") or ""),
+                "slot": int(slot_index),
+                "error": "%s: %s" % (type(exc).__name__, exc),
+            }
+        )
+
+    def discard_unassigned_materials():
+        for material in reversed(created_materials):
+            try:
+                if int(getattr(material, "users", 0) or 0) == 0:
+                    bpy.data.materials.remove(material)
+            except Exception:
+                pass
+
+    # Phase 1: build and prove every replacement before mutating the scene.
+    for mesh in targets:
+        if getattr(mesh, "type", "") != "MESH":
+            continue
+        mesh_data = getattr(mesh, "data", None)
+        if mesh_data is None:
+            record_failure(mesh, -1, ValueError("Blender Mesh has no writable mesh data"))
+            continue
+        try:
+            slots = list(mesh_data.materials)
+        except Exception as exc:
+            record_failure(mesh, -1, exc)
+            continue
+        for slot_index, source in enumerate(slots):
+            try:
+                if source is None:
+                    raise ValueError("missing_source_material")
+                image_failure = _blender_material_image_failure(source)
+                if image_failure:
+                    raise RuntimeError(image_failure)
+                image = _blender_material_image(source)
+                image_key = _pointer(image) if image is not None else 0
+                source_key = _pointer(source) if source is not None else 0
+                cache_key = (image_key, source_key if image_key == 0 else 0)
+                material = cache.get(cache_key)
+                if material is None:
+                    if image is not None:
+                        material = _blender_create_unlit_material(
+                            "PC_REHD_Standard_%s_%s" % (
+                                str(getattr(mesh, "name", "Mesh")),
+                                int(slot_index),
+                            ),
+                            image=image,
+                        )
+                    else:
+                        source_color = getattr(source, "diffuse_color", None)
+                        if source_color is None:
+                            raise ValueError("missing_base_color")
+                        material = _blender_create_unlit_material(
+                            "PC_REHD_Standard_%s_%s" % (
+                                str(getattr(mesh, "name", "Mesh")),
+                                int(slot_index),
+                            ),
+                            color=source_color,
+                        )
+                    created_materials.append(material)
+                    cache[cache_key] = material
+                if not _blender_unlit_material_is_verified(material, image):
+                    raise RuntimeError("Blender material is not verified as unlit")
+                plans.append(
+                    {
+                        "mesh": mesh,
+                        "mesh_data": mesh_data,
+                        "slot": int(slot_index),
+                        "source": source,
+                        "material": material,
+                        "had_bsdf": _blender_material_has_bsdf(source),
+                    }
+                )
+            except Exception as exc:
+                record_failure(mesh, slot_index, exc)
+
+    if failure_rows:
+        discard_unassigned_materials()
+        return {
+            "status": "FAILED",
+            "mesh_count": len(targets),
+            "normalized_slot_count": 0,
+            "unlit_verified_count": 0,
+            "bsdf_replaced_count": 0,
+            "skipped_count": len(failure_rows),
+            "failure_count": len(failure_rows),
+            "failure_rows": failure_rows[:512],
+            "rows": failure_rows[:512],
+            "material_policy": "ImageTexture->Emission->MaterialOutput",
+        }
+
+    # Phase 2: commit only the fully verified plan. Roll back every write if
+    # Blender rejects one slot, so an old BSDF is never silently left behind.
+    assigned = []
+    try:
+        for plan in plans:
+            mesh_data = plan["mesh_data"]
+            slot_index = int(plan["slot"])
+            previous = mesh_data.materials[slot_index]
+            mesh_data.materials[slot_index] = plan["material"]
+            if mesh_data.materials[slot_index] is not plan["material"]:
+                raise RuntimeError("Blender rejected the verified unlit material assignment")
+            assigned.append((mesh_data, slot_index, previous))
+    except Exception as exc:
+        for mesh_data, slot_index, previous in reversed(assigned):
+            try:
+                mesh_data.materials[slot_index] = previous
+            except Exception:
+                pass
+        discard_unassigned_materials()
+        failed_plan = plans[len(assigned)] if len(assigned) < len(plans) else {}
+        record_failure(failed_plan.get("mesh"), failed_plan.get("slot", -1), exc)
+        return {
+            "status": "FAILED",
+            "mesh_count": len(targets),
+            "normalized_slot_count": 0,
+            "unlit_verified_count": 0,
+            "bsdf_replaced_count": 0,
+            "skipped_count": len(failure_rows),
+            "failure_count": len(failure_rows),
+            "failure_rows": failure_rows[:512],
+            "rows": failure_rows[:512],
+            "material_policy": "ImageTexture->Emission->MaterialOutput",
+        }
+
+    normalized = len(plans)
+    bsdf_replaced = sum(1 for plan in plans if plan["had_bsdf"])
+    return {
+        "status": "PASS",
+        "mesh_count": len(targets),
+        "normalized_slot_count": normalized,
+        "unlit_verified_count": normalized,
+        "bsdf_replaced_count": bsdf_replaced,
+        "skipped_count": 0,
+        "failure_count": 0,
+        "failure_rows": [],
+        "rows": [
+            {
+                "mesh": str(getattr(plan["mesh"], "name", "") or ""),
+                "slot": int(plan["slot"]),
+                "had_bsdf": bool(plan["had_bsdf"]),
+            }
+            for plan in plans[:512]
+        ],
+        "material_policy": "ImageTexture->Emission->MaterialOutput",
+    }
 
 
 def _blender_apply_mrl_material_bind(payload):
@@ -29365,19 +30574,17 @@ def _blender_apply_mrl_material_bind(payload):
                 continue
         material, image, normalized_path = cached
         try:
-            _blender_replace_mesh_material(mesh, material)
+            _blender_assign_verified_material(
+                mesh,
+                material,
+                _blender_base_color_material_has_image,
+                image,
+            )
             mesh["PC_REHD_MRL_IMAGE_PATH"] = normalized_path
             mesh["PC_REHD_MRL_RESOURCE"] = str(
                 binding.get("resource", "") or ""
             )
-            verified = _blender_base_color_material_has_image(material, image)
-            if verified:
-                verified_mesh_slots.append(int(slot))
-            else:
-                record_skip(
-                    "base_color_graph_verification_failed", mesh, slot
-                )
-                continue
+            verified_mesh_slots.append(int(slot))
             applied_rows.append(
                 {
                     "mesh_slot": int(slot),
@@ -29394,6 +30601,7 @@ def _blender_apply_mrl_material_bind(payload):
                 "%s: %s" % (type(exc).__name__, exc),
             )
 
+    material_normalization = _blender_normalize_scene_materials()
     undo_step_created = False
     if applied_rows:
         try:
@@ -29424,6 +30632,7 @@ def _blender_apply_mrl_material_bind(payload):
             else ""
         ),
         "undo_step_created": undo_step_created,
+        "material_normalization": material_normalization,
     }
 
 
@@ -29477,10 +30686,13 @@ def _blender_apply_manual_texture(payload):
                 "pc-rehd-blender-manual-texture-v1"
             )
             material["PC_REHD_MANUAL_IMAGE_PATH"] = normalized_path
-            _blender_replace_mesh_material(mesh, material)
+            _blender_assign_verified_material(
+                mesh,
+                material,
+                _blender_base_color_material_has_image,
+                image,
+            )
             mesh["PC_REHD_MANUAL_TEXTURE_PATH"] = normalized_path
-            if not _blender_base_color_material_has_image(material, image):
-                raise RuntimeError("Blender Base Color graph verification failed")
             receipt["applied"] += 1
             receipt["bound_mesh_names"].append(str(mesh.name))
         except Exception as exc:
@@ -29489,6 +30701,7 @@ def _blender_apply_manual_texture(payload):
             receipt["skipped_reasons"][reason] = (
                 int(receipt["skipped_reasons"].get(reason, 0)) + 1
             )
+    receipt["material_normalization"] = _blender_normalize_scene_materials()
     if receipt["applied"]:
         try:
             bpy.ops.ed.undo_push(message="PC-REHD Manual Texture Bind")
@@ -29607,24 +30820,16 @@ def _apply_blender_mrl_material_contract(
             if material is None:
                 material = _blender_mrl_material_for_image(image, image_sha256)
                 canonical_materials[image_sha256] = material
-            mesh.data.materials.clear()
-            mesh.data.materials.append(material)
-            for polygon in mesh.data.polygons:
-                polygon.material_index = 0
+            _blender_assign_verified_material(
+                mesh,
+                material,
+                _blender_mrl_material_has_image,
+                image_sha256,
+            )
             mesh["PC_REHD_MRL_IMAGE_SHA256"] = image_sha256
             mesh["PC_REHD_MRL_RESOURCE"] = str(binding.get("resource", "") or "")
             receipt["rebuilt_mesh_slots"].append(mesh_slot)
-            if _blender_mrl_material_has_image(material, image_sha256):
-                receipt["verified_mesh_slots"].append(mesh_slot)
-            else:
-                receipt["unresolved"].append(
-                    {
-                        "mesh_slot": mesh_slot,
-                        "mesh_name": str(mesh.name),
-                        "reason": "base_color_graph_verification_failed",
-                        "image_sha256": image_sha256,
-                    }
-                )
+            receipt["verified_mesh_slots"].append(mesh_slot)
         except Exception as exc:
             receipt["unresolved"].append(
                 {
@@ -29673,6 +30878,7 @@ def _apply_blender_mrl_material_contract(
         if len(verified) == len(bindings) and not receipt["unresolved"]
         else "PARTIAL"
     )
+    receipt["material_normalization"] = _blender_normalize_scene_materials(imported_meshes)
     return receipt
 
 
@@ -30366,6 +31572,13 @@ def _import_fbx(payload):
         # still succeed if a Blender material API changes in a later release.
         material_validation = {
             "schema": "pc-rehd-blender-mrl-material-validation-v1",
+            "status": "FAILED",
+            "error": "%s: %s" % (type(exc).__name__, exc),
+        }
+    try:
+        material_validation["scene_normalization"] = _blender_normalize_scene_materials()
+    except Exception as exc:
+        material_validation["scene_normalization"] = {
             "status": "FAILED",
             "error": "%s: %s" % (type(exc).__name__, exc),
         }
@@ -31123,30 +32336,29 @@ def _scene_data_apply_display_material(obj, binding, material_cache):
     if not image_path or not os.path.isfile(image_path):
         return False, "texture file is unavailable"
     cache_key = image_sha256 or os.path.normcase(image_path)
-    material = material_cache.get(cache_key)
-    if material is None:
+    cached = material_cache.get(cache_key)
+    if cached is None:
         try:
-            image = bpy.data.images.load(image_path, check_existing=True)
-            try:
-                image.pack()
-            except RuntimeError:
-                pass
-            material = bpy.data.materials.new("RE6_BM_" + cache_key[:12])
-            material.use_nodes = True
-            nodes = material.node_tree.nodes
-            links = material.node_tree.links
-            principled = next(
-                (node for node in nodes if node.type == "BSDF_PRINCIPLED"), None
+            image, normalized_path = _blender_load_packed_image(image_path)
+            material = _blender_create_unlit_material(
+                "RE6_BM_" + cache_key[:12],
+                image=image,
             )
-            texture = nodes.new("ShaderNodeTexImage")
-            texture.image = image
-            if principled is not None:
-                links.new(texture.outputs["Color"], principled.inputs["Base Color"])
-            material_cache[cache_key] = material
+            if not _blender_base_color_material_has_image(material, image):
+                raise RuntimeError("Blender Scene Data image graph verification failed")
+            material_cache[cache_key] = (material, image, normalized_path)
         except Exception as exc:
             return False, "%s: %s" % (type(exc).__name__, exc)
-    if obj.data.materials.get(material.name) is None:
-        obj.data.materials.append(material)
+    material, image, _normalized_path = cached or material_cache[cache_key]
+    try:
+        _blender_assign_verified_material(
+            obj,
+            material,
+            _blender_base_color_material_has_image,
+            image,
+        )
+    except Exception as exc:
+        return False, "%s: %s" % (type(exc).__name__, exc)
     return True, ""
 
 
@@ -31359,6 +32571,7 @@ def _scene_data_build_scene(data, reset_scene=False, include_normals=True):
         imported_slots.append(slot)
     bpy.context.view_layer.update()
     hierarchy = _rebuild_lod_hierarchy(imported)
+    material_normalization = _blender_normalize_scene_materials()
     return {
         "imported": True,
         "scene_reset": bool(reset_scene),
@@ -31371,6 +32584,7 @@ def _scene_data_build_scene(data, reset_scene=False, include_normals=True):
         "normal_modes": normal_modes,
         "texture_bound_mesh_count": texture_bound_count,
         "texture_errors": texture_errors[:12],
+        "material_normalization": material_normalization,
         "hierarchy": hierarchy,
         "scene_contract": _scene_contract(),
     }
@@ -31735,6 +32949,7 @@ def _blender_worker_capabilities():
         "scene.filter",
         "scene.apply_mrl_material",
         "scene.apply_manual_texture",
+        "scene.normalize_texture_materials",
         "fbx.export",
         "scene.data.begin",
         "scene.data.chunk",
@@ -31892,6 +33107,7 @@ class _BlenderWorker:
                         "tool.texture_to_fbx",
                         "scene.apply_mrl_material",
                         "scene.apply_manual_texture",
+                        "scene.normalize_texture_materials",
                     }
                     else 120.0
                     if command.startswith("scene.data.") or command.startswith("scene.snapshot.")
@@ -32020,6 +33236,8 @@ class _BlenderWorker:
             return _blender_apply_mrl_material_bind(payload)
         if command == "scene.apply_manual_texture":
             return _blender_apply_manual_texture(payload)
+        if command == "scene.normalize_texture_materials":
+            return _blender_normalize_scene_materials()
         if command == "tool.texture_to_fbx":
             return _run_texture_to_fbx_tool(payload)
         if command == "tool.import_3dsmax_fbx":
@@ -33904,6 +35122,7 @@ class ManagedBlenderSession:
                 "tool.texture_to_fbx",
                 "scene.apply_mrl_material",
                 "scene.apply_manual_texture",
+                "scene.normalize_texture_materials",
             }
             else 120.0
             if normalized_command.startswith("scene.data.")
@@ -40707,6 +41926,13 @@ MAX_SCENE_ACCESS_INTERFACES: dict[str, dict[str, str]] = {
     },
     "manual_texture.apply": {
         "command": "manual_texture", "contract": "passthrough", "operation": "texture",
+    },
+    "scene_materials.scene": {
+        "command": "probe_scene_names", "contract": "light_mesh", "operation": "texture",
+        "target_policy": "all_scene",
+    },
+    "scene_materials.apply": {
+        "command": "normalize_scene_materials", "contract": "passthrough", "operation": "texture",
     },
     "mrl_bind.scene": {
         "command": "probe_scene_names", "contract": "light_mesh", "operation": "texture",
@@ -49632,6 +50858,21 @@ class LauncherApp:
         )
         style.map("Accent.TButton", background=[("pressed", c["select"]), ("active", c["select"])])
         style.configure(
+            "BakeSafe.TButton",
+            background=c["accent"],
+            foreground=c["accent_text"],
+            bordercolor=c["accent"],
+            lightcolor=c["accent"],
+            darkcolor=c["accent"],
+            anchor="center",
+            justify="center",
+            padding=(5, 3),
+        )
+        style.map(
+            "BakeSafe.TButton",
+            background=[("pressed", c["select"]), ("active", c["select"])],
+        )
+        style.configure(
             "LanguageRemembered.TButton",
             background=c["warn"],
             foreground=c["warn_text"],
@@ -50083,6 +51324,8 @@ class LauncherApp:
         self.toolbox_window = None
         self.blender_toolbox_window = None
         self.blender_texture_tool_button = None
+        self.blender_texture_tooltip = None
+        self.blender_material_normalize_button = None
         self.blender_max_fbx_import_tool_button = None
         self.blender_max_fbx_import_tooltip = None
         self.blender_max_fbx_name_repair_tool_button = None
@@ -50126,6 +51369,7 @@ class LauncherApp:
         self.instance_copy_tool_button = None
         self.scene_auto_colors_tool_button = None
         self.scene_auto_colors_mode_button = None
+        self.max_material_normalize_button = None
         self.seam_weight_tool_button = None
         self.launcher_icon_button = None
         self.backend_mode_status_badge = None
@@ -59558,6 +60802,7 @@ class LauncherApp:
             self.scene_auto_colors_tool_button = None
             self.scene_auto_colors_mode_button = None
             self.seam_weight_tool_button = None
+            self.max_material_normalize_button = None
         try:
             if bool(window.winfo_exists()):
                 window.destroy()
@@ -59701,6 +60946,18 @@ class LauncherApp:
         )
         self.scene_auto_colors_mode_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self._refresh_scene_auto_colors_button()
+        self.max_material_normalize_button = self.ttk.Button(
+            body,
+            text=self._tr(
+                "场景贴图材质修复 - 无阴影自发光\n适用于贴图烘焙场景",
+                "Scene Texture Material Repair - Shadowless Emissive Material\nFor Texture Baking",
+            ),
+            command=self._normalize_max_scene_materials,
+            style="BakeSafe.TButton",
+        )
+        self.max_material_normalize_button.grid(
+            row=9, column=0, sticky="ew", pady=(8, 0), ipady=8
+        )
         self.seam_weight_tool_button = self.ttk.Button(
             body,
             text=self._tr("接缝处权重统一", "Seam Weight Unify"),
@@ -59708,13 +60965,13 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.seam_weight_tool_button.grid(
-            row=9, column=0, sticky="ew", pady=(8, 0)
+            row=10, column=0, sticky="ew", pady=(8, 0)
         )
         self.ttk.Button(
             body,
             text=self._tr("关闭", "Close"),
             command=close_toolbox,
-        ).grid(row=10, column=0, sticky="e", pady=(14, 0))
+        ).grid(row=11, column=0, sticky="e", pady=(14, 0))
 
         self._restore_toolbox_window_geometry(window)
         self._refresh_toolbox_action_states()
@@ -59979,6 +61236,8 @@ class LauncherApp:
         if getattr(self, "blender_toolbox_window", None) is window:
             self.blender_toolbox_window = None
             self.blender_texture_tool_button = None
+            self.blender_texture_tooltip = None
+            self.blender_material_normalize_button = None
             self.blender_max_fbx_import_tool_button = None
             self.blender_max_fbx_import_tooltip = None
             self.blender_embedded_texture_fbx_tool_button = None
@@ -60054,6 +61313,25 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.blender_texture_tool_button.grid(row=1, column=0, sticky="ew")
+        self.blender_texture_tooltip = HoverTooltip(
+            self.blender_texture_tool_button,
+            lambda: self._tr(
+                "本按钮为导出带贴图 FBX 给 3ds Max 设计。如果只在 Blender 场景烘焙贴图、不涉及跨 3D 软件操作，应使用“场景贴图材质修复 - 无阴影自发光 - 适用于贴图烘焙场景”按钮，这样就能获得不受光照和阴影影响的贴图烘焙结果。",
+                "This button exports textured FBX for 3ds Max. If you are baking textures only in Blender without moving data between 3D applications, use the “Scene Texture Material Repair - Shadowless Emissive Material - For Texture Baking” button to get bake results unaffected by lighting and shadows.",
+            ),
+        )
+        self.blender_material_normalize_button = self.ttk.Button(
+            body,
+            text=self._tr(
+                "场景贴图材质修复 - 无阴影自发光\n适用于贴图烘焙场景",
+                "Scene Texture Material Repair - Shadowless Emissive Material\nFor Texture Baking",
+            ),
+            command=self._normalize_blender_scene_materials,
+            style="BakeSafe.TButton",
+        )
+        self.blender_material_normalize_button.grid(
+            row=2, column=0, sticky="ew", pady=(8, 0), ipady=8
+        )
         self.blender_max_fbx_import_tool_button = self.ttk.Button(
             body,
             text=self._tr(
@@ -60064,7 +61342,7 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.blender_max_fbx_import_tool_button.grid(
-            row=2, column=0, sticky="ew", pady=(8, 0)
+            row=3, column=0, sticky="ew", pady=(8, 0)
         )
         self.blender_max_fbx_import_tooltip = HoverTooltip(
             self.blender_max_fbx_import_tool_button,
@@ -60083,7 +61361,7 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.blender_embedded_texture_fbx_tool_button.grid(
-            row=3, column=0, sticky="ew", pady=(8, 0)
+            row=4, column=0, sticky="ew", pady=(8, 0)
         )
         self.blender_embedded_texture_fbx_tooltip = HoverTooltip(
             self.blender_embedded_texture_fbx_tool_button,
@@ -60096,7 +61374,7 @@ class LauncherApp:
             body,
             text=self._tr("关闭", "Close"),
             command=close_blender_toolbox,
-        ).grid(row=4, column=0, sticky="e", pady=(14, 0))
+        ).grid(row=5, column=0, sticky="e", pady=(14, 0))
 
         self._restore_toolbox_window_geometry(window)
         try:
@@ -69749,6 +71027,135 @@ class LauncherApp:
             on_error=failure,
         )
 
+    def _normalize_max_scene_materials(self) -> None:
+        """Normalize all live Max Mesh materials for texture baking."""
+        if self.blender_mode_enabled:
+            self._normalize_blender_scene_materials()
+            return
+        session = self._active_session()
+        workspace = self._active_workspace()
+        if session is None or workspace is None:
+            self._show_error(RuntimeError(self._tr("当前没有活动的 Max。", "No active Max session.")))
+            return
+        action = "normalize_max_materials"
+        generation = self._begin_session_operation(session, action)
+
+        def operation() -> tuple[str, dict[str, Any]]:
+            _probe_request_id, scene_data = self._request_max_scene_interface(
+                session, "scene_materials.scene"
+            )
+            rows = [
+                dict(row)
+                for row in scene_data.get("target_meshes", [])
+                if isinstance(row, dict) and int(row.get("handle", 0) or 0) > 0
+            ]
+            request_id, result = self._request_max_scene_interface(
+                session,
+                "scene_materials.apply",
+                {
+                    "scene_interface_id": "scene_materials.scene",
+                    "scene_snapshot_digest": str(scene_data.get("digest", "") or ""),
+                    "node_handles": [int(row["handle"]) for row in rows],
+                    "node_names": {
+                        str(int(row["handle"])): str(row.get("name", "") or "")
+                        for row in rows
+                    },
+                },
+            )
+            return request_id, dict(result)
+
+        def success(value: tuple[str, dict[str, Any]]) -> None:
+            if not self._owns_session_operation(session, action, generation):
+                return
+            request_id, result = value
+            changed = int(result.get("changed_count", 0) or 0)
+            skipped = int(result.get("skipped_count", 0) or 0)
+            preserved = int(result.get("preserved_count", 0) or 0)
+            texture_failures = int(
+                result.get("texture_extraction_failed_count", 0) or 0
+            )
+            workspace.last_status = self._tr(
+                f"Max 贴图材质修复：处理 {changed}，保留 {preserved}，贴图提取失败 {texture_failures}，跳过 {skipped}",
+                f"Max texture material repair: changed {changed}, preserved {preserved}, texture extraction failed {texture_failures}, skipped {skipped}",
+            )
+            if self._session_is_visible(session):
+                self._set_status(f"{workspace.last_status} | {request_id[:12]}", progress=100)
+
+        self._run_background(
+            operation,
+            success,
+            label=self._tr("正在修复 Max 贴图材质", "Repairing Max texture materials"),
+            on_error=lambda exc: self._session_error(session, action, generation, exc),
+        )
+
+    def _normalize_blender_scene_materials(self) -> None:
+        """Normalize every Blender scene Mesh to Image Texture -> Emission."""
+        session = self._active_blender_session()
+        workspace = self._active_workspace()
+        if (
+            not self.blender_mode_enabled
+            or session is None
+            or workspace is None
+            or not self._blender_operation_controls_ready()
+        ):
+            return
+        if self._blender_material_bind_inflight:
+            return
+        action = "normalize_blender_materials"
+        generation = self._begin_session_operation(session, action)
+        self._blender_material_bind_inflight = True
+        self._refresh_blender_material_bind_action_states()
+
+        def operation() -> tuple[str, dict[str, Any]]:
+            result = session.request("scene.normalize_texture_materials", {})
+            return uuid.uuid4().hex, dict(result)
+
+        def success(value: tuple[str, dict[str, Any]]) -> None:
+            self._blender_material_bind_inflight = False
+            self._refresh_blender_material_bind_action_states()
+            if not self._owns_session_operation(session, action, generation):
+                return
+            request_id, result = value
+            changed = int(result.get("normalized_slot_count", 0) or 0)
+            unlit_verified = int(result.get("unlit_verified_count", 0) or 0)
+            bsdf_replaced = int(result.get("bsdf_replaced_count", 0) or 0)
+            skipped = int(result.get("skipped_count", 0) or 0)
+            failure_count = int(result.get("failure_count", 0) or 0)
+            if str(result.get("status", "") or "").upper() == "FAILED" or failure_count:
+                failure_rows = result.get("failure_rows", [])
+                first_failure = (
+                    dict(failure_rows[0])
+                    if isinstance(failure_rows, list) and failure_rows and isinstance(failure_rows[0], dict)
+                    else {}
+                )
+                detail = str(first_failure.get("error", "") or "")
+                workspace.last_status = self._tr(
+                    f"Blender 贴图材质修复失败：{failure_count} 个槽未转换，场景未修改。{detail}",
+                    f"Blender texture material repair failed: {failure_count} slots were not converted; the scene was not changed. {detail}",
+                )
+                if self._session_is_visible(session):
+                    self._show_error(RuntimeError(workspace.last_status))
+                    self._set_status(f"{workspace.last_status} | {request_id[:12]}", progress=0)
+                return
+            workspace.last_status = self._tr(
+                f"Blender 贴图材质修复：处理 {changed}，无光验证 {unlit_verified}，替换 BSDF {bsdf_replaced}，跳过 {skipped}",
+                f"Blender texture material repair: changed {changed}, unlit verified {unlit_verified}, BSDF replaced {bsdf_replaced}, skipped {skipped}",
+            )
+            if self._session_is_visible(session):
+                self._set_status(f"{workspace.last_status} | {request_id[:12]}", progress=100)
+
+        def failure(exc: Exception) -> None:
+            self._blender_material_bind_inflight = False
+            self._refresh_blender_material_bind_action_states()
+            self._session_error(session, action, generation, exc)
+
+        self._run_background(
+            operation,
+            success,
+            label=self._tr("正在修复 Blender 贴图材质", "Repairing Blender texture materials"),
+            on_error=failure,
+        )
+
     def _backend_blender_manual_texture(self, texture_format: str) -> None:
         """Bind one user-selected image to selected Blender RE6 Meshes only."""
         session = self._active_blender_session()
@@ -75660,11 +77067,25 @@ class LauncherApp:
                 handle = int(row.get("scene_node_handle", 0) or 0)
             except (TypeError, ValueError, OverflowError):
                 continue
-            name = str(row.get("scene_node", "") or "").strip()
+            authority_name = str(row.get("scene_node", "") or "").strip()
+            # Blender's authority Header name can differ from the actual
+            # datablock name after 5.2's FBX collision handling.  Send both;
+            # the Worker resolves by the stable pointer handle first.
+            name = str(
+                row.get("blender_object_name", "")
+                or authority_name
+            ).strip()
             if handle <= 0 or not name or handle in seen_handles:
                 continue
             seen_handles.add(handle)
-            node_refs.append({"handle": handle, "name": name})
+            node_refs.append(
+                {
+                    "handle": handle,
+                    "name": name,
+                    "blender_object_name": name,
+                    "authority_name": authority_name,
+                }
+            )
         if not node_refs:
             self._record_operation_diagnostic(
                 "import_mod",
@@ -75684,41 +77105,56 @@ class LauncherApp:
         )
 
         def focus_operation() -> None:
-            receipt: dict[str, Any]
-            try:
-                if int(time.time() * 1000) > deadline_epoch_ms:
-                    receipt = {
-                        "schema": "pc-rehd-blender-import-viewport-focus-v1",
-                        "status": "SKIPPED",
-                        "advisory": True,
-                        "detail": "launcher_advisory_deadline_expired",
-                    }
-                elif (
-                    not self.blender_mode_enabled
-                    or self._active_blender_session() is not session
-                ):
-                    receipt = {
-                        "schema": "pc-rehd-blender-import-viewport-focus-v1",
-                        "status": "SKIPPED",
-                        "advisory": True,
-                        "detail": "target_blender_session_no_longer_active",
-                    }
-                else:
-                    receipt = session.request_advisory(
-                        "scene.focus_imported_view",
-                        {
-                            "node_refs": node_refs,
-                            "deadline_epoch_ms": deadline_epoch_ms,
-                        },
-                        timeout=BLENDER_IMPORT_VIEWPORT_FOCUS_TIMEOUT_SECONDS,
+            receipt: dict[str, Any] = {}
+            attempt_count = 0
+            while attempt_count < 4:
+                attempt_count += 1
+                try:
+                    remaining_seconds = (
+                        float(deadline_epoch_ms - int(time.time() * 1000)) / 1000.0
                     )
-            except Exception as exc:
-                receipt = {
-                    "schema": "pc-rehd-blender-import-viewport-focus-v1",
-                    "status": "SKIPPED",
-                    "advisory": True,
-                    "detail": f"{type(exc).__name__}: {exc}",
-                }
+                    if remaining_seconds <= 0.0:
+                        receipt = {
+                            "schema": "pc-rehd-blender-import-viewport-focus-v1",
+                            "status": "SKIPPED",
+                            "advisory": True,
+                            "detail": "launcher_advisory_deadline_expired",
+                        }
+                    elif (
+                        self.blender_sessions.get(session.pid) is not session
+                        or not _process_is_alive(session.process)
+                    ):
+                        receipt = {
+                            "schema": "pc-rehd-blender-import-viewport-focus-v1",
+                            "status": "SKIPPED",
+                            "advisory": True,
+                            "detail": "target_blender_session_no_longer_available",
+                        }
+                    else:
+                        receipt = session.request_advisory(
+                            "scene.focus_imported_view",
+                            {
+                                "node_refs": node_refs,
+                                "deadline_epoch_ms": deadline_epoch_ms,
+                            },
+                            timeout=min(
+                                BLENDER_IMPORT_VIEWPORT_FOCUS_TIMEOUT_SECONDS,
+                                max(0.2, remaining_seconds),
+                            ),
+                        )
+                except Exception as exc:
+                    receipt = {
+                        "schema": "pc-rehd-blender-import-viewport-focus-v1",
+                        "status": "SKIPPED",
+                        "advisory": True,
+                        "detail": f"{type(exc).__name__}: {exc}",
+                    }
+                receipt["attempt_count"] = attempt_count
+                if str(receipt.get("status", "") or "") == "FOCUSED":
+                    break
+                if int(time.time() * 1000) >= deadline_epoch_ms:
+                    break
+                time.sleep(0.12)
             receipt["correlation_id"] = correlation_id
             receipt["blender_process_id"] = session.pid
             self._record_operation_diagnostic(
