@@ -8,6 +8,10 @@ PC-REHD Code X is a Windows desktop workflow tool for Resident Evil 6 / PC-REHD 
 
 This repository contains the source and dependency snapshot for the current Code X release. Download the ready-to-run package from the GitHub Releases page.
 
+### Similar GitHub Project
+
+- [Blender Albam Addon](https://github.com/HenryOfCarim/albam_reloaded)
+
 ### Tested Platforms
 
 - Blender 5.0+ with the modern FBX importer.
@@ -128,6 +132,10 @@ The record below is transcribed from the comments in the archived `PC_REHD-v1_2_
 PC-REHD Code X 是一个面向 Windows 的 Resident Evil 6 / PC-REHD 工作流工具，用于处理 `.MOD`、`.MRL` 与 FBX 文件，并支持 3ds Max 和 Blender 的导入、导出及往返编辑流程。
 
 本仓库发布当前版本的源码和依赖快照；可直接运行的完整程序包请从 GitHub Releases 页面下载。
+
+### 类似的 GitHub 项目
+
+- [Blender Albam Addon](https://github.com/HenryOfCarim/albam_reloaded)
 
 ### 已测试平台
 
