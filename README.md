@@ -4,9 +4,9 @@
 
 ## English
 
-PC-REHD Code X is a Windows desktop workflow tool for Resident Evil 6 / PC-REHD `.MOD`, `.MRL`, and FBX work with 3ds Max and Blender.
+PC-REHD Code X is a Python rewrite of the PC-REHD 1.2.8 script designed to streamline Resident Evil 6 modding. It uses FBX as the interchange format between 3ds Max and Blender, so models can be edited in almost any 3D application that supports FBX. This workflow is inspired by the MaxScript REEM Project.
 
-This repository contains the source and dependency snapshot for the current Code X release. Download the ready-to-run package from the GitHub Releases page.
+This repository contains the source code and dependency snapshot for the current Code X release. Download the ready-to-run package from the GitHub Releases page.
 
 ### Similar GitHub Project
 
@@ -28,7 +28,7 @@ This repository contains the source and dependency snapshot for the current Code
 
 - Python Launcher and the Python import/export bridge.
 - 3ds Max and Blender Agent and FBX workflow code.
-- Texture, material, MRL, mesh, normal, and skeletal-edit support code.
+- Texture, material, mesh, normal, and skeletal-edit support code.
 - The pinned dependency snapshot in `PY依赖 PY Libs`.
 - Windows bootstrap scripts and the Python installer used by the distribution.
 
@@ -40,7 +40,7 @@ The repository and Release package exclude the embedded Python runtime, generate
 2. Download `RE6-PC-REHD-Code-X-v1.0.0.7z`.
 3. Extract it to a writable folder with a short path.
 4. Run `先点Bat文件 - Click Bat First.ps1`. If Python is not installed, run `一定要先点我安装Python - Click to Install Python First.bat` first.
-5. Back up your `.MOD`, `.MRL`, FBX, and DCC scene files before import, export, or skeletal-edit operations.
+5. Back up your `.MOD`, FBX, and DCC scene files before import, export, or skeletal-edit operations.
 
 ### Important Notes
 
@@ -129,9 +129,9 @@ The record below is transcribed from the comments in the archived `PC_REHD-v1_2_
 
 ## 中文
 
-PC-REHD Code X 是一个面向 Windows 的 Resident Evil 6 / PC-REHD 工作流工具，用于处理 `.MOD`、`.MRL` 与 FBX 文件，并支持 3ds Max 和 Blender 的导入、导出及往返编辑流程。
+PC-REHD Code X 是对 PC-REHD 1.2.8 脚本的 Python 重写版，旨在简化《生化危机 6》的 MOD 制作流程。它以 FBX 作为 3ds Max 与 Blender 之间的交换格式，因此模型可以在几乎任何支持 FBX 的 3D 软件中编辑，并用于 RE6 MOD 制作。这套工作流的设计思路受 MaxScript REEM Project 启发。
 
-本仓库发布当前版本的源码和依赖快照；可直接运行的完整程序包请从 GitHub Releases 页面下载。
+本仓库包含当前 Code X 版本的源代码与依赖快照。可直接运行的完整程序包请从 GitHub Releases 页面下载。
 
 ### 类似的 GitHub 项目
 
@@ -153,7 +153,7 @@ PC-REHD Code X 是一个面向 Windows 的 Resident Evil 6 / PC-REHD 工作流�
 
 - Python Launcher、导入导出桥接程序与界面代码。
 - 3ds Max、Blender 的 Agent 及 FBX 工作流代码。
-- 贴图、材质、MRL、网格、法线与骨骼编辑相关功能代码。
+- 贴图、材质、网格、法线与骨骼编辑相关功能代码。
 - 固定版本的 Python 依赖快照：`PY依赖 PY Libs`。
 - Windows 启动脚本与发布包使用的 Python 安装程序。
 
@@ -165,7 +165,7 @@ PC-REHD Code X 是一个面向 Windows 的 Resident Evil 6 / PC-REHD 工作流�
 2. 下载 `RE6-PC-REHD-Code-X-v1.0.0.7z`。
 3. 解压到一个具有写入权限且路径较短的文件夹。
 4. 先运行 `先点Bat文件 - Click Bat First.ps1`。如果尚未安装 Python，请先运行 `一定要先点我安装Python - Click to Install Python First.bat`。
-5. 使用导入、导出或骨骼编辑前，请备份 `.MOD`、`.MRL`、FBX 和 DCC 场景文件。
+5. 使用导入、导出或骨骼编辑前，请备份 `.MOD`、FBX 和 DCC 场景文件。
 
 ### 重要说明
 
