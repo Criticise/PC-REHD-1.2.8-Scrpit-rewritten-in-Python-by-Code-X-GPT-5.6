@@ -10,6 +10,10 @@ if (-not $scriptRoot) {
     $scriptRoot = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
 }
 $scriptRoot = [System.IO.Path]::GetFullPath($scriptRoot)
+$requiredPythonMajor = 3
+$requiredPythonMinor = 14
+$requiredPythonMicro = 7
+$requiredPythonText = "$requiredPythonMajor.$requiredPythonMinor.$requiredPythonMicro"
 $bootstrapPath = Join-Path $scriptRoot 'codex_python_runtime_bootstrap.py'
 $localAppDataRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
 if (-not $localAppDataRoot) { $localAppDataRoot = [string]$env:LOCALAPPDATA }
@@ -223,28 +227,32 @@ function Get-PythonCandidates {
 function Get-PythonInfo([object]$candidate) {
     $path = [string]$candidate.Path
     try {
-        $code = "import struct,sys;print(str(sys.version_info.major)+'|'+str(sys.version_info.minor)+'|'+str(struct.calcsize('P')*8)+'|'+sys.executable)"
+        $code = "import struct,sys;print(str(sys.version_info.major)+'|'+str(sys.version_info.minor)+'|'+str(sys.version_info.micro)+'|'+str(sys.version_info.releaselevel)+'|'+str(struct.calcsize('P')*8)+'|'+sys.executable)"
         $probe = Invoke-CapturedProcess $path @('-I', '-B', '-c', $code) 15 $scriptRoot
         $line = ([string]($probe.Stdout -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)).Trim()
-        $parts = $line -split '\|', 4
-        if ($probe.ExitCode -ne 0 -or $parts.Count -ne 4) { return $null }
+        $parts = $line -split '\|', 6
+        if ($probe.ExitCode -ne 0 -or $parts.Count -ne 6) { return $null }
         $major = 0
         $minor = 0
+        $micro = 0
         $bits = 0
         if (-not [int]::TryParse($parts[0], [ref]$major)) { return $null }
         if (-not [int]::TryParse($parts[1], [ref]$minor)) { return $null }
-        if (-not [int]::TryParse($parts[2], [ref]$bits)) { return $null }
+        if (-not [int]::TryParse($parts[2], [ref]$micro)) { return $null }
+        if (-not [int]::TryParse($parts[4], [ref]$bits)) { return $null }
         if ($major -lt 3 -or $bits -ne 64) { return $null }
         return [pscustomobject]@{
             # The candidate path has already launched successfully. Do not replace it
             # with sys.executable, which can be mojibake on embedded Python in a CJK path.
             Path = [System.IO.Path]::GetFullPath($path)
-            ReportedPath = [string]$parts[3]
+            ReportedPath = [string]$parts[5]
             Source = [string]$candidate.Source
             Major = $major
             Minor = $minor
+            Micro = $micro
+            ReleaseLevel = [string]$parts[3]
             Bits = $bits
-            VersionRank = -(($major * 1000) + $minor)
+            VersionRank = -(($major * 1000000) + ($minor * 1000) + $micro)
             Priority = [int]$candidate.Priority
         }
     }
@@ -255,14 +263,20 @@ function Find-HealthyPythons {
     $healthy = @()
     foreach ($candidate in Get-PythonCandidates) {
         $info = Get-PythonInfo $candidate
-        if ($null -ne $info) { $healthy += $info }
+        if ($null -ne $info -and
+            $info.Major -eq $requiredPythonMajor -and
+            $info.Minor -eq $requiredPythonMinor -and
+            $info.Micro -eq $requiredPythonMicro -and
+            ([string]$info.ReleaseLevel).ToLowerInvariant() -eq 'final') {
+            $healthy += $info
+        }
     }
     return @($healthy | Sort-Object Priority, VersionRank, Path)
 }
 
 function Get-BundledPythonInstaller {
-    $installer = Get-ChildItem -LiteralPath $scriptRoot -Filter 'python-3.14*-amd64.exe' -File -ErrorAction SilentlyContinue |
-        Sort-Object Name -Descending | Select-Object -First 1
+    $installer = Get-ChildItem -LiteralPath $scriptRoot -Filter "python-$requiredPythonText-amd64.exe" -File -ErrorAction SilentlyContinue |
+        Select-Object -First 1
     return $installer
 }
 
@@ -275,7 +289,7 @@ function Invoke-BundledPythonInstaller([bool]$repair) {
     New-Item -ItemType Directory -Path (Split-Path -Path $target -Parent) -Force | Out-Null
     if (-not $Json.IsPresent) {
         $verb = if ($repair) { 'Repairing' } else { 'Installing' }
-        Write-Host ("[REPAIR] $verb bundled Python 3.14.6 - this is only used when every existing runtime failed")
+        Write-Host ("[REPAIR] $verb bundled Python $requiredPythonText - exact Launcher runtime")
     }
     $arguments = if ($repair) {
         @('/quiet', '/repair', '/norestart')
@@ -339,7 +353,7 @@ function Invoke-WingetPythonInstall([int]$minor) {
 function Invoke-BootstrapCandidate([object]$pythonInfo, [string]$mode) {
     try {
         if (-not $Json.IsPresent) {
-            Write-Host ("[CHECK] Bootstrap runtime - Python $($pythonInfo.Major).$($pythonInfo.Minor) [$($pythonInfo.Source)]")
+            Write-Host ("[CHECK] Bootstrap runtime - Python $($pythonInfo.Major).$($pythonInfo.Minor).$($pythonInfo.Micro) [$($pythonInfo.Source)]")
         }
         $result = Invoke-CapturedProcess $pythonInfo.Path @('-I', '-B', $bootstrapPath, $mode, '--json') 180 $scriptRoot
         $payload = ConvertFrom-LastJsonLine $result.Stdout
@@ -352,7 +366,7 @@ function Invoke-BootstrapCandidate([object]$pythonInfo, [string]$mode) {
         else {
             Get-BootstrapFailureClassification $payload
         }
-        $detail = "Python $($pythonInfo.Major).$($pythonInfo.Minor) [$($pythonInfo.Source)] exit=$($result.ExitCode) status=$overall"
+        $detail = "Python $($pythonInfo.Major).$($pythonInfo.Minor).$($pythonInfo.Micro) [$($pythonInfo.Source)] exit=$($result.ExitCode) status=$overall"
         if (-not $ready) {
             $reason = if ($null -eq $payload) { [string]$result.Stderr } else { ([string]$payload.error + ' ' + [string]$result.Stderr).Trim() }
             if ($reason.Length -gt 1200) { $reason = $reason.Substring($reason.Length - 1200) }
@@ -374,7 +388,7 @@ function Invoke-BootstrapCandidate([object]$pythonInfo, [string]$mode) {
             Python = $pythonInfo
             Result = $null
             Payload = $null
-            Detail = "Python $($pythonInfo.Major).$($pythonInfo.Minor) [$($pythonInfo.Source)] could not run Bootstrap: $($_.Exception.Message)"
+            Detail = "Python $($pythonInfo.Major).$($pythonInfo.Minor).$($pythonInfo.Micro) [$($pythonInfo.Source)] could not run Bootstrap: $($_.Exception.Message)"
             FailureClass = 'bootstrap-protocol'
             RuntimeRecoveryRecommended = $true
         }
@@ -481,8 +495,8 @@ try {
     $bootstrapMode = if ($CheckOnly.IsPresent) { '--system-check' } else { '--system-initialize' }
     $runtimeAttempts = New-Object System.Collections.Generic.List[object]
     $recoveryUsed = $false
-    # Try every already available runtime before changing the machine. The
-    # recovery loop below installs Python only when all of them actually fail.
+    # Only the exact required runtime is eligible. Older/newer Pythons are
+    # staging processes and must be replaced before Bootstrap can pass.
     $bootstrapAttempt = Find-ReadyPythonBootstrap $bootstrapMode $runtimeAttempts
     $bootstrapReady = $null -ne $bootstrapAttempt -and $bootstrapAttempt.Ready -eq $true
 
@@ -490,8 +504,7 @@ try {
         foreach ($repairStep in @(
             { Invoke-BundledPythonInstaller $false },
             { Invoke-BundledPythonInstaller $true },
-            { Invoke-WingetPythonInstall 14 },
-            { Invoke-WingetPythonInstall 12 }
+            { Invoke-WingetPythonInstall 14 }
         )) {
             $recoveryUsed = $true
             $repairResult = & $repairStep
@@ -524,7 +537,7 @@ try {
         }
         $failedPython = $bootstrapAttempt.Python
         $pythonStatus = if ($recoveryUsed) { 'REPAIRED' } else { 'PASS' }
-        Add-Check 'python_runtime' 'Python x64 runtime' $pythonStatus ("Python $($failedPython.Major).$($failedPython.Minor) x64 starts correctly | $($failedPython.Path)") | Out-Null
+        Add-Check 'python_runtime' 'Python x64 runtime' $pythonStatus ("Python $($failedPython.Major).$($failedPython.Minor).$($failedPython.Micro) x64 starts correctly | $($failedPython.Path)") | Out-Null
         if ($null -ne $bootstrapAttempt.Payload) {
             foreach ($row in @($bootstrapAttempt.Payload.checks)) {
                 Add-Check ([string]$row.id) ([string]$row.label) ([string]$row.status) ([string]$row.detail) ([string]$row.repair) | Out-Null
@@ -541,7 +554,7 @@ try {
     $payload = $bootstrapAttempt.Payload
     $failedBootstrapAttempts = @($runtimeAttempts | Where-Object { $_.action -eq 'bootstrap' -and $_.success -ne $true }).Count
     $pythonStatus = if ($recoveryUsed -or $failedBootstrapAttempts -gt 0) { 'REPAIRED' } else { 'PASS' }
-    $pythonDetail = "Python $($pythonInfo.Major).$($pythonInfo.Minor) x64 [$($pythonInfo.Source)] | $($pythonInfo.Path)"
+    $pythonDetail = "Python $($pythonInfo.Major).$($pythonInfo.Minor).$($pythonInfo.Micro) x64 [$($pythonInfo.Source)] | $($pythonInfo.Path)"
     if ($failedBootstrapAttempts -gt 0) { $pythonDetail += " | fallback after $failedBootstrapAttempts failed runtime contract(s)" }
     Add-Check 'python_runtime' 'Python x64 runtime' $pythonStatus $pythonDetail | Out-Null
 

@@ -46,6 +46,12 @@ Allowlisted for local-first, online-fallback upgrades:
 - `Pillow`
 - `orjson`
 
+Transitive security payload:
+
+- `certifi` is shipped with `requests` as a pure-Python CA bundle. Refreshes
+  must keep the package ABI-neutral and pass `certifi.where()` plus an HTTPS
+  import-health check. The current release payload is `certifi 2026.7.22`.
+
 The two `codex_*_accel` packages may still advance from a newer local prebuilt
 or source candidate. Their names must never be resolved from a public index.
 
@@ -232,14 +238,14 @@ First-run user setup now lives next to the V4 script:
 
 - `一定要先点我安装Python  - Click to Install Python First.bat`
 - `先点Bat文件 - Click Bat First.ps1`
-- `python-3.14.6-amd64.exe`
+- `python-3.14.7-amd64.exe`
 
-The helper prefers the bundled `python-3.14.6-amd64.exe` for a local/offline
+The helper prefers the bundled `python-3.14.7-amd64.exe` for a local/offline
 install, then falls back to `winget` or the official python.org download path if
 the EXE is missing. Runtime discovery and selection stay inside the BAT/PS1 and
 Python layers; Launcher and 3ds Max do not own runtime promotion or rollback.
 
-1. The fixed release baseline is Python 3.14.6 x64 (`cp314`).
+1. The fixed release baseline is Python 3.14.7 x64 (`cp314`).
 2. A newer Python, including a future major version, is tested in the inactive
    A/B slot and becomes active only after the full Bootstrap contract passes.
 3. The previously approved runtime remains the rollback slot.

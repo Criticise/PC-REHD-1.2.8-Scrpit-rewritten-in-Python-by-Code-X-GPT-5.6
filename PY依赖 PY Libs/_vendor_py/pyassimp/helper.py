@@ -8,7 +8,7 @@ import os
 import ctypes
 import operator
 
-from distutils.sysconfig import get_python_lib
+from sysconfig import get_paths
 import re
 import sys
 
@@ -36,8 +36,8 @@ if os.name=='posix':
     # check if running from anaconda.
     anaconda_keywords = ("conda", "continuum")
     if any(k in sys.version.lower() for k in anaconda_keywords):
-      cur_path = get_python_lib()
-      pattern = re.compile('.*\/lib\/')
+      cur_path = get_paths().get("purelib", sys.prefix)
+      pattern = re.compile(r".*/lib/")
       conda_lib = pattern.match(cur_path).group()
       logger.info("Adding Anaconda lib path:"+ conda_lib)
       additional_dirs.append(conda_lib)

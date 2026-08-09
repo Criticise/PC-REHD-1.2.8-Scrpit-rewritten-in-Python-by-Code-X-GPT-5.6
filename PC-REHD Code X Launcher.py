@@ -1342,7 +1342,8 @@ GITHUB_RELEASE_PAGE_URL = (
 )
 GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS = 20.0
 GITHUB_SOURCE_METADATA_MAX_BYTES = 32 * 1024
-LAUNCHER_SUPPORTED_PYTHON_MINORS = ((3, 12), (3, 14))
+LAUNCHER_SUPPORTED_PYTHON_MINORS = ((3, 14),)
+LAUNCHER_REQUIRED_PYTHON = (3, 14, 7)
 ISOLATED_PYTHON_ENVIRONMENT = {
     "PYTHONUTF8": "1",
     "PYTHONIOENCODING": "utf-8",
@@ -1380,6 +1381,8 @@ INSTANCE_COPY_NATIVE_UNDO_LABELS = {
     "undo": "PC-REHD Undo Instance Copy",
     "restore": "PC-REHD Restore Instance Copy",
 }
+IMPORT_MOD_NATIVE_UNDO_LABEL = "PC-REHD Import MOD"
+BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL = "PC-REHD Import Blender FBX"
 MRL_BIND_NATIVE_UNDO_LABEL = "PC-REHD MRL Auto Texture Bind"
 MESH_RENAME_NATIVE_UNDO_LABEL = "PC-REHD Mesh Rename"
 MESH_FILTER_NATIVE_UNDO_LABEL = "PC-REHD Mesh Filter"
@@ -2033,43 +2036,55 @@ def _isolated_python_child_environment(
 
 
 def _require_supported_launcher_python(
-    version_info: tuple[int, int] | None = None,
+    version_info: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     if version_info is None:
         try:
-            from codex_python_runtime_bootstrap import ensure_active_python_runtime
+            from codex_python_runtime_bootstrap import ensure_required_python_runtime
 
-            runtime_report = ensure_active_python_runtime(context_label="PC-REHD Code X Launcher")
-            current = (sys.version_info.major, sys.version_info.minor)
+            runtime_report = ensure_required_python_runtime(
+                context_label="PC-REHD Code X Launcher"
+            )
+            current = (
+                sys.version_info.major,
+                sys.version_info.minor,
+                sys.version_info.micro,
+            )
             return {
-                "current": f"{current[0]}.{current[1]}",
-                "supported": runtime_report.get("supported") is True,
+                "current": f"{current[0]}.{current[1]}.{current[2]}",
+                "supported": runtime_report.get("exact_required") is True,
                 "supported_versions": list(runtime_report.get("supported_python_versions", [])),
                 "bootstrap_approved": runtime_report.get("ab_approved") is True,
                 "candidate_session": runtime_report.get("candidate_session") is True,
+                "required_python": ".".join(str(part) for part in LAUNCHER_REQUIRED_PYTHON),
             }
         except SystemExit:
             raise
         except Exception:
-            # Keep the original fixed runtimes usable if Bootstrap itself needs repair.
-            if (sys.version_info.major, sys.version_info.minor) not in LAUNCHER_SUPPORTED_PYTHON_MINORS:
-                raise
+            # A failed exact-runtime install is a real startup failure. Never
+            # continue under the old interpreter after Bootstrap reports it.
+            raise
     current = (
-        (sys.version_info.major, sys.version_info.minor)
+        (
+            sys.version_info.major,
+            sys.version_info.minor,
+            sys.version_info.micro,
+        )
         if version_info is None
-        else (int(version_info[0]), int(version_info[1]))
+        else tuple(int(value) for value in version_info)
     )
-    supported = current in LAUNCHER_SUPPORTED_PYTHON_MINORS
+    supported = current == LAUNCHER_REQUIRED_PYTHON
     report = {
-        "current": f"{current[0]}.{current[1]}",
+        "current": ".".join(str(part) for part in current),
         "supported": supported,
         "supported_versions": [f"{major}.{minor}" for major, minor in LAUNCHER_SUPPORTED_PYTHON_MINORS],
+        "required_python": ".".join(str(part) for part in LAUNCHER_REQUIRED_PYTHON),
     }
     if supported is not True:
         raise RuntimeError(
             "Unsupported Launcher Python "
             + report["current"]
-            + ". Use the validated x64 Python 3.12 or 3.14 runtime; future Python versions require a new ABI and regression review."
+            + ". The Launcher requires the validated x64 Python 3.14.7 runtime; it will not fall back to another Python release."
         )
     return report
 
@@ -4831,6 +4846,7 @@ PYMXS_EXPORT_ALLOWED_RUNTIME_CALLS = (
     "rt.deleteModifier",
     "rt.exportFile",
     "rt.getAnimByHandle",
+    "rt.gc",
     "rt.getHandleByAnim",
     "rt.getNodeByName",
     "rt.getNumFaces",
@@ -4948,6 +4964,8 @@ _PYMXS_APPROVED_RUNTIME_CALLS = frozenset(
         "rt.dotNetClass",
         "rt.execute",
         "rt.exportFile",
+        "rt.fetchMaxFile",
+        "rt.gc",
         "rt.getAnimByHandle",
         "rt.getFace",
         "rt.getFaceMatID",
@@ -4961,6 +4979,7 @@ _PYMXS_APPROVED_RUNTIME_CALLS = frozenset(
         "rt.getSubMtl",
         "rt.getUserProp",
         "rt.getUserPropBuffer",
+        "rt.holdMaxFile",
         "rt.importFile",
         "rt.instance",
         "rt.isValidNode",
@@ -5109,29 +5128,7 @@ def _run_pymxs_runtime_api_policy_guard() -> dict[str, Any]:
     unreviewed = sorted(effective_paths - reviewed_paths)
     stale = sorted(_PYMXS_APPROVED_RUNTIME_CALLS - effective_paths)
     stale_optional = sorted(_PYMXS_OPTIONAL_RUNTIME_CALLS - effective_paths)
-    lifetime_violations: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        runtime_path = _runtime_attribute_path(node.func)
-        if runtime_path == "rt.gc":
-            lifetime_violations.append(f"forced-MaxScript-GC@{node.lineno}")
-        if runtime_path != "rt.importFile":
-            continue
-        current: ast.AST | None = node
-        while current is not None:
-            if isinstance(current, ast.With):
-                for item in current.items:
-                    context_expr = item.context_expr
-                    context_path = _runtime_attribute_path(
-                        context_expr.func
-                    ) if isinstance(context_expr, ast.Call) else ""
-                    if context_path == "pymxs.undo":
-                        lifetime_violations.append(
-                            f"FBX-import-inside-pymxs.undo@{node.lineno}"
-                        )
-            current = parents.get(current)
-    if unreviewed or stale or stale_optional or dynamic_runtime_getattrs or lifetime_violations:
+    if unreviewed or stale or stale_optional or dynamic_runtime_getattrs:
         detail: list[str] = []
         if unreviewed:
             detail.append("unreviewed=" + ",".join(unreviewed))
@@ -5142,10 +5139,6 @@ def _run_pymxs_runtime_api_policy_guard() -> dict[str, Any]:
         if dynamic_runtime_getattrs:
             detail.append(
                 "dynamic_getattr=" + ",".join(str(line) for line in dynamic_runtime_getattrs)
-            )
-        if lifetime_violations:
-            detail.append(
-                "wrapper_lifetime=" + ",".join(sorted(set(lifetime_violations)))
             )
         raise RuntimeError(
             "PYMXS runtime API policy violation; review every direct runtime call: "
@@ -10227,16 +10220,8 @@ def _run_agent_compatibility_policy_guard() -> dict[str, Any]:
         )
         if route not in dispatcher_source:
             violations.append(f"_execute_max_command:missing-native-undo-{label_key}")
-    # Max 2026's native FBX importer must not run inside pymxs.undo(). Its
-    # plug-in transaction and pymxs MXSWrapper lifetime are independent.
-    if "IMPORT_MOD_NATIVE_UNDO_LABEL, _max_import_mod, payload" in dispatcher_source:
-        violations.append("_execute_max_command:forbidden-native-undo-around-fbx-import")
-    if "result = _max_import_mod(payload)" not in dispatcher_source:
-        violations.append("_execute_max_command:missing-direct-native-fbx-import-route")
-    if "BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL, _max_import_blender_fbx, payload" in dispatcher_source:
-        violations.append("_execute_max_command:forbidden-native-undo-around-blender-fbx-import")
-    if "return _max_import_blender_fbx(payload)" not in dispatcher_source:
-        violations.append("_execute_max_command:missing-direct-blender-fbx-import-route")
+    if "IMPORT_MOD_NATIVE_UNDO_LABEL, _max_import_mod, payload" not in dispatcher_source:
+        violations.append("_execute_max_command:missing-native-undo-import")
     import_start = dispatcher_source.find('if command == "import_mod":')
     import_selection_clear = dispatcher_source.find("rt.clearSelection()", import_start)
     import_focus = dispatcher_source.find("_max_focus_imported_model", import_start)
@@ -13383,6 +13368,10 @@ def _max_seam_world_positions(rt: Any, node: Any, indices: list[int]) -> dict[in
         return positions
     finally:
         snapshot = None
+        try:
+            rt.gc(light=True)
+        except Exception:
+            pass
 
 
 def _max_seam_record(
@@ -18160,14 +18149,7 @@ def _max_import_mod(payload: dict[str, Any]) -> dict[str, Any]:
     # only validates the immutable handoff snapshot so its main thread can
     # begin the actual import without a second full-file digest pass.
     actual_fbx_sha = expected_fbx_sha
-    # Resetting the scene invalidates every pre-reset node wrapper. Do not
-    # retain those wrappers across resetMaxFile; only the non-reset import
-    # path needs the pre-import identity snapshot.
-    before_nodes_by_handle = (
-        {}
-        if reset_scene
-        else _max_scene_nodes_by_handle(rt)
-    )
+    before_nodes_by_handle = _max_scene_nodes_by_handle(rt)
     # The FBX importer and post-import viewport framing both use Max's native
     # selection internally. Import MOD deliberately ends with an empty
     # selection: imported Meshes must never be mistaken for a user's later
@@ -18182,10 +18164,10 @@ def _max_import_mod(payload: dict[str, Any]) -> dict[str, Any]:
     previous_settings: dict[str, Any] = {}
     settings_restored = False
     try:
-        # FBXIMP must remain outside pymxs.undo(). Max 2026 can invalidate
-        # pymxs MXSWrapper objects when the FBX plug-in is entered inside a
-        # Python undo transaction. The importer owns its native transaction;
-        # do not add a duplicate holdMaxFile snapshot around it.
+        # ``_max_execute_with_native_undo()`` owns this entire operation. A
+        # second holdMaxFile snapshot duplicates the whole pre-import scene,
+        # including its native import state, and can exhaust Max memory/temp
+        # storage during repeated textured imports.
         if reset_scene:
             rt.resetMaxFile(rt.Name("noPrompt"))
         previous_settings = _max_configure_fbx_import(rt)
@@ -18219,9 +18201,9 @@ def _max_import_mod(payload: dict[str, Any]) -> dict[str, Any]:
         _max_verify_import_binding_scope(contract)
         _max_restore_fbx_import(rt, previous_settings)
         settings_restored = True
-        # FBXIMP may invalidate pre-import pymxs node wrappers. Handoff only
-        # validated physical-Mesh Handles and resolve fresh wrappers after the
-        # importer has completed.
+        # A pymxs node wrapper is not valid across the native Undo commit.
+        # Handoff only the validated physical-Mesh Handles, then resolve fresh
+        # wrappers after the Import MOD undo node has committed.
         post_undo_focus_handles = sorted(
             {
                 int(row.get("scene_node_handle", 0) or 0)
@@ -18235,8 +18217,8 @@ def _max_import_mod(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "action": "import_mod",
             "imported": True,
-            "native_undo": False,
-            "native_undo_reason": "fbx_importer_owns_native_transaction",
+            "native_undo": True,
+            "native_undo_label": IMPORT_MOD_NATIVE_UNDO_LABEL,
             "mod_path": str(payload.get("mod_path", "")),
             "source_sha256": expected_source_sha,
             "fbx_sha256": actual_fbx_sha,
@@ -18592,8 +18574,8 @@ def _max_import_blender_fbx(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "action": "import_blender_fbx",
             "imported": True,
-            "native_undo": False,
-            "native_undo_reason": "fbx_importer_owns_native_transaction",
+            "native_undo": True,
+            "native_undo_label": BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL,
             "fbx_path": str(fbx_path),
             "max_process_id": os.getpid(),
             "imported_node_count": 0,
@@ -19365,11 +19347,10 @@ def _max_import_auxiliary_fbx(payload: dict[str, Any]) -> dict[str, Any]:
     before_handles = {_max_node_handle(rt, node) for node in list(rt.objects)}
     previous_selection = _max_selection_handles(rt)
     previous_settings: dict[str, Any] = {}
+    held = False
     try:
-        # FBXIMP owns its native transaction. A Max Hold/Fetch snapshot around
-        # the importer retains a second scene graph and can invalidate every
-        # wrapper when an error path fetches it. It also leaves a hold buffer
-        # behind after a successful import. Keep this route transaction-free.
+        rt.holdMaxFile()
+        held = True
         previous_settings = _max_configure_fbx_import(rt)
         imported = rt.importFile(str(fbx_path), rt.Name("noPrompt"), using=rt.FBXIMP)
         new_nodes = [
@@ -19419,6 +19400,8 @@ def _max_import_auxiliary_fbx(payload: dict[str, Any]) -> dict[str, Any]:
             )
         rt.select([row_node for row_node in new_nodes if _max_node_handle(rt, row_node) in used_handles])
         rt.completeRedraw()
+        if held:
+            held = False
         return {
             "kind": kind,
             "created": len(identities),
@@ -19428,6 +19411,13 @@ def _max_import_auxiliary_fbx(payload: dict[str, Any]) -> dict[str, Any]:
             "nodes": identities,
             "carrier": "python_fbx",
         }
+    except Exception:
+        if held:
+            try:
+                rt.fetchMaxFile(quiet=True)
+            except Exception:
+                pass
+        raise
     finally:
         try:
             _max_restore_fbx_import(rt, previous_settings)
@@ -20998,9 +20988,11 @@ def _execute_max_command(command: str, payload: dict[str, Any]) -> dict[str, Any
             ),
         }
     if command == "import_mod":
-        # FBXIMP owns its native transaction. Do not place it inside
-        # pymxs.undo(), which can invalidate Max's MXSWrapper state on Max 2026.
-        result = _max_import_mod(payload)
+        result = _max_execute_with_native_undo(
+            IMPORT_MOD_NATIVE_UNDO_LABEL,
+            _max_import_mod,
+            payload,
+        )
         # FBX import selects its created nodes internally. Clear that transient
         # selection before this command can hand control back to any Bucket or
         # Quick Select request; viewport framing below has its own temporary
@@ -21080,8 +21072,11 @@ def _execute_max_command(command: str, payload: dict[str, Any]) -> dict[str, Any
     if command == "import_blender_fbx":
         # The Launcher has already repaired a disposable FBX copy. This route
         # must not inspect, select, focus, rename, or re-parent Max scene nodes.
-        # The native FBX importer must not run inside pymxs.undo().
-        return _max_import_blender_fbx(payload)
+        return _max_execute_with_native_undo(
+            BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL,
+            _max_import_blender_fbx,
+            payload,
+        )
     if command == "export_embedded_fbx":
         return _max_export_embedded_fbx(payload)
     if command == "export_mod":
@@ -82044,9 +82039,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
     # GUI and business operations must not wait for Bootstrap maintenance.
     # The explicit runtime-compat mode above remains the sole full A/B check.
-    _require_supported_launcher_python(
-        (sys.version_info.major, sys.version_info.minor)
-    )
+    _require_supported_launcher_python()
     if args.writer_transport_smoke:
         print(json.dumps(_run_writer_process_transport_smoke(), ensure_ascii=False))
         return 0

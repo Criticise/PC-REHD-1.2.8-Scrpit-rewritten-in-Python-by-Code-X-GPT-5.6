@@ -1,9 +1,9 @@
 Expected local Python runtime bundle layout:
 
-- `python-3.14.6-embed-amd64.zip`
+- `python-3.14.7-embed-amd64.zip`
 
 Bootstrap reports this local baseline bundle for system-level recovery. The
-BAT/PS1 first-stage detector installs the signed full Python 3.14.6 EXE when no
+BAT/PS1 first-stage detector installs the signed full Python 3.14.7 EXE when no
 working interpreter exists; Python A/B management owns later upgrades and
 rollbacks.
 

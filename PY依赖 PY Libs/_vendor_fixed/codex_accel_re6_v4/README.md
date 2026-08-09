@@ -13,7 +13,7 @@ Expected local accelerator bundle layout:
 - `cp314/codex_fbx_probe_accel/`
 - `cp314/codex_uv_layout_accel/`
 
-The formal fixed bundle ships cp314 as the Python 3.14.6 release baseline.
+The formal fixed bundle ships cp314 as the Python 3.14.7 release baseline.
 Future ABIs are compiled and tested in the inactive A/B slot before promotion;
 the previously approved runtime remains the rollback slot.
 

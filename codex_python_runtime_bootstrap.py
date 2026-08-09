@@ -36,6 +36,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import threading
 import time
 import traceback
 import urllib.error
@@ -256,6 +257,10 @@ SUPPORTED_PYTHON_MINORS = (
     (3, 14),
 )
 RECOMMENDED_PYTHON = (3, 14)
+# Launcher activation is pinned to this full release.  The minor-level ABI
+# policy above remains useful for dependency probing, but it must not allow a
+# different patch release to start the user-facing Launcher.
+REQUIRED_PYTHON_RUNTIME = (3, 14, 7)
 ISOLATED_PYTHON_ENVIRONMENT = {
     "PYTHONUTF8": "1",
     "PYTHONIOENCODING": "utf-8",
@@ -1681,6 +1686,24 @@ def _python_runtime_version_text(value: object | None = None) -> str:
     return f"{major}.{minor}.{micro}"
 
 
+def _runtime_matches_required_python(
+    version_info: object | None = None,
+    *,
+    releaselevel: object | None = None,
+) -> bool:
+    """Return True only for the exact stable Launcher runtime release."""
+    try:
+        version = _python_runtime_version_tuple(version_info)
+    except Exception:
+        return False
+    level = (
+        getattr(sys.version_info, "releaselevel", "final")
+        if releaselevel is None
+        else releaselevel
+    )
+    return version == REQUIRED_PYTHON_RUNTIME and str(level).casefold() == "final"
+
+
 def _same_runtime_path(left: object | None, right: object | None) -> bool:
     left_path = _normalize_existing_python_path(left)
     right_path = _normalize_existing_python_path(right)
@@ -2151,6 +2174,51 @@ def _discover_python_paths_via_launcher_list() -> tuple[Path, ...]:
     return tuple(candidates)
 
 
+def _discover_python_paths_via_registry() -> tuple[Path, ...]:
+    """Read every registered Windows PythonCore install, including custom dirs."""
+    if os.name != "nt":
+        return tuple()
+    try:
+        import winreg
+    except Exception:
+        return tuple()
+    candidates: list[Path] = []
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, r"Software\Python\PythonCore") as root_key:
+                version_count = int(winreg.QueryInfoKey(root_key)[0])
+                version_names = [
+                    str(winreg.EnumKey(root_key, index))
+                    for index in range(version_count)
+                ]
+        except Exception:
+            continue
+        for version_name in version_names:
+            try:
+                with winreg.OpenKey(
+                    hive,
+                    rf"Software\Python\PythonCore\{version_name}\InstallPath",
+                ) as install_key:
+                    values: list[str] = []
+                    for value_name in ("ExecutablePath", ""):
+                        try:
+                            value, _value_type = winreg.QueryValueEx(install_key, value_name)
+                        except Exception:
+                            continue
+                        if str(value).strip():
+                            values.append(str(value))
+                    for value in values:
+                        candidate = Path(value)
+                        if candidate.is_dir():
+                            candidate = candidate / "python.exe"
+                        normalized = _normalize_existing_python_path(candidate)
+                        if normalized is not None and normalized not in candidates:
+                            candidates.append(normalized)
+            except Exception:
+                continue
+    return tuple(candidates)
+
+
 def _discover_python_paths_from_common_locations() -> tuple[Path, ...]:
     candidates: list[Path] = []
 
@@ -2158,6 +2226,12 @@ def _discover_python_paths_from_common_locations() -> tuple[Path, ...]:
         candidate = _normalize_existing_python_path(path_value)
         if candidate is not None and candidate not in candidates:
             candidates.append(candidate)
+
+    # Permit a user who intentionally keeps a custom Python install outside
+    # the normal registry/launcher locations to point the Launcher at it
+    # without allowing the managed installer to overwrite that directory.
+    for environment_name in ("PC_REHD_CODE_X_PYTHON", "CODEX_PRIMARY_PYTHON"):
+        add_candidate(os.environ.get(environment_name, ""))
 
     local_python_root = BASE_DIR / "Python"
     if local_python_root.exists() is True:
@@ -2239,6 +2313,8 @@ def _iter_supported_python_candidates() -> tuple[Path, ...]:
     for candidate_path in _discover_python_paths_from_common_locations():
         add_candidate(candidate_path)
     for candidate_path in _discover_python_paths_via_launcher_targets(candidate_health_state):
+        add_candidate(candidate_path)
+    for candidate_path in _discover_python_paths_via_registry():
         add_candidate(candidate_path)
     return tuple(candidates)
 
@@ -2347,6 +2423,26 @@ def _find_exact_python_runtime_candidate(required_version: tuple[int, int]) -> d
     return None
 
 
+def _find_exact_python_runtime_patch_candidate(
+    required_version: tuple[int, int, int],
+) -> dict[str, object] | None:
+    """Find an installed final interpreter matching every version component."""
+    target_version = _python_runtime_version_tuple(required_version)
+    for candidate_path in _iter_supported_python_candidates():
+        probe = _probe_python_runtime_candidate(candidate_path)
+        if not isinstance(probe, dict):
+            continue
+        if _python_runtime_version_tuple(probe.get("version_tuple")) != target_version:
+            continue
+        if str(probe.get("releaselevel", "") or "").casefold() != "final":
+            continue
+        runtime_report = probe.get("runtime_report")
+        if not isinstance(runtime_report, dict) or runtime_report.get("supported") is not True:
+            continue
+        return probe
+    return None
+
+
 def _build_runtime_restart_error_message(report: dict[str, object]) -> str:
     bundle_report = get_local_python_bundle_report()
     if runtime_ui_is_chinese():
@@ -2404,6 +2500,198 @@ def _show_blocking_runtime_error_gui(message_text: str) -> bool:
         runtime_ui_text("Codex Python 运行时错误", "Codex Python Runtime Error"),
         str(message_text),
     )
+
+
+class _RequiredRuntimeInstallProgress:
+    """Small non-modal status window for first-run exact-runtime installation."""
+
+    def __init__(self, required_text: str, installer_path: Path | None = None) -> None:
+        self.required_text = str(required_text)
+        self.installer_path = installer_path
+        self._finished = threading.Event()
+        self._ui_ready = threading.Event()
+        self._cancel_requested = threading.Event()
+        self._automatic_started = threading.Event()
+        self._manual_installer_started = threading.Event()
+        self._success = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="pc-rehd-python-runtime-progress",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def wait_for_auto_start(self, timeout_seconds: float = 8.0) -> bool:
+        if self._ui_ready.wait(timeout=1.0) is not True:
+            return False
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        while time.monotonic() < deadline:
+            if self._cancel_requested.is_set():
+                return True
+            time.sleep(0.05)
+        return self._cancel_requested.is_set()
+
+    def begin_automatic_install(self) -> None:
+        self._automatic_started.set()
+
+    def wait_for_manual_runtime(
+        self,
+        finder: Callable[[], dict[str, object] | None],
+        *,
+        timeout_seconds: float = 1800.0,
+    ) -> dict[str, object] | None:
+        deadline = time.monotonic() + max(1.0, float(timeout_seconds))
+        while time.monotonic() < deadline:
+            candidate = finder()
+            if isinstance(candidate, dict):
+                return candidate
+            time.sleep(1.0)
+        return None
+
+    def finish(self, *, success: bool) -> None:
+        self._success = bool(success)
+        self._finished.set()
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=2.5)
+
+    def _launch_manual_installer(self) -> None:
+        installer = self.installer_path
+        if installer is None or installer.is_file() is not True:
+            return
+        try:
+            subprocess.Popen([str(installer)], cwd=str(BASE_DIR), close_fds=True)
+        except Exception:
+            return
+        self._manual_installer_started.set()
+
+    def _request_manual_install(self, body: Any, button: Any) -> None:
+        if self._cancel_requested.is_set():
+            return
+        self._cancel_requested.set()
+        button.configure(state="disabled")
+        body.configure(
+            text=runtime_ui_text(
+                "自动安装已停止。请在打开的 Python 安装程序中选择自定义安装并指定其他目录；安装完成后脚本会自动启动。",
+                "Automatic installation stopped. Choose Customize Installation and another folder in the opened Python installer; the Launcher will start automatically after installation.",
+            ),
+            foreground="#FFD27A",
+        )
+        self._launch_manual_installer()
+
+    def _run(self) -> None:
+        try:
+            import tkinter as tk
+
+            root = tk.Tk()
+            root.title("PC-REHD Code X")
+            root.configure(background="#111820")
+            root.resizable(False, False)
+            try:
+                root.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            frame = tk.Frame(
+                root,
+                background="#111820",
+                highlightbackground="#2D91FF",
+                highlightcolor="#2D91FF",
+                highlightthickness=1,
+                padx=24,
+                pady=20,
+            )
+            frame.grid(row=0, column=0, sticky="nsew")
+            title = tk.Label(
+                frame,
+                text=runtime_ui_text(
+                    "Python 安装中，请稍候！",
+                    "Python runtime installation",
+                ),
+                background="#111820",
+                foreground="#F4F7FA",
+                font=("Microsoft YaHei", 13, "bold"),
+                anchor="w",
+            )
+            title.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+            body = tk.Label(
+                frame,
+                text=runtime_ui_text(
+                    f"Python {self.required_text} 正在自动安装，安装成功后脚本会重启。",
+                    f"Python {self.required_text} is being installed automatically. The Launcher will restart after installation succeeds.",
+                ),
+                background="#111820",
+                foreground="#C8D1DB",
+                font=("Microsoft YaHei", 10),
+                justify="left",
+                anchor="w",
+                wraplength=510,
+            )
+            body.grid(row=1, column=0, sticky="ew")
+            body.configure(
+                text=runtime_ui_text(
+                    f"即将替换本工具管理的旧版 Python，安装新版 Python {self.required_text}。如果仍需保留旧版，请点击下方按钮停止自动安装。",
+                    f"The tool-managed old Python will be replaced by Python {self.required_text}. If you need to keep the old version, click the button below to stop automatic installation.",
+                )
+            )
+            stop_button = tk.Button(
+                frame,
+                text=runtime_ui_text(
+                    "停止自动安装，手动安装到其他目录",
+                    "Stop automatic install and choose another folder",
+                ),
+                command=lambda: self._request_manual_install(body, stop_button),
+                background="#273646",
+                foreground="#F4F7FA",
+                activebackground="#38526D",
+                activeforeground="#FFFFFF",
+                relief="flat",
+                padx=12,
+                pady=8,
+            )
+            stop_button.grid(row=2, column=0, sticky="ew", pady=(16, 0))
+            frame.columnconfigure(0, weight=1)
+            root.update_idletasks()
+            width = max(560, int(root.winfo_reqwidth()))
+            height = max(150, int(root.winfo_reqheight()))
+            x = max(0, (int(root.winfo_screenwidth()) - width) // 2)
+            y = max(0, (int(root.winfo_screenheight()) - height) // 2)
+            root.geometry(f"{width}x{height}+{x}+{y}")
+            self._ui_ready.set()
+
+            def poll() -> None:
+                if not self._finished.is_set():
+                    if self._automatic_started.is_set():
+                        stop_button.configure(state="disabled")
+                        body.configure(
+                            text=runtime_ui_text(
+                                f"Python {self.required_text} 正在自动安装，安装成功后脚本会重启。",
+                                f"Python {self.required_text} is being installed automatically. The Launcher will restart after installation succeeds.",
+                            )
+                        )
+                    root.after(100, poll)
+                    return
+                body.configure(
+                    text=runtime_ui_text(
+                        f"Python {self.required_text} 安装成功，脚本即将重启。"
+                        if self._success
+                        else f"Python {self.required_text} 安装失败。",
+                        f"Python {self.required_text} installed successfully. The Launcher is restarting."
+                        if self._success
+                        else f"Python {self.required_text} installation failed.",
+                    ),
+                    foreground="#8BE28B" if self._success else "#FF9B9B",
+                )
+                stop_button.configure(state="disabled")
+                root.after(850, root.destroy)
+
+            root.protocol("WM_DELETE_WINDOW", lambda: None)
+            root.deiconify()
+            root.lift()
+            root.after(100, poll)
+            root.mainloop()
+        except Exception:
+            # A headless session can still complete the silent installer.
+            self._ui_ready.clear()
+            return
 
 
 def _relaunch_under_supported_python(report: dict[str, object]) -> dict[str, object]:
@@ -2483,6 +2771,60 @@ def _relaunch_under_exact_python(
     raise SystemExit(completed.returncode)
 
 
+def _relaunch_under_python_path(
+    target_path: str | Path,
+    *,
+    context_label: str,
+    required_version: tuple[int, int, int],
+) -> dict[str, object]:
+    """Re-exec the current command under a verified interpreter path.
+
+    This path deliberately has no fallback: the caller has requested an exact
+    runtime and continuing under the old interpreter would violate that
+    contract.
+    """
+    normalized_target = _normalize_existing_python_path(target_path)
+    required_text = _python_runtime_version_text(required_version)
+    if normalized_target is None:
+        raise RuntimeError(
+            f"{context_label} cannot start required Python {required_text}: {target_path}"
+        )
+    probe = _probe_python_runtime_candidate(normalized_target)
+    if not isinstance(probe, dict) or not _runtime_matches_required_python(
+        probe.get("version_tuple"),
+        releaselevel=probe.get("releaselevel"),
+    ):
+        raise RuntimeError(
+            f"{context_label} rejected non-matching Python runtime {normalized_target}; "
+            f"required {required_text}."
+        )
+    runtime_report = probe.get("runtime_report")
+    if isinstance(runtime_report, dict):
+        _remember_supported_python_path(normalized_target, runtime_report)
+    env = _isolated_python_child_environment()
+    tried_paths = list(_get_tried_python_paths())
+    target_text = str(normalized_target).lower()
+    if target_text not in tried_paths:
+        tried_paths.append(target_text)
+    env[BOOTSTRAP_REEXEC_PATH_ENV] = str(normalized_target)
+    env[BOOTSTRAP_REEXEC_DEPTH_ENV] = str(
+        int(str(env.get(BOOTSTRAP_REEXEC_DEPTH_ENV, "0") or "0")) + 1
+    )
+    env[BOOTSTRAP_TRIED_PYTHONS_ENV] = os.pathsep.join(tried_paths)
+    env[BOOTSTRAP_PYTHON_HINT_ENV] = str(normalized_target)
+    try:
+        completed = _run_hidden_subprocess(
+            [str(normalized_target), *sys.argv],
+            check=False,
+            env=env,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            f"{context_label} could not start required Python {required_text}: {exc}"
+        ) from exc
+    raise SystemExit(completed.returncode)
+
+
 def validate_python_runtime(version_info: object | None = None) -> dict[str, object]:
     report = get_runtime_support_report(version_info)
     if report["supported"] is True or report["override_enabled"] is True:
@@ -2508,6 +2850,97 @@ def ensure_preferred_python_runtime(
         _remember_supported_python_path(sys.executable, runtime_report)
         return runtime_report
     return _relaunch_under_exact_python(target_version, context_label=context_label)
+
+
+def ensure_required_python_runtime(
+    *,
+    context_label: str = "PC-REHD Code X Launcher",
+) -> dict[str, object]:
+    """Ensure Launcher activation runs on exactly Python 3.14.7.
+
+    An older or newer interpreter is only a staging process.  It first looks
+    for an already-installed exact runtime, then installs the signed official
+    target through the existing A/B installer, and finally re-execs.  There is
+    intentionally no old-runtime fallback.
+    """
+    target_version = REQUIRED_PYTHON_RUNTIME
+    target_text = _python_runtime_version_text(target_version)
+    current_probe = _probe_python_runtime_candidate(Path(sys.executable))
+    if isinstance(current_probe, dict) and _runtime_matches_required_python(
+        current_probe.get("version_tuple"),
+        releaselevel=current_probe.get("releaselevel"),
+    ):
+        runtime_report = current_probe.get("runtime_report")
+        if isinstance(runtime_report, dict) and runtime_report.get("supported") is True:
+            _remember_supported_python_path(sys.executable, runtime_report)
+            return {
+                **runtime_report,
+                "required_python": target_text,
+                "exact_required": True,
+            }
+
+    installed_candidate = _find_exact_python_runtime_patch_candidate(target_version)
+    if isinstance(installed_candidate, dict):
+        return _relaunch_under_python_path(
+            str(installed_candidate.get("path", "")),
+            context_label=context_label,
+            required_version=target_version,
+        )
+
+    installer_path = _find_required_python_installer_path()
+    progress = _RequiredRuntimeInstallProgress(target_text, installer_path)
+    if progress.wait_for_auto_start():
+        manual_candidate = progress.wait_for_manual_runtime(
+            lambda: _find_exact_python_runtime_patch_candidate(target_version)
+        )
+        if isinstance(manual_candidate, dict):
+            progress.finish(success=True)
+            return _relaunch_under_python_path(
+                str(manual_candidate.get("path", "")),
+                context_label=context_label,
+                required_version=target_version,
+            )
+        progress.finish(success=False)
+        message = (
+            f"{context_label} is waiting for a separate Python {target_text} installation, "
+            "but no matching interpreter was found."
+        )
+        _show_blocking_runtime_error_gui(message)
+        raise RuntimeError(message)
+    progress.begin_automatic_install()
+    try:
+        upgrade = run_python_runtime_upgrade(
+            target_python=target_text,
+            force=True,
+        )
+    except Exception as exc:
+        progress.finish(success=False)
+        message = (
+            f"{context_label} requires Python {target_text}. Automatic installation failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        _show_blocking_runtime_error_gui(message)
+        raise RuntimeError(message) from exc
+    if upgrade.get("ready") is not True or str(upgrade.get("status", "")).casefold() != "promoted":
+        progress.finish(success=False)
+        message = (
+            f"{context_label} requires Python {target_text}. Automatic installation did not complete: "
+            + json.dumps(upgrade, ensure_ascii=False)[-12000:]
+        )
+        _show_blocking_runtime_error_gui(message)
+        raise RuntimeError(message)
+    active = upgrade.get("active")
+    active_path = (
+        dict(active).get("python_exe")
+        if isinstance(active, dict)
+        else ""
+    )
+    progress.finish(success=True)
+    return _relaunch_under_python_path(
+        str(active_path or ""),
+        context_label=context_label,
+        required_version=target_version,
+    )
 
 
 def _extract_first_version_text(text_value: str) -> str | None:
@@ -4297,10 +4730,134 @@ def _build_runtime_advisory_popup_payload(advisories: list[dict[str, object]]) -
 
 def _default_runtime_advisory_popup(title_text: str, popup_text: str) -> bool:
     try:
-        import ctypes
+        import tkinter as tk
 
-        flags = 0x00000000 | 0x00000030
-        ctypes.windll.user32.MessageBoxW(None, str(popup_text), str(title_text), flags)
+        background = "#111820"
+        panel = "#1B2530"
+        border = "#2B3947"
+        accent = "#F59E0B"
+        foreground = "#F4F7FA"
+        muted = "#C8D1DB"
+        root = tk.Tk()
+        root.withdraw()
+        root.title(str(title_text))
+        root.configure(background=background)
+        root.resizable(False, False)
+        root.overrideredirect(True)
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+
+        outer = tk.Frame(
+            root,
+            background=background,
+            highlightbackground=border,
+            highlightcolor=border,
+            highlightthickness=1,
+            padx=22,
+            pady=18,
+        )
+        outer.pack(fill="both", expand=True)
+        tk.Frame(outer, background=accent, height=4).pack(fill="x", side="top")
+
+        header = tk.Frame(outer, background=background)
+        header.pack(fill="x", pady=(14, 10))
+        tk.Label(
+            header,
+            text=str(title_text),
+            background=background,
+            foreground=foreground,
+            font=("Microsoft YaHei", 13, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            header,
+            text=runtime_ui_text(
+                "Bootstrap 需要先解决运行时问题。",
+                "Bootstrap needs this runtime issue resolved before it can continue.",
+            ),
+            background=background,
+            foreground=accent,
+            font=("Microsoft YaHei", 10),
+            anchor="w",
+        ).pack(fill="x", pady=(4, 0))
+
+        content = tk.Frame(outer, background=panel)
+        content.pack(fill="both", expand=True)
+        scrollbar = tk.Scrollbar(
+            content,
+            orient="vertical",
+            background=border,
+            troughcolor=panel,
+            activebackground=accent,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        scrollbar.pack(side="right", fill="y")
+        details = tk.Text(
+            content,
+            width=76,
+            height=14,
+            wrap="word",
+            background=panel,
+            foreground=muted,
+            insertbackground=foreground,
+            selectbackground="#3B4D60",
+            selectforeground=foreground,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            padx=14,
+            pady=12,
+            font=("Microsoft YaHei", 10),
+            yscrollcommand=scrollbar.set,
+        )
+        details.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=details.yview)
+        details.insert("1.0", str(popup_text))
+        details.configure(state="disabled")
+
+        footer = tk.Frame(outer, background=background)
+        footer.pack(fill="x", pady=(14, 0))
+        tk.Label(
+            footer,
+            text=runtime_ui_text("请处理后重新启动工具。", "Fix the issue, then restart the tool."),
+            background=background,
+            foreground=muted,
+            font=("Microsoft YaHei", 9),
+            anchor="w",
+        ).pack(side="left")
+        close_button = tk.Button(
+            footer,
+            text=runtime_ui_text("确定", "OK"),
+            command=root.destroy,
+            background=accent,
+            activebackground="#FFB84D",
+            foreground="#111820",
+            activeforeground="#111820",
+            relief="flat",
+            borderwidth=0,
+            padx=24,
+            pady=7,
+            cursor="hand2",
+            font=("Microsoft YaHei", 10, "bold"),
+        )
+        close_button.pack(side="right")
+        root.bind("<Return>", lambda _event: root.destroy())
+        root.bind("<Escape>", lambda _event: root.destroy())
+        root.update_idletasks()
+        width = max(640, int(root.winfo_reqwidth()))
+        height = max(330, int(root.winfo_reqheight()))
+        x = max(0, (int(root.winfo_screenwidth()) - width) // 2)
+        y = max(0, (int(root.winfo_screenheight()) - height) // 2)
+        root.geometry(f"{width}x{height}+{x}+{y}")
+        root.deiconify()
+        root.lift()
+        root.focus_force()
+        close_button.focus_set()
+        root.mainloop()
         return True
     except Exception:
         try:
@@ -10952,6 +11509,16 @@ def _runtime_ab_local_installer_inventory() -> list[dict[str, object]]:
     )
 
 
+def _find_required_python_installer_path() -> Path | None:
+    for row in _runtime_ab_local_installer_inventory():
+        if tuple(row.get("version_tuple", ())) != REQUIRED_PYTHON_RUNTIME:
+            continue
+        candidate = Path(str(row.get("path", "") or ""))
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def discover_official_python_runtime_update(
     *,
     current_version: object | None = None,
@@ -10981,10 +11548,14 @@ def discover_official_python_runtime_update(
         }
         release_versions.update(local_by_version)
     eligible: list[tuple[int, int, int]] = []
+    exact_target = target is not None and len(target) >= 3
     for version_tuple in release_versions:
-        if version_tuple <= active_version:
+        if exact_target:
+            if version_tuple != tuple(target[:3]):
+                continue
+        elif version_tuple <= active_version:
             continue
-        if target is not None and version_tuple[: len(target)] != target:
+        elif target is not None and version_tuple[: len(target)] != target:
             continue
         eligible.append(version_tuple)
     for version_tuple in sorted(eligible, reverse=True):
@@ -11250,6 +11821,12 @@ def _runtime_ab_install_python(
     slot: str,
 ) -> dict[str, object]:
     target_dir = _runtime_ab_slot_dir(slot)
+    managed_root = RUNTIME_INTERPRETER_ROOT_DIR.resolve()
+    if managed_root not in target_dir.resolve().parents:
+        raise RuntimeError(
+            "Refusing to install managed Python over a user-selected directory: "
+            + str(target_dir)
+        )
     expected_version = _python_runtime_version_tuple(release.get("version"))
     existing_python = target_dir / "python.exe"
     if existing_python.is_file():
@@ -11926,6 +12503,8 @@ def run_python_runtime_upgrade(
 ) -> dict[str, object]:
     started = time.perf_counter()
     runtime_ab = ensure_python_runtime_ab_state()
+    target_spec = _runtime_ab_parse_target(target_python)
+    exact_target = target_spec is not None and len(target_spec) >= 3
     active = dict(runtime_ab.get("active", {}))
     if _runtime_ab_entry_is_usable(active) is not True:
         raise RuntimeError("Python A/B upgrade has no usable active rollback runtime.")
@@ -11977,7 +12556,7 @@ def run_python_runtime_upgrade(
             }
 
         active_contract = _runtime_ab_contract_under_python(active["python_exe"])
-        if active_contract.get("ready") is not True:
+        if active_contract.get("ready") is not True and exact_target is not True:
             _runtime_ab_status_update(
                 last_result="active-contract-failed-upgrade-not-started",
                 last_active_contract=active_contract,
@@ -11991,6 +12570,17 @@ def run_python_runtime_upgrade(
                 "discovery": release,
                 "lock": lock_report,
                 "elapsed_seconds": round(time.perf_counter() - started, 6),
+            }
+        if active_contract.get("ready") is not True and exact_target:
+            # Exact first-run promotion must be able to repair a machine whose
+            # currently active interpreter is old, newer, or otherwise outside
+            # the packaged contract.  The target candidate gets the full
+            # contract before promotion; the old interpreter is never resumed.
+            active_contract = {
+                "ready": False,
+                "status": "skipped-for-exact-target",
+                "python_exe": active.get("python_exe"),
+                "target_python": _python_runtime_version_text(target_spec),
             }
 
         stage = "download"
@@ -12485,7 +13075,7 @@ def _show_launcher_restart_notice(target_max_pid: int, *, seconds: int = 3) -> N
             ),
             background="#111820",
             foreground="#F4F7FA",
-            font=("Microsoft YaHei UI", 13, "bold"),
+            font=("Microsoft YaHei", 13, "bold"),
             anchor="w",
         ).grid(row=1, column=0, sticky="ew")
         tk.Label(
@@ -12493,7 +13083,7 @@ def _show_launcher_restart_notice(target_max_pid: int, *, seconds: int = 3) -> N
             text=f"MAX PID {int(target_max_pid)}",
             background="#111820",
             foreground="#6DB7FF",
-            font=("Microsoft YaHei UI", 10, "bold"),
+            font=("Microsoft YaHei", 10, "bold"),
             anchor="w",
         ).grid(row=2, column=0, sticky="ew", pady=(5, 10))
         tk.Label(
@@ -12504,7 +13094,7 @@ def _show_launcher_restart_notice(target_max_pid: int, *, seconds: int = 3) -> N
             ),
             background="#111820",
             foreground="#C8D1DB",
-            font=("Microsoft YaHei UI", 10),
+            font=("Microsoft YaHei", 10),
             justify="left",
             anchor="w",
             wraplength=440,
@@ -12515,7 +13105,7 @@ def _show_launcher_restart_notice(target_max_pid: int, *, seconds: int = 3) -> N
             textvariable=countdown,
             background="#111820",
             foreground="#6DB7FF",
-            font=("Microsoft YaHei UI", 10),
+            font=("Microsoft YaHei", 10),
             anchor="e",
         ).grid(row=4, column=0, sticky="ew", pady=(14, 0))
         body.columnconfigure(0, weight=1)
