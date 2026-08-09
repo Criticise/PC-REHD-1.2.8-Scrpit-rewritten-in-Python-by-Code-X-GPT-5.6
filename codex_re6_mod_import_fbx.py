@@ -126,6 +126,8 @@ MOD_HEADER_PREFIX_SIZE = 4 + 2 + MOD_HEADER_STRUCT.size
 BONE_INFO_SIZE = BONE_INFO_STRUCT.size
 BONE_MATRIX_SIZE = MATRIX4X4_STRUCT.size
 BONE_MTP_SIZE = 256
+MOD_FULL_SCAN_SCHEMA = "re6-mod-full-scan-v1"
+MOD_FULL_SCAN_HEXDUMP_BYTES_PER_ROW = 16
 EPSILON = 1.0e-10
 
 LOD_GROUP_IDS = (0, 1, 2, 3, 4, 5, 6, 249, 252, 254, 255)
@@ -1052,13 +1054,31 @@ def _parse_meshes(
     fix_processing_mode: str = FIX_PROCESSING_MODE_CODEX,
     include_normals: bool = True,
     blender_compact_mesh_names: bool = False,
+    mesh_start_index: int = 0,
+    mesh_end_index: int | None = None,
+    display_map: Sequence[int] | None = None,
 ) -> tuple[list[ParsedMesh], list[int]]:
     normalized_fix_mode = _normalize_fix_processing_mode(fix_processing_mode)
-    display_map = _find_cdxm_display_map(data, header)
+    start_index = int(mesh_start_index)
+    end_index = len(mesh_headers) if mesh_end_index is None else int(mesh_end_index)
+    if start_index < 0 or end_index < start_index or end_index > len(mesh_headers):
+        raise ValueError(
+            f"Invalid Mesh parse range {start_index}..{end_index} for "
+            f"{len(mesh_headers)} Mesh headers"
+        )
+    if display_map is None:
+        display_map = _find_cdxm_display_map(data, header)
+    else:
+        display_map = [int(value) for value in display_map]
     bone_map_rows = _parse_bone_map_rows(data, header)
-    face_cursor = header.ptr_triangle
+    face_cursor = int(header.ptr_triangle) + sum(
+        max(0, int(item.face_count) // 3) * 6
+        for item in mesh_headers[:start_index]
+    )
     parsed: list[ParsedMesh] = []
-    for mesh_index, mesh_header in enumerate(mesh_headers, start=1):
+    for mesh_index, mesh_header in enumerate(
+        mesh_headers[start_index:end_index], start=start_index + 1
+    ):
         parser_fvf = _parser_fvf(mesh_header.fvf_info, fix_lp2=fix_lp2, fix_dmc=fix_dmc)
         layout = FVF_LAYOUTS.get(parser_fvf) or _default_layout(parser_fvf, mesh_header.vert_stride)
         bone_palette = _mesh_bone_palette(mesh_header, bone_map_rows) if layout.skin_kind is not None else None
@@ -1232,6 +1252,532 @@ def _as_jsonable(value: Any) -> Any:
     if isinstance(value, list):
         return value
     return value
+
+
+def _mod_full_scan_text(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, (int, str)):
+        return str(value) if isinstance(value, int) else json.dumps(value, ensure_ascii=False)
+    return json.dumps(value, ensure_ascii=False, allow_nan=True, separators=(",", ":"))
+
+
+def _mod_full_scan_hex(value: int) -> str:
+    return f"0x{max(0, int(value)):X}"
+
+
+def _mod_full_scan_section(
+    region: str,
+    offset: int,
+    size: int,
+    file_size: int,
+) -> dict[str, Any]:
+    start = int(offset)
+    requested = max(0, int(size))
+    end = start + requested
+    available = max(0, min(max(0, int(file_size)) - max(0, start), requested))
+    return {
+        "region": str(region),
+        "offset": start,
+        "offset_hex": _mod_full_scan_hex(start),
+        "requested_bytes": requested,
+        "end_offset": end,
+        "end_offset_hex": _mod_full_scan_hex(end),
+        "available_bytes": available,
+    }
+
+
+def _mod_full_scan_record_gap(
+    scan: dict[str, Any],
+    region: str,
+    exc: Exception,
+    *,
+    offset: int | None = None,
+    requested_bytes: int | None = None,
+    available_bytes: int | None = None,
+) -> None:
+    row: dict[str, Any] = {
+        "region": str(region),
+        "exception_type": type(exc).__name__,
+        "exception_text": str(exc),
+    }
+    if offset is not None:
+        row["offset"] = int(offset)
+        row["offset_hex"] = _mod_full_scan_hex(int(offset))
+    if requested_bytes is not None:
+        row["requested_bytes"] = max(0, int(requested_bytes))
+    if available_bytes is not None:
+        row["available_bytes"] = max(0, int(available_bytes))
+    scan["unrecorded_or_partial_regions"].append(row)
+
+
+def _mod_full_scan_rows(
+    data: bytes,
+    *,
+    region: str,
+    offset: int,
+    row_count: int,
+    row_struct: struct.Struct,
+    scan: dict[str, Any],
+) -> list[list[Any]]:
+    start = int(offset)
+    requested_rows = max(0, int(row_count))
+    row_size = int(row_struct.size)
+    available_bytes = max(0, len(data) - max(0, start))
+    readable_rows = min(requested_rows, available_bytes // row_size)
+    rows: list[list[Any]] = []
+    try:
+        for index in range(readable_rows):
+            rows.append(
+                [
+                    value.item() if hasattr(value, "item") else value
+                    for value in row_struct.unpack_from(data, start + index * row_size)
+                ]
+            )
+    except Exception as exc:
+        _mod_full_scan_record_gap(
+            scan,
+            region,
+            exc,
+            offset=start,
+            requested_bytes=requested_rows * row_size,
+            available_bytes=available_bytes,
+        )
+        return rows
+    if readable_rows < requested_rows:
+        _mod_full_scan_record_gap(
+            scan,
+            region,
+            ValueError(
+                f"recorded {readable_rows} of {requested_rows} rows from the declared range"
+            ),
+            offset=start,
+            requested_bytes=requested_rows * row_size,
+            available_bytes=available_bytes,
+        )
+    return rows
+
+
+def _mod_full_scan_summary(scan: dict[str, Any]) -> dict[str, int]:
+    meshes = [row for row in scan.get("meshes", []) if isinstance(row, dict)]
+    return {
+        "mesh_header_count": len(scan.get("mesh_headers", [])),
+        "mesh_payload_count": len(meshes),
+        "bone_count": len(scan.get("bones", [])),
+        "material_id_count": len(scan.get("material_ids", [])),
+        "bone_map_row_count": len(scan.get("bone_map_rows", [])),
+        "vertex_row_count": sum(
+            len(row.get("positions", []))
+            for row in meshes
+            if isinstance(row.get("positions"), list)
+        ),
+        "face_row_count": sum(
+            len(row.get("faces", []))
+            for row in meshes
+            if isinstance(row.get("faces"), list)
+        ),
+        "unrecorded_or_partial_region_count": len(
+            scan.get("unrecorded_or_partial_regions", [])
+        ),
+    }
+
+
+def scan_mod_file_observables(mod_path: str | Path) -> dict[str, Any]:
+    """Read every available MOD field without assigning a validity verdict.
+
+    The scanner retains source binary bytes for a complete hexdump, and records
+    a named partial-region row whenever a specific reader cannot continue.
+    This lets support reports retain useful sections after a later Mesh, Bone,
+    or table stops decoding.
+    """
+    source = _windows_lexical_full_path(mod_path)
+    data = source.read_bytes()
+    scan: dict[str, Any] = {
+        "schema": MOD_FULL_SCAN_SCHEMA,
+        "source": {
+            "path": str(source),
+            "name": source.name,
+            "suffix": source.suffix,
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        },
+        "raw_header_hex": data[:MOD_HEADER_PREFIX_SIZE].hex(" "),
+        "section_ranges": [
+            _mod_full_scan_section(
+                "mod_header", 0, MOD_HEADER_PREFIX_SIZE, len(data)
+            ),
+            _mod_full_scan_section(
+                "bounds_and_import_preamble",
+                MOD_HEADER_PREFIX_SIZE,
+                68,
+                len(data),
+            ),
+        ],
+        "header": {},
+        "bounds": [],
+        "import_preamble": {},
+        "mesh_headers": [],
+        "material_ids": [],
+        "bone_map_rows": [],
+        "cdxm_display_map": [],
+        "bones": [],
+        "mtp": [],
+        "root_mesh_scale": [],
+        "meshes": [],
+        "unrecorded_or_partial_regions": [],
+        "raw_binary": data,
+    }
+    try:
+        header = _parse_header(data)
+    except Exception as exc:
+        _mod_full_scan_record_gap(
+            scan,
+            "mod_header",
+            exc,
+            offset=0,
+            requested_bytes=MOD_HEADER_PREFIX_SIZE,
+            available_bytes=len(data),
+        )
+        scan["summary"] = _mod_full_scan_summary(scan)
+        return scan
+
+    scan["header"] = _as_jsonable(header)
+    bone_local_offset = int(header.ptr_bone) + int(header.bone_count) * BONE_INFO_SIZE
+    bone_world_offset = bone_local_offset + int(header.bone_count) * BONE_MATRIX_SIZE
+    bone_mtp_offset = bone_world_offset + int(header.bone_count) * BONE_MATRIX_SIZE
+    scan["section_ranges"].extend(
+        (
+            _mod_full_scan_section(
+                "bone_info_table",
+                int(header.ptr_bone),
+                int(header.bone_count) * BONE_INFO_SIZE,
+                len(data),
+            ),
+            _mod_full_scan_section(
+                "bone_local_matrix_table",
+                bone_local_offset,
+                int(header.bone_count) * BONE_MATRIX_SIZE,
+                len(data),
+            ),
+            _mod_full_scan_section(
+                "bone_world_matrix_table",
+                bone_world_offset,
+                int(header.bone_count) * BONE_MATRIX_SIZE,
+                len(data),
+            ),
+            _mod_full_scan_section(
+                "bone_mtp_table",
+                bone_mtp_offset,
+                BONE_MTP_SIZE if int(header.bone_count) > 0 else 0,
+                len(data),
+            ),
+            _mod_full_scan_section(
+                "bone_map_table",
+                int(header.ptr_bone_map),
+                int(header.bone_map_count) * BONE_MAP_ROW_STRUCT.size,
+                len(data),
+            ),
+            _mod_full_scan_section(
+                "material_id_table",
+                int(header.ptr_mat_id),
+                int(header.mat_count) * 4,
+                len(data),
+            ),
+            _mod_full_scan_section(
+                "mesh_header_table",
+                int(header.ptr_mesh),
+                int(header.mesh_count) * MESH_HEADER_STRUCT.size,
+                len(data),
+            ),
+            _mod_full_scan_section(
+                "vertex_buffer",
+                int(header.ptr_vertex),
+                int(header.vertex_buffer_size),
+                len(data),
+            ),
+            _mod_full_scan_section(
+                "triangle_buffer",
+                int(header.ptr_triangle),
+                int(header.triangle_count) * 6,
+                len(data),
+            ),
+            _mod_full_scan_section(
+                "declared_end_size", 0, int(header.end_size), len(data)
+            ),
+        )
+    )
+
+    try:
+        bounds, preamble = _read_bounds_and_preamble(data)
+        scan["bounds"] = bounds
+        scan["import_preamble"] = {
+            "lodzero": int(preamble[0]),
+            "lodone": int(preamble[1]),
+            "ldc": int(preamble[2]),
+            "pad": int(preamble[3]),
+            "entrycount": int(preamble[4]),
+        }
+    except Exception as exc:
+        _mod_full_scan_record_gap(
+            scan,
+            "bounds_and_import_preamble",
+            exc,
+            offset=MOD_HEADER_PREFIX_SIZE,
+            requested_bytes=68,
+            available_bytes=max(0, len(data) - MOD_HEADER_PREFIX_SIZE),
+        )
+
+    mesh_headers: list[MeshHeader] = []
+    try:
+        mesh_headers = _parse_mesh_headers(data, header)
+        scan["mesh_headers"] = [_as_jsonable(item) for item in mesh_headers]
+    except Exception as exc:
+        _mod_full_scan_record_gap(
+            scan,
+            "mesh_headers",
+            exc,
+            offset=int(header.ptr_mesh),
+            requested_bytes=int(header.mesh_count) * MESH_HEADER_STRUCT.size,
+            available_bytes=max(0, len(data) - int(header.ptr_mesh)),
+        )
+
+    material_rows = _mod_full_scan_rows(
+        data,
+        region="material_ids",
+        offset=int(header.ptr_mat_id),
+        row_count=int(header.mat_count),
+        row_struct=struct.Struct("<I"),
+        scan=scan,
+    )
+    scan["material_ids"] = [
+        {
+            "material_slot": index,
+            "value": int(values[0]),
+            "value_hex": f"0x{int(values[0]):08X}",
+        }
+        for index, values in enumerate(material_rows, start=1)
+    ]
+
+    bone_map_rows = _mod_full_scan_rows(
+        data,
+        region="bone_map_rows",
+        offset=int(header.ptr_bone_map),
+        row_count=int(header.bone_map_count),
+        row_struct=BONE_MAP_ROW_STRUCT,
+        scan=scan,
+    )
+    scan["bone_map_rows"] = [
+        {"row": index, "slots": [int(value) for value in values]}
+        for index, values in enumerate(bone_map_rows, start=1)
+    ]
+
+    display_map: list[int] = []
+    try:
+        display_map = _find_cdxm_display_map(data, header)
+        scan["cdxm_display_map"] = [int(value) for value in display_map]
+    except Exception as exc:
+        _mod_full_scan_record_gap(scan, "cdxm_display_map", exc)
+
+    root_scale = [1.0, 1.0, 1.0]
+    try:
+        bones, mtp, root_scale = _parse_bones(data, header)
+        scan["bones"] = [_as_jsonable(item) for item in bones]
+        scan["mtp"] = [int(value) for value in mtp]
+        scan["root_mesh_scale"] = [float(value) for value in root_scale]
+    except Exception as exc:
+        _mod_full_scan_record_gap(
+            scan,
+            "bones_and_mtp",
+            exc,
+            offset=int(header.ptr_bone),
+            requested_bytes=(
+                int(header.bone_count)
+                * (BONE_INFO_SIZE + BONE_MATRIX_SIZE * 2)
+                + (BONE_MTP_SIZE if int(header.bone_count) > 0 else 0)
+            ),
+            available_bytes=max(0, len(data) - int(header.ptr_bone)),
+        )
+
+    for mesh_index, mesh_header in enumerate(mesh_headers, start=1):
+        try:
+            rows, _display_map = _parse_meshes(
+                data,
+                header,
+                mesh_headers,
+                root_scale=root_scale,
+                fix_lp2=False,
+                fix_dmc=False,
+                include_normals=True,
+                mesh_start_index=mesh_index - 1,
+                mesh_end_index=mesh_index,
+                display_map=display_map,
+            )
+            if rows:
+                scan["meshes"].append(_as_jsonable(rows[0]))
+        except Exception as exc:
+            vertex_offset = (
+                int(header.ptr_vertex)
+                + int(mesh_header.vert_base)
+                + int(mesh_header.vert_start) * int(mesh_header.vert_stride)
+            )
+            _mod_full_scan_record_gap(
+                scan,
+                f"mesh_{mesh_index:04d}_observable_payload",
+                exc,
+                offset=vertex_offset,
+                requested_bytes=int(mesh_header.vert_count)
+                * max(0, int(mesh_header.vert_stride)),
+                available_bytes=max(0, len(data) - vertex_offset),
+            )
+
+    scan["summary"] = _mod_full_scan_summary(scan)
+    return scan
+
+
+def _write_mod_full_scan_mapping(
+    handle: Any,
+    values: dict[str, Any],
+    *,
+    prefix: str = "",
+) -> None:
+    for key, value in values.items():
+        name = str(key).upper()
+        if isinstance(value, dict):
+            handle.write(f"{prefix}{name}_BEGIN\n")
+            _write_mod_full_scan_mapping(handle, value, prefix=prefix + "  ")
+            handle.write(f"{prefix}{name}_END\n")
+        else:
+            handle.write(f"{prefix}{name}={_mod_full_scan_text(value)}\n")
+
+
+def _write_mod_full_scan_rows(
+    handle: Any,
+    label: str,
+    values: Any,
+) -> None:
+    rows = values if isinstance(values, list) else []
+    for index, value in enumerate(rows):
+        handle.write(f"{label}[{index:06d}]={_mod_full_scan_text(value)}\n")
+
+
+def _write_mod_full_scan_mesh(handle: Any, mesh: dict[str, Any], index: int) -> None:
+    mesh_label = f"MESH[{index:04d}]"
+    handle.write(f"[{mesh_label}]\n")
+    sequence_fields = {
+        "positions",
+        "uv1",
+        "uv2",
+        "max_normals",
+        "game_normals",
+        "raw_tangents",
+        "raw_skin_bones",
+        "raw_skin_weights",
+        "fbx_skin_bones",
+        "fbx_skin_weights",
+        "faces",
+    }
+    scalar_values = {
+        str(key): value
+        for key, value in mesh.items()
+        if str(key) not in sequence_fields
+    }
+    _write_mod_full_scan_mapping(handle, scalar_values)
+    for field in (
+        "positions",
+        "uv1",
+        "uv2",
+        "max_normals",
+        "game_normals",
+        "raw_tangents",
+        "raw_skin_bones",
+        "raw_skin_weights",
+        "fbx_skin_bones",
+        "fbx_skin_weights",
+        "faces",
+    ):
+        handle.write(f"[{mesh_label}.{field.upper()}]\n")
+        _write_mod_full_scan_rows(handle, field.upper(), mesh.get(field, []))
+
+
+def _write_mod_full_scan_hexdump(handle: Any, data: bytes) -> None:
+    handle.write("[RAW_BINARY_HEXDUMP]\n")
+    for offset in range(0, len(data), MOD_FULL_SCAN_HEXDUMP_BYTES_PER_ROW):
+        row = data[offset : offset + MOD_FULL_SCAN_HEXDUMP_BYTES_PER_ROW]
+        hex_text = row.hex(" ").upper()
+        ascii_text = "".join(
+            chr(value) if 32 <= value <= 126 else "." for value in row
+        )
+        handle.write(f"OFFSET={offset:08X} HEX={hex_text} ASCII={ascii_text}\n")
+
+
+def write_mod_full_scan_report(
+    scan: dict[str, Any], output_path: str | Path
+) -> Path:
+    """Write the complete English, AI-readable TXT report without cleanup."""
+    output = _windows_lexical_full_path(output_path)
+    raw_binary = scan.get("raw_binary", b"")
+    if not isinstance(raw_binary, bytes):
+        raise TypeError("MOD full scan report requires raw binary bytes")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write("RE6_MOD_FULL_SCAN_REPORT\n")
+        handle.write(f"REPORT_SCHEMA={MOD_FULL_SCAN_SCHEMA}\n")
+        handle.write("DATA_POLICY=RECORD_ONLY_NO_VALIDITY_VERDICT\n")
+        handle.write(
+            "NOTE=All readable decoded fields and a complete binary hexdump are included. "
+            "Unreadable regions are listed without a validity verdict.\n\n"
+        )
+        handle.write("[SOURCE]\n")
+        _write_mod_full_scan_mapping(handle, dict(scan.get("source", {})))
+        handle.write(f"RAW_HEADER_HEX={scan.get('raw_header_hex', '')}\n\n")
+        handle.write("[SUMMARY]\n")
+        _write_mod_full_scan_mapping(handle, dict(scan.get("summary", {})))
+        handle.write("\n[MOD_HEADER]\n")
+        _write_mod_full_scan_mapping(handle, dict(scan.get("header", {})))
+        handle.write("\n[BOUNDS]\n")
+        _write_mod_full_scan_rows(handle, "BOUND", scan.get("bounds", []))
+        handle.write("\n[IMPORT_PREAMBLE]\n")
+        _write_mod_full_scan_mapping(handle, dict(scan.get("import_preamble", {})))
+        handle.write("\n[SECTION_RANGES]\n")
+        for index, row in enumerate(scan.get("section_ranges", []), start=1):
+            handle.write(f"SECTION[{index:03d}]\n")
+            _write_mod_full_scan_mapping(handle, dict(row))
+        handle.write("\n[MATERIAL_ID_TABLE]\n")
+        for row in scan.get("material_ids", []):
+            _write_mod_full_scan_mapping(handle, dict(row))
+        handle.write("\n[BONE_MAP_TABLE]\n")
+        for row in scan.get("bone_map_rows", []):
+            _write_mod_full_scan_mapping(handle, dict(row))
+        handle.write("\n[CDXM_DISPLAY_MAP]\n")
+        _write_mod_full_scan_rows(handle, "DISPLAY_SLOT", scan.get("cdxm_display_map", []))
+        handle.write("\n[MTP]\n")
+        _write_mod_full_scan_rows(handle, "MTP", scan.get("mtp", []))
+        handle.write("\n[ROOT_MESH_SCALE]\n")
+        _write_mod_full_scan_rows(handle, "SCALE", scan.get("root_mesh_scale", []))
+        handle.write("\n[BONES]\n")
+        for index, row in enumerate(scan.get("bones", []), start=1):
+            handle.write(f"BONE[{index:04d}]\n")
+            _write_mod_full_scan_mapping(handle, dict(row))
+        handle.write("\n[MESH_HEADERS]\n")
+        for index, row in enumerate(scan.get("mesh_headers", []), start=1):
+            handle.write(f"MESH_HEADER[{index:04d}]\n")
+            _write_mod_full_scan_mapping(handle, dict(row))
+        handle.write("\n[MESHES]\n")
+        for index, row in enumerate(scan.get("meshes", []), start=1):
+            _write_mod_full_scan_mesh(handle, dict(row), index)
+        handle.write("\n[UNRECORDED_OR_PARTIAL_REGIONS]\n")
+        for index, row in enumerate(
+            scan.get("unrecorded_or_partial_regions", []), start=1
+        ):
+            handle.write(f"REGION_RECORD[{index:04d}]\n")
+            _write_mod_full_scan_mapping(handle, dict(row))
+        handle.write("\n")
+        _write_mod_full_scan_hexdump(handle, raw_binary)
+    return output
 
 
 def _sha256_file(path: Path) -> str:
