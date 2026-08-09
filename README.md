@@ -10,7 +10,7 @@ This repository contains the source and dependency snapshot for the current Code
 
 ### Similar GitHub Project
 
-- [Blender Albam Addon](https://github.com/HenryOfCarim/albam_reloaded)
+- [Blender Albam Addon](https://github.com/Brachi/albam)
 
 ### Tested Platforms
 
@@ -135,7 +135,7 @@ PC-REHD Code X 是一个面向 Windows 的 Resident Evil 6 / PC-REHD 工作流�
 
 ### 类似的 GitHub 项目
 
-- [Blender Albam Addon](https://github.com/HenryOfCarim/albam_reloaded)
+- [Blender Albam Addon](https://github.com/Brachi/albam)
 
 ### 已测试平台
 
