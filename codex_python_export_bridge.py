@@ -8069,6 +8069,8 @@ def _evaluate_check_source_advisory(
             "blocking": False,
             "requires_confirmation": False,
             "notice_seconds": 0,
+            "bucket_mesh_missing_count": 0,
+            "all_bucket_meshes_missing_from_source": False,
         }
 
     selected_sha = _normalize_import_source_sha256(source_sha256)
@@ -8182,6 +8184,14 @@ def _evaluate_check_source_advisory(
         str(number): sum(1 for row in differences if _int_or_default(row.get("bucket"), 0) == number)
         for number in (1, 2, 3)
     }
+    bucket_mesh_missing_count = sum(
+        1
+        for row in differences
+        if str(row.get("kind", "") or "") == "bucket_mesh_missing_from_source"
+    )
+    all_bucket_meshes_missing_from_source = bool(bucket_rows) and (
+        bucket_mesh_missing_count == len(bucket_rows)
+    )
     return {
         "status": "NOTICE" if differences else "PASS",
         "evidence_mode": evidence_mode,
@@ -8201,6 +8211,8 @@ def _evaluate_check_source_advisory(
         "source_mesh_name_count": len(source_name_slots),
         "invalid_identity_count": invalid_identity_count,
         "bucket_difference_counts": bucket_difference_counts,
+        "bucket_mesh_missing_count": bucket_mesh_missing_count,
+        "all_bucket_meshes_missing_from_source": all_bucket_meshes_missing_from_source,
         "difference_count": len(differences),
         "differences": differences[:CHECK_SOURCE_MAX_RESULT_LINES],
         "ui_language": str(job.get("export_rules", {}).get("ui_language", "") or ""),
@@ -8281,6 +8293,21 @@ def _run_check_source_advisory_regression_guard() -> dict[str, Any]:
         )
         if receipt.get("status") != "NOTICE" or receipt.get("bucket_difference_counts", {}).get(str(bucket_number)) != 1:
             raise RuntimeError(f"Check Source advisory regression: Bucket {bucket_number} name difference was lost")
+
+    receipt = evaluate(
+        [],
+        [
+            {"scene_node": "Mesh_099_Custom", "lane": "lod0"},
+            {"scene_node": "Mesh_100_Custom", "lane": "delete"},
+            {"scene_node": "Mesh_101_Custom", "lane": "modify"},
+        ],
+    )
+    if (
+        receipt.get("bucket_mesh_missing_count") != 3
+        or receipt.get("all_bucket_meshes_missing_from_source") is not True
+        or receipt.get("blocking") is not False
+    ):
+        raise RuntimeError("Check Source advisory regression: all missing Bucket Meshes were not recorded as advisory")
 
     receipt = evaluate([], [], enabled=False)
     if receipt.get("status") != "DISABLED":
