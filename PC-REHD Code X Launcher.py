@@ -1386,9 +1386,12 @@ INSTANCE_COPY_NATIVE_UNDO_LABELS = {
     "restore": "PC-REHD Restore Instance Copy",
 }
 MRL_BIND_NATIVE_UNDO_LABEL = "PC-REHD MRL Auto Texture Bind"
+SCENE_MATERIALS_NATIVE_UNDO_LABEL = "PC-REHD Scene Texture Material Repair"
 MESH_RENAME_NATIVE_UNDO_LABEL = "PC-REHD Mesh Rename"
 MESH_FILTER_NATIVE_UNDO_LABEL = "PC-REHD Mesh Filter"
 EXPORT_MAP2_NATIVE_UNDO_LABEL = "PC-REHD Collapse UV Map 2"
+IMPORT_MOD_NATIVE_UNDO_LABEL = "PC-REHD Import MOD"
+BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL = "PC-REHD Import Blender FBX"
 _MAX_BLENDER_FBX_LOD_GROUP_IDS = frozenset((0, 1, 2, 3, 4, 5, 6, 249, 252, 254, 255))
 _MAX_BLENDER_FBX_IMPORT_SUFFIX_RE = re.compile(
     r"(?i)_Import_?(?P<ordinal>[2-9]|[1-9]\d+)(?:_(?P<duplicate>[1-9]\d*))?$"
@@ -3673,6 +3676,12 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
     blender_toolbox_geometry = normalize_toolbox_geometry(
         source.get("blender_toolbox_geometry", "")
     )
+    # Older builds could save Tk's hidden staging coordinate (+0+0) as the
+    # Blender Toolbox position. Only a geometry captured from a visible
+    # Toolbox is trusted when that ambiguous coordinate is restored.
+    blender_toolbox_geometry_verified = bool(
+        source.get("blender_toolbox_geometry_verified", False)
+    )
     max_toolbox_visible = bool(
         source.get("max_toolbox_visible", source.get("toolbox_visible", False))
     )
@@ -3869,6 +3878,7 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
         "blender_toolbox_visible": blender_toolbox_visible,
         "max_toolbox_geometry": max_toolbox_geometry,
         "blender_toolbox_geometry": blender_toolbox_geometry,
+        "blender_toolbox_geometry_verified": blender_toolbox_geometry_verified,
         "scene_normals_visible": bool(source.get("scene_normals_visible", False)),
         "scene_normals_geometry": scene_normals_geometry,
         "scene_normals_dock_side": scene_normals_dock_side,
@@ -10768,6 +10778,7 @@ def _run_agent_compatibility_policy_guard() -> dict[str, Any]:
     if 'scene_data.get("nodes", [])[:scene_mesh_count]' in scene_normals_poll_source:
         violations.append("LauncherApp._poll_scene_normals:raw-geometry-plan-bypass")
     native_undo_source = source_for("_max_execute_with_native_undo")
+    dispatcher_source = " ".join(source_for("_execute_max_command").split())
     for token in (
         "with pymxs.undo(True, label)",
         "pending_error = exc",
@@ -10775,6 +10786,71 @@ def _run_agent_compatibility_policy_guard() -> dict[str, Any]:
     ):
         if token not in native_undo_source:
             violations.append(f"_max_execute_with_native_undo:missing-{token}")
+    max_material_repair_source = function_nodes.get(
+        "_max_apply_scene_material_normalization"
+    )
+    if max_material_repair_source is None:
+        violations.append("scene_material_repair:max-undo-operation-missing")
+    else:
+        max_material_repair_source_text = (
+            ast.get_source_segment(source_text, max_material_repair_source) or ""
+        )
+        for token in (
+            "_max_resolve_scene_interface_nodes(",
+            "_max_normalize_scene_materials(",
+        ):
+            if token not in max_material_repair_source_text:
+                violations.append(
+                    f"scene_material_repair:max-undo-operation-missing-{token}"
+                )
+        for forbidden in ("rt.gc(", "gc.collect("):
+            if forbidden in max_material_repair_source_text:
+                violations.append(
+                    f"scene_material_repair:max-undo-operation-forbidden-{forbidden}"
+                )
+    for forbidden in ("rt.gc(", "gc.collect("):
+        if forbidden in native_undo_source:
+            violations.append(
+                f"_max_execute_with_native_undo:forbidden-{forbidden}"
+            )
+    max_material_repair_dispatcher_route = (
+        "SCENE_MATERIALS_NATIVE_UNDO_LABEL, "
+        "_max_apply_scene_material_normalization, payload"
+    )
+    if max_material_repair_dispatcher_route not in dispatcher_source:
+        violations.append("scene_material_repair:max-native-undo-route-missing")
+    blender_worker_source = _blender_worker_template_source()
+    blender_material_repair_marker = (
+        "def _blender_normalize_scene_materials_with_undo("
+    )
+    blender_material_repair_start = blender_worker_source.find(
+        blender_material_repair_marker
+    )
+    if blender_material_repair_start < 0:
+        violations.append("scene_material_repair:blender-undo-operation-missing")
+    else:
+        blender_material_repair_end = blender_worker_source.find(
+            "\ndef ", blender_material_repair_start + 1
+        )
+        blender_material_repair_source = blender_worker_source[
+            blender_material_repair_start:
+            None if blender_material_repair_end < 0 else blender_material_repair_end
+        ]
+        for token in (
+            "_blender_normalize_scene_materials(",
+            "_record_blender_scene_undo(",
+            "BLENDER_SCENE_MATERIALS_UNDO_LABEL",
+            "normalized_slot_count",
+        ):
+            if token not in blender_material_repair_source:
+                violations.append(
+                    f"scene_material_repair:blender-undo-operation-missing-{token}"
+                )
+    if (
+        "return _blender_normalize_scene_materials_with_undo()"
+        not in blender_worker_source
+    ):
+        violations.append("scene_material_repair:blender-native-undo-route-missing")
     live_node_source = source_for("_max_is_live_scene_node")
     if "rt.isValidNode(node)" not in live_node_source:
         violations.append("_max_is_live_scene_node:missing-Max-liveness-authority")
@@ -11050,6 +11126,31 @@ def _run_agent_compatibility_policy_guard() -> dict[str, Any]:
         violations.append("_execute_max_command:forbidden-native-undo-around-blender-fbx-import")
     if "return _max_import_blender_fbx(payload)" not in dispatcher_source:
         violations.append("_execute_max_command:missing-direct-blender-fbx-import-route")
+    for function_name, label in (
+        ("_max_import_mod", "IMPORT_MOD_NATIVE_UNDO_LABEL"),
+        ("_max_import_blender_fbx", "BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL"),
+    ):
+        import_source = source_for(function_name)
+        begin_at = import_source.find(
+            f"_max_begin_native_fbx_import_undo(rt, {label})"
+        )
+        if begin_at < 0:
+            begin_at = import_source.find("_max_begin_native_fbx_import_undo(")
+        import_at = import_source.find("rt.importFile")
+        accept_at = import_source.find("_max_accept_native_fbx_import_undo")
+        cancel_at = import_source.find("_max_cancel_native_fbx_import_undo")
+        if begin_at < 0 or import_at < 0 or begin_at > import_at:
+            violations.append(
+                f"{function_name}:missing-native-fbx-undo-begin-before-import"
+            )
+        if accept_at < import_at:
+            violations.append(
+                f"{function_name}:missing-native-fbx-undo-accept-after-import"
+            )
+        if cancel_at < import_at:
+            violations.append(
+                f"{function_name}:missing-native-fbx-undo-cancel-after-import"
+            )
     import_start = dispatcher_source.find('if command == "import_mod":')
     import_selection_clear = dispatcher_source.find("rt.clearSelection()", import_start)
     import_focus = dispatcher_source.find("_max_focus_imported_model", import_start)
@@ -11060,6 +11161,44 @@ def _run_agent_compatibility_policy_guard() -> dict[str, Any]:
         or import_selection_clear > import_focus
     ):
         violations.append("_execute_max_command:missing-import-selection-handoff-clear")
+    focus_command_start = dispatcher_source.find('if command == "focus_viewport":')
+    import_route_source = dispatcher_source[
+        import_start:focus_command_start if focus_command_start > import_start else None
+    ]
+    focus_route_source = dispatcher_source[
+        focus_command_start if focus_command_start >= 0 else len(dispatcher_source):
+    ]
+    focus_wrapper_source = source_for("_max_focus_imported_model_without_undo")
+    viewport_undo_source = source_for("_max_viewport_undo_suppression")
+    for token in (
+        "with pymxs.undo(False):",
+        "theHold.DisableUndo()",
+        "theHold.enableUndo()",
+    ):
+        if token not in viewport_undo_source:
+            violations.append(
+                f"_max_viewport_undo_suppression:missing-{token}"
+            )
+    if "_max_viewport_undo_suppression(" not in focus_wrapper_source:
+        violations.append(
+            "_max_focus_imported_model_without_undo:missing-undo-suppression"
+        )
+    for route_name, route_source in (
+        ("import_mod", import_route_source),
+        ("focus_viewport", focus_route_source),
+    ):
+        if "_max_focus_imported_model_without_undo(" not in route_source:
+            violations.append(
+                f"_execute_max_command:{route_name}-bypasses-undo-free-focus-wrapper"
+            )
+        if "_max_focus_imported_model(" in route_source:
+            violations.append(
+                f"_execute_max_command:{route_name}-calls-raw-focus-implementation"
+            )
+    if "_max_viewport_undo_suppression(rt, clear_import_selection)" not in import_route_source:
+        violations.append(
+            "_execute_max_command:import-selection-clear-must-use-undo-suppression"
+        )
     auxiliary_fbx_import_source = source_for("_max_import_auxiliary_fbx")
     for token in (
         "previous_selection = _max_selection_handles(rt)",
@@ -13267,6 +13406,30 @@ def _max_runtime() -> Any:
     import pymxs
 
     return pymxs.runtime
+
+
+def _max_begin_native_fbx_import_undo(rt: Any, label: str) -> None:
+    """Start a super-hold before FBXIMP enters its nested plug-in transaction."""
+    if not str(label or "").strip():
+        raise ValueError("FBX import native Undo label is required")
+    # FBXIMP opens and accepts its own native Hold.  A normal Begin/Accept is
+    # split by that nested transaction; SuperBegin/SuperAccept groups the
+    # importer transaction into one user-visible Ctrl+Z step.
+    rt.execute("theHold.SuperBegin()")
+
+
+def _max_accept_native_fbx_import_undo(rt: Any, label: str) -> None:
+    """Commit the super-hold as one visible Undo history entry."""
+    text = str(label or "").strip()
+    if not text:
+        raise ValueError("FBX import native Undo label is required")
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("\r", " ").replace("\n", " ")
+    rt.execute(f'theHold.SuperAccept "{escaped}"')
+
+
+def _max_cancel_native_fbx_import_undo(rt: Any) -> None:
+    """Discard an unfinished native FBX import super-hold after failure."""
+    rt.execute("theHold.SuperCancel()")
 
 
 def _max_execute_with_native_undo(
@@ -18451,6 +18614,53 @@ def _max_focus_imported_model(
     })
 
 
+def _max_focus_imported_model_without_undo(
+    rt: Any,
+    imported_nodes: list[Any],
+    *,
+    excluded_names: set[str] | None = None,
+    restore_selection_handles: list[int] | None = None,
+) -> dict[str, Any]:
+    """Frame imported geometry without adding a newer Max Undo record."""
+    return _max_viewport_undo_suppression(
+        rt,
+        lambda: _max_focus_imported_model(
+            rt,
+            imported_nodes,
+            excluded_names=excluded_names,
+            restore_selection_handles=restore_selection_handles,
+        ),
+    )
+
+
+def _max_viewport_undo_suppression(
+    rt: Any,
+    operation: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    """Run visual/selection handoff code without creating a Max Undo step.
+
+    ``pymxs.undo(False)`` only suspends the Python context.  Max 2026 can still
+    record native selection and viewport commands unless the global Hold undo
+    switch is disabled for the same small scope.  The prior state is restored
+    even when the operation fails, so the import Hold remains the newest entry.
+    """
+    import pymxs
+
+    undo_was_disabled = bool(rt.IsUndoDisabled())
+    result: dict[str, Any] | None = None
+    with pymxs.undo(False):
+        if not undo_was_disabled:
+            rt.theHold.DisableUndo()
+        try:
+            result = operation()
+        finally:
+            if not undo_was_disabled:
+                rt.theHold.enableUndo()
+    if result is None:
+        raise RuntimeError("Max viewport handoff returned no receipt")
+    return result
+
+
 def _max_require_import_identity(rt: Any, node: Any, expectation: dict[str, Any]) -> None:
     name = str(getattr(node, "name", "") or "<unnamed>")
     expected_contract = str(expectation.get("contract_id", "") or "")
@@ -19100,14 +19310,16 @@ def _max_import_mod(payload: dict[str, Any]) -> dict[str, Any]:
     imported_nodes: list[Any] = []
     previous_settings: dict[str, Any] = {}
     settings_restored = False
+    native_undo_open = False
     try:
         # FBXIMP must remain outside pymxs.undo(). Max 2026 can invalidate
-        # pymxs MXSWrapper objects when the FBX plug-in is entered inside a
-        # Python undo transaction. The importer owns its native transaction;
-        # do not add a duplicate holdMaxFile snapshot around it.
+        # pymxs MXSWrapper objects inside a Python undo transaction. Use the
+        # native MaxScript Hold system immediately before and after import.
         if reset_scene:
             rt.resetMaxFile(rt.Name("noPrompt"))
         previous_settings = _max_configure_fbx_import(rt)
+        _max_begin_native_fbx_import_undo(rt, IMPORT_MOD_NATIVE_UNDO_LABEL)
+        native_undo_open = True
         imported = rt.importFile(str(fbx_path), rt.Name("noPrompt"), using=rt.FBXIMP)
         if not imported:
             raise RuntimeError("3ds Max FBX importer returned failure")
@@ -19151,11 +19363,14 @@ def _max_import_mod(payload: dict[str, Any]) -> dict[str, Any]:
         )
         if not post_undo_focus_handles:
             raise RuntimeError("Import validation returned no physical Mesh Handles for viewport focus")
+        _max_accept_native_fbx_import_undo(rt, IMPORT_MOD_NATIVE_UNDO_LABEL)
+        native_undo_open = False
         return {
             "action": "import_mod",
             "imported": True,
-            "native_undo": False,
-            "native_undo_reason": "fbx_importer_owns_native_transaction",
+            "native_undo": True,
+            "native_undo_label": IMPORT_MOD_NATIVE_UNDO_LABEL,
+            "native_undo_scope": "fbx_import_and_postprocess",
             "mod_path": str(payload.get("mod_path", "")),
             "source_sha256": expected_source_sha,
             "fbx_sha256": actual_fbx_sha,
@@ -19175,6 +19390,14 @@ def _max_import_mod(payload: dict[str, Any]) -> dict[str, Any]:
         }
     except Exception as exc:
         recovery_failures: list[str] = []
+        if native_undo_open:
+            try:
+                _max_cancel_native_fbx_import_undo(rt)
+            except Exception as undo_exc:
+                recovery_failures.append(
+                    f"FBX native Undo rollback failed: {undo_exc}"
+                )
+            native_undo_open = False
         if previous_settings and not settings_restored:
             try:
                 _max_restore_fbx_import(rt, previous_settings)
@@ -19464,8 +19687,13 @@ def _max_import_blender_fbx(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Original Blender FBX import was not authorized by the preprocessor")
     previous_settings: dict[str, Any] = {}
     settings_restored = False
+    native_undo_open = False
     try:
         previous_settings = _max_configure_fbx_import(rt)
+        _max_begin_native_fbx_import_undo(
+            rt, BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL
+        )
+        native_undo_open = True
         imported = rt.importFile(str(fbx_path), rt.Name("noPrompt"), using=rt.FBXIMP)
         if not imported:
             raise RuntimeError("3ds Max FBX importer returned failure")
@@ -19508,11 +19736,16 @@ def _max_import_blender_fbx(payload: dict[str, Any]) -> dict[str, Any]:
         _max_restore_fbx_import(rt, previous_settings)
         settings_restored = True
         rt.completeRedraw()
+        _max_accept_native_fbx_import_undo(
+            rt, BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL
+        )
+        native_undo_open = False
         return {
             "action": "import_blender_fbx",
             "imported": True,
-            "native_undo": False,
-            "native_undo_reason": "fbx_importer_owns_native_transaction",
+            "native_undo": True,
+            "native_undo_label": BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL,
+            "native_undo_scope": "fbx_import_only",
             "fbx_path": str(fbx_path),
             "max_process_id": os.getpid(),
             "imported_node_count": 0,
@@ -19521,14 +19754,23 @@ def _max_import_blender_fbx(payload: dict[str, Any]) -> dict[str, Any]:
             "viewport_focus": {"status": "NOT_REQUESTED_FILE_ONLY"},
         }
     except Exception as exc:
+        undo_failure = ""
+        if native_undo_open:
+            try:
+                _max_cancel_native_fbx_import_undo(rt)
+            except Exception as undo_exc:
+                undo_failure = f" | FBX native Undo rollback failed: {undo_exc}"
+            native_undo_open = False
         if previous_settings and not settings_restored:
             try:
                 _max_restore_fbx_import(rt, previous_settings)
                 settings_restored = True
             except Exception as restore_exc:
                 raise RuntimeError(
-                    f"{exc} | FBX parameter rollback also failed: {restore_exc}"
+                    f"{exc}{undo_failure} | FBX parameter rollback also failed: {restore_exc}"
                 ) from exc
+        if undo_failure:
+            raise RuntimeError(f"{exc}{undo_failure}") from exc
         raise
     finally:
         _max_release_transient_runtime(rt)
@@ -20457,6 +20699,25 @@ def _max_normalize_scene_materials(rt: Any, nodes: list[Any] | None = None) -> d
         "rows": rows[:512],
         "material_policy": "StandardMaterial+selfIllumAmount=100+specularLevel=0+glossiness=0+twoSided",
     }
+
+
+def _max_apply_scene_material_normalization(payload: dict[str, Any]) -> dict[str, Any]:
+    """Apply material repair inside the caller's native Max Undo transaction."""
+    rt = _max_runtime()
+    targets = _max_resolve_scene_interface_nodes(
+        rt,
+        payload,
+        require_mesh=True,
+    )
+    receipt = _max_normalize_scene_materials(rt, targets)
+    receipt.update(
+        {
+            "action": "normalize_scene_materials",
+            "max_process_id": os.getpid(),
+            "scene_interface_id": str(payload.get("scene_interface_id", "") or ""),
+        }
+    )
+    return receipt
 
 
 def _max_standard_texture_material(rt: Any, node_name: str, path: str) -> Any:
@@ -22541,17 +22802,29 @@ def _execute_max_command(command: str, payload: dict[str, Any]) -> dict[str, Any
             ),
         }
     if command == "import_mod":
-        # FBXIMP owns its native transaction. Do not place it inside
-        # pymxs.undo(), which can invalidate Max's MXSWrapper state on Max 2026.
-        result = _max_import_mod(payload)
+        # The import function owns a native MaxScript Hold transaction. Do not
+        # place FBXIMP inside pymxs.undo(), which can invalidate MXSWrapper
+        # state on Max 2026.
+        if bool(payload.get("_diagnostic_python_undo", False)):
+            result = _max_execute_with_native_undo(
+                IMPORT_MOD_NATIVE_UNDO_LABEL,
+                _max_import_mod,
+                payload,
+            )
+        else:
+            result = _max_import_mod(payload)
         # FBX import selects its created nodes internally. Clear that transient
         # selection before this command can hand control back to any Bucket or
         # Quick Select request; viewport framing below has its own temporary
         # selection scope and restores the explicit empty handoff state.
         try:
-            rt.clearSelection()
-            if list(rt.selection):
-                raise RuntimeError("FBX importer selection remained after clearSelection")
+            def clear_import_selection() -> dict[str, Any]:
+                rt.clearSelection()
+                if list(rt.selection):
+                    raise RuntimeError("FBX importer selection remained after clearSelection")
+                return {"status": "CLEARED"}
+
+            _max_viewport_undo_suppression(rt, clear_import_selection)
         except Exception as exc:
             raise RuntimeError(
                 "Import MOD could not clear the FBX import selection before handoff"
@@ -22591,7 +22864,7 @@ def _execute_max_command(command: str, payload: dict[str, Any]) -> dict[str, Any
                 _max_agent_viewport_execution_state(os.getpid())
             )
             if viewport_ready:
-                viewport_focus = _max_focus_imported_model(
+                viewport_focus = _max_focus_imported_model_without_undo(
                     rt,
                     focus_nodes,
                     excluded_names=bound_names,
@@ -22623,7 +22896,8 @@ def _execute_max_command(command: str, payload: dict[str, Any]) -> dict[str, Any
     if command == "import_blender_fbx":
         # The Launcher has already repaired a disposable FBX copy. This route
         # must not inspect, select, focus, rename, or re-parent Max scene nodes.
-        # The native FBX importer must not run inside pymxs.undo().
+        # Its native Hold transaction lives inside the import function, never
+        # inside pymxs.undo().
         return _max_import_blender_fbx(payload)
     if command == "export_embedded_fbx":
         return _max_export_embedded_fbx(payload)
@@ -22659,19 +22933,13 @@ def _execute_max_command(command: str, payload: dict[str, Any]) -> dict[str, Any
     if command == "manual_texture":
         return _max_manual_texture(payload)
     if command == "normalize_scene_materials":
-        targets = _max_resolve_scene_interface_nodes(
-            rt,
+        receipt = _max_execute_with_native_undo(
+            SCENE_MATERIALS_NATIVE_UNDO_LABEL,
+            _max_apply_scene_material_normalization,
             payload,
-            require_mesh=True,
         )
-        receipt = _max_normalize_scene_materials(rt, targets)
-        receipt.update(
-            {
-                "action": "normalize_scene_materials",
-                "max_process_id": os.getpid(),
-                "scene_interface_id": str(payload.get("scene_interface_id", "") or ""),
-            }
-        )
+        receipt["native_undo"] = True
+        receipt["native_undo_label"] = SCENE_MATERIALS_NATIVE_UNDO_LABEL
         return receipt
     if command == "import_auxiliary":
         return _max_import_auxiliary(payload)
@@ -22746,7 +23014,7 @@ def _execute_max_command(command: str, payload: dict[str, Any]) -> dict[str, Any
             "max_process_id": os.getpid(),
             "requested_node_count": len(raw_handles),
             "resolved_node_count": len(nodes),
-            "viewport_focus": _max_focus_imported_model(
+            "viewport_focus": _max_focus_imported_model_without_undo(
                 rt,
                 nodes,
                 excluded_names=excluded_names,
@@ -27133,6 +27401,7 @@ _SCENE_SNAPSHOT_SCHEMA = "pc-rehd-code-x-blender-scene-snapshot-v1"
 _SCENE_TRANSFER_CHUNK_BYTES = 4 * 1024 * 1024
 _SCENE_TRANSFER_MAX_COMPRESSED_BYTES = 96 * 1024 * 1024
 _SCENE_TRANSFER_MAX_RAW_BYTES = 192 * 1024 * 1024
+BLENDER_SCENE_MATERIALS_UNDO_LABEL = "PC-REHD Scene Texture Material Repair"
 _LOD_GROUP_IDS = frozenset((0, 1, 2, 3, 4, 5, 6, 249, 252, 254, 255))
 _LOD_NAME_RE = re.compile(r"(?i)_lodx(-?\d+)(?:_|$)")
 _IMPORT_SUFFIX_RE = re.compile(r"(?i)(?:_import_?\d+)?(?:\.\d{3})?$")
@@ -31306,6 +31575,17 @@ def _blender_normalize_scene_materials(objects=None):
     }
 
 
+def _blender_normalize_scene_materials_with_undo(objects=None):
+    """Normalize scene materials and record one native Blender Undo step."""
+    receipt = _blender_normalize_scene_materials(objects)
+    changed = int(receipt.get("normalized_slot_count", 0) or 0) > 0
+    return _record_blender_scene_undo(
+        receipt,
+        BLENDER_SCENE_MATERIALS_UNDO_LABEL,
+        changed=changed,
+    )
+
+
 def _blender_apply_mrl_material_bind(payload):
     """Apply only the MRL planner's Base Color binding to matching RE6 slots."""
     if str(payload.get("schema", "") or "") != "pc-rehd-blender-mrl-bind-v1":
@@ -34089,7 +34369,7 @@ class _BlenderWorker:
         if command == "scene.apply_manual_texture":
             return _blender_apply_manual_texture(payload)
         if command == "scene.normalize_texture_materials":
-            return _blender_normalize_scene_materials()
+            return _blender_normalize_scene_materials_with_undo()
         if command == "tool.texture_to_fbx":
             return _run_texture_to_fbx_tool(payload)
         if command == "tool.import_3dsmax_fbx":
@@ -51049,9 +51329,32 @@ class LauncherApp:
                 return False
             width = int(match.group("width"))
             height = int(match.group("height"))
+            live_x = int(window.winfo_x())
+            live_y = int(window.winfo_y())
             if preserve_position:
-                x = int(window.winfo_x())
-                y = int(window.winfo_y())
+                x = live_x
+                y = live_y
+                # A withdrawn/staging Tk Toplevel commonly reports +0+0 even
+                # after its saved or centered geometry has been scheduled.
+                # Preserve that planned position while resizing its contents.
+                requested = str(
+                    getattr(window, "_pc_rehd_requested_geometry", "") or ""
+                ).strip()
+                requested_match = TK_WINDOW_GEOMETRY_RE.fullmatch(requested)
+                state = str(
+                    getattr(window, "_pc_rehd_window_state", "") or ""
+                )
+                if requested_match is not None and (
+                    not bool(window.winfo_viewable())
+                    or state in {
+                        MANAGED_WINDOW_LAYOUT,
+                        MANAGED_WINDOW_STAGING,
+                        MANAGED_WINDOW_LAUNCHER_HIDDEN,
+                        MANAGED_WINDOW_FLOATING_HIDDEN,
+                    }
+                ):
+                    x = int(requested_match.group("x"))
+                    y = int(requested_match.group("y"))
             else:
                 x = int(match.group("x"))
                 y = int(match.group("y"))
@@ -51059,8 +51362,8 @@ class LauncherApp:
             current = (
                 int(window.winfo_width()),
                 int(window.winfo_height()),
-                x,
-                y,
+                live_x,
+                live_y,
             )
             if current != (width, height, x, y):
                 _set_themed_window_geometry(
@@ -62022,10 +62325,26 @@ class LauncherApp:
             normalized = ""
         page = self._toolbox_state_page(window)
         key = f"{page}_toolbox_geometry"
-        updates: dict[str, str] = {key: normalized}
+        updates: dict[str, Any] = {key: normalized}
         if page == "max":
             # Keep the legacy record as a MAX mirror for older Launcher builds.
             updates["toolbox_geometry"] = normalized
+        elif page == "blender":
+            verified = bool(
+                self.launcher_state.get(
+                    "blender_toolbox_geometry_verified", False
+                )
+            )
+            if not normalized:
+                verified = False
+            elif window is not None:
+                try:
+                    verified = bool(window.winfo_viewable()) and str(
+                        getattr(window, "_pc_rehd_window_state", "") or ""
+                    ) == MANAGED_WINDOW_VISIBLE
+                except (self.tk.TclError, TypeError, ValueError):
+                    pass
+            updates["blender_toolbox_geometry_verified"] = verified
         if all(self.launcher_state.get(name) == value for name, value in updates.items()):
             return
         self.launcher_state.update(updates)
@@ -62166,6 +62485,21 @@ class LauncherApp:
             or ""
         ).strip()
         match = TK_WINDOW_GEOMETRY_RE.fullmatch(saved_geometry)
+        if (
+            page == "blender"
+            and match is not None
+            and int(match.group("x")) == 0
+            and int(match.group("y")) == 0
+            and not bool(
+                self.launcher_state.get(
+                    "blender_toolbox_geometry_verified", False
+                )
+            )
+        ):
+            # Migrate the old hidden-Tk staging coordinate. It was never a
+            # visible user choice, so start this Toolbox at screen center.
+            self._persist_toolbox_geometry("", window=window)
+            match = None
         if match is None:
             self._center_toolbox_window(window, reset_size=True)
             return
