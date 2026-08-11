@@ -87554,6 +87554,10 @@ class _DearPyGuiLauncher:
         self.always_on_top = bool(self.state.get("always_on_top_enabled", True))
         self.log_lines: list[str] = []
         self._tags: dict[str, str] = {}
+        self._backend_root: Any | None = None
+        self._backend_app: LauncherApp | None = None
+        self._backend_pump_scheduled = False
+        self._source_dialog_tag = "pc_rehd_dpg_source_dialog"
 
     def tr(self, cn: str, en: str) -> str:
         return cn if self.language == "CN" else en
@@ -87615,13 +87619,118 @@ class _DearPyGuiLauncher:
         dpg.bind_theme(theme)
 
     def _dispatch(self, operation: str) -> None:
+        direct_handlers: dict[str, Callable[[], Any]] = {}
+        if operation == "import_mod":
+            direct_handlers[operation] = self._show_source_dialog
+        backend = self._ensure_backend()
+        if backend is not None:
+            direct_handlers.update(
+                {
+                    "launch_max": backend._launch_max,
+                    "switch_pid": backend._manual_switch_pid,
+                    "blender_mode": backend._activate_blender_mode,
+                    "export_mod": backend._request_mod_export,
+                }
+            )
+        direct_handler = direct_handlers.get(operation)
+        if direct_handler is not None:
+            try:
+                direct_handler()
+                self.log(f"{operation}: existing Launcher backend invoked")
+            except Exception as exc:
+                self.log(f"{operation}: backend failed: {type(exc).__name__}: {exc}")
+            return
         try:
             canonical = _canonical_operation_name(operation)
             _operation_required_domains(canonical)
         except (TypeError, ValueError, RuntimeError) as exc:
             self.log(f"{operation}: {exc}")
             return
-        self.log(f"{canonical}: dispatched through existing operation contract")
+        handlers: dict[str, Callable[[], Any]] = {}
+        if backend is not None:
+            handlers.update(
+                {
+                    "inspect_scene": backend._inspect_active,
+                }
+            )
+        handler = handlers.get(canonical)
+        if handler is None:
+            self.log(f"{canonical}: contract accepted; UI adapter has no visible action yet")
+            return
+        try:
+            handler()
+            self.log(f"{canonical}: existing Launcher backend invoked")
+        except Exception as exc:
+            self.log(f"{canonical}: backend failed: {type(exc).__name__}: {exc}")
+
+    def _ensure_backend(self) -> LauncherApp | None:
+        if self._backend_app is not None:
+            return self._backend_app
+        try:
+            import tkinter as tk
+
+            root = tk.Tk()
+            root.withdraw()
+            app = LauncherApp(
+                root,
+                persist_message_editor=True,
+                persist_launcher_state=True,
+            )
+            app._start_runtime_services()
+            self._backend_root = root
+            self._backend_app = app
+            self._schedule_backend_pump()
+            self.log("Existing Launcher backend connected")
+            return app
+        except Exception as exc:
+            self.log(f"Existing Launcher backend unavailable: {type(exc).__name__}: {exc}")
+            return None
+
+    def _schedule_backend_pump(self) -> None:
+        if self._backend_pump_scheduled or not self.dpg.is_dearpygui_running():
+            return
+        self._backend_pump_scheduled = True
+        self.dpg.set_frame_callback(self.dpg.get_frame_count() + 2, self._pump_backend)
+
+    def _pump_backend(self, _sender: int = 0, _data: Any = None) -> None:
+        self._backend_pump_scheduled = False
+        root = self._backend_root
+        if root is not None:
+            try:
+                root.update()
+            except Exception:
+                self._backend_root = None
+                self._backend_app = None
+        if self.dpg.is_dearpygui_running():
+            self._schedule_backend_pump()
+
+    def _show_source_dialog(self) -> None:
+        self._ensure_backend()
+        if not self.dpg.does_item_exist(self._source_dialog_tag):
+            with self.dpg.file_dialog(
+                tag=self._source_dialog_tag,
+                show=False,
+                callback=self._on_source_selected,
+                width=760,
+                height=520,
+            ):
+                self.dpg.add_file_extension(".mod", color=(120, 190, 255, 255))
+                self.dpg.add_file_extension(".newmod", color=(120, 190, 255, 255))
+                self.dpg.add_file_extension(".*")
+        self.dpg.show_item(self._source_dialog_tag)
+
+    def _on_source_selected(self, _sender: int, app_data: dict[str, Any]) -> None:
+        source = str(app_data.get("file_path_name", "") or "").strip()
+        backend = self._backend_app
+        if not source or backend is None:
+            return
+        workspace = backend._active_workspace()
+        if workspace is None:
+            self.log("Import requires an active MAX/Blender session")
+            return
+        backend._set_workspace_source_mod(workspace, Path(source))
+        backend._import_mod()
+        self.log(f"Import queued: {source}")
 
     def _panel_button(self, parent: str, label: str, operation: str) -> None:
         self.dpg.add_button(parent=parent, label=label, callback=lambda _s, _a, op=operation: self._dispatch(op))
@@ -87630,33 +87739,61 @@ class _DearPyGuiLauncher:
         dpg = self.dpg
         content = self.tag("content")
         with dpg.child_window(tag=content, parent=self._tags["root"], autosize_x=True, autosize_y=True, border=False):
-            with dpg.collapsing_header(label=self.tr("模型文件", "Model File"), default_open=True) as panel:
-                self._panel_button(panel, self.tr("导入 MOD", "Import Mod"), "auxiliary")
-                self._panel_button(panel, self.tr("导出到 MOD", "Export To Mod"), "export_mod")
-                for cn, en in (("导入法线", "Import Normals"), ("导入贴图", "Import Textures"), ("检查源文件", "Check Source"), ("导出 UV Map 2", "Export UV Map 2"), ("UV 半精度保护", "UV Half Safe"), ("日志模式", "Log Mode")):
-                    dpg.add_checkbox(parent=panel, label=self.tr(cn, en))
-            with dpg.collapsing_header(label="Mesh Filter", default_open=True) as panel:
-                dpg.add_input_text(parent=panel, label="Filter")
-                with dpg.group(horizontal=True, parent=panel):
-                    dpg.add_input_int(label="LOD", width=120)
-                    dpg.add_input_int(label="Material", width=120)
-                    dpg.add_input_int(label="FVF", width=120)
-                self._panel_button(panel, self.tr("选择全部", "Select All"), "inspect_scene")
-                self._panel_button(panel, self.tr("清除选择", "Clear Selection"), "health")
-            with dpg.collapsing_header(label="RE6", default_open=True) as panel:
-                for operation, cn, en in (("inspect_scene", "检查场景", "Inspect Scene"), ("scene_normals", "场景法线", "Scene Normals"), ("random_normals", "随机法线", "Random Normals"), ("auxiliary", "Python Bridge", "Python Bridge"), ("seam_weight", "接缝权重", "Seam Weight"), ("bone_tools", "骨骼工具", "Bone Tools")):
-                    self._panel_button(panel, self.tr(cn, en), operation)
-            with dpg.collapsing_header(label=self.tr("高级选项", "Advanced Options"), default_open=self.advanced) as panel:
-                dpg.add_input_text(parent=panel, label=self.tr("日志目录", "Log Directory"), default_value=str(DEFAULT_LOG_DIR), width=-1)
-                dpg.add_input_text(parent=panel, label=self.tr("长期缓存目录", "Long-term Cache Directory"), default_value=str(DEFAULT_LOG_DIR), width=-1)
-                self._panel_button(panel, self.tr("导出设置", "Export Settings"), "export_sets")
-                self._panel_button(panel, self.tr("工具箱", "Toolbox"), "toolbox")
+            with dpg.group(horizontal=True):
+                left = dpg.add_child_window(width=680, autosize_y=True, border=False)
+                right = dpg.add_child_window(width=300, autosize_y=True, border=False)
+            with dpg.group(parent=left):
+                with dpg.collapsing_header(label=self.tr("模型文件", "Model File"), default_open=True) as panel:
+                    self._panel_button(panel, self.tr("导入 MOD", "Import Mod"), "import_mod")
+                    self._panel_button(panel, self.tr("导出到 MOD", "Export To Mod"), "export_mod")
+                    for cn, en in (("导入法线", "Import Normals"), ("导入贴图", "Import Textures"), ("导入时重置场景", "Reset Scene on Import"), ("检查源文件", "Check Source"), ("导出 UV Map 2", "Export UV Map 2"), ("UV 半精度保护", "UV Half Safe"), ("日志模式", "Log Mode")):
+                        dpg.add_checkbox(parent=panel, label=self.tr(cn, en))
+                    dpg.add_text(self.tr("来源文件：未选择", "Source: none"), parent=panel)
+                with dpg.collapsing_header(label="RE6", default_open=True) as panel:
+                    with dpg.group(horizontal=True, parent=panel):
+                        self._panel_button(panel, self.tr("检查场景", "Inspect Scene"), "inspect_scene")
+                        self._panel_button(panel, self.tr("刷新", "Refresh"), "inspect_scene")
+                    dpg.add_text(self.tr("场景尚未同步", "Scene not inspected"), parent=panel)
+                    for operation, cn, en in (("scene_normals", "场景法线", "Scene Normals"), ("random_normals", "随机法线", "Random Normals"), ("auxiliary", "Python Bridge", "Python Bridge"), ("seam_weight", "接缝权重", "Seam Weight"), ("bone_tools", "骨骼工具", "Bone Tools")):
+                        self._panel_button(panel, self.tr(cn, en), operation)
+                with dpg.collapsing_header(label=self.tr("网格筛选", "Mesh Filtering"), default_open=True) as panel:
+                    dpg.add_checkbox(parent=panel, label=self.tr("隐藏退化面", "Hide degenerate"))
+                    dpg.add_checkbox(parent=panel, label=self.tr("隐藏 LOD 0", "Hide LOD 0"))
+                    with dpg.group(horizontal=True, parent=panel):
+                        dpg.add_combo(["", "LOD 0", "LOD 1", "LOD 2", "LOD 3"], label="LOD", width=145)
+                        dpg.add_combo(["", "Material 0", "Material 1"], label=self.tr("材质", "Material"), width=145)
+                    dpg.add_combo(["", "FVF 0", "FVF 1", "FVF 2"], label="Vertex FVF", parent=panel, width=-1)
+                with dpg.collapsing_header(label=self.tr("导出分组", "Export Buckets"), default_open=False) as panel:
+                    dpg.add_combo(["Position", "Normal", "UV", "Skin"], label=self.tr("Header 字段", "Header Field"), parent=panel, width=-1)
+                    for cn, en in (("Header 覆盖", "Mesh Header Override"), ("删除 Mesh", "Delete Meshes"), ("修改 Mesh", "Modified Meshes")):
+                        with dpg.group(horizontal=True, parent=panel):
+                            dpg.add_text(self.tr(cn, en))
+                            self._panel_button(panel, self.tr("清除", "Clear"), "health")
+            with dpg.group(parent=right):
+                dpg.add_text(self.tr("MAX 进程状态", "MAX Process Status"), color=(255, 183, 86, 255))
+                dpg.add_text(self.tr("未连接", "Not connected"))
+                self._panel_button(right, self.tr("启动 Max", "Launch Max"), "launch_max")
+                self._panel_button(right, self.tr("切换 PID", "Switch PID"), "switch_pid")
+                dpg.add_separator(parent=right)
+                dpg.add_checkbox(parent=right, label=self.tr("场景自动颜色", "Scene Auto Colors"))
+                self._panel_button(right, self.tr("工具箱", "Toolbox"), "toolbox")
+                self._panel_button(right, self.tr("重启脚本", "Restart Script"), "restart_script")
+                self._panel_button(right, self.tr("重置窗口大小", "Reset Window Size"), "reset_window")
+                dpg.add_separator(parent=right)
+                with dpg.collapsing_header(label=self.tr("高级选项", "Advanced Options"), parent=right, default_open=self.advanced) as panel:
+                    dpg.add_input_text(parent=panel, label=self.tr("日志目录", "Log Directory"), default_value=str(DEFAULT_LOG_DIR), width=-1)
+                    dpg.add_input_text(parent=panel, label=self.tr("长期缓存目录", "Long-term Cache Directory"), default_value=str(DEFAULT_LOG_DIR), width=-1)
+                    self._panel_button(panel, self.tr("导出设置", "Export Settings"), "export_sets")
+                    self._panel_button(panel, self.tr("Blender 工具箱", "Blender Toolbox"), "blender_toolbox")
 
     def _rebuild_content(self) -> None:
         content = self._tags.get("content")
         if content and self.dpg.does_item_exist(content):
             self.dpg.delete_item(content)
             self._build_content()
+            log_tag = self._tags.get("log")
+            if log_tag and self.dpg.does_item_exist(log_tag):
+                self.dpg.move_item(content, parent=self._tags["root"], before=log_tag)
 
     def _mode(self, _sender: int, value: str) -> None:
         self.mode = str(value)
@@ -87715,6 +87852,11 @@ def _run_dearpygui_ui() -> int:
         ui.dpg.start_dearpygui()
     finally:
         ui.save()
+        if ui._backend_root is not None:
+            try:
+                ui._backend_root.destroy()
+            except Exception:
+                pass
         ui.dpg.destroy_context()
     return 0
 
