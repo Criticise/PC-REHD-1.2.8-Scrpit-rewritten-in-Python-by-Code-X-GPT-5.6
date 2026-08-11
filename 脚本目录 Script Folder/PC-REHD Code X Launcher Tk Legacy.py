@@ -92,12 +92,6 @@ import zlib
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-
-_DEARPYGUI_VENDOR = (
-    Path(__file__).resolve().parent / "PY依赖 PY Libs" / "dearpygui_vendor"
-)
-if _DEARPYGUI_VENDOR.is_dir() and str(_DEARPYGUI_VENDOR) not in sys.path:
-    sys.path.insert(0, str(_DEARPYGUI_VENDOR))
 from typing import Any, Callable, Iterable
 
 
@@ -87531,196 +87525,66 @@ def _centered_window_position(
     )
 
 
-class _DearPyGuiLauncher:
-    """Dear PyGui presentation layer over the existing Launcher contracts."""
+def run_ui(*, initial_target_pid: int = 0) -> int:
+    import tkinter as tk
 
-    _FONT_CANDIDATES = (
-        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "msyh.ttc",
-        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "NotoSansSC-VF.ttf",
-        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "simhei.ttf",
+    initial_foreground_pid = int(initial_target_pid) if int(initial_target_pid) > 0 else _foreground_window_pid()
+    _set_windows_launcher_app_id()
+    root = tk.Tk()
+    setattr(root, "_pc_rehd_startup_publish_complete", False)
+    root.withdraw()
+    _mask_window_until_themed(root)
+    _capture_launcher_original_window_icon(root)
+    app = LauncherApp(
+        root,
+        initial_foreground_pid=initial_foreground_pid,
+    )
+    _apply_native_window_theme(root, dark=bool(getattr(app, "_theme_dark", False)))
+    root.update_idletasks()
+
+    minimum_width, minimum_height = root.minsize()
+    requested_geometry = app._main_window_requested_geometry
+    if (
+        requested_geometry is not None
+        and requested_geometry[0] == app._main_window_size_mode
+    ):
+        final_width = max(int(minimum_width), int(requested_geometry[1]))
+        final_height = max(int(minimum_height), int(requested_geometry[2]))
+    else:
+        final_width = max(int(minimum_width), int(root.winfo_width()))
+        final_height = max(int(minimum_height), int(root.winfo_height()))
+    desired_x, desired_y = _centered_window_position(
+        final_width,
+        final_height,
+        root.winfo_screenwidth(),
+        root.winfo_screenheight(),
     )
 
-    def __init__(self) -> None:
-        import dearpygui.dearpygui as dpg
+    dark = bool(getattr(app, "_theme_dark", False))
+    _set_themed_window_geometry(
+        root,
+        f"{final_width}x{final_height}+{desired_x}+{desired_y}",
+        dark=dark,
+    )
+    _prepare_native_window_theme_restore(root, dark=dark)
+    window_scheduler = _managed_window_scheduler(root)
+    if window_scheduler.publish_root(dark=dark):
+        app._launcher_window_state = LAUNCHER_WINDOW_VISIBLE
+    else:
+        def publish_after_mainloop_starts() -> None:
+            if window_scheduler.publish_root(dark=dark):
+                app._launcher_window_state = LAUNCHER_WINDOW_VISIBLE
 
-        self.dpg = dpg
-        self.state = _load_launcher_state(DEFAULT_LOG_DIR)
-        self.language = str(self.state.get("ui_language_preference", "") or "").upper()
-        if self.language not in {"CN", "EN"}:
-            self.language = _detect_system_ui_language()
-        self.mode = "BLENDER" if bool(self.state.get("blender_mode_enabled", False)) else "MAX"
-        self.advanced = bool(self.state.get("advanced_options_visible", True))
-        self.scaling = bool(self.state.get("scaling_mode_enabled", False))
-        self.always_on_top = bool(self.state.get("always_on_top_enabled", True))
-        self.log_lines: list[str] = []
-        self._tags: dict[str, str] = {}
-
-    def tr(self, cn: str, en: str) -> str:
-        return cn if self.language == "CN" else en
-
-    def tag(self, name: str) -> str:
-        value = f"pc_rehd_dpg_{name}"
-        self._tags[name] = value
-        return value
-
-    def log(self, message: str) -> None:
-        self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] {message}")
-        self.log_lines[:] = self.log_lines[-200:]
-        tag = self._tags.get("log")
-        if tag and self.dpg.does_item_exist(tag):
-            self.dpg.set_value(tag, "\n".join(self.log_lines))
-
-    def save(self) -> None:
-        self.state.update(
-            {
-                "ui_language_preference": self.language,
-                "blender_mode_enabled": self.mode == "BLENDER",
-                "advanced_options_visible": self.advanced,
-                "scaling_mode_enabled": self.scaling,
-                "always_on_top_enabled": self.always_on_top,
-            }
-        )
-        try:
-            _write_launcher_state(self.state, DEFAULT_LOG_DIR)
-        except (OSError, TypeError, ValueError) as exc:
-            self.log(f"Launcher state save failed: {exc}")
-
-    def _font(self) -> None:
-        path = next((item for item in self._FONT_CANDIDATES if item.is_file()), None)
-        if path is None:
-            self.log("微软雅黑字体未找到，使用默认字体")
-            return
-        with self.dpg.font_registry():
-            with self.dpg.font(str(path), 16) as font:
-                try:
-                    self.dpg.add_font_range_hint(self.dpg.mvFontRangeHint_Chinese_Full)
-                except (AttributeError, RuntimeError):
-                    pass
-        self.dpg.bind_font(font)
-        self.log(f"微软雅黑字体已加载: {path.name}")
-
-    def _theme(self) -> None:
-        dpg = self.dpg
-        with dpg.theme() as theme:
-            with dpg.theme_component(dpg.mvAll):
-                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (25, 27, 31, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (31, 34, 40, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (44, 48, 56, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_Button, (52, 86, 120, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (70, 113, 153, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (40, 68, 96, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_Text, (235, 238, 242, 255))
-                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 3)
-                dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 6, 5)
-        dpg.bind_theme(theme)
-
-    def _dispatch(self, operation: str) -> None:
-        try:
-            canonical = _canonical_operation_name(operation)
-            _operation_required_domains(canonical)
-        except (TypeError, ValueError, RuntimeError) as exc:
-            self.log(f"{operation}: {exc}")
-            return
-        self.log(f"{canonical}: dispatched through existing operation contract")
-
-    def _panel_button(self, parent: str, label: str, operation: str) -> None:
-        self.dpg.add_button(parent=parent, label=label, callback=lambda _s, _a, op=operation: self._dispatch(op))
-
-    def _build_content(self) -> None:
-        dpg = self.dpg
-        content = self.tag("content")
-        with dpg.child_window(tag=content, parent=self._tags["root"], autosize_x=True, autosize_y=True, border=False):
-            with dpg.collapsing_header(label=self.tr("模型文件", "Model File"), default_open=True) as panel:
-                self._panel_button(panel, self.tr("导入 MOD", "Import Mod"), "auxiliary")
-                self._panel_button(panel, self.tr("导出到 MOD", "Export To Mod"), "export_mod")
-                for cn, en in (("导入法线", "Import Normals"), ("导入贴图", "Import Textures"), ("检查源文件", "Check Source"), ("导出 UV Map 2", "Export UV Map 2"), ("UV 半精度保护", "UV Half Safe"), ("日志模式", "Log Mode")):
-                    dpg.add_checkbox(parent=panel, label=self.tr(cn, en))
-            with dpg.collapsing_header(label="Mesh Filter", default_open=True) as panel:
-                dpg.add_input_text(parent=panel, label="Filter")
-                with dpg.group(horizontal=True, parent=panel):
-                    dpg.add_input_int(label="LOD", width=120)
-                    dpg.add_input_int(label="Material", width=120)
-                    dpg.add_input_int(label="FVF", width=120)
-                self._panel_button(panel, self.tr("选择全部", "Select All"), "inspect_scene")
-                self._panel_button(panel, self.tr("清除选择", "Clear Selection"), "health")
-            with dpg.collapsing_header(label="RE6", default_open=True) as panel:
-                for operation, cn, en in (("inspect_scene", "检查场景", "Inspect Scene"), ("scene_normals", "场景法线", "Scene Normals"), ("random_normals", "随机法线", "Random Normals"), ("auxiliary", "Python Bridge", "Python Bridge"), ("seam_weight", "接缝权重", "Seam Weight"), ("bone_tools", "骨骼工具", "Bone Tools")):
-                    self._panel_button(panel, self.tr(cn, en), operation)
-            with dpg.collapsing_header(label=self.tr("高级选项", "Advanced Options"), default_open=self.advanced) as panel:
-                dpg.add_input_text(parent=panel, label=self.tr("日志目录", "Log Directory"), default_value=str(DEFAULT_LOG_DIR), width=-1)
-                dpg.add_input_text(parent=panel, label=self.tr("长期缓存目录", "Long-term Cache Directory"), default_value=str(DEFAULT_LOG_DIR), width=-1)
-                self._panel_button(panel, self.tr("导出设置", "Export Settings"), "export_sets")
-                self._panel_button(panel, self.tr("工具箱", "Toolbox"), "toolbox")
-
-    def _rebuild_content(self) -> None:
-        content = self._tags.get("content")
-        if content and self.dpg.does_item_exist(content):
-            self.dpg.delete_item(content)
-            self._build_content()
-
-    def _mode(self, _sender: int, value: str) -> None:
-        self.mode = str(value)
-        self._rebuild_content()
-        self.save()
-
-    def _language(self, _sender: int, value: str) -> None:
-        self.language = str(value)
-        self._rebuild_content()
-        self.save()
-
-    def _toggle_advanced(self, _sender: int, value: bool) -> None:
-        self.advanced = bool(value)
-        self._rebuild_content()
-        self.save()
-
-    def _toggle_scaling(self, _sender: int, value: bool) -> None:
-        self.scaling = bool(value)
-        self.save()
-
-    def _toggle_topmost(self, _sender: int, value: bool) -> None:
-        self.always_on_top = bool(value)
-        self.dpg.set_viewport_always_top(self.always_on_top)
-        self.save()
-
-    def build(self) -> None:
-        dpg = self.dpg
-        dpg.create_context()
-        self._theme()
-        dpg.create_viewport(title=APP_NAME, width=980, height=760, resizable=True)
-        self._font()
-        with dpg.window(tag=self.tag("root"), label=APP_NAME, no_collapse=True):
-            with dpg.group(horizontal=True):
-                dpg.add_text("PC-REHD Code X", color=(108, 181, 235, 255))
-                dpg.add_combo(["MAX", "BLENDER"], default_value=self.mode, width=120, callback=self._mode)
-                dpg.add_combo(["EN", "CN"], default_value=self.language, width=80, callback=self._language)
-                dpg.add_checkbox(label=self.tr("窗口置顶", "Always on top"), default_value=self.always_on_top, callback=self._toggle_topmost)
-                dpg.add_checkbox(label=self.tr("缩放模式", "Scaling Mode"), default_value=self.scaling, callback=self._toggle_scaling)
-                dpg.add_checkbox(label=self.tr("高级选项", "Advanced Options"), default_value=self.advanced, callback=self._toggle_advanced)
-            dpg.add_separator()
-            self._build_content()
-            dpg.add_separator()
-            dpg.add_text(self.tr("状态：空闲", "Status: Idle"))
-            dpg.add_input_text(tag=self.tag("log"), multiline=True, readonly=True, height=140, width=-1)
-        dpg.set_primary_window(self._tags["root"], True)
-        dpg.set_viewport_always_top(self.always_on_top)
-        dpg.setup_dearpygui()
-        dpg.show_viewport()
-        self.log("Dear PyGui 主界面已启动")
-
-
-def _run_dearpygui_ui() -> int:
-    ui = _DearPyGuiLauncher()
-    ui.build()
-    try:
-        ui.dpg.start_dearpygui()
-    finally:
-        ui.save()
-        ui.dpg.destroy_context()
+        root.after(0, publish_after_mainloop_starts)
+    app._apply_topmost()
+    app._start_runtime_services()
+    # The first frame is already published; warm reusable UI surfaces in
+    # short Tk slices so startup and pointer input never wait for the cache.
+    app._schedule_main_ui_preload()
+    # AI maintenance policy is explicit CLI work. Never run its fixed SHA table
+    # in a user's GUI session or let a stale review affect normal operations.
+    root.mainloop()
     return 0
-
-
-def run_ui(*, initial_target_pid: int = 0) -> int:
-    return _run_dearpygui_ui()
 
 
 def run_ui_smoke_test() -> dict[str, Any]:
