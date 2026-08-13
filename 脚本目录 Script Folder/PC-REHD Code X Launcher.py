@@ -92,12 +92,6 @@ import zlib
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-
-_DEARPYGUI_VENDOR = (
-    Path(__file__).resolve().parent / "PY依赖 PY Libs" / "dearpygui_vendor"
-)
-if _DEARPYGUI_VENDOR.is_dir() and str(_DEARPYGUI_VENDOR) not in sys.path:
-    sys.path.insert(0, str(_DEARPYGUI_VENDOR))
 from typing import Any, Callable, Iterable
 
 
@@ -2633,8 +2627,9 @@ MAIN_WINDOW_COLLAPSED_MIN_HEIGHT = 270
 MAIN_WINDOW_ADVANCED_ORIGINAL_SIZE = (792, 1039)
 MAIN_WINDOW_SCALING_MIN_SCALE = 0.08
 MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE = 0.32
+MAIN_WINDOW_SCALING_MIN_FONT_SCALE = 0.7
 MAIN_WINDOW_SCALING_MAX_SCALE = 1.35
-MAIN_UI_SCALING_LAYOUT_CACHE_VERSION = "scaling-layout-v3"
+MAIN_UI_SCALING_LAYOUT_CACHE_VERSION = "scaling-layout-v8-global-main-window"
 MAIN_RESIZE_GRIP_SIZE = 18
 MAIN_RESIZE_GRIP_EXPANDED_SIZE = 34
 MAIN_UI_PRELOAD_SLICE_MS = 6
@@ -3613,133 +3608,66 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
     if not isinstance(raw_window_sizes, dict):
         raw_window_sizes = {}
     main_window_sizes: dict[str, list[int]] = {}
-    for page in ("max", "blender"):
-        for language in ("CN", "EN"):
-            for mode in ("expanded", "collapsed"):
-                for scaling in (False, True):
-                    surface = f"main-{page}"
-                    if scaling:
-                        surface += "-scaling"
-                    cache_key = _ui_layout_cache_key(language, surface, mode)
-                    legacy_key = _ui_layout_cache_key(language, "main", mode)
-                    raw_size = (
-                        raw_window_sizes.get(cache_key, [])
-                        if scaling
-                        else raw_window_sizes.get(
-                            cache_key,
-                            raw_window_sizes.get(
-                                legacy_key, raw_window_sizes.get(mode, [])
-                            ),
-                        )
-                    )
-                    try:
-                        width, height = int(raw_size[0]), int(raw_size[1])
-                    except (IndexError, TypeError, ValueError):
-                        main_window_sizes[cache_key] = []
-                    else:
-                        main_window_sizes[cache_key] = (
-                            [width, height] if width > 0 and height > 0 else []
-                        )
+    for cache_key in ("main:normal:expanded", "main:normal:collapsed", "main:scaling"):
+        raw_size = raw_window_sizes.get(cache_key, [])
+        try:
+            width, height = int(raw_size[0]), int(raw_size[1])
+        except (IndexError, TypeError, ValueError):
+            main_window_sizes[cache_key] = []
+        else:
+            main_window_sizes[cache_key] = (
+                [width, height] if width > 0 and height > 0 else []
+            )
     raw_window_signatures = source.get("main_window_layout_signatures", {})
     if not isinstance(raw_window_signatures, dict):
         raw_window_signatures = {}
-    main_window_layout_signatures = {}
-    for page in ("max", "blender"):
-        for language in ("CN", "EN"):
-            for mode in ("expanded", "collapsed"):
-                for scaling in (False, True):
-                    surface = f"main-{page}"
-                    if scaling:
-                        surface += "-scaling"
-                    cache_key = _ui_layout_cache_key(language, surface, mode)
-                    legacy_key = _ui_layout_cache_key(language, "main", mode)
-                    main_window_layout_signatures[cache_key] = str(
-                        (
-                            raw_window_signatures.get(cache_key, "")
-                            if scaling
-                            else raw_window_signatures.get(
-                                cache_key,
-                                raw_window_signatures.get(
-                                    legacy_key, raw_window_signatures.get(mode, "")
-                                ),
-                            )
-                        )
-                        or ""
-                    )
+    main_window_layout_signatures = {
+        cache_key: str(raw_window_signatures.get(cache_key, "") or "")
+        for cache_key in ("main:normal:expanded", "main:normal:collapsed", "main:scaling")
+    }
 
     raw_scaling_layout_cache = source.get("main_ui_scaling_layout_cache", {})
     if not isinstance(raw_scaling_layout_cache, dict):
         raw_scaling_layout_cache = {}
     main_ui_scaling_layout_cache: dict[str, dict[str, Any]] = {}
-    for page in ("max", "blender"):
-        for language in ("CN", "EN"):
-            for mode in ("expanded", "collapsed"):
-                cache_key = _ui_layout_cache_key(
-                    language, f"main-{page}-scaling", mode
-                )
-                raw_entry = raw_scaling_layout_cache.get(cache_key, {})
-                if not isinstance(raw_entry, dict):
-                    continue
-                try:
-                    cached_width = int(raw_entry.get("width", 0) or 0)
-                    cached_height = int(raw_entry.get("height", 0) or 0)
-                    spacing_scale = float(
-                        raw_entry.get("spacing_scale", 1.0) or 1.0
-                    )
-                    widget_scale = float(
-                        raw_entry.get("widget_scale", 1.0) or 1.0
-                    )
-                except (TypeError, ValueError):
-                    continue
-                if (
-                    cached_width <= 0
-                    or cached_height <= 0
-                    or not math.isfinite(spacing_scale)
-                    or not math.isfinite(widget_scale)
-                    or not (
-                        MAIN_WINDOW_SCALING_MIN_SCALE
-                        <= spacing_scale
-                        <= MAIN_WINDOW_SCALING_MAX_SCALE
-                    )
-                    or not (
-                        MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE
-                        <= widget_scale
-                        <= MAIN_WINDOW_SCALING_MAX_SCALE
-                    )
-                ):
-                    continue
-                main_ui_scaling_layout_cache[cache_key] = {
+    unified_key = "main:scaling"
+    raw_entry = raw_scaling_layout_cache.get(unified_key, {})
+    if isinstance(raw_entry, dict):
+        try:
+            cached_width = int(raw_entry.get("width", 0) or 0)
+            cached_height = int(raw_entry.get("height", 0) or 0)
+            spacing_scale = float(raw_entry.get("spacing_scale", 1.0) or 1.0)
+            widget_scale = float(raw_entry.get("widget_scale", 1.0) or 1.0)
+            font_scale = float(raw_entry.get("font_scale", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if (
+                cached_width > 0
+                and cached_height > 0
+                and math.isfinite(spacing_scale)
+                and math.isfinite(widget_scale)
+                and math.isfinite(font_scale)
+                and MAIN_WINDOW_SCALING_MIN_SCALE <= spacing_scale <= MAIN_WINDOW_SCALING_MAX_SCALE
+                and MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE <= widget_scale <= MAIN_WINDOW_SCALING_MAX_SCALE
+                and MAIN_WINDOW_SCALING_MIN_FONT_SCALE <= font_scale <= MAIN_WINDOW_SCALING_MAX_SCALE
+                and str(raw_entry.get("signature", "") or "") == MAIN_UI_SCALING_LAYOUT_CACHE_VERSION
+            ):
+                main_ui_scaling_layout_cache[unified_key] = {
                     "width": cached_width,
                     "height": cached_height,
                     "spacing_scale": spacing_scale,
                     "widget_scale": widget_scale,
-                    "signature": str(raw_entry.get("signature", "") or ""),
+                    "font_scale": font_scale,
+                    "signature": MAIN_UI_SCALING_LAYOUT_CACHE_VERSION,
                 }
     raw_window_default_modes = source.get("main_window_default_modes", {})
     if not isinstance(raw_window_default_modes, dict):
         raw_window_default_modes = {}
-    main_window_default_modes = {}
-    for page in ("max", "blender"):
-        for language in ("CN", "EN"):
-            for mode in ("expanded", "collapsed"):
-                for scaling in (False, True):
-                    surface = f"main-{page}"
-                    if scaling:
-                        surface += "-scaling"
-                    cache_key = _ui_layout_cache_key(language, surface, mode)
-                    legacy_key = _ui_layout_cache_key(language, "main", mode)
-                    main_window_default_modes[cache_key] = bool(
-                        (
-                            raw_window_default_modes.get(cache_key, False)
-                            if scaling
-                            else raw_window_default_modes.get(
-                                cache_key,
-                                raw_window_default_modes.get(
-                                    legacy_key, raw_window_default_modes.get(mode, False)
-                                ),
-                            )
-                        )
-                    )
+    main_window_default_modes = {
+        cache_key: bool(raw_window_default_modes.get(cache_key, False))
+        for cache_key in ("main:normal:expanded", "main:normal:collapsed", "main:scaling")
+    }
     try:
         export_sets_scroll_position = float(
             source.get("export_sets_scroll_position", 0.0) or 0.0
@@ -3969,30 +3897,12 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
             "blender_mode_restore_advanced_visible", advanced_options_visible
         )
     )
-    max_scaling_mode_enabled = bool(
-        source.get(
-            "max_scaling_mode_enabled",
-            source.get("scaling_mode_enabled", False),
-        )
+    # Scaling Mode has one explicit state for the Launcher main window.
+    # Old MAX/Blender/language records are deliberately ignored: re-reading
+    # them makes a retired page-specific layout reappear after a restart.
+    main_window_scaling_mode_enabled = bool(
+        source.get("main_window_scaling_mode_enabled", False)
     )
-    blender_scaling_mode_enabled = bool(
-        source.get("blender_scaling_mode_enabled", False)
-    )
-    raw_scaling_mode_enabled_by_surface = source.get(
-        "scaling_mode_enabled_by_surface", {}
-    )
-    if not isinstance(raw_scaling_mode_enabled_by_surface, dict):
-        raw_scaling_mode_enabled_by_surface = {}
-    scaling_mode_enabled_by_surface = {}
-    for page, fallback in (
-        ("max", max_scaling_mode_enabled),
-        ("blender", blender_scaling_mode_enabled),
-    ):
-        for language in ("CN", "EN"):
-            surface = f"{page}:{language}"
-            scaling_mode_enabled_by_surface[surface] = bool(
-                raw_scaling_mode_enabled_by_surface.get(surface, fallback)
-            )
     # This is a per-Launcher safety switch. A new Launcher run always restores
     # automatic repair; a one-time stop is stored beside Blender's startup bridge.
     blender_fbx_hierarchy_auto_repair_enabled = True
@@ -4027,10 +3937,7 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
         "blender_mode_restore_advanced_visible": (
             blender_mode_restore_advanced_visible
         ),
-        "scaling_mode_enabled": max_scaling_mode_enabled,
-        "max_scaling_mode_enabled": max_scaling_mode_enabled,
-        "blender_scaling_mode_enabled": blender_scaling_mode_enabled,
-        "scaling_mode_enabled_by_surface": scaling_mode_enabled_by_surface,
+        "main_window_scaling_mode_enabled": main_window_scaling_mode_enabled,
         "blender_fbx_hierarchy_auto_repair_enabled": (
             blender_fbx_hierarchy_auto_repair_enabled
         ),
@@ -8786,6 +8693,7 @@ def _run_ui_quality_policy_guard() -> dict[str, Any]:
         "_toggle_collapsible_section": (
             "self._reflow_left_sections(flush_layout=False)",
             "self._refresh_main_viewport_layout()",
+            "self._settle_scaling_main_viewport_layout()",
         ),
         "_toggle_compact_mode_panel": (
             "self._reflow_left_sections(flush_layout=False)",
@@ -8795,6 +8703,8 @@ def _run_ui_quality_policy_guard() -> dict[str, Any]:
             "self._scaling_mode_enabled",
             "self._fit_main_window_to_content(",
             "self._apply_main_window_geometry(",
+            "self._settle_scaling_main_viewport_layout(",
+            "self._enforce_scaling_main_page_minimum(",
         ),
         "_apply_advanced_visibility": (
             "self._schedule_main_window_geometry_commit(",
@@ -21771,6 +21681,8 @@ def _bucket_identity_digest(max_process_id: int, rows: list[dict[str, Any]]) -> 
                 row.get("source_scene_node_handle", row.get("scene_node_handle", 0)) or 0
             ),
             "scene_node": str(row.get("scene_node", "") or ""),
+            "same_name_ordinal": int(row.get("same_name_ordinal", 0) or 0),
+            "same_name_count": int(row.get("same_name_count", 1) or 1),
             "mesh_slot": int(row.get("mesh_slot", 0) or 0),
             "mesh_slot_basis": str(row.get("mesh_slot_basis", "") or ""),
             "physical_mesh_slot": int(row.get("physical_mesh_slot", 0) or 0),
@@ -21904,6 +21816,13 @@ def _max_bucket_identity_receipt(
         auto_header_only = bool(row.get("auto_header_only", False))
         source_passthrough = bool(row.get("source_passthrough", False))
         source_fallback_reason = str(row.get("source_fallback_reason", "") or "")
+        same_name_count = positive_int(row.get("same_name_count")) or 1
+        same_name_ordinal = positive_int(row.get("same_name_ordinal"))
+        if same_name_ordinal >= same_name_count:
+            raise ValueError(
+                f"Max Handle {handle} has invalid same-name identity "
+                f"{same_name_ordinal}/{same_name_count}"
+            )
         live_row = dict(row)
         live_row.update(
             {
@@ -21911,6 +21830,8 @@ def _max_bucket_identity_receipt(
                 "scene_node": live_name,
                 "source_scene_node_handle": handle,
                 "scene_node_handle": handle,
+                "same_name_ordinal": same_name_ordinal,
+                "same_name_count": same_name_count,
                 "mesh_slot": mesh_slot,
                 "mesh_slot_basis": str(slot_resolution["mesh_slot_basis"]),
                 "physical_mesh_slot": physical_slot or None,
@@ -24982,6 +24903,841 @@ def _restore_tk_grab_after_map(window: Any) -> None:
         return
 
 
+@dataclass(frozen=True, slots=True)
+class TtkUiSurface:
+    """One existing Tk/TTK surface owned by the central UI scheduler."""
+
+    surface_id: str
+    window: str
+    role: str
+    widget: Any
+    widget_attribute: str
+    description: str
+    state_tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TtkUiSurfaceSpec:
+    """Fixed maintenance entry for a reachable TTK page, tool, or dialog."""
+
+    surface_id: str
+    window: str
+    role: str
+    widget_attribute: str
+    owner_type: str
+    builder_name: str
+    description: str
+    state_tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TtkUiBehaviorSpec:
+    """One layout, input, scroll, or overlay mechanism owned by the control plane."""
+
+    behavior_id: str
+    category: str
+    owner_type: str
+    method_names: tuple[str, ...]
+    description: str
+    state_tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TtkUiToplevelFactorySpec:
+    """One exact Toplevel creation source mapped back to its UI surface."""
+
+    factory_id: str
+    owner_type: str
+    method_name: str
+    surface_id: str
+    description: str
+    state_tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TtkModelOptionRowSpec:
+    """One standard Model File checkbutton row built by the UI control plane."""
+
+    key: str
+    text_cn: str
+    text_en: str
+    variable_attribute: str
+    command_name: str
+    row: int
+    control_attribute: str = ""
+    help_topic: str = ""
+    help_attribute: str = ""
+    columnspan: int = 1
+    accessory_text: str = ""
+    accessory_command_name: str = ""
+
+
+def _ttk_ui_surface_spec(
+    surface_id: str,
+    window: str,
+    role: str,
+    widget_attribute: str,
+    owner_type: str,
+    builder_name: str,
+    description: str,
+    *state_tags: str,
+) -> TtkUiSurfaceSpec:
+    return TtkUiSurfaceSpec(
+        surface_id=surface_id,
+        window=window,
+        role=role,
+        widget_attribute=widget_attribute,
+        owner_type=owner_type,
+        builder_name=builder_name,
+        description=description,
+        state_tags=tuple(state_tags),
+    )
+
+
+def _ttk_ui_behavior_spec(
+    behavior_id: str,
+    category: str,
+    owner_type: str,
+    description: str,
+    method_names: tuple[str, ...],
+    *state_tags: str,
+) -> TtkUiBehaviorSpec:
+    return TtkUiBehaviorSpec(
+        behavior_id=behavior_id,
+        category=category,
+        owner_type=owner_type,
+        method_names=method_names,
+        description=description,
+        state_tags=tuple(state_tags),
+    )
+
+
+def _ttk_ui_toplevel_factory_spec(
+    factory_id: str,
+    owner_type: str,
+    method_name: str,
+    surface_id: str,
+    description: str,
+    *state_tags: str,
+) -> TtkUiToplevelFactorySpec:
+    return TtkUiToplevelFactorySpec(
+        factory_id=factory_id,
+        owner_type=owner_type,
+        method_name=method_name,
+        surface_id=surface_id,
+        description=description,
+        state_tags=tuple(state_tags),
+    )
+
+
+# TTK UI CONTROL PLANE
+#
+# This is the single maintenance map for every reachable TTK UI entry.  New
+# pages, tools, dialogs, or generic dialog types must be declared here before
+# their builder is changed.  The scheduler resolves source locations at runtime
+# so a human description or screenshot can be routed here without repository
+# searching or stale handwritten line numbers.
+TTK_UI_SURFACE_CATALOG: dict[str, TtkUiSurfaceSpec] = {
+    spec.surface_id: spec
+    for spec in (
+        _ttk_ui_surface_spec("main.runtime_root", "main", "root", "", "module", "run_ui", "Launcher root-window creation and application startup.", "all-modes"),
+        _ttk_ui_surface_spec("main.viewport", "main", "viewport", "main_viewport_canvas", "LauncherApp", "_build_ui", "Main content viewport and scroll surface.", "all-modes"),
+        _ttk_ui_surface_spec("main.variables", "main", "state", "", "LauncherApp", "_build_variables", "Main-page Tk variable and callback bindings.", "all-modes"),
+        _ttk_ui_surface_spec("main.collapsible_group", "main", "component", "", "LauncherApp", "_build_collapsible_group", "Reusable main-page collapsible group shell.", "all-modes"),
+        _ttk_ui_surface_spec("main.toolbar", "main", "toolbar", "toolbar", "LauncherApp", "_build_toolbar", "Process selection and global Launcher actions.", "all-modes"),
+        _ttk_ui_surface_spec("main.model_file", "main", "group", "model_group", "LauncherApp", "_build_ui", "Model import, export, and model option controls.", "all-modes", "collapsible"),
+        _ttk_ui_surface_spec("main.model_options", "main", "component", "", "LauncherApp", "_build_model_option_rows", "Central Model File option-row builder and callback contracts.", "all-modes"),
+        _ttk_ui_surface_spec("main.rehd", "main", "area", "right_area", "LauncherApp", "_build_rehd_groups", "REHD auxiliary files, fixes, material binding, and log controls.", "advanced"),
+        _ttk_ui_surface_spec("main.mesh_rename", "main", "group", "rename_group", "LauncherApp", "_build_mesh_rename_group", "Selected mesh rename controls and history actions.", "all-modes", "collapsible"),
+        _ttk_ui_surface_spec("main.bridge", "main", "status", "status_group", "LauncherApp", "_build_bridge_group", "Operation status and progress indicator within Model File.", "all-modes"),
+        _ttk_ui_surface_spec("main.bone_tools", "main", "group", "bone_edit_group", "LauncherApp", "_build_bone_group", "Bone edit and advanced scene tool area.", "advanced"),
+        _ttk_ui_surface_spec("main.mesh_filter", "main", "group", "filter_group", "LauncherApp", "_build_mesh_filter_group", "Mesh visibility and LOD/material/FVF filtering controls.", "all-modes", "collapsible"),
+        _ttk_ui_surface_spec("main.footer", "main", "footer", "footer_frame", "LauncherApp", "_build_footer_controls", "Advanced toggle, language controls, and compact-mode controls.", "all-modes"),
+        _ttk_ui_surface_spec("main.advanced_toggle", "main", "control", "advanced_toggle", "LauncherApp", "_build_footer_controls", "Switches the main window between advanced and compact pages.", "all-modes"),
+        _ttk_ui_surface_spec("dialog.export_sets.scene_panel", "dialog.export_sets", "panel", "", "LauncherApp", "_build_scene_panel", "Export Sets scene selection panel.", "managed"),
+        _ttk_ui_surface_spec("dialog.export_sets.bucket_panel", "dialog.export_sets", "panel", "", "LauncherApp", "_build_bucket_panel", "Export Sets bucket selection panel.", "managed"),
+        _ttk_ui_surface_spec("tool.blender_node_map.data", "tool.blender_node_map", "data-view", "", "LauncherApp", "_build_and_apply_blender_node_map", "Blender node-map data view builder.", "blender", "managed"),
+        _ttk_ui_surface_spec("popup.toolbar_process_dropdown", "popup.toolbar_process", "menu", "toolbar_process_dropdown_window", "LauncherApp", "_show_toolbar_process_dropdown", "Toolbar process selection dropdown.", "managed"),
+        _ttk_ui_surface_spec("popup.github_update_title_click_surface", "popup.github_update", "transparent-hit-target", "_github_update_click_surface", "LauncherApp", "_sync_github_update_title_click_surface", "Native-caption update reminder click surface.", "managed", "transient"),
+        _ttk_ui_surface_spec("popup.main_resize_grip", "popup.main_resize", "transparent-hit-target", "main_resize_grip", "LauncherApp", "_build_ui", "Invisible lower-right main-window resize hit surface.", "all-modes", "transient"),
+        _ttk_ui_surface_spec("popup.blender_hierarchy_message", "popup.blender_hierarchy", "notice", "blender_hierarchy_message_window", "LauncherApp", "_build_toolbar", "Blender hierarchy repair status message overlay.", "blender", "managed", "transient"),
+        _ttk_ui_surface_spec("popup.rename_value_history", "popup.rename_history", "menu", "rename_value_history_window", "LauncherApp", "_ensure_rename_value_history_dropdown", "Rename-value history dropdown.", "managed", "transient"),
+        _ttk_ui_surface_spec("popup.floating_ball", "popup.floating_ball", "floating-ball", "floating_ball_window", "LauncherApp", "_ensure_floating_ball_window", "Launcher floating-ball window.", "managed", "transient"),
+        _ttk_ui_surface_spec("popup.blender_compact_reference_floating_ball", "popup.blender_compact_reference", "floating-ball", "", "LauncherApp", "_ensure_blender_compact_name_reference_floating_ball", "Blender node-reference floating-ball window.", "blender", "managed", "transient"),
+        _ttk_ui_surface_spec("dialog.software_restart_required", "dialog.choice", "dialog", "", "LauncherApp", "_show_software_restart_required_notice", "Software restart-required notice."),
+        _ttk_ui_surface_spec("dialog.legacy_export_notice", "dialog.legacy_export", "notice", "_legacy_export_notices", "LauncherApp", "_show_legacy_export_notice", "Legacy export advisory notice.", "max"),
+        _ttk_ui_surface_spec("dialog.export_sets", "dialog.export_sets", "dialog", "export_sets_window", "LauncherApp", "_show_export_sets", "Export Sets configuration window.", "managed"),
+        _ttk_ui_surface_spec("dialog.bucket_help", "dialog.choice", "dialog", "", "LauncherApp", "_show_bucket_help", "Export bucket help dialog."),
+        _ttk_ui_surface_spec("dialog.blender_name_repair", "dialog.blender_name_repair", "dialog", "blender_max_fbx_name_repair_window", "LauncherApp", "_show_blender_max_fbx_name_repair_dialog", "Blender Max-FBX name repair dialog.", "blender", "managed"),
+        _ttk_ui_surface_spec("dialog.blender_hierarchy_recovery", "dialog.blender_hierarchy_recovery", "dialog", "blender_fbx_hierarchy_recovery_window", "LauncherApp", "_show_blender_fbx_hierarchy_recovery_dialog", "Blender FBX hierarchy recovery dialog.", "blender", "managed"),
+        _ttk_ui_surface_spec("popup.mesh_rename_failure", "popup.mesh_rename_failure", "notice", "mesh_rename_failure_notice", "LauncherApp", "_show_mesh_rename_failure_notice", "Mesh rename failure notice.", "managed"),
+        _ttk_ui_surface_spec("popup.rename_selection", "popup.rename_selection", "notice", "rename_selection_notice_window", "LauncherApp", "_show_rename_selection_notice", "Mesh rename selection notice.", "managed"),
+        _ttk_ui_surface_spec("toolbox.main", "toolbox.max", "toolbox", "toolbox_window", "LauncherApp", "_show_toolbox", "3ds Max scene and RE6 utility toolbox.", "max", "managed"),
+        _ttk_ui_surface_spec("toolbox.blender", "toolbox.blender", "toolbox", "blender_toolbox_window", "LauncherApp", "_show_blender_toolbox", "Blender scene and RE6 utility toolbox.", "blender", "managed"),
+        _ttk_ui_surface_spec("tool.blender_node_map", "tool.blender_node_map", "tool", "blender_node_map_window", "LauncherApp", "_show_blender_node_map", "Blender RE6 node-map viewer.", "blender", "managed"),
+        _ttk_ui_surface_spec("tool.blender_compact_reference", "tool.blender_compact_reference", "tool", "blender_compact_name_reference_window", "LauncherApp", "_show_blender_compact_name_reference", "Blender compact name reference.", "blender", "managed"),
+        _ttk_ui_surface_spec("tool.blender_compact_reference_legacy", "tool.blender_compact_reference", "tool", "blender_compact_name_reference_window", "LauncherApp", "_show_blender_compact_name_reference_legacy", "Legacy Blender compact name reference entry.", "blender", "managed"),
+        _ttk_ui_surface_spec("tool.instance_copy", "tool.instance_copy", "tool", "instance_copy_window", "LauncherApp", "_show_instance_copy_tool", "Max scene instance-copy tool.", "max", "managed"),
+        _ttk_ui_surface_spec("tool.seam_weight", "tool.seam_weight", "exclusive-tool", "seam_window", "LauncherApp", "_show_seam_weight_tool", "Seam Weight Unify tool and recorded selection controls.", "max", "managed", "exclusive"),
+        _ttk_ui_surface_spec("dialog.seam_error", "dialog.choice", "dialog", "", "LauncherApp", "_show_seam_error", "Seam Weight tool error dialog."),
+        _ttk_ui_surface_spec("tool.message_editor", "tool.message_editor", "tool", "message_editor_window", "LauncherApp", "_show_message_editor", "Persistent Launcher message editor.", "managed"),
+        _ttk_ui_surface_spec("tool.scene_normals", "tool.scene_normals", "monitor", "scene_normals_window", "LauncherApp", "_show_scene_normals_monitor", "Selected and full-scene normal status monitor.", "max", "managed", "non-modal"),
+        _ttk_ui_surface_spec("dialog.script_logic_chain", "dialog.choice", "dialog", "", "LauncherApp", "_show_script_logic_chain", "Script logic-chain information dialog."),
+        _ttk_ui_surface_spec("dialog.manual_texture_history", "dialog.manual_texture_history", "dialog", "manual_texture_history_window", "LauncherApp", "_show_manual_texture_path_history", "Manual texture path history dialog.", "managed"),
+        _ttk_ui_surface_spec("dialog.help", "dialog.choice", "dialog", "", "LauncherApp", "_show_help", "Contextual help dialog."),
+        _ttk_ui_surface_spec("dialog.unskinned_mesh_notice", "dialog.choice", "dialog", "", "LauncherApp", "_show_unskinned_mesh_edit_export_notice", "Unskinned Mesh export advisory."),
+        _ttk_ui_surface_spec("dialog.fix_notice", "dialog.choice", "dialog", "", "LauncherApp", "_show_fix_notice", "Compatibility-fix advisory."),
+        _ttk_ui_surface_spec("dialog.import_receipt_error", "dialog.choice", "dialog", "", "LauncherApp", "_show_import_receipt_error", "Import receipt failure dialog."),
+        _ttk_ui_surface_spec("dialog.error", "dialog.choice", "dialog", "", "LauncherApp", "_show_error", "General Launcher error dialog."),
+        _ttk_ui_surface_spec("dialog.nonstandard_export_mesh", "dialog.nonstandard_export_mesh", "dialog", "", "LauncherApp", "_show_nonstandard_re6_export_mesh_dialog", "Nonstandard RE6 export mesh dialog.", "managed"),
+        _ttk_ui_surface_spec("dialog.check_source_advisory", "dialog.choice", "dialog", "", "LauncherApp", "_show_check_source_advisory_notice", "Source file advisory dialog."),
+        _ttk_ui_surface_spec("dialog.skin_influence", "dialog.choice", "dialog", "", "LauncherApp", "_show_skin_influence_processing_notice", "Skin influence processing notice."),
+        _ttk_ui_surface_spec("dialog.fvf_weight_capacity", "dialog.choice", "dialog", "", "LauncherApp", "_show_fvf_weight_capacity_notice", "FVF weight capacity notice."),
+        _ttk_ui_surface_spec("dialog.mesh_slot_limit", "dialog.mesh_slot_limit", "dialog", "", "LauncherApp", "_show_mesh_slot_limit_notice", "Mesh slot-limit notice."),
+        _ttk_ui_surface_spec("dialog.choice", "dialog.choice", "dialog", "window", "ChoiceDialog", "show", "Reusable choice and confirmation dialog.", "managed"),
+        _ttk_ui_surface_spec("popup.hover_tooltip", "popup.tooltip", "tooltip", "tip", "HoverTooltip", "show_now", "Reusable hover tooltip.", "managed", "transient"),
+        _ttk_ui_surface_spec("dialog.mrl_texture_bind", "dialog.mrl_texture_bind", "dialog", "window", "MrlTextureBindDialog", "show", "MRL texture binding dialog.", "managed"),
+        _ttk_ui_surface_spec("dialog.mrl_texture_bind.history", "dialog.mrl_texture_bind", "dialog", "_history_window", "MrlTextureBindDialog", "_show_history", "MRL texture path history dialog.", "managed"),
+        _ttk_ui_surface_spec("dialog.import_texture_config", "dialog.import_texture_config", "dialog", "window", "ImportTextureConfigDialog", "show", "Texture import configuration dialog.", "managed"),
+    )
+}
+
+
+# Layout, resize, scroll, drag, and overlay behavior belongs beside the
+# surfaces above.  Each entry intentionally owns a small cohesive mechanism,
+# while retaining every concrete method needed to trace a visual defect.
+TTK_UI_BEHAVIOR_CATALOG: dict[str, TtkUiBehaviorSpec] = {
+    spec.behavior_id: spec
+    for spec in (
+        _ttk_ui_behavior_spec(
+            "layout.main.geometry", "layout", "LauncherApp",
+            "Main page geometry, viewport bounds, and post-map layout pass.",
+            (
+                "_main_layout", "_expand_main_layout",
+                "_refresh_main_viewport_layout", "_set_main_viewport_content_size",
+                "_settle_scaling_main_viewport_layout",
+                "_sync_main_viewport_scrollregion",
+                "_on_main_viewport_canvas_configure",
+                "_finalize_main_window_layout_after_map",
+                "_measure_main_viewport_content_bounds",
+                "_main_window_layout_signature",
+                "_main_window_layout_signature_matches",
+                "_sync_canvas_scrollregion_from_bbox",
+                "_position_content_after_toolbar", "_reflow_left_sections",
+            ),
+            "all-modes",
+        ),
+        _ttk_ui_behavior_spec(
+            "layout.main.scaling", "layout", "LauncherApp",
+            "Unified main-window scaling state, cache, and widget metrics.",
+            (
+                "_main_scaling_snapshot_cache_key",
+                "_main_window_unscaled_natural_size_cache_key",
+                "_main_ui_scaling_layout_signature", "_main_ui_resize_interaction_active",
+                "_resize_main_viewport_surface_for_live_gesture",
+                "_schedule_main_live_resize_commit", "_schedule_main_ui_scaling_reflow",
+                "_main_ui_scale_factor", "_main_ui_font_scale_factor",
+                "_main_ui_spacing_scale_factor", "_scale_main_ui_spacing_metric",
+                "_scale_main_ui_metric", "_scale_main_ui_padding",
+                "_apply_main_ui_widget_scale", "_apply_main_ui_font_scale",
+                "_apply_main_ui_style_scale",
+                "_scaling_visible_widget_size", "_scaling_section_required_height",
+                "_raise_scaling_main_content_layers", "_capture_pre_scaling_window_size",
+                "_restore_pre_scaling_window_size",
+                "_persist_main_ui_scaling_layout_cache",
+                "_prime_main_ui_scaling_cache", "_toggle_scaling_mode",
+                "_apply_main_ui_scaling_policy", "_settle_scaling_main_viewport_layout",
+                "_ensure_scaling_main_window_contains_content",
+                "_reclaim_scaling_window_whitespace",
+                "_enforce_scaling_main_page_minimum",
+            ),
+            "all-modes", "scaling-mode",
+        ),
+        _ttk_ui_behavior_spec(
+            "layout.main.advanced_and_collapsible", "layout", "LauncherApp",
+            "Advanced/compact page topology, toolbar placement, and section collapse.",
+            (
+                "_build_collapsible_group", "_set_collapsible_section_state",
+                "_toggle_collapsible_section", "_apply_collapsible_section_policy",
+                "_place_collapsible_section_button",
+                "_persist_advanced_visibility_state",
+                "_restore_blender_mode_button_alignment",
+                "_apply_toolbar_action_layout",
+                "_apply_advanced_visibility",
+            ),
+            "all-modes", "advanced", "compact",
+        ),
+        _ttk_ui_behavior_spec(
+            "theme.main.style_scope", "theme", "LauncherApp",
+            "Shared ttk style scope and image resources for every Launcher surface.",
+            ("_apply_main_ui_style_scope", "_configure_theme"),
+            "all-modes", "theme",
+        ),
+        _ttk_ui_behavior_spec(
+            "theme.launcher_icon_resources", "theme", "module",
+            "Launcher umbrella icon resource construction for the native window.",
+            ("_launcher_umbrella_icon_images",),
+            "all-modes", "theme",
+        ),
+        _ttk_ui_behavior_spec(
+            "scheduler.managed_toplevel_primitive", "factory", "module",
+            "Low-level managed Toplevel constructor used only by indexed surfaces.",
+            ("_create_managed_toplevel", "_create_indexed_toplevel"),
+            "scheduler",
+        ),
+        _ttk_ui_behavior_spec(
+            "layout.message_editor.entries", "layout", "LauncherApp",
+            "Message Editor entry-card renderer and widget reuse layout.",
+            ("_render_message_editor_entries",),
+            "tool.message_editor", "managed",
+        ),
+        _ttk_ui_behavior_spec(
+            "interaction.main.viewport_scroll", "scroll", "LauncherApp",
+            "Main canvas wheel dispatch, settle delay, origin reset, and dropdown guard.",
+            (
+                "_on_main_viewport_mousewheel", "_schedule_main_viewport_scroll_settle",
+                "_scroll_main_viewport", "_flush_main_viewport_scroll",
+                "_main_viewport_dropdown_is_open", "_reset_main_viewport_origin",
+            ),
+            "main", "all-modes",
+        ),
+        _ttk_ui_behavior_spec(
+            "interaction.main.resize_grip", "drag", "LauncherApp",
+            "Main window resize-grip placement, enlarged hit target, and drag commit.",
+            (
+                "_position_main_resize_grip", "_expand_main_resize_grip_hit_area",
+                "_schedule_main_resize_grip_hit_area_collapse",
+                "_flush_main_resize_grip_geometry",
+                "_queue_main_resize_grip_geometry", "_begin_main_resize_grip",
+                "_drag_main_resize_grip", "_end_main_resize_grip",
+            ),
+            "main", "all-modes",
+        ),
+        _ttk_ui_behavior_spec(
+            "scroll.export_sets", "scroll", "LauncherApp",
+            "Export Sets nested scroll position, target routing, and history reveal.",
+            (
+                "_scroll_export_history_into_view", "_store_export_sets_scroll_position",
+                "_queue_export_sets_scroll_position",
+                "_flush_export_sets_scroll_position",
+                "_capture_export_sets_scroll_position",
+                "_restore_export_sets_scroll_position", "_export_sets_scroll_scope",
+                "_scroll_export_sets_target", "_export_sets_wheel_units",
+                "_on_export_sets_mousewheel", "_bind_export_sets_mousewheel",
+            ),
+            "dialog.export_sets", "managed",
+        ),
+        _ttk_ui_behavior_spec(
+            "scroll.shared_wheel_normalization", "scroll", "LauncherApp",
+            "Shared platform mouse-wheel step normalization for dropdown controls.",
+            ("_mousewheel_event_steps",),
+            "all-modes",
+        ),
+        _ttk_ui_behavior_spec(
+            "interaction.rename_history", "drag", "LauncherApp",
+            "Rename history dropdown scrolling and pointer drag interaction.",
+            (
+                "_scroll_rename_value_history_dropdown",
+                "_scroll_rename_value_history_views",
+                "_begin_rename_value_history_drag", "_drag_rename_value_history",
+                "_finish_rename_value_history_drag",
+            ),
+            "main", "mesh-rename",
+        ),
+        _ttk_ui_behavior_spec(
+            "interaction.floating_ball", "drag", "LauncherApp",
+            "Launcher floating-ball draw, layout, hover, drag, and restore lifecycle.",
+            (
+                "_floating_ball_expanded_width", "_draw_floating_ball",
+                "_layout_floating_ball", "_cancel_floating_ball_collapse",
+                "_on_floating_ball_enter", "_on_floating_ball_leave",
+                "_on_floating_ball_press", "_on_floating_ball_drag",
+                "_on_floating_ball_release", "_ensure_floating_ball_window",
+                "_enter_floating_ball", "_restore_from_floating_ball",
+                "_toggle_floating_ball", "_draw_compact_floating_ball_button",
+                "_bind_compact_floating_ball_button",
+            ),
+            "main", "floating-ball",
+        ),
+        _ttk_ui_behavior_spec(
+            "interaction.blender_compact_reference_floating_ball", "drag", "LauncherApp",
+            "Blender node reference floating ball and its independent drag lifecycle.",
+            (
+                "_cancel_blender_compact_name_reference_floating_collapse",
+                "_dispose_blender_compact_name_reference_floating_ball",
+                "_draw_blender_compact_name_reference_floating_ball",
+                "_layout_blender_compact_name_reference_floating_ball",
+                "_on_blender_compact_name_reference_floating_ball_enter",
+                "_on_blender_compact_name_reference_floating_ball_leave",
+                "_on_blender_compact_name_reference_floating_ball_press",
+                "_on_blender_compact_name_reference_floating_ball_drag",
+                "_on_blender_compact_name_reference_floating_ball_release",
+                "_ensure_blender_compact_name_reference_floating_ball",
+                "_restore_blender_compact_name_reference_from_floating_ball",
+            ),
+            "blender", "floating-ball", "managed",
+        ),
+        _ttk_ui_behavior_spec(
+            "layout.instance_copy", "overlay", "LauncherApp",
+            "Instance Copy overlay rows, scrollbar state, placeholder, and viewport range.",
+            (
+                "_instance_copy_refresh_source_overlays",
+                "_instance_copy_refresh_target_text_scrollbar",
+                "_instance_copy_layout_placeholder",
+                "_instance_copy_viewport_group_range",
+            ),
+            "max", "tool.instance_copy",
+        ),
+        _ttk_ui_behavior_spec(
+            "scroll.instance_copy", "scroll", "LauncherApp",
+            "Instance Copy canvas wheel routing and recursive scope binding.",
+            ("_on_instance_copy_mousewheel", "_bind_instance_copy_mousewheel"),
+            "max", "tool.instance_copy",
+        ),
+        _ttk_ui_behavior_spec(
+            "scroll.message_editor", "scroll", "LauncherApp",
+            "Message Editor wheel routing and dynamic scroll-region maintenance.",
+            ("_scroll_message_editor_entries", "_refresh_message_editor_scrollregion"),
+            "tool.message_editor", "managed",
+        ),
+        _ttk_ui_behavior_spec(
+            "layout.blender_import_focus", "layout", "LauncherApp",
+            "Deferred Blender import viewport focus after page changes.",
+            ("_schedule_blender_import_viewport_focus",),
+            "blender",
+        ),
+        _ttk_ui_behavior_spec(
+            "scheduler.scroll_dispatch", "scroll", "_ManagedWindowScheduler",
+            "Scheduler-owned coalesced scroll queue and saved scroll-view restoration.",
+            (
+                "register_scroll_surface", "unregister_scroll_surface",
+                "scroll_is_blocked", "scroll_uses_atomic_paint", "latch_scrollbar",
+                "queue_scroll", "flush_scroll", "cancel_scroll", "capture_scroll_view",
+                "cancel_scroll_view_restore", "schedule_scroll_view_restore",
+            ),
+            "scheduler",
+        ),
+        _ttk_ui_behavior_spec(
+            "scheduler.floating_window_lifecycle", "overlay", "_ManagedWindowScheduler",
+            "Scheduler-owned floating-ball visibility and managed-window lifecycle.",
+            (
+                "floating_ball_active", "is_floating_ball",
+                "window_deferred_for_floating", "wait_until_floating_restored",
+                "run_after_floating_restore", "_defer_window_for_floating",
+                "_cancel_floating_guard", "_schedule_floating_guard",
+                "enforce_floating_ball", "enter_floating_ball",
+                "restore_from_floating_ball",
+            ),
+            "scheduler", "floating-ball",
+        ),
+        _ttk_ui_behavior_spec(
+            "overlay.native_paint_and_theme_mask", "overlay", "module",
+            "Native canvas paint guard and themed-window masking around Windows updates.",
+            (
+                "_managed_scroll_command", "_atomic_native_viewport_paint",
+                "_mask_window_until_themed", "_restore_native_window_theme_mask",
+            ),
+            "native-window", "all-modes",
+        ),
+    )
+}
+
+
+# Every direct `_create_managed_toplevel` call is indexed here.  A surface
+# describes what the user sees; this map names the exact source method that
+# creates it so that an otherwise invisible overlay cannot become orphaned.
+TTK_UI_TOPLEVEL_FACTORY_CATALOG: dict[str, TtkUiToplevelFactorySpec] = {
+    spec.factory_id: spec
+    for spec in (
+        _ttk_ui_toplevel_factory_spec("factory.hover_tooltip", "HoverTooltip", "_show", "popup.hover_tooltip", "Creates the reusable tooltip Toplevel.", "transient"),
+        _ttk_ui_toplevel_factory_spec("factory.choice_dialog", "ChoiceDialog", "__init__", "dialog.choice", "Creates the reusable choice-dialog Toplevel.", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.mrl_texture_bind", "MrlTextureBindDialog", "__init__", "dialog.mrl_texture_bind", "Creates the MRL texture binding dialog.", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.mrl_texture_bind_history", "MrlTextureBindDialog", "_show_history", "dialog.mrl_texture_bind.history", "Creates the MRL path history dialog.", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.import_texture_config", "ImportTextureConfigDialog", "__init__", "dialog.import_texture_config", "Creates the texture configuration dialog.", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.github_update_title_click_surface", "LauncherApp", "_sync_github_update_title_click_surface", "popup.github_update_title_click_surface", "Creates the transparent native-caption update hit surface.", "transient"),
+        _ttk_ui_toplevel_factory_spec("factory.main_resize_grip", "LauncherApp", "_build_ui", "popup.main_resize_grip", "Creates the transparent main-window resize hit surface.", "transient"),
+        _ttk_ui_toplevel_factory_spec("factory.toolbar_process_dropdown", "LauncherApp", "_ensure_toolbar_process_dropdown", "popup.toolbar_process_dropdown", "Creates the toolbar process dropdown.", "transient"),
+        _ttk_ui_toplevel_factory_spec("factory.blender_hierarchy_message", "LauncherApp", "_build_toolbar", "popup.blender_hierarchy_message", "Creates the Blender hierarchy message overlay.", "transient"),
+        _ttk_ui_toplevel_factory_spec("factory.legacy_export_notice", "LauncherApp", "_show_legacy_export_notice", "dialog.legacy_export_notice", "Creates the legacy export notice.", "max", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.export_sets", "LauncherApp", "_show_export_sets", "dialog.export_sets", "Creates the Export Sets window.", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.launcher_floating_ball", "LauncherApp", "_ensure_floating_ball_window", "popup.floating_ball", "Creates the Launcher floating ball.", "transient"),
+        _ttk_ui_toplevel_factory_spec("factory.blender_name_repair", "LauncherApp", "_show_blender_max_fbx_name_repair_dialog", "dialog.blender_name_repair", "Creates the Blender Max-FBX name repair dialog.", "blender", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.blender_hierarchy_recovery", "LauncherApp", "_show_blender_fbx_hierarchy_recovery_dialog", "dialog.blender_hierarchy_recovery", "Creates the Blender hierarchy recovery dialog.", "blender", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.rename_value_history", "LauncherApp", "_ensure_rename_value_history_dropdown", "popup.rename_value_history", "Creates the rename-value history dropdown.", "transient"),
+        _ttk_ui_toplevel_factory_spec("factory.rename_selection_notice", "LauncherApp", "_show_rename_selection_notice", "popup.rename_selection", "Creates the rename selection notice.", "transient"),
+        _ttk_ui_toplevel_factory_spec("factory.max_toolbox", "LauncherApp", "_show_toolbox", "toolbox.main", "Creates the Max toolbox.", "max", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.blender_toolbox", "LauncherApp", "_show_blender_toolbox", "toolbox.blender", "Creates the Blender toolbox.", "blender", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.blender_node_map", "LauncherApp", "_show_blender_node_map", "tool.blender_node_map", "Creates the Blender node-map window.", "blender", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.blender_compact_reference_legacy", "LauncherApp", "_show_blender_compact_name_reference_legacy", "tool.blender_compact_reference_legacy", "Creates the legacy Blender node reference.", "blender", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.blender_compact_reference_floating_ball", "LauncherApp", "_ensure_blender_compact_name_reference_floating_ball", "popup.blender_compact_reference_floating_ball", "Creates the Blender node-reference floating ball.", "blender", "transient"),
+        _ttk_ui_toplevel_factory_spec("factory.blender_compact_reference", "LauncherApp", "_show_blender_compact_name_reference", "tool.blender_compact_reference", "Creates the Blender node-reference window.", "blender", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.instance_copy", "LauncherApp", "_show_instance_copy_tool", "tool.instance_copy", "Creates the Instance Copy window.", "max", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.seam_weight", "LauncherApp", "_show_seam_weight_tool", "tool.seam_weight", "Creates the Seam Weight tool.", "max", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.message_editor", "LauncherApp", "_show_message_editor", "tool.message_editor", "Creates the Message Editor.", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.scene_normals", "LauncherApp", "_show_scene_normals_monitor", "tool.scene_normals", "Creates the Scene Normals monitor.", "max", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.manual_texture_history", "LauncherApp", "_show_manual_texture_path_history", "dialog.manual_texture_history", "Creates the manual texture history dialog.", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.fvf_weight_capacity", "LauncherApp", "_show_fvf_weight_capacity_notice", "dialog.fvf_weight_capacity", "Creates the FVF capacity notice.", "managed"),
+        _ttk_ui_toplevel_factory_spec("factory.mesh_slot_limit", "LauncherApp", "_show_mesh_slot_limit_notice", "dialog.mesh_slot_limit", "Creates the mesh-slot limit notice.", "managed"),
+    )
+}
+
+
+def _create_indexed_toplevel(
+    owner: Any,
+    surface_id: str,
+    *,
+    activate: bool = True,
+) -> Any:
+    """Create a managed Toplevel and bind its semantic lifetime to one surface."""
+    normalized_surface_id = str(surface_id or "").strip()
+    spec = TTK_UI_SURFACE_CATALOG.get(normalized_surface_id)
+    if spec is None:
+        raise ValueError(f"Unknown TTK UI surface: {surface_id!r}")
+    window = _create_managed_toplevel(owner, activate=activate)
+    root = _tk_root_window(owner)
+    scheduler = _managed_window_scheduler(root)
+    scheduler.register_ui_surface(
+        normalized_surface_id,
+        window=spec.window,
+        role=spec.role,
+        widget=window,
+        widget_attribute=spec.widget_attribute,
+        description=spec.description,
+        state_tags=spec.state_tags,
+    )
+
+    def unregister_on_destroy(event: Any = None) -> None:
+        if event is not None and getattr(event, "widget", None) is not window:
+            return
+        scheduler.unregister_ui_surface(normalized_surface_id, widget=window)
+
+    try:
+        window.bind("<Destroy>", unregister_on_destroy, add="+")
+    except Exception:
+        scheduler.unregister_ui_surface(normalized_surface_id, widget=window)
+        try:
+            window.destroy()
+        except Exception:
+            pass
+        raise
+    return window
+
+
+TTK_UI_COMPOSITION_CALL_PREFIXES: tuple[str, ...] = (
+    "tk.", "ttk.", "self.tk.", "self.ttk.", "_create_indexed_toplevel",
+)
+TTK_UI_COMPOSITION_DIALOG_CALLS: frozenset[str] = frozenset(
+    {
+        "ChoiceDialog",
+        "HoverTooltip",
+        "MrlTextureBindDialog",
+        "ImportTextureConfigDialog",
+    }
+)
+TTK_UI_COMPOSITION_DIALOG_SURFACES: dict[str, str] = {
+    "ChoiceDialog": "dialog.choice",
+    "HoverTooltip": "popup.hover_tooltip",
+    "MrlTextureBindDialog": "dialog.mrl_texture_bind",
+    "ImportTextureConfigDialog": "dialog.import_texture_config",
+}
+TTK_UI_COMPOSITION_EXCLUDED_SOURCES: frozenset[tuple[str, str]] = frozenset(
+    {("module", "run_ui_smoke_test")}
+)
+
+
+def _ttk_ui_ast_call_name(node: Any) -> str:
+    if isinstance(node, ast.Name):
+        return str(node.id)
+    if isinstance(node, ast.Attribute):
+        prefix = _ttk_ui_ast_call_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else str(node.attr)
+    return ""
+
+
+def _ttk_ui_ast_text_metadata(node: Any) -> dict[str, Any]:
+    """Extract static or localized widget text without evaluating UI code."""
+    for keyword in tuple(getattr(node, "keywords", ()) or ()):
+        if keyword.arg != "text":
+            continue
+        value = keyword.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            return {"text_kind": "literal", "text_values": (value.value,)}
+        if (
+            isinstance(value, ast.Call)
+            and _ttk_ui_ast_call_name(value.func).endswith("._tr")
+        ):
+            localized_values = tuple(
+                argument.value
+                for argument in value.args[:2]
+                if isinstance(argument, ast.Constant)
+                and isinstance(argument.value, str)
+            )
+            if localized_values:
+                return {
+                    "text_kind": "localized",
+                    "text_values": localized_values,
+                }
+        return {"text_kind": "dynamic", "text_values": ()}
+    return {"text_kind": "none", "text_values": ()}
+
+
+def _ttk_ui_callable_member(member: Any) -> Any:
+    """Resolve classmethod/staticmethod descriptors for source indexing."""
+    if isinstance(member, (staticmethod, classmethod)):
+        return member.__func__
+    return member
+
+
+def _ttk_ui_widget_compositions(
+    owner_types: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Index every Tk/TTK composition method with its exact source locations."""
+    import inspect
+    import textwrap
+
+    source_surfaces: dict[tuple[str, str], set[str]] = {}
+    for surface_id, spec in TTK_UI_SURFACE_CATALOG.items():
+        source_surfaces.setdefault(
+            (spec.owner_type, spec.builder_name), set()
+        ).add(surface_id)
+    for spec in TTK_UI_TOPLEVEL_FACTORY_CATALOG.values():
+        source_surfaces.setdefault(
+            (spec.owner_type, spec.method_name), set()
+        ).add(spec.surface_id)
+    source_behaviors: dict[tuple[str, str], set[str]] = {}
+    for behavior_id, spec in TTK_UI_BEHAVIOR_CATALOG.items():
+        for method_name in spec.method_names:
+            source_behaviors.setdefault(
+                (spec.owner_type, method_name), set()
+            ).add(behavior_id)
+
+    compositions: dict[str, dict[str, Any]] = {}
+    for owner_name, owner_type in owner_types.items():
+        if owner_name not in {
+            "module",
+            "LauncherApp",
+            "HoverTooltip",
+            "ChoiceDialog",
+            "MrlTextureBindDialog",
+            "ImportTextureConfigDialog",
+        }:
+            continue
+        for method_name, member in vars(owner_type).items():
+            if (owner_name, method_name) in TTK_UI_COMPOSITION_EXCLUDED_SOURCES:
+                continue
+            method = _ttk_ui_callable_member(member)
+            if not callable(method):
+                continue
+            code = getattr(method, "__code__", None)
+            if code is None:
+                continue
+            try:
+                source_tree = ast.parse(
+                    textwrap.dedent(inspect.getsource(method))
+                )
+            except (OSError, TypeError, SyntaxError):
+                continue
+            widget_calls: list[dict[str, Any]] = []
+            related_surfaces = set(
+                source_surfaces.get((owner_name, method_name), set())
+            )
+            for node in ast.walk(source_tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                call_name = _ttk_ui_ast_call_name(node.func)
+                if not (
+                    call_name.startswith(TTK_UI_COMPOSITION_CALL_PREFIXES)
+                    or call_name in TTK_UI_COMPOSITION_DIALOG_CALLS
+                ):
+                    continue
+                if call_name in TTK_UI_COMPOSITION_DIALOG_SURFACES:
+                    related_surfaces.add(
+                        TTK_UI_COMPOSITION_DIALOG_SURFACES[call_name]
+                    )
+                elif call_name == "_create_indexed_toplevel":
+                    arguments = tuple(getattr(node, "args", ()) or ())
+                    if len(arguments) >= 2 and isinstance(
+                        arguments[1], ast.Constant
+                    ) and isinstance(arguments[1].value, str):
+                        related_surfaces.add(str(arguments[1].value))
+                widget_call = {
+                    "factory": call_name,
+                    "source_line": int(code.co_firstlineno) + int(node.lineno) - 1,
+                }
+                widget_call.update(_ttk_ui_ast_text_metadata(node))
+                widget_calls.append(widget_call)
+            if not widget_calls:
+                continue
+            composition_id = f"composition.{owner_name}.{method_name}"
+            behavior_ids = sorted(
+                source_behaviors.get((owner_name, method_name), set())
+            )
+            compositions[composition_id] = {
+                "owner": owner_name,
+                "method": method_name,
+                "source_path": str(code.co_filename),
+                "source_line": int(code.co_firstlineno),
+                "widgets": tuple(widget_calls),
+                "surface_ids": tuple(sorted(related_surfaces)),
+                "behavior_ids": tuple(behavior_ids),
+                "classification": (
+                    "surface-composition"
+                    if related_surfaces
+                    else "behavior-support"
+                    if behavior_ids
+                    else "shared-widget-composition"
+                ),
+            }
+    return compositions
+
+
+def _ttk_ui_interactions(
+    owner_types: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Index all Tk bindings and their event-handler methods for maintenance."""
+    import inspect
+    import textwrap
+
+    source_surfaces: dict[tuple[str, str], set[str]] = {}
+    for surface_id, spec in TTK_UI_SURFACE_CATALOG.items():
+        source_surfaces.setdefault(
+            (spec.owner_type, spec.builder_name), set()
+        ).add(surface_id)
+    source_behaviors: dict[tuple[str, str], set[str]] = {}
+    for behavior_id, spec in TTK_UI_BEHAVIOR_CATALOG.items():
+        for method_name in spec.method_names:
+            source_behaviors.setdefault(
+                (spec.owner_type, method_name), set()
+            ).add(behavior_id)
+
+    interactions: dict[str, dict[str, Any]] = {}
+    for owner_name, owner_type in owner_types.items():
+        if owner_name not in {
+            "LauncherApp",
+            "HoverTooltip",
+            "ChoiceDialog",
+            "MrlTextureBindDialog",
+            "ImportTextureConfigDialog",
+        }:
+            continue
+        for method_name, member in vars(owner_type).items():
+            method = _ttk_ui_callable_member(member)
+            if not callable(method):
+                continue
+            code = getattr(method, "__code__", None)
+            if code is None:
+                continue
+            try:
+                source_tree = ast.parse(
+                    textwrap.dedent(inspect.getsource(method))
+                )
+            except (OSError, TypeError, SyntaxError):
+                continue
+            function_node = next(
+                (
+                    node
+                    for node in source_tree.body
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                ),
+                None,
+            )
+            if function_node is None:
+                continue
+            event_parameters = tuple(
+                argument.arg
+                for argument in (
+                    *function_node.args.posonlyargs,
+                    *function_node.args.args,
+                    *function_node.args.kwonlyargs,
+                )
+                if "event" in str(argument.arg).casefold()
+            )
+            bindings: list[dict[str, Any]] = []
+            for node in ast.walk(source_tree):
+                if not isinstance(node, ast.Call) or not isinstance(
+                    node.func, ast.Attribute
+                ):
+                    continue
+                if node.func.attr not in {"bind", "bind_all", "bind_class"}:
+                    continue
+                bindings.append(
+                    {
+                        "binding": node.func.attr,
+                        "target": _ttk_ui_ast_call_name(node.func.value),
+                        "source_line": int(code.co_firstlineno) + int(node.lineno) - 1,
+                    }
+                )
+            if not event_parameters and not bindings:
+                continue
+            interactions[f"interaction.{owner_name}.{method_name}"] = {
+                "owner": owner_name,
+                "method": method_name,
+                "source_path": str(code.co_filename),
+                "source_line": int(code.co_firstlineno),
+                "event_parameters": event_parameters,
+                "bindings": tuple(bindings),
+                "surface_ids": tuple(
+                    sorted(source_surfaces.get((owner_name, method_name), set()))
+                ),
+                "behavior_ids": tuple(
+                    sorted(source_behaviors.get((owner_name, method_name), set()))
+                ),
+            }
+    return interactions
+
+
+TTK_UI_BEHAVIOR_NAME_MARKERS: tuple[str, ...] = (
+    "layout", "scroll", "resize", "scal", "overlay", "mask", "viewport",
+    "collapsible", "floating", "drag",
+)
+
+
+def _is_ttk_ui_behavior_method(name: str) -> bool:
+    """Detect behavior methods that must be declared in the central control plane."""
+    normalized = str(name or "")
+    return normalized.startswith("_") and any(
+        marker in normalized for marker in TTK_UI_BEHAVIOR_NAME_MARKERS
+    )
+
+
+# Model File option rows use the same geometry and callback wiring. Keep their
+# complete contract here instead of duplicating it inside the page builder.
+TTK_UI_MODEL_OPTION_ROWS: tuple[TtkModelOptionRowSpec, ...] = (
+    TtkModelOptionRowSpec(
+        "import_normals", "导入法线", "Import Normals", "import_normals_var",
+        "_on_import_normals_changed", 2, "import_normals_check",
+        "blender_import_normals", "blender_import_normals_help_button", 2,
+    ),
+    TtkModelOptionRowSpec(
+        "import_textures", "导入贴图", "Import Textures", "import_textures_var",
+        "_persist_model_option_preferences", 1, "import_textures_check",
+        "import_textures",
+    ),
+    TtkModelOptionRowSpec(
+        "reset_scene", "导入时重置场景", "Reset Scene on Import",
+        "reset_scene_on_import_var", "_persist_model_option_preferences", 3,
+        "reset_scene_on_import_check", columnspan=2,
+    ),
+    TtkModelOptionRowSpec(
+        "check_source", "检查源文件", "Check Source", "check_source_var",
+        "_persist_model_option_preferences", 5, help_topic="source",
+    ),
+    TtkModelOptionRowSpec(
+        "export_map2", "导出 UV Map 2", "Export UV Map 2", "export_map2_var",
+        "_commit_export_map2", 6, help_topic="map2",
+    ),
+    TtkModelOptionRowSpec(
+        "uv_half_safe", "UV 半精度保护", "UV Half Safe", "uv_half_safe_var",
+        "_commit_uv_half_safe_preference", 7, help_topic="uv_half",
+    ),
+    TtkModelOptionRowSpec(
+        "log_mode", "日志模式", "Log Mode", "log_mode_var",
+        "_persist_model_option_preferences", 8, accessory_text="...",
+        accessory_command_name="_open_log_directory",
+    ),
+)
+
+
 class _ManagedWindowScheduler:
     """Single owner of managed Toplevel visibility, activation, and Z-order.
 
@@ -25023,6 +25779,7 @@ class _ManagedWindowScheduler:
         self._floating_native_topmost_api: Any | bool | None = None
         self._floating_restore_serial = 0
         self._floating_restore_variable = f"_pc_rehd_floating_restore_{id(self)}"
+        self._ui_surfaces: dict[str, TtkUiSurface] = {}
         try:
             root.setvar(self._floating_restore_variable, "0")
         except Exception:
@@ -25033,6 +25790,157 @@ class _ManagedWindowScheduler:
         root.bind("<Configure>", self._on_root_configure, add="+")
         root.bind("<Activate>", self._on_root_activate, add="+")
         root.bind("<ButtonRelease>", self._on_root_button_release, add="+")
+
+    def clear_ui_surfaces(self, *, window: str | None = None) -> None:
+        """Clear semantic records for one UI surface family or every family."""
+        if window is None:
+            self._ui_surfaces.clear()
+            return
+        target = str(window)
+        self._ui_surfaces = {
+            surface_id: surface
+            for surface_id, surface in self._ui_surfaces.items()
+            if surface.window != target
+        }
+
+    def register_ui_surface(
+        self,
+        surface_id: str,
+        *,
+        window: str,
+        role: str,
+        widget: Any,
+        widget_attribute: str,
+        description: str,
+        state_tags: Iterable[str] = (),
+    ) -> None:
+        """Register an existing widget without changing its Tk lifecycle."""
+        normalized_id = str(surface_id or "").strip()
+        if not normalized_id:
+            raise ValueError("TTK UI surface id cannot be empty")
+        self._ui_surfaces[normalized_id] = TtkUiSurface(
+            surface_id=normalized_id,
+            window=str(window or "").strip(),
+            role=str(role or "").strip(),
+            widget=widget,
+            widget_attribute=str(widget_attribute or "").strip(),
+            description=str(description or "").strip(),
+            state_tags=tuple(
+                sorted(
+                    {
+                        str(tag).strip()
+                        for tag in state_tags
+                        if str(tag).strip()
+                    }
+                )
+            ),
+        )
+
+    def unregister_ui_surface(
+        self, surface_id: str, *, widget: Any | None = None
+    ) -> bool:
+        normalized_id = str(surface_id or "").strip()
+        surface = self._ui_surfaces.get(normalized_id)
+        if surface is None or (widget is not None and surface.widget is not widget):
+            return False
+        del self._ui_surfaces[normalized_id]
+        return True
+
+    @staticmethod
+    def _ui_surface_widget_snapshot(widget: Any) -> dict[str, Any]:
+        try:
+            exists = bool(widget is not None and widget.winfo_exists())
+        except Exception:
+            exists = False
+        snapshot: dict[str, Any] = {
+            "widget_exists": exists,
+            "widget_class": "",
+            "manager": "",
+            "mapped": False,
+            "text": "",
+            "style": "",
+            "state": "",
+            "bounds": None,
+        }
+        if not exists:
+            return snapshot
+        try:
+            snapshot["widget_class"] = str(widget.winfo_class())
+            snapshot["manager"] = str(widget.winfo_manager())
+            snapshot["mapped"] = bool(widget.winfo_ismapped())
+            snapshot["bounds"] = {
+                "x": int(widget.winfo_rootx()),
+                "y": int(widget.winfo_rooty()),
+                "width": int(widget.winfo_width()),
+                "height": int(widget.winfo_height()),
+            }
+        except Exception:
+            pass
+        for option, output_key in (
+            ("text", "text"),
+            ("style", "style"),
+            ("state", "state"),
+        ):
+            try:
+                snapshot[output_key] = str(widget.cget(option))
+            except Exception:
+                continue
+        return snapshot
+
+    @classmethod
+    def _ui_surface_widget_tree(cls, root_widget: Any) -> list[dict[str, Any]]:
+        """Enumerate an existing surface for screenshot-to-widget matching."""
+        if root_widget is None:
+            return []
+        tree: list[dict[str, Any]] = []
+        pending: list[tuple[Any, str, int]] = [(root_widget, "", 0)]
+        seen: set[str] = set()
+        while pending and len(tree) < 2048:
+            widget, parent_path, depth = pending.pop(0)
+            try:
+                widget_path = str(widget)
+            except Exception:
+                continue
+            if not widget_path or widget_path in seen:
+                continue
+            seen.add(widget_path)
+            record = cls._ui_surface_widget_snapshot(widget)
+            record.update(
+                {
+                    "widget_path": widget_path,
+                    "parent_path": parent_path,
+                    "depth": int(depth),
+                }
+            )
+            tree.append(record)
+            if not record["widget_exists"]:
+                continue
+            try:
+                children = tuple(widget.winfo_children())
+            except Exception:
+                children = ()
+            pending.extend(
+                (child, widget_path, depth + 1) for child in children
+            )
+        return tree
+
+    def ui_surface_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Return the centralized semantic map used for TTK UI maintenance."""
+        result: dict[str, dict[str, Any]] = {}
+        for surface_id, surface in self._ui_surfaces.items():
+            payload = self._ui_surface_widget_snapshot(surface.widget)
+            payload["widget_tree"] = self._ui_surface_widget_tree(surface.widget)
+            payload.update(
+                {
+                    "window": surface.window,
+                    "role": surface.role,
+                    "widget_attribute": surface.widget_attribute,
+                    "description": surface.description,
+                    "state_tags": surface.state_tags,
+                }
+            )
+            result[surface_id] = payload
+        return result
 
     def _live_windows(self) -> list[Any]:
         live: list[Any] = []
@@ -42553,6 +43461,20 @@ def _cached_export_scene_name_snapshot(
 
 def _build_bucket_rows(workspace: MaxWorkspaceState) -> list[dict[str, Any]]:
     mesh_index = _scene_mesh_index(workspace.scene_contract)
+    identity_by_handle = {
+        int(row["scene_node_handle"]): row
+        for row in _assign_max_duplicate_mesh_identity(
+            [
+                {
+                    "scene_node": str(mesh.get("scene_node", "") or ""),
+                    "scene_node_handle": int(mesh.get("scene_node_handle", 0) or 0),
+                }
+                for mesh in workspace.scene_contract.get("meshes", [])
+                if isinstance(mesh, dict)
+                and int(mesh.get("scene_node_handle", 0) or 0) > 0
+            ]
+        )
+    }
     rows: list[dict[str, Any]] = []
     seen: set[int] = set()
     for lane in ("header", "delete", "modify"):
@@ -42563,11 +43485,16 @@ def _build_bucket_rows(workspace: MaxWorkspaceState) -> list[dict[str, Any]]:
             if mesh is None:
                 raise ValueError(f"Export bucket references missing Max node handle {handle}")
             seen.add(handle)
+            duplicate_identity = identity_by_handle.get(int(handle))
+            if duplicate_identity is None:
+                raise ValueError(f"Export bucket Handle {handle} is missing its Max identity")
             rows.append(
                 {
                     "lane": lane,
                     "scene_node": str(mesh.get("scene_node", "")),
                     "scene_node_handle": int(handle),
+                    "same_name_ordinal": int(duplicate_identity["same_name_ordinal"]),
+                    "same_name_count": int(duplicate_identity["same_name_count"]),
                     "mesh_slot": int(mesh.get("mesh_slot", 0) or 0),
                     "mesh_slot_basis": str(mesh.get("mesh_slot_basis", "")),
                     "physical_mesh_slot": int(mesh.get("physical_mesh_slot", 0) or 0),
@@ -42602,6 +43529,26 @@ def _build_bucket_rows(workspace: MaxWorkspaceState) -> list[dict[str, Any]]:
                 }
             )
     return rows
+
+
+def _assign_max_duplicate_mesh_identity(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Assign a Max Handle order inside each same-name Mesh group."""
+    result = [dict(row) for row in rows if isinstance(row, dict)]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in result:
+        handle = int(row.get("scene_node_handle", 0) or 0)
+        if handle <= 0:
+            raise ValueError("Max duplicate identity requires a positive scene node Handle")
+        name_key = str(row.get("scene_node", "") or "").casefold()
+        groups.setdefault(name_key, []).append(row)
+    for group in groups.values():
+        group.sort(key=lambda row: int(row["scene_node_handle"]))
+        for ordinal, row in enumerate(group):
+            row["same_name_ordinal"] = ordinal
+            row["same_name_count"] = len(group)
+    return result
 
 
 def _is_standard_re6_export_mesh_name(value: Any) -> bool:
@@ -42748,6 +43695,8 @@ def _merge_live_bucket_receipt(
     update_fields = {
         "scene_node",
         "scene_node_handle",
+        "same_name_ordinal",
+        "same_name_count",
         "mesh_slot",
         "mesh_slot_basis",
         "physical_mesh_slot",
@@ -45854,7 +46803,9 @@ class HoverTooltip:
                         pass
                     self.window = None
                 return
-        tip = _create_managed_toplevel(self.widget, activate=False)
+        tip = _create_indexed_toplevel(
+            self.widget, "popup.hover_tooltip", activate=False
+        )
         self.window = tip
         self._layer_owner = tip
         scheduler.acquire_temporary_layer(
@@ -46249,7 +47200,7 @@ class ChoiceDialog:
         self._auto_close_after: Any = None
         self._auto_close_cancelled = False
         self._auto_close_last_remaining: int | None = None
-        self.window = _create_managed_toplevel(parent)
+        self.window = _create_indexed_toplevel(parent, "dialog.choice")
         self.window.title(title)
         self.window.resizable(True, False)
         root = _tk_root_window(parent)
@@ -47070,7 +48021,9 @@ class MrlTextureBindDialog:
         self._target_host = str(target_host or "max").strip().casefold()
         if self._target_host not in {"max", "blender"}:
             raise ValueError(f"Unsupported MRL texture bind target: {target_host!r}")
-        self.window = _create_managed_toplevel(parent)
+        self.window = _create_indexed_toplevel(
+            parent, "dialog.mrl_texture_bind"
+        )
         self.window.title(self._tr("MRL 自动绑定贴图", "MRL Auto Tex Bind"))
         self.window.resizable(True, False)
         self.window.protocol("WM_DELETE_WINDOW", self._cancel)
@@ -47549,7 +48502,9 @@ class MrlTextureBindDialog:
             [current_path, *self._history_paths]
         )
         self._history_rows = rows
-        window = _create_managed_toplevel(self.window, activate=False)
+        window = _create_indexed_toplevel(
+            self.window, "dialog.mrl_texture_bind.history", activate=False
+        )
         self._history_window = window
         setattr(window, "_pc_rehd_stack_layer", MANAGED_WINDOW_DIALOG_LAYER)
         window.title(self._tr("MRL 历史快照", "MRL History"))
@@ -47871,7 +48826,9 @@ class ImportTextureConfigDialog:
         self._tk = tk
         self._ttk = ttk
         self._tr = translate
-        self.window = _create_managed_toplevel(parent)
+        self.window = _create_indexed_toplevel(
+            parent, "dialog.import_texture_config"
+        )
         self.window.title(self._tr("导入贴图设置", "Import Texture Setup"))
         self.window.resizable(True, False)
         self.window.protocol("WM_DELETE_WINDOW", self._cancel)
@@ -48440,6 +49397,18 @@ class ImportTextureConfigDialog:
         return self.value
 
 
+@dataclass(frozen=True, slots=True)
+class TtkModelOptionRow:
+    """Semantic contract for one Model File checkbutton row."""
+
+    key: str
+    row: int
+    control: Any
+    control_attribute: str
+    variable_attribute: str
+    help_topic: str
+
+
 class LauncherApp:
     def __init__(
         self,
@@ -48606,11 +49575,12 @@ class LauncherApp:
         self._main_layout_cache: dict[tuple[Any, ...], dict[str, int]] = {}
         self._main_ui_layout_scale = 1.0
         self._main_ui_widget_scale = 1.0
+        self._main_ui_font_scale = 1.0
         self._main_ui_scaling_layout_cache: dict[str, dict[str, Any]] = dict(
             self.launcher_state.get("main_ui_scaling_layout_cache", {})
         )
-        self._main_ui_layout_available_size: tuple[int, int] | None = None
         self._main_ui_scaling_reflow = False
+        self._main_ui_scaling_containment_active = False
         self._main_ui_grid_metrics: dict[Any, dict[str, Any]] = {}
         self._ui_text_measure_cache: dict[tuple[Any, ...], int] = {}
         self._ui_line_height_cache: dict[tuple[Any, ...], int] = {}
@@ -48684,29 +49654,8 @@ class LauncherApp:
                 )
             ),
         }
-        self._scaling_mode_enabled_by_page = {
-            "max": bool(
-                self.launcher_state.get(
-                    "max_scaling_mode_enabled",
-                    self.launcher_state.get("scaling_mode_enabled", False),
-                )
-            ),
-            "blender": bool(
-                self.launcher_state.get("blender_scaling_mode_enabled", False)
-            ),
-        }
-        raw_scaling_mode_enabled_by_surface = self.launcher_state.get(
-            "scaling_mode_enabled_by_surface", {}
-        )
-        if not isinstance(raw_scaling_mode_enabled_by_surface, dict):
-            raw_scaling_mode_enabled_by_surface = {}
-        self._scaling_mode_enabled_by_surface = {}
-        for page, fallback in self._scaling_mode_enabled_by_page.items():
-            for language in ("CN", "EN"):
-                surface = f"{page}:{language}"
-                self._scaling_mode_enabled_by_surface[surface] = bool(
-                    raw_scaling_mode_enabled_by_surface.get(surface, fallback)
-                )
+        # Scaling Mode is intentionally one Launcher-main-window switch.
+        # Page/language state is not retained in memory or restored from disk.
         self._section_collapsed_preferences: dict[str, bool] = {}
         self._compact_mode_panel_collapsed = False
         self._scaling_mode_enabled = False
@@ -49290,7 +50239,11 @@ class LauncherApp:
             return
         try:
             if window is None or not bool(window.winfo_exists()):
-                window = _create_managed_toplevel(self.root, activate=False)
+                window = _create_indexed_toplevel(
+                    self.root,
+                    "popup.github_update_title_click_surface",
+                    activate=False,
+                )
                 window.wm_overrideredirect(True)
                 window.wm_resizable(False, False)
                 window.configure(
@@ -50456,34 +51409,19 @@ class LauncherApp:
     def _active_ui_page_key(self) -> str:
         return "blender" if bool(self.blender_mode_enabled) else "max"
 
-    def _active_ui_scaling_surface_key(self) -> str:
-        language = "CN" if str(self.ui_language).upper() == "CN" else "EN"
-        return f"{self._active_ui_page_key()}:{language}"
-
     def _main_window_natural_size_cache_key(self, mode: str) -> str:
         normalized_mode = "expanded" if mode == "expanded" else "collapsed"
-        scale_surface = (
-            "scaling"
-            if bool(getattr(self, "_scaling_mode_enabled", False))
-            else "normal"
-        )
-        return (
-            f"{self._active_ui_page_key()}:"
-            f"{str(self.ui_language)}:{normalized_mode}:{scale_surface}"
-        )
+        surface = "main:scaling" if bool(
+            getattr(self, "_scaling_mode_enabled", False)
+        ) else "main:normal"
+        return f"{surface}:{normalized_mode}"
 
     def _main_window_unscaled_natural_size_cache_key(self, mode: str) -> str:
         normalized_mode = "expanded" if mode == "expanded" else "collapsed"
-        return (
-            f"{self._active_ui_page_key()}:"
-            f"{str(self.ui_language)}:{normalized_mode}:normal"
-        )
+        return f"main:normal:{normalized_mode}"
 
     def _main_scaling_snapshot_cache_key(self) -> str:
-        return (
-            f"{self._active_ui_page_key()}:"
-            f"{str(self.ui_language)}:{self._main_window_size_mode}"
-        )
+        return "main:scaling"
 
     def _restore_active_ui_page_preferences(self) -> None:
         page = self._active_ui_page_key()
@@ -50500,10 +51438,7 @@ class LauncherApp:
             self._compact_mode_panel_collapsed_by_page.get(page, False)
         )
         self._scaling_mode_enabled = bool(
-            self._scaling_mode_enabled_by_surface.get(
-                self._active_ui_scaling_surface_key(),
-                self._scaling_mode_enabled_by_page.get(page, False),
-            )
+            self.launcher_state.get("main_window_scaling_mode_enabled", False)
         )
         scaling_var = getattr(self, "scaling_mode_var", None)
         if scaling_var is not None:
@@ -50522,27 +51457,18 @@ class LauncherApp:
         scaling_enabled = bool(self._scaling_mode_enabled)
         self._section_collapsed_preferences_by_page[page] = preferences
         self._compact_mode_panel_collapsed_by_page[page] = compact_collapsed
-        self._scaling_mode_enabled_by_page[page] = scaling_enabled
-        self._scaling_mode_enabled_by_surface[
-            self._active_ui_scaling_surface_key()
-        ] = scaling_enabled
-
+        # Scaling Mode is a single main-window policy.
         collapsed_key = f"{page}_collapsed_sections"
         compact_key = f"{page}_compact_mode_panel_collapsed"
-        scaling_key = f"{page}_scaling_mode_enabled"
         updates: dict[str, Any] = {
             collapsed_key: dict(preferences),
             compact_key: compact_collapsed,
-            scaling_key: scaling_enabled,
-            "scaling_mode_enabled_by_surface": dict(
-                self._scaling_mode_enabled_by_surface
-            ),
+            "main_window_scaling_mode_enabled": scaling_enabled,
         }
         if page == "max":
             # Keep the legacy keys as MAX mirrors for older Launcher builds.
             updates["collapsed_sections"] = dict(preferences)
             updates["compact_mode_panel_collapsed"] = compact_collapsed
-            updates["scaling_mode_enabled"] = scaling_enabled
         changed = any(
             self.launcher_state.get(key) != value
             for key, value in updates.items()
@@ -51001,6 +51927,22 @@ class LauncherApp:
             )
             advanced_visible = bool(self.advanced_visible_var.get())
             scaling_mode = bool(getattr(self, "_scaling_mode_enabled", False))
+            if scaling_mode:
+                # Configure callbacks can observe the previous cached size
+                # while a collapsed grid row is settling.  Replace it with
+                # the current visible widget bounds before publishing the
+                # canvas scrollregion.
+                live_width, live_height = self._measure_main_viewport_content_bounds()
+                edge_tolerance = max(
+                    4, self._scale_main_ui_spacing_metric(6, minimum=2)
+                )
+                # A placed page starts a couple of pixels inside the canvas;
+                # do not turn that border allowance into a horizontal bar.
+                if int(live_width) <= root_width + edge_tolerance:
+                    content_width = min(root_width, max(1, int(content_width)))
+                else:
+                    content_width = max(1, int(live_width), int(content_width))
+                content_height = max(1, int(live_height), int(content_height))
             original_width, original_height = (
                 MAIN_WINDOW_ADVANCED_ORIGINAL_SIZE
                 if advanced_visible and not scaling_mode
@@ -51016,37 +51958,50 @@ class LauncherApp:
             horizontal_height = max(10, int(hscroll.winfo_reqheight()))
             ui_scheduler = _managed_window_scheduler(self.root)
 
-            need_horizontal = ui_scheduler.latch_scrollbar(
-                canvas,
-                "x",
-                content_width > root_width,
-                latch=not scaling_mode,
-            )
-            need_vertical = ui_scheduler.latch_scrollbar(
-                canvas,
-                "y",
-                content_height > root_height,
-                latch=not scaling_mode,
-            )
-            for _iteration in range(2):
-                viewport_width = max(
-                    1, root_width - (vertical_width if need_vertical else 0)
+            if scaling_mode:
+                # Scaling Mode is no-scroll-first.  Do not let a vertical bar
+                # consume a few pixels and then promote an otherwise fitting
+                # page into a second horizontal bar.  The scaled layout has
+                # already compressed against the full window; a horizontal
+                # bar is justified only when the page itself exceeds it.
+                edge_tolerance = max(
+                    4, self._scale_main_ui_spacing_metric(6, minimum=2)
                 )
-                viewport_height = max(
-                    1, root_height - (horizontal_height if need_horizontal else 0)
-                )
+                self._enforce_scaling_main_page_minimum(content_width, content_height)
+                need_horizontal = False
+                need_vertical = False
+            else:
                 need_horizontal = ui_scheduler.latch_scrollbar(
                     canvas,
                     "x",
-                    content_width > viewport_width,
-                    latch=not scaling_mode,
+                    content_width > root_width,
+                    latch=True,
                 )
                 need_vertical = ui_scheduler.latch_scrollbar(
                     canvas,
                     "y",
-                    content_height > viewport_height,
-                    latch=not scaling_mode,
+                    content_height > root_height,
+                    latch=True,
                 )
+                for _iteration in range(2):
+                    viewport_width = max(
+                        1, root_width - (vertical_width if need_vertical else 0)
+                    )
+                    viewport_height = max(
+                        1, root_height - (horizontal_height if need_horizontal else 0)
+                    )
+                    need_horizontal = ui_scheduler.latch_scrollbar(
+                        canvas,
+                        "x",
+                        content_width > viewport_width,
+                        latch=True,
+                    )
+                    need_vertical = ui_scheduler.latch_scrollbar(
+                        canvas,
+                        "y",
+                        content_height > viewport_height,
+                        latch=True,
+                    )
 
             viewport_width = max(
                 1, root_width - (vertical_width if need_vertical else 0)
@@ -51088,6 +52043,15 @@ class LauncherApp:
                 frame_width = max(frame_width, int(bounds[2]))
                 frame_height = max(frame_height, int(bounds[3]))
             canvas.configure(scrollregion=(0, 0, frame_width, frame_height))
+            if scaling_mode:
+                # Keep the hit surface full-window while the page itself is
+                # maintained at its computed no-scroll minimum.  The bars are
+                # never mapped in this mode, so there is no viewport deduction.
+                hscroll.place_forget()
+                vscroll.place_forget()
+                canvas.xview_moveto(0.0)
+                canvas.yview_moveto(0.0)
+                return
             if need_horizontal:
                 hscroll.place(
                     x=0,
@@ -51125,6 +52089,148 @@ class LauncherApp:
             self._main_viewport_layout_signature = None
         self._refresh_main_viewport_layout()
 
+    def _settle_scaling_main_viewport_layout(
+        self, *, reset_origin: bool = False
+    ) -> None:
+        """Re-measure a scaled page after visibility or mode changes.
+
+        Collapsing a section changes ``grid_remove`` children asynchronously.
+        If the viewport is refreshed before Tk has assigned those rectangles,
+        the previous page size survives for one turn and leaves a scrollbar or
+        an empty band behind.  Scaling Mode gets two bounded layout passes so
+        the live section flow, content size, and scrollbar decision are based
+        on the same settled widget tree.  Normal mode intentionally bypasses
+        this path and keeps its existing scrollbar policy.
+        """
+        if not bool(getattr(self, "_scaling_mode_enabled", False)):
+            return
+        try:
+            for _pass in range(2):
+                self.root.update_idletasks()
+                self._position_content_after_toolbar(flush_layout=False)
+                self._reflow_left_sections(flush_layout=False)
+                self.root.update_idletasks()
+                # This recomputes the exact visible bounds and replaces stale
+                # pre-collapse content dimensions without changing geometry.
+                self._fit_main_window_to_content(flush_layout=False)
+                self.root.update_idletasks()
+                width = max(1, int(self.root.winfo_width()))
+                height = max(1, int(self.root.winfo_height()))
+                self._main_viewport_layout_signature = None
+                self._refresh_main_viewport_layout(
+                    window_width=width,
+                    window_height=height,
+                )
+                self.root.update_idletasks()
+            if reset_origin:
+                self._reset_main_viewport_origin()
+        except (self.tk.TclError, TypeError, ValueError):
+            return
+
+    def _ensure_scaling_main_window_contains_content(self) -> None:
+        """Grow only the Launcher root when a settled scaled page still overflows.
+
+        Scaling Mode has no main-page scrollbars.  The layout solver is allowed
+        to compact the page first; this final control-plane pass then expands
+        the root to the measured page bounds when compaction reaches a metric
+        floor.  It is guarded against Configure feedback and never touches
+        dialogs or tool windows.
+        """
+        if not bool(getattr(self, "_scaling_mode_enabled", False)):
+            return
+        if bool(getattr(self, "_main_ui_scaling_containment_active", False)):
+            return
+        if self._main_ui_resize_interaction_active():
+            return
+        try:
+            self.root.update_idletasks()
+            content_width, content_height = self._fit_main_window_to_content(
+                flush_layout=False
+            )
+            current_width = max(1, int(self.root.winfo_width()))
+            current_height = max(1, int(self.root.winfo_height()))
+            tolerance = max(
+                2,
+                self._scale_main_ui_spacing_metric(4, minimum=2),
+            )
+            if (
+                int(content_width) <= current_width + tolerance
+                and int(content_height) <= current_height + tolerance
+            ):
+                return
+            screen_width = max(320, int(self.root.winfo_screenwidth()))
+            screen_height = max(320, int(self.root.winfo_screenheight()))
+            target_width = min(
+                screen_width,
+                max(current_width, int(content_width)),
+            )
+            target_height = min(
+                screen_height,
+                max(current_height, int(content_height)),
+            )
+            if (target_width, target_height) == (current_width, current_height):
+                return
+            self._main_ui_scaling_containment_active = True
+            self._apply_main_window_geometry(
+                self._main_window_size_mode,
+                target_width,
+                target_height,
+                persist=True,
+                center=False,
+                default_size=False,
+            )
+            self.root.update_idletasks()
+            actual_width = max(1, int(self.root.winfo_width()))
+            actual_height = max(1, int(self.root.winfo_height()))
+            self._main_ui_scaling_applied_size = (actual_width, actual_height)
+            self._main_viewport_layout_signature = None
+            self._refresh_main_viewport_layout(
+                window_width=actual_width,
+                window_height=actual_height,
+            )
+            self._settle_scaling_main_viewport_layout()
+            self._persist_main_ui_scaling_layout_cache(
+                actual_width,
+                actual_height,
+            )
+        except (self.tk.TclError, TypeError, ValueError):
+            return
+        finally:
+            self._main_ui_scaling_containment_active = False
+
+    def _enforce_scaling_main_page_minimum(
+        self, content_width: int, content_height: int
+    ) -> None:
+        """Make the scaled main page large enough to show every control.
+
+        Scaling Mode deliberately has no main-page scrollbars, but its resize
+        floor must remain below the current content measurement.  Otherwise
+        the native window stops before the scaling controller receives a
+        smaller target and it can never compact the remaining empty area.
+        """
+        if not bool(getattr(self, "_scaling_mode_enabled", False)):
+            return
+        try:
+            screen_width = max(320, int(self.root.winfo_screenwidth()))
+            screen_height = max(320, int(self.root.winfo_screenheight()))
+            minimum_width = min(
+                screen_width,
+                max(
+                    220,
+                    int(round(int(content_width) * MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE)),
+                ),
+            )
+            minimum_height = min(
+                screen_height,
+                max(
+                    240,
+                    int(round(int(content_height) * MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE)),
+                ),
+            )
+            self.root.minsize(minimum_width, minimum_height)
+        except (self.tk.TclError, TypeError, ValueError):
+            return
+
     def _sync_main_viewport_scrollregion(self, event: Any = None) -> None:
         """Use Tk's real canvas bounds; the viewport size must never replace page size."""
         canvas = getattr(self, "main_viewport_canvas", None)
@@ -51152,6 +52258,10 @@ class LauncherApp:
             )
             advanced_visible = bool(self.advanced_visible_var.get())
             scaling_mode = bool(getattr(self, "_scaling_mode_enabled", False))
+            if scaling_mode:
+                live_width, live_height = self._measure_main_viewport_content_bounds()
+                content_width = max(1, int(live_width), int(content_width))
+                content_height = max(1, int(live_height), int(content_height))
             original_width, original_height = (
                 MAIN_WINDOW_ADVANCED_ORIGINAL_SIZE
                 if advanced_visible and not scaling_mode
@@ -51171,6 +52281,23 @@ class LauncherApp:
                     message_content_bottom,
                 ),
             )
+            if scaling_mode:
+                target_region = (
+                    0,
+                    0,
+                    int(content_width),
+                    int(content_height),
+                )
+            if scaling_mode:
+                # The main page is non-scrollable in Scaling Mode.  Keep the
+                # region equal to the page bounds for wheel routing and never
+                # let a stale canvas bbox resurrect a scrollbar-sized surface.
+                target_region = (
+                    target_region[0],
+                    target_region[1],
+                    int(content_width),
+                    int(content_height),
+                )
             try:
                 current_region = tuple(
                     int(float(value))
@@ -51265,6 +52392,9 @@ class LauncherApp:
             self._main_viewport_layout_signature = None
             self._refresh_main_viewport_layout()
             self.root.update_idletasks()
+            if bool(getattr(self, "_scaling_mode_enabled", False)):
+                self._settle_scaling_main_viewport_layout(reset_origin=True)
+                self._ensure_scaling_main_window_contains_content()
             _redraw_native_window_after_geometry(self.root)
             self._schedule_blender_hierarchy_message_position()
         except self.tk.TclError:
@@ -51445,19 +52575,29 @@ class LauncherApp:
         try:
             if not bool(grip.winfo_exists()):
                 return
+            if str(self.root.state()).casefold() in {"iconic", "withdrawn"}:
+                _managed_window_scheduler(self.root).hide(grip)
+                return
             width = max(1, int(self.root.winfo_width()))
             height = max(1, int(self.root.winfo_height()))
             # Keep the enlarged hit target in place from the first frame.
             # Resizing this widget on <Enter>/<Leave> moves it under the
             # pointer and makes Tk alternate between arrow and resize cursors.
             grip_size = MAIN_RESIZE_GRIP_EXPANDED_SIZE
-            grip.place(
-                x=max(0, width - grip_size),
-                y=max(0, height - grip_size),
-                width=grip_size,
-                height=grip_size,
+            target_x = int(self.root.winfo_rootx()) + max(0, width - grip_size)
+            target_y = int(self.root.winfo_rooty()) + max(0, height - grip_size)
+            _set_themed_window_geometry(
+                grip,
+                f"{grip_size}x{grip_size}{target_x:+d}{target_y:+d}",
+                dark=bool(getattr(self, "_theme_dark", False)),
             )
-            grip.lift()
+            if not bool(grip.winfo_viewable()):
+                _show_managed_toplevel(
+                    grip, self.root, activate=False, force_front=True
+                )
+            if target_x < 0 or target_y < 0:
+                grip.update_idletasks()
+                _set_native_absolute_window_position(grip, target_x, target_y)
         except (self.tk.TclError, TypeError, ValueError):
             return
 
@@ -51757,13 +52897,19 @@ class LauncherApp:
             screen_height = max(320, int(self.root.winfo_screenheight()))
             outer_margin = int(layout["left_x"])
             if advanced_visible:
-                content_minimum_width = (
-                    max(
-                        int(layout["window_w"]),
-                        int(layout["left_x"])
-                        + int(layout["left_w"])
-                        + outer_margin,
-                    )
+                # In Scaling Mode the live placed bounds are authoritative.
+                # The normal layout's three-column baseline is intentionally
+                # wider and must not become a hidden minimum after a page
+                # switch or a narrow resize.
+                content_minimum_width = max(
+                    (
+                        self._scale_main_ui_metric(220, minimum=180)
+                        if bool(getattr(self, "_scaling_mode_enabled", False))
+                        else int(layout["window_w"])
+                    ),
+                    int(layout["left_x"])
+                    + int(layout["left_w"])
+                    + outer_margin,
                 )
                 content_width = max(
                     content_minimum_width, right + outer_margin
@@ -51857,11 +53003,8 @@ class LauncherApp:
 
     def _main_ui_scaling_layout_signature(self, mode: str | None = None) -> str:
         """Version the persisted Scaling Mode layout contract independently."""
-        normalized_mode = mode or self._main_window_size_mode
-        return (
-            f"{MAIN_UI_SCALING_LAYOUT_CACHE_VERSION}|"
-            f"{self._main_window_layout_signature(normalized_mode)}"
-        )
+        del mode
+        return MAIN_UI_SCALING_LAYOUT_CACHE_VERSION
 
     def _main_window_layout_signature_matches(
         self, cached_signature: str, expected_signature: str
@@ -51877,15 +53020,10 @@ class LauncherApp:
         }
 
     def _main_window_size_cache_key(self, mode: str) -> str:
-        normalized_mode = "expanded" if mode == "expanded" else "collapsed"
-        surface = f"main-{self._active_ui_page_key()}"
         if bool(getattr(self, "_scaling_mode_enabled", False)):
-            surface += "-scaling"
-        return _managed_window_scheduler(self.root).layout_cache_key(
-            self.ui_language,
-            surface,
-            normalized_mode,
-        )
+            return "main:scaling"
+        normalized_mode = "expanded" if mode == "expanded" else "collapsed"
+        return f"main:normal:{normalized_mode}"
 
     def _store_main_window_size(
         self,
@@ -51905,7 +53043,11 @@ class LauncherApp:
         default_modes = dict(
             self.launcher_state.get("main_window_default_modes", {})
         )
-        signature = self._main_window_layout_signature(normalized_mode)
+        signature = (
+            self._main_ui_scaling_layout_signature()
+            if bool(getattr(self, "_scaling_mode_enabled", False))
+            else self._main_window_layout_signature(normalized_mode)
+        )
         default_mode_changed = False
         if default_size is not None:
             normalized_default_size = bool(default_size)
@@ -52082,7 +53224,11 @@ class LauncherApp:
             ).get(cache_key, "")
             or ""
         )
-        expected_signature = self._main_window_layout_signature(normalized_mode)
+        expected_signature = (
+            self._main_ui_scaling_layout_signature()
+            if bool(getattr(self, "_scaling_mode_enabled", False))
+            else self._main_window_layout_signature(normalized_mode)
+        )
         layout_signature_changed = not self._main_window_layout_signature_matches(
             cached_signature, expected_signature
         )
@@ -52107,7 +53253,7 @@ class LauncherApp:
             max(minimum_height, cached_height),
         )
         if bool(getattr(self, "_scaling_mode_enabled", False)):
-            scaling_entry = self._main_ui_scaling_layout_cache.get(cache_key)
+            scaling_entry = self._main_ui_scaling_layout_cache.get("main:scaling")
             expected_scaling_signature = self._main_ui_scaling_layout_signature(
                 normalized_mode
             )
@@ -52124,7 +53270,7 @@ class LauncherApp:
                     # with the final minimum-clamped window size. Otherwise a
                     # cold start always sees mismatched dimensions and reruns
                     # the entire scaling solver after the window is shown.
-                    self._main_ui_scaling_layout_cache[cache_key] = rebased_entry
+                    self._main_ui_scaling_layout_cache["main:scaling"] = rebased_entry
                     self.launcher_state["main_ui_scaling_layout_cache"] = dict(
                         self._main_ui_scaling_layout_cache
                     )
@@ -52933,6 +54079,8 @@ class LauncherApp:
                 window_width=actual_size[0],
                 window_height=actual_size[1],
             )
+            self._settle_scaling_main_viewport_layout()
+            self._ensure_scaling_main_window_contains_content()
             self._schedule_blender_hierarchy_message_position()
             self._schedule_launcher_tile_follow()
 
@@ -52965,7 +54113,20 @@ class LauncherApp:
                 self._resize_main_viewport_surface_for_live_gesture(width, height)
                 self._schedule_main_live_resize_commit()
             elif bool(getattr(self, "_scaling_mode_enabled", False)):
-                self._schedule_main_ui_scaling_reflow(width, height)
+                if self._main_ui_scaling_applied_size is None:
+                    self._main_ui_scaling_applied_size = viewport_size
+                    self._apply_main_ui_scaling_policy(
+                        window_width=width,
+                        window_height=height,
+                    )
+                    self._refresh_main_viewport_layout(
+                        window_width=width, window_height=height
+                    )
+                    self._settle_scaling_main_viewport_layout()
+                    self._ensure_scaling_main_window_contains_content()
+                    self._schedule_blender_hierarchy_message_position()
+                else:
+                    self._schedule_main_ui_scaling_reflow(width, height)
             else:
                 self._refresh_main_viewport_layout(
                     window_width=width, window_height=height
@@ -53125,7 +54286,9 @@ class LauncherApp:
         except self.tk.TclError:
             pass
 
-        window = _create_managed_toplevel(self.root, activate=False)
+        window = _create_indexed_toplevel(
+            self.root, "popup.toolbar_process_dropdown", activate=False
+        )
         scheduler = _managed_window_scheduler(self.root)
         try:
             window.wm_overrideredirect(True)
@@ -53367,11 +54530,11 @@ class LauncherApp:
         )
 
     def _main_ui_font_scale_factor(self) -> float:
-        """Scaling Mode never changes the Launcher text size."""
-        widget_scale = self._main_ui_scale_factor()
-        if not bool(getattr(self, "_scaling_mode_enabled", False)):
-            return widget_scale
-        return 1.0
+        scale = float(getattr(self, "_main_ui_font_scale", 1.0) or 1.0)
+        return max(
+            MAIN_WINDOW_SCALING_MIN_FONT_SCALE,
+            min(MAIN_WINDOW_SCALING_MAX_SCALE, scale),
+        )
 
     def _main_ui_spacing_scale_factor(self) -> float:
         scale = float(getattr(self, "_main_ui_layout_scale", 1.0) or 1.0)
@@ -53523,6 +54686,21 @@ class LauncherApp:
             except (self.tk.TclError, TypeError, ValueError, AttributeError):
                 continue
         self._apply_main_ui_grid_metrics()
+
+    def _apply_main_ui_font_scale(self, scale: float) -> None:
+        normalized = max(
+            MAIN_WINDOW_SCALING_MIN_FONT_SCALE,
+            min(MAIN_WINDOW_SCALING_MAX_SCALE, float(scale)),
+        )
+        previous = float(getattr(self, "_main_ui_font_scale", 1.0) or 1.0)
+        if abs(normalized - previous) < 0.002:
+            self._apply_main_ui_style_scope()
+            return
+        self._main_ui_font_scale = normalized
+        self._ui_text_measure_cache.clear()
+        self._ui_line_height_cache.clear()
+        self._apply_main_ui_style_scale(self.ttk.Style(self.root))
+        self._apply_main_ui_style_scope()
 
     @staticmethod
     def _main_ui_style_variant_name(source: str) -> str:
@@ -54374,6 +55552,9 @@ class LauncherApp:
     def _build_ui(self) -> None:
         ttk = self.ttk
         root = self.root
+        previous_resize_grip = getattr(self, "main_resize_grip", None)
+        if previous_resize_grip is not None:
+            _managed_window_scheduler(root).dispose(previous_resize_grip)
         self._compact_model_control_anchor: dict[int, tuple[int, int, int, int]] = {}
         layout = self._main_layout()
         self._main_viewport_content_size = (1, 1)
@@ -54436,15 +55617,26 @@ class LauncherApp:
             self._main_viewport_dropdown_is_open,
             atomic_paint=False,
         )
-        self.main_resize_grip = self.tk.Frame(
+        self.main_resize_grip = _create_indexed_toplevel(
             root,
-            width=MAIN_RESIZE_GRIP_SIZE,
-            height=MAIN_RESIZE_GRIP_SIZE,
+            "popup.main_resize_grip",
+            activate=False,
+        )
+        self.main_resize_grip.wm_overrideredirect(True)
+        self.main_resize_grip.wm_resizable(False, False)
+        self.main_resize_grip.configure(
             background=self.colors["bg"],
             borderwidth=0,
             highlightthickness=0,
             cursor="size_nw_se",
         )
+        self.main_resize_grip.transient(root)
+        # The native window is only a pointer hit target.  A Tk child frame
+        # cannot be transparent, so keep this managed Toplevel at alpha zero.
+        self.main_resize_grip.attributes("-alpha", 0.0)
+        setattr(self.main_resize_grip, "_pc_rehd_themed_target_alpha", 0.0)
+        setattr(self.main_resize_grip, "_pc_rehd_stack_layer", MANAGED_WINDOW_TOOLTIP_LAYER)
+        setattr(self.main_resize_grip, "_pc_rehd_force_front", True)
         self.main_resize_grip.bind(
             "<ButtonPress-1>", self._begin_main_resize_grip, add="+"
         )
@@ -54462,6 +55654,7 @@ class LauncherApp:
         )
         self._position_main_resize_grip()
         self.option_controls = []
+        self._model_option_rows: dict[str, TtkModelOptionRow] = {}
         self.max_scene_controls: list[tuple[Any, str]] = []
         self.aux_export_buttons: dict[str, Any] = {}
         self.aux_export_tooltips: dict[str, HoverTooltip] = {}
@@ -54557,92 +55750,16 @@ class LauncherApp:
         model.columnconfigure(1, weight=0)
         self.import_button = ttk.Button(model, text=self._tr("导入 Mod", "Import Mod"), command=self._choose_and_import_mod)
         self.import_button.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(6, 2))
-        import_normals = ttk.Checkbutton(
-            model, text=self._tr("导入法线", "Import Normals"),
-            variable=self.import_normals_var, command=self._on_import_normals_changed,
-        )
-        self.import_normals_check = import_normals
-        import_normals.grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=2)
-        self.blender_import_normals_help_button = ttk.Button(
-            model,
-            text="?",
-            width=3,
-            command=lambda: self._show_help("blender_import_normals"),
-        )
-        self.blender_import_normals_help_button.grid(
-            row=2, column=1, sticky="e", padx=(2, 8), pady=2
-        )
+        model_option_controls, model_option_accessories = self._build_model_option_rows(model)
+        import_normals = model_option_controls["import_normals"]
         self._sync_backend_model_option_controls()
-        self.import_textures_check = ttk.Checkbutton(
-            model,
-            text=self._tr("导入贴图", "Import Textures"),
-            variable=self.import_textures_var,
-            command=self._persist_model_option_preferences,
-        )
-        self.import_textures_check.grid(
-            row=1, column=0, sticky="w", padx=8, pady=2
-        )
-        ttk.Button(
-            model,
-            text="?",
-            width=3,
-            command=lambda: self._show_help("import_textures"),
-        ).grid(row=1, column=1, sticky="e", padx=(2, 8), pady=2)
-        self.reset_scene_on_import_check = ttk.Checkbutton(
-            model,
-            text=self._tr("导入时重置场景", "Reset Scene on Import"),
-            variable=self.reset_scene_on_import_var,
-            command=self._persist_model_option_preferences,
-        )
-        self.reset_scene_on_import_check.grid(
-            row=3, column=0, columnspan=2, sticky="w", padx=8, pady=2
-        )
         self.export_button = ttk.Button(model, text=self._tr("导出到 Mod", "Export To Mod"), command=self._request_mod_export)
         self.export_button.grid(row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=2)
-        check_source = ttk.Checkbutton(
-            model,
-            text=self._tr("检查源文件", "Check Source"),
-            variable=self.check_source_var,
-            command=self._persist_model_option_preferences,
-        )
-        check_source.grid(row=5, column=0, sticky="w", padx=8, pady=2)
-        ttk.Button(model, text="?", width=3, command=lambda: self._show_help("source")).grid(row=5, column=1, sticky="e", padx=(2, 8), pady=2)
-        export_map2 = ttk.Checkbutton(
-            model,
-            text=self._tr("导出 UV Map 2", "Export UV Map 2"),
-            variable=self.export_map2_var,
-            command=self._commit_export_map2,
-        )
-        export_map2.grid(row=6, column=0, sticky="w", padx=8, pady=2)
-        ttk.Button(model, text="?", width=3, command=lambda: self._show_help("map2")).grid(row=6, column=1, sticky="e", padx=(2, 8), pady=2)
-        uv_half = ttk.Checkbutton(
-            model,
-            text=self._tr("UV 半精度保护", "UV Half Safe"),
-            variable=self.uv_half_safe_var,
-            command=self._commit_uv_half_safe_preference,
-        )
-        uv_half.grid(row=7, column=0, sticky="w", padx=8, pady=2)
-        ttk.Button(model, text="?", width=3, command=lambda: self._show_help("uv_half")).grid(row=7, column=1, sticky="e", padx=(2, 8), pady=2)
-        log_mode = ttk.Checkbutton(
-            model,
-            text=self._tr("日志模式", "Log Mode"),
-            variable=self.log_mode_var,
-            command=self._persist_model_option_preferences,
-        )
-        log_mode.grid(row=8, column=0, sticky="w", padx=8, pady=2)
-        model_log_directory_button = ttk.Button(
-            model,
-            text="...",
-            width=3,
-            command=self._open_log_directory,
-        )
-        model_log_directory_button.grid(
-            row=8,
-            column=1,
-            sticky="e",
-            padx=(2, 8),
-            pady=2,
-        )
+        check_source = model_option_controls["check_source"]
+        export_map2 = model_option_controls["export_map2"]
+        uv_half = model_option_controls["uv_half_safe"]
+        log_mode = model_option_controls["log_mode"]
+        model_log_directory_button = model_option_accessories["log_mode"]
         self.log_cache_directory_tooltips.append(
             HoverTooltip(
                 model_log_directory_button,
@@ -54667,6 +55784,7 @@ class LauncherApp:
         self._build_bone_group(content)
         self._build_mesh_filter_group(content)
         self._build_footer_controls(content)
+        self._register_main_ui_surfaces()
         self._apply_advanced_visibility()
         self._capture_main_ui_grid_metrics()
         if self.blender_mode_enabled:
@@ -54676,6 +55794,374 @@ class LauncherApp:
                 )
             except self.tk.TclError:
                 self._set_blender_hierarchy_message_expanded(True)
+
+    def _register_main_ui_surfaces(self) -> None:
+        """Index stable main-page areas after their existing widgets are built."""
+        ui_scheduler = _managed_window_scheduler(self.root)
+        ui_scheduler.clear_ui_surfaces(window="main")
+        for surface_id, spec in TTK_UI_SURFACE_CATALOG.items():
+            if spec.window != "main" or not spec.widget_attribute:
+                continue
+            ui_scheduler.register_ui_surface(
+                surface_id,
+                window=spec.window,
+                role=spec.role,
+                widget=getattr(self, spec.widget_attribute, None),
+                widget_attribute=spec.widget_attribute,
+                description=spec.description,
+                state_tags=spec.state_tags,
+            )
+
+    def _ui_surface_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Return a serializable map for screenshot-guided TTK maintenance."""
+        return _managed_window_scheduler(self.root).ui_surface_snapshot()
+
+    def _ui_control_plane_snapshot(self) -> dict[str, Any]:
+        """Return the central TTK maintenance map with live UI state and lines."""
+        owner_types: dict[str, Any] = {
+            "LauncherApp": type(self),
+            "_ManagedWindowScheduler": _ManagedWindowScheduler,
+            "ChoiceDialog": ChoiceDialog,
+            "HoverTooltip": HoverTooltip,
+            "MrlTextureBindDialog": MrlTextureBindDialog,
+            "ImportTextureConfigDialog": ImportTextureConfigDialog,
+            "module": sys.modules.get(__name__),
+        }
+        live_surfaces = self._ui_surface_snapshot()
+        catalog: dict[str, dict[str, Any]] = {}
+        for surface_id, spec in TTK_UI_SURFACE_CATALOG.items():
+            owner_type = owner_types.get(spec.owner_type)
+            builder = (
+                getattr(owner_type, spec.builder_name, None)
+                if owner_type is not None
+                else None
+            )
+            code = getattr(builder, "__code__", None)
+            catalog[surface_id] = {
+                "window": spec.window,
+                "role": spec.role,
+                "widget_attribute": spec.widget_attribute,
+                "builder": f"{spec.owner_type}.{spec.builder_name}",
+                "source_path": str(getattr(code, "co_filename", "")),
+                "source_line": int(getattr(code, "co_firstlineno", 0) or 0),
+                "description": spec.description,
+                "state_tags": spec.state_tags,
+                "registered": surface_id in live_surfaces,
+            }
+        behaviors: dict[str, dict[str, Any]] = {}
+        for behavior_id, spec in TTK_UI_BEHAVIOR_CATALOG.items():
+            owner_type = owner_types.get(spec.owner_type)
+            source_locations: list[dict[str, Any]] = []
+            for method_name in spec.method_names:
+                method = (
+                    getattr(owner_type, method_name, None)
+                    if owner_type is not None
+                    else None
+                )
+                code = getattr(method, "__code__", None)
+                source_locations.append(
+                    {
+                        "method": f"{spec.owner_type}.{method_name}",
+                        "source_path": str(getattr(code, "co_filename", "")),
+                        "source_line": int(
+                            getattr(code, "co_firstlineno", 0) or 0
+                        ),
+                    }
+                )
+            behaviors[behavior_id] = {
+                "category": spec.category,
+                "description": spec.description,
+                "state_tags": spec.state_tags,
+                "source_locations": source_locations,
+            }
+        toplevel_factories: dict[str, dict[str, Any]] = {}
+        for factory_id, spec in TTK_UI_TOPLEVEL_FACTORY_CATALOG.items():
+            owner_type = owner_types.get(spec.owner_type)
+            method = (
+                getattr(owner_type, spec.method_name, None)
+                if owner_type is not None
+                else None
+            )
+            code = getattr(method, "__code__", None)
+            uses_indexed_factory = False
+            try:
+                import inspect
+                import textwrap
+
+                source_tree = ast.parse(
+                    textwrap.dedent(inspect.getsource(method))
+                )
+                uses_indexed_factory = any(
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "_create_indexed_toplevel"
+                    for node in ast.walk(source_tree)
+                )
+            except (OSError, TypeError, SyntaxError):
+                pass
+            toplevel_factories[factory_id] = {
+                "surface_id": spec.surface_id,
+                "method": f"{spec.owner_type}.{spec.method_name}",
+                "source_path": str(getattr(code, "co_filename", "")),
+                "source_line": int(getattr(code, "co_firstlineno", 0) or 0),
+                "uses_indexed_factory": uses_indexed_factory,
+                "description": spec.description,
+                "state_tags": spec.state_tags,
+            }
+        try:
+            root_state = str(self.root.state()).casefold()
+        except self.tk.TclError:
+            root_state = "destroyed"
+        declared_launcher_gui_methods = {
+            spec.builder_name
+            for spec in TTK_UI_SURFACE_CATALOG.values()
+            if spec.owner_type == "LauncherApp"
+        }
+        observed_launcher_gui_methods = {
+            name
+            for name, member in vars(type(self)).items()
+            if callable(_ttk_ui_callable_member(member))
+            and (name.startswith("_build_") or name.startswith("_show_"))
+        }
+        undeclared_launcher_gui_methods = sorted(
+            observed_launcher_gui_methods - declared_launcher_gui_methods
+        )
+        declared_launcher_ui_behavior_methods = {
+            method_name
+            for spec in TTK_UI_BEHAVIOR_CATALOG.values()
+            if spec.owner_type == "LauncherApp"
+            for method_name in spec.method_names
+        }
+        observed_launcher_ui_behavior_methods = {
+            name
+            for name, member in vars(type(self)).items()
+            if callable(_ttk_ui_callable_member(member))
+            and _is_ttk_ui_behavior_method(name)
+        }
+        undeclared_launcher_ui_behavior_methods = sorted(
+            observed_launcher_ui_behavior_methods
+            - declared_launcher_ui_behavior_methods
+        )
+        declared_toplevel_factories = {
+            (spec.owner_type, spec.method_name)
+            for spec in TTK_UI_TOPLEVEL_FACTORY_CATALOG.values()
+        }
+        observed_toplevel_factories: set[tuple[str, str]] = set()
+        try:
+            import inspect
+            import textwrap
+
+            observed_factory_owners = {
+                spec.owner_type for spec in TTK_UI_TOPLEVEL_FACTORY_CATALOG.values()
+            }
+            for owner_name in observed_factory_owners:
+                owner_type = owner_types.get(owner_name)
+                if owner_type is None:
+                    continue
+                for method_name, member in vars(owner_type).items():
+                    method = _ttk_ui_callable_member(member)
+                    if not callable(method):
+                        continue
+                    try:
+                        source = inspect.getsource(method)
+                        source_tree = ast.parse(textwrap.dedent(source))
+                    except (OSError, TypeError):
+                        continue
+                    if any(
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == "_create_managed_toplevel"
+                        for node in ast.walk(source_tree)
+                    ):
+                        observed_toplevel_factories.add((owner_name, method_name))
+        except Exception:
+            observed_toplevel_factories = set()
+        undeclared_toplevel_factories = sorted(
+            f"{owner_name}.{method_name}"
+            for owner_name, method_name in (
+                observed_toplevel_factories - declared_toplevel_factories
+            )
+        )
+        widget_compositions = _ttk_ui_widget_compositions(owner_types)
+        ui_interactions = _ttk_ui_interactions(owner_types)
+        return {
+            "control_plane": "_ManagedWindowScheduler",
+            "state": {
+                "language": str(self.ui_language),
+                "backend": "blender" if self.blender_mode_enabled else "max",
+                "advanced_options": bool(self.advanced_visible_var.get()),
+                "scaling_mode": bool(self.scaling_mode_var.get()),
+                "floating_ball": _managed_window_scheduler(
+                    self.root
+                ).floating_ball_active(),
+                "root_window_state": root_state,
+            },
+            "catalog": catalog,
+            "behaviors": behaviors,
+            "toplevel_factories": toplevel_factories,
+            "widget_compositions": widget_compositions,
+            "ui_interactions": ui_interactions,
+            "surfaces": live_surfaces,
+            "model_option_rows": self._model_option_row_snapshot(),
+            "coverage": {
+                "declared_launcher_gui_methods": sorted(
+                    declared_launcher_gui_methods
+                ),
+                "observed_launcher_gui_methods": sorted(
+                    observed_launcher_gui_methods
+                ),
+                "undeclared_launcher_gui_methods": undeclared_launcher_gui_methods,
+                "declared_launcher_ui_behavior_methods": sorted(
+                    declared_launcher_ui_behavior_methods
+                ),
+                "observed_launcher_ui_behavior_methods": sorted(
+                    observed_launcher_ui_behavior_methods
+                ),
+                "undeclared_launcher_ui_behavior_methods": (
+                    undeclared_launcher_ui_behavior_methods
+                ),
+                "declared_toplevel_factories": sorted(
+                    f"{owner_name}.{method_name}"
+                    for owner_name, method_name in declared_toplevel_factories
+                ),
+                "observed_toplevel_factories": sorted(
+                    f"{owner_name}.{method_name}"
+                    for owner_name, method_name in observed_toplevel_factories
+                ),
+                "undeclared_toplevel_factories": undeclared_toplevel_factories,
+            },
+        }
+
+    def _build_model_option_rows(
+        self, parent: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Build the fixed Model File option rows from their control-plane spec."""
+        controls: dict[str, Any] = {}
+        accessories: dict[str, Any] = {}
+        self._model_option_rows.clear()
+        for spec in TTK_UI_MODEL_OPTION_ROWS:
+            control = self.ttk.Checkbutton(
+                parent,
+                text=self._tr(spec.text_cn, spec.text_en),
+                variable=getattr(self, spec.variable_attribute),
+                command=getattr(self, spec.command_name),
+            )
+            grid_options: dict[str, Any] = {
+                "row": spec.row,
+                "column": 0,
+                "sticky": "w",
+                "padx": 8,
+                "pady": 2,
+            }
+            if spec.columnspan > 1:
+                grid_options["columnspan"] = spec.columnspan
+            control.grid(**grid_options)
+            if spec.control_attribute:
+                setattr(self, spec.control_attribute, control)
+            accessory = None
+            if spec.help_topic:
+                accessory = self.ttk.Button(
+                    parent,
+                    text="?",
+                    width=3,
+                    command=lambda topic=spec.help_topic: self._show_help(topic),
+                )
+            elif spec.accessory_command_name:
+                accessory = self.ttk.Button(
+                    parent,
+                    text=spec.accessory_text,
+                    width=3,
+                    command=getattr(self, spec.accessory_command_name),
+                )
+            if accessory is not None:
+                accessory.grid(
+                    row=spec.row,
+                    column=1,
+                    sticky="e",
+                    padx=(2, 8),
+                    pady=2,
+                )
+                if spec.help_attribute:
+                    setattr(self, spec.help_attribute, accessory)
+                accessories[spec.key] = accessory
+            controls[spec.key] = control
+            self._register_model_option_row(
+                spec.key,
+                row=spec.row,
+                control=control,
+                control_attribute=spec.control_attribute,
+                variable_attribute=spec.variable_attribute,
+                help_topic=spec.help_topic,
+            )
+        return controls, accessories
+
+    def _register_model_option_row(
+        self,
+        key: str,
+        *,
+        row: int,
+        control: Any,
+        variable_attribute: str,
+        control_attribute: str = "",
+        help_topic: str = "",
+    ) -> None:
+        """Declare a Model File row without altering its existing widget path."""
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            raise ValueError("Model option row key cannot be empty")
+        self._model_option_rows[normalized_key] = TtkModelOptionRow(
+            key=normalized_key,
+            row=int(row),
+            control=control,
+            control_attribute=str(control_attribute or "").strip(),
+            variable_attribute=str(variable_attribute or "").strip(),
+            help_topic=str(help_topic or "").strip(),
+        )
+
+    def _model_option_row_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Expose stable Model File row contracts for screenshot-guided edits."""
+        snapshot: dict[str, dict[str, Any]] = {}
+        for key, record in self._model_option_rows.items():
+            try:
+                control_exists = bool(
+                    record.control is not None and record.control.winfo_exists()
+                )
+            except Exception:
+                control_exists = False
+            snapshot[key] = {
+                "row": record.row,
+                "control_attribute": record.control_attribute,
+                "variable_attribute": record.variable_attribute,
+                "help_topic": record.help_topic,
+                "control_plane": "TTK_UI_MODEL_OPTION_ROWS",
+                "control_exists": control_exists,
+            }
+        return snapshot
+
+    def _register_managed_ui_surface(
+        self, surface_id: str, window: Any
+    ) -> None:
+        """Attach an existing managed Toplevel through the central catalog."""
+        spec = TTK_UI_SURFACE_CATALOG.get(str(surface_id or "").strip())
+        if spec is None:
+            raise ValueError(f"Unknown TTK UI surface: {surface_id!r}")
+        _managed_window_scheduler(self.root).register_ui_surface(
+            surface_id,
+            window=spec.window,
+            role=spec.role,
+            widget=window,
+            widget_attribute=spec.widget_attribute,
+            description=spec.description,
+            state_tags=spec.state_tags,
+        )
+
+    def _unregister_managed_ui_surface(
+        self, surface_id: str, window: Any
+    ) -> None:
+        """Forget only the closing Toplevel, never a newer replacement."""
+        _managed_window_scheduler(self.root).unregister_ui_surface(
+            surface_id, widget=window
+        )
 
     def _build_collapsible_group(self, parent: Any, key: str, title: str) -> Any:
         """Create a LabelFrame whose title contains one compact collapse button."""
@@ -55266,10 +56752,30 @@ class LauncherApp:
             self._queue_launcher_state_write()
         self._set_collapsible_section_state(key, collapsed)
         self._reflow_left_sections(flush_layout=False)
+        if bool(getattr(self, "_scaling_mode_enabled", False)):
+            try:
+                # A saved layout is only a warm start.  Collapsing and then
+                # reopening a section must converge to the same compact
+                # factors as a first render at this exact window size.
+                self._apply_main_ui_scaling_policy(
+                    window_width=max(1, int(self.root.winfo_width())),
+                    window_height=max(1, int(self.root.winfo_height())),
+                )
+            except (self.tk.TclError, TypeError, ValueError):
+                pass
+            # Collapse changes grid-managed children asynchronously.  Settle
+            # the scaled viewport now so an old page size cannot keep a bar
+            # visible until the deferred window-geometry commit runs.
+            self._settle_scaling_main_viewport_layout()
+            self._ensure_scaling_main_window_contains_content()
+            self._reclaim_scaling_window_whitespace()
         self._schedule_main_window_geometry_commit(
             "collapsed",
             reset_origin=False,
-            fit_to_content=True,
+            # Scaling Mode owns the user's current window dimensions.  It
+            # must compact the page into that rectangle, not enlarge the
+            # window after a section toggle and hide the layout defect.
+            fit_to_content=not bool(getattr(self, "_scaling_mode_enabled", False)),
         )
         if canvas is not None and restore_view is not None:
             scheduler.schedule_scroll_view_restore(
@@ -55288,6 +56794,17 @@ class LauncherApp:
         if self._persist_active_ui_page_preferences():
             self._queue_launcher_state_write()
         self._reflow_left_sections(flush_layout=False)
+        if bool(getattr(self, "_scaling_mode_enabled", False)):
+            try:
+                self._apply_main_ui_scaling_policy(
+                    window_width=max(1, int(self.root.winfo_width())),
+                    window_height=max(1, int(self.root.winfo_height())),
+                )
+            except (self.tk.TclError, TypeError, ValueError):
+                pass
+            self._settle_scaling_main_viewport_layout()
+            self._ensure_scaling_main_window_contains_content()
+            self._reclaim_scaling_window_whitespace()
         self._schedule_main_window_geometry_commit(
             "collapsed",
             reset_origin=False,
@@ -55697,68 +57214,47 @@ class LauncherApp:
             pass
         return int(model_y) + self._measure_ui_line_height() + 2
 
-    def _scaling_mode_preserves_advanced_topology(self) -> bool:
-        """Keep Advanced Options in its familiar two-column arrangement."""
-        return True
-
-    def _apply_main_ui_advanced_scaling_layout(
-        self, *, enabled: bool, width: int | None = None
-    ) -> None:
-        """Compress Advanced Options without changing its visible arrangement."""
-        area = getattr(self, "right_area", None)
-        left_stack = getattr(self, "right_left_stack", None)
-        right_stack = getattr(self, "right_right_stack", None)
-        if area is None or left_stack is None or right_stack is None:
+    def _reclaim_scaling_window_whitespace(self) -> None:
+        """Shrink a scaled page after a visibility change removes old content."""
+        if not bool(getattr(self, "_scaling_mode_enabled", False)):
+            return
+        if self._main_ui_resize_interaction_active():
             return
         try:
-            if enabled:
-                column_gap = self._scale_main_ui_spacing_metric(7, minimum=1)
-                area.columnconfigure(0, weight=1, uniform="right_columns")
-                area.columnconfigure(1, weight=1, uniform="right_columns")
-                area.rowconfigure(0, weight=0)
-                area.rowconfigure(1, weight=0)
-                left_stack.grid_configure(
-                    row=0, column=0, padx=(0, column_gap), pady=0, sticky="new"
-                )
-                right_stack.grid_configure(
-                    row=0, column=1, padx=(column_gap, 0), pady=0, sticky="new"
-                )
-                area.update_idletasks()
-                # Keep each advanced column at its natural minimum.  An
-                # explicit placed width must not squeeze the tool stack into
-                # the neighboring column.
-                left_minimum_width = max(1, int(left_stack.winfo_reqwidth()))
-                right_minimum_stack_width = max(
-                    1, int(right_stack.winfo_reqwidth())
-                )
-                area.columnconfigure(0, minsize=left_minimum_width)
-                area.columnconfigure(1, minsize=right_minimum_stack_width)
-                area.update_idletasks()
-                minimum_width = max(
-                    1,
-                    int(area.winfo_reqwidth()),
-                    left_minimum_width
-                    + right_minimum_stack_width
-                    + (2 * column_gap)
-                    + 14,
-                )
-                if width is not None:
-                    area.configure(width=max(minimum_width, int(width)))
+            self.root.update_idletasks()
+            target_width, target_height = self._fit_main_window_to_content(
+                flush_layout=False
+            )
+            current_width = max(1, int(self.root.winfo_width()))
+            current_height = max(1, int(self.root.winfo_height()))
+            tolerance = max(
+                8,
+                self._scale_main_ui_spacing_metric(10, minimum=4),
+            )
+            if (
+                current_width - int(target_width) <= tolerance
+                and current_height - int(target_height) <= tolerance
+            ):
                 return
-            area.columnconfigure(0, minsize=0)
-            area.columnconfigure(1, minsize=0)
-            area.columnconfigure(0, weight=1, uniform="right_columns")
-            area.columnconfigure(1, weight=1, uniform="right_columns")
-            area.rowconfigure(0, weight=0)
-            area.rowconfigure(1, weight=0)
-            left_stack.grid_configure(
-                row=0, column=0, padx=(0, 7), pady=0, sticky="new"
+            target_width = min(current_width, max(1, int(target_width)))
+            target_height = min(current_height, max(1, int(target_height)))
+            self._apply_main_window_geometry(
+                self._main_window_size_mode,
+                target_width,
+                target_height,
+                persist=True,
+                center=False,
+                default_size=True,
             )
-            right_stack.grid_configure(
-                row=0, column=1, padx=(7, 0), pady=0, sticky="new"
+            # Geometry changes can expose one final row/column measurement;
+            # settle once against the reclaimed rectangle and persist it.
+            self._apply_main_ui_scaling_policy(
+                window_width=target_width,
+                window_height=target_height,
             )
-            area.update_idletasks()
-            area.configure(width=max(1, int(area.winfo_reqwidth())))
+            self._persist_main_ui_scaling_layout_cache(
+                target_width, target_height
+            )
         except (self.tk.TclError, TypeError, ValueError):
             return
 
@@ -55769,7 +57265,12 @@ class LauncherApp:
         toolbar_y = int(self.toolbar.winfo_y())
         process_area = getattr(self, "toolbar_process_area", self.toolbar)
         content_toolbar_rows = (
-            {0, 1} if not bool(self.advanced_visible_var.get()) else {0}
+            {0, 1}
+            if (
+                not bool(self.advanced_visible_var.get())
+                or bool(getattr(self, "_scaling_mode_enabled", False))
+            )
+            else {0}
         )
         toolbar_content_bottom = 0
         try:
@@ -55823,20 +57324,6 @@ class LauncherApp:
             pass
         if toolbar_content_bottom <= 0:
             toolbar_content_bottom = int(self.toolbar.winfo_reqheight())
-        if (
-            bool(getattr(self, "_scaling_mode_enabled", False))
-            and bool(self.advanced_visible_var.get())
-            and not self._scaling_mode_preserves_advanced_topology()
-        ):
-            action_area = getattr(self, "toolbar_action_area", None)
-            try:
-                if action_area is not None and str(action_area.winfo_manager()) == "place":
-                    toolbar_content_bottom = max(
-                        toolbar_content_bottom,
-                        int(action_area.winfo_y()) + int(action_area.winfo_height()),
-                    )
-            except (self.tk.TclError, TypeError, ValueError):
-                pass
         content_top = (
             toolbar_y
             + toolbar_content_bottom
@@ -55988,7 +57475,7 @@ class LauncherApp:
             # lets that button cover the preceding section's action button.
             # Reserve only the small overlap allowance; do not restore normal
             # mode's large vertical spacing.
-            gap = max(4, gap)
+            gap = max(1, gap)
         x = int(layout["left_x"])
         width = max(
             int(layout["left_w"]),
@@ -56022,143 +57509,13 @@ class LauncherApp:
         )
         model_y = blender_mode_y + blender_mode_h
         scaling_mode = bool(getattr(self, "_scaling_mode_enabled", False))
-        available_size = getattr(self, "_main_ui_layout_available_size", None)
-        try:
-            available_width = max(
-                1,
-                int(available_size[0])
-                if isinstance(available_size, tuple) and len(available_size) >= 2
-                else int(self.root.winfo_width()),
-            )
-        except (self.tk.TclError, TypeError, ValueError, IndexError):
-            available_width = width
-        content_width = max(width, available_width - (2 * x))
-        secondary_minimum_width = max(
-            int(layout["left_w"]),
-            self.rename_group.winfo_reqwidth(),
-            self.rename_button.winfo_reqwidth(),
-            self.filter_group.winfo_reqwidth(),
+        advanced_visible = (
+            bool(self.advanced_visible_var.get())
+            if hasattr(self, "advanced_visible_var")
+            else True
         )
-        use_compact_columns = bool(
-            scaling_mode
-            and not bool(self.advanced_visible_var.get())
-            and content_width >= width + gap + secondary_minimum_width
-        )
-        if use_compact_columns:
-            # Scaling Mode uses the available width before reducing controls.
-            # This keeps every compact section visible without a vertical
-            # scrollbar on the common small-but-wide window sizes.
-            compact_controls_h = self._place_compact_model_controls(
-                x=x,
-                y=content_top,
-                width=content_width,
-            )
-            blender_mode_y = content_top + compact_controls_h
-            blender_mode_h = self._place_compact_blender_mode_controls(
-                x=x,
-                y=blender_mode_y,
-                width=content_width,
-            )
-            model_y = blender_mode_y + blender_mode_h
-            secondary_x = x + width + gap
-            secondary_width = max(
-                secondary_minimum_width,
-                content_width - width - gap,
-            )
-            self._set_widget_place_geometry(
-                self.model_group, x=x, y=model_y, width=width, height=model_h
-            )
-            self._place_collapsible_section_button(
-                "model", x=x, y=model_y, width=width
-            )
-
-            rename_y = model_y
-            rename_collapsed = bool(
-                self._collapsible_sections.get("rename", {}).get("collapsed", False)
-            )
-            rename_h = (
-                self._collapsed_section_height()
-                if rename_collapsed
-                else self._scaling_section_required_height(
-                    self.rename_group,
-                    self._scale_main_ui_metric(int(layout["rename_h"]), minimum=1),
-                )
-            )
-            self._set_widget_place_geometry(
-                self.rename_group,
-                x=secondary_x,
-                y=rename_y,
-                width=secondary_width,
-                height=rename_h,
-            )
-            self._place_collapsible_section_button(
-                "rename", x=secondary_x, y=rename_y, width=secondary_width
-            )
-            self._place_mesh_rename_failure_notice(
-                x=secondary_x, y=rename_y, width=secondary_width
-            )
-            if rename_collapsed:
-                self._set_widget_place_visible(self.rename_button, False)
-                filter_y = rename_y + rename_h + gap
-            else:
-                button_y = rename_y + rename_h + gap
-                button_h = self.rename_button.winfo_reqheight()
-                self._set_widget_place_geometry(
-                    self.rename_button,
-                    x=secondary_x,
-                    y=button_y,
-                    width=secondary_width,
-                    height=button_h,
-                )
-                filter_y = button_y + button_h + gap
-            filter_collapsed = bool(
-                self._collapsible_sections.get("filter", {}).get("collapsed", False)
-            )
-            filter_h = (
-                self._collapsed_section_height()
-                if filter_collapsed
-                else self._scaling_section_required_height(
-                    self.filter_group,
-                    self._scale_main_ui_metric(int(layout["filter_h"]), minimum=1),
-                )
-            )
-            self._set_widget_place_geometry(
-                self.filter_group,
-                x=secondary_x,
-                y=filter_y,
-                width=secondary_width,
-                height=filter_h,
-            )
-            self._place_collapsible_section_button(
-                "filter", x=secondary_x, y=filter_y, width=secondary_width
-            )
-            self._right_x = secondary_x
-            if hasattr(self, "right_area"):
-                self._set_widget_place_visible(self.right_area, False)
-            if hasattr(self, "footer_frame"):
-                self._set_widget_place_geometry(
-                    self.footer_frame,
-                    x=x,
-                    y=model_y
-                    + model_h
-                    + self._scale_main_ui_spacing_metric(8, minimum=2),
-                    width=width,
-                )
-            self._section_flow = {
-                "content_top": content_top,
-                "right_content_top": model_y,
-                "blender_mode_y": blender_mode_y,
-                "blender_mode_h": blender_mode_h,
-                "model_y": model_y,
-                "left_width": content_width,
-                "model_h": model_h,
-                "rename_y": rename_y,
-                "rename_h": rename_h,
-                "filter_y": filter_y,
-                "filter_h": filter_h,
-            }
-            self._raise_scaling_main_content_layers()
-            return
+        # Scaling Mode changes metrics only.  It must not switch the normal
+        # page from its existing relative placement into a second topology.
         self._set_widget_place_geometry(
             self.model_group, x=x, y=model_y, width=width, height=model_h
         )
@@ -56220,89 +57577,24 @@ class LauncherApp:
         )
         right_x = x + width + gap
         self._right_x = right_x
-        advanced_visible = (
-            bool(self.advanced_visible_var.get())
-            if hasattr(self, "advanced_visible_var")
-            else True
-        )
         right_content_top = self._advanced_area_aligned_top(model_y)
         if hasattr(self, "right_area") and advanced_visible:
-            scaling_mode = bool(getattr(self, "_scaling_mode_enabled", False))
-            available_size = getattr(self, "_main_ui_layout_available_size", None)
-            try:
-                available_width = (
-                    int(available_size[0])
-                    if isinstance(available_size, tuple) and len(available_size) >= 2
-                    else int(self.root.winfo_width())
-                )
-            except (self.tk.TclError, TypeError, ValueError, IndexError):
-                available_width = right_x + 1
-            right_width = max(
-                1,
-                available_width - right_x - self._scale_main_ui_spacing_metric(10, minimum=2),
-            )
-            if scaling_mode:
-                # Advanced Options owns a fixed origin and must only compress
-                # from its natural two-column footprint. Filling all remaining
-                # window width stretches it into the toolbar action column and
-                # covers Scaling Mode plus the adjacent action controls.
-                try:
-                    right_width = min(
-                        right_width,
-                        max(1, int(self.right_area.winfo_reqwidth())),
-                    )
-                except (self.tk.TclError, TypeError, ValueError):
-                    pass
-            self._apply_main_ui_advanced_scaling_layout(
-                enabled=scaling_mode,
-                width=right_width if scaling_mode else None,
-            )
             self.right_area.update_idletasks()
-            if scaling_mode and self._scaling_mode_preserves_advanced_topology():
-                # The available viewport width is only a target.  Keep the
-                # complete two-column advanced topology at its natural minimum
-                # so the right-side tool column cannot overlap the left stack.
-                column_gap = self._scale_main_ui_spacing_metric(7, minimum=1)
-                right_minimum_width = max(
-                    1,
-                    int(self.right_area.winfo_reqwidth()),
-                    int(self.right_left_stack.winfo_reqwidth())
-                    + int(self.right_right_stack.winfo_reqwidth())
-                    + (2 * column_gap)
-                    + 14,
+            right_width = max(1, int(self.right_area.winfo_reqwidth()))
+            area_height = max(
+                1,
+                int(self.right_area.winfo_reqheight()),
+                max(
+                    int(self.right_left_stack.winfo_reqheight()),
+                    int(self.right_right_stack.winfo_reqheight()),
                 )
-                right_width = max(right_width, right_minimum_width)
-            if (
-                scaling_mode
-                and not self._scaling_mode_preserves_advanced_topology()
-            ):
-                self.right_area.update_idletasks()
-                area_height = max(
-                    1,
-                    int(self.right_left_stack.winfo_reqheight())
-                    + int(self.right_right_stack.winfo_reqheight())
-                    + self._scale_main_ui_spacing_metric(6, minimum=2),
-                )
-            else:
-                self.right_area.update_idletasks()
-                area_height = max(
-                    1,
-                    int(self.right_area.winfo_reqheight()),
-                    max(
-                        int(self.right_left_stack.winfo_reqheight()),
-                        int(self.right_right_stack.winfo_reqheight()),
-                    )
-                    + self._scale_main_ui_spacing_metric(12, minimum=4),
-                )
+                + self._scale_main_ui_spacing_metric(12, minimum=4),
+            )
             self._set_widget_place_geometry(
                 self.right_area,
                 x=right_x,
                 y=right_content_top,
-                width=(
-                    right_width
-                    if scaling_mode
-                    else max(1, int(self.right_area.winfo_reqwidth()))
-                ),
+                width=right_width,
                 height=area_height,
             )
             self._raise_placed_widget(self.right_area)
@@ -56604,8 +57896,8 @@ class LauncherApp:
             row=8, column=0, sticky="ew", pady=(4, 0)
         )
         self.blender_hierarchy_message_button.grid_remove()
-        self.blender_hierarchy_message_window = _create_managed_toplevel(
-            self.root, activate=False
+        self.blender_hierarchy_message_window = _create_indexed_toplevel(
+            self.root, "popup.blender_hierarchy_message", activate=False
         )
         self.blender_hierarchy_message_window.wm_overrideredirect(True)
         self.blender_hierarchy_message_window.wm_resizable(False, False)
@@ -56885,18 +58177,7 @@ class LauncherApp:
                 )
         except (self.tk.TclError, TypeError, ValueError):
             pass
-        scaling_advanced = bool(
-            getattr(self, "_scaling_mode_enabled", False)
-            and advanced_visible
-            and not self._scaling_mode_preserves_advanced_topology()
-        )
-        if scaling_advanced:
-            # Scaling Mode keeps the action stack below the wrapped process
-            # rows, so the advanced page never grows a hidden horizontal strip.
-            action_x = int(layout["left_x"])
         action_y = int(layout["toolbar_y"]) + process_height + 10
-        if scaling_advanced:
-            action_y += self._scale_main_ui_spacing_metric(2, minimum=1)
         toolbar_x = int(layout["left_x"])
         toolbar_y = int(layout["toolbar_y"])
         action_relative_x = max(0, action_x - toolbar_x)
@@ -59058,7 +60339,9 @@ class LauncherApp:
             except Exception:
                 pass
 
-        window = _create_managed_toplevel(self.root, activate=True)
+        window = _create_indexed_toplevel(
+            self.root, "dialog.legacy_export_notice", activate=True
+        )
         self._legacy_export_notices[session.pid] = window
         window.title(self._tr("旧式导出已激活", "Legacy Export Enabled"))
         window.configure(background=self.colors["bg"])
@@ -59487,7 +60770,7 @@ class LauncherApp:
             ).casefold()
         except self.tk.TclError:
             self._export_sets_root_state_before_open = "normal"
-        window = _create_managed_toplevel(self.root)
+        window = _create_indexed_toplevel(self.root, "dialog.export_sets")
         self.export_sets_window = window
         self.export_sets_action_tooltips = []
         self.export_target_tooltips = []
@@ -60672,7 +61955,9 @@ class LauncherApp:
                 return window
         except self.tk.TclError:
             pass
-        window = _create_managed_toplevel(self.root, activate=False)
+        window = _create_indexed_toplevel(
+            self.root, "popup.floating_ball", activate=False
+        )
         window.title(self._tr("RE6 悬浮球", "RE6 Floating Ball"))
         window.resizable(False, False)
         window.overrideredirect(True)
@@ -60923,6 +62208,17 @@ class LauncherApp:
             self._fit_main_window_to_content()
             self._main_window_size_mode = mode
             self._restore_main_window_size(mode)
+            if bool(getattr(self, "_scaling_mode_enabled", False)):
+                try:
+                    self._apply_main_ui_scaling_policy(
+                        window_width=max(1, int(self.root.winfo_width())),
+                        window_height=max(1, int(self.root.winfo_height())),
+                    )
+                except (self.tk.TclError, TypeError, ValueError):
+                    pass
+                self._settle_scaling_main_viewport_layout(reset_origin=True)
+                self._ensure_scaling_main_window_contains_content()
+                self._reclaim_scaling_window_whitespace()
             self._apply_topmost()
             self._set_status(self._tr("已切换到中文。", "Switched to English."))
             if reopen_toolbox:
@@ -61706,7 +63002,7 @@ class LauncherApp:
             if workspace is not None
             else ""
         )
-        window = _create_managed_toplevel(self.root)
+        window = _create_indexed_toplevel(self.root, "dialog.blender_name_repair")
         self.blender_max_fbx_name_repair_window = window
         setattr(window, "_pc_rehd_stack_layer", MANAGED_WINDOW_DIALOG_LAYER)
         window.title(self._tr("修复MAX FBX命名错误", "Repair Max FBX Naming Errors"))
@@ -62064,7 +63360,9 @@ class LauncherApp:
             except self.tk.TclError:
                 pass
 
-        window = _create_managed_toplevel(self.root)
+        window = _create_indexed_toplevel(
+            self.root, "dialog.blender_hierarchy_recovery"
+        )
         self.blender_fbx_hierarchy_recovery_window = window
         setattr(window, "_pc_rehd_stack_layer", MANAGED_WINDOW_DIALOG_LAYER)
         window.title(
@@ -63295,6 +64593,7 @@ class LauncherApp:
                 self._main_ui_spacing_scale_factor(), 4
             ),
             "widget_scale": round(self._main_ui_scale_factor(), 4),
+            "font_scale": round(self._main_ui_font_scale_factor(), 4),
             "signature": self._main_ui_scaling_layout_signature(
                 self._main_window_size_mode
             ),
@@ -63320,6 +64619,7 @@ class LauncherApp:
             cached_height = int(entry.get("height", 0) or 0)
             spacing_scale = float(entry.get("spacing_scale", 1.0) or 1.0)
             widget_scale = float(entry.get("widget_scale", 1.0) or 1.0)
+            font_scale = float(entry.get("font_scale", 1.0) or 1.0)
         except (TypeError, ValueError):
             return
         if (
@@ -63328,6 +64628,7 @@ class LauncherApp:
             or
             not math.isfinite(spacing_scale)
             or not math.isfinite(widget_scale)
+            or not math.isfinite(font_scale)
             or not (
                 MAIN_WINDOW_SCALING_MIN_SCALE
                 <= spacing_scale
@@ -63338,6 +64639,11 @@ class LauncherApp:
                 <= widget_scale
                 <= MAIN_WINDOW_SCALING_MAX_SCALE
             )
+            or not (
+                MAIN_WINDOW_SCALING_MIN_FONT_SCALE
+                <= font_scale
+                <= MAIN_WINDOW_SCALING_MAX_SCALE
+            )
         ):
             return
         # A stale signature is still a useful visual warm start. The scaling
@@ -63345,6 +64651,7 @@ class LauncherApp:
         # must not first paint the unscaled layout during that pass.
         self._main_ui_layout_scale = spacing_scale
         self._main_ui_widget_scale = widget_scale
+        self._main_ui_font_scale = font_scale
 
     def _toggle_scaling_mode(self) -> None:
         """Enable the opt-in compact layout policy for the active backend page."""
@@ -63362,12 +64669,9 @@ class LauncherApp:
             # scaled reflow. The new control is the only item added below them.
             self._capture_compact_model_control_anchor()
         self._scaling_mode_enabled = enabled
-        if enabled:
-            self._apply_main_ui_scaled_process_layout()
-        else:
-            self._apply_model_process_toolbar_mode(
-                advanced_visible=bool(self.advanced_visible_var.get())
-            )
+        self._apply_model_process_toolbar_mode(
+            advanced_visible=bool(self.advanced_visible_var.get())
+        )
         self._main_ui_scaling_applied_size = None
         self._main_ui_scaling_pending_size = None
         if enabled:
@@ -63380,7 +64684,6 @@ class LauncherApp:
                 and int(cached_scaling_size[0] or 0) > 0
                 and int(cached_scaling_size[1] or 0) > 0
             )
-        self._scaling_mode_enabled_by_page[self._active_ui_page_key()] = enabled
         if self._persist_active_ui_page_preferences():
             self._queue_launcher_state_write()
         self._main_layout_cache.clear()
@@ -63418,6 +64721,11 @@ class LauncherApp:
             self._restore_main_window_size(self._main_window_size_mode, center=False)
         elif enabled:
             self._capture_main_window_size(self._main_window_size_mode)
+        if enabled:
+            # A saved factor is only a warm start.  After the real root geometry
+            # is restored, enforce the no-scroll containment contract once.
+            self._settle_scaling_main_viewport_layout(reset_origin=True)
+            self._ensure_scaling_main_window_contains_content()
         if not enabled:
             pending_callback = getattr(self, "_main_ui_scaling_after", None)
             if pending_callback is not None:
@@ -63452,7 +64760,15 @@ class LauncherApp:
         window_height: int | None = None,
         force_reset: bool = False,
     ) -> None:
-        """Fit the complete main surface to the current window with one UI scale."""
+        """Fit the complete main surface before allowing viewport overflow.
+
+        Scaling Mode treats the current main-window size as a hard layout
+        target.  It first removes grid/place whitespace, then reduces control
+        chrome while preserving all text metrics.  The viewport scrollbar is
+        only a last-resort fallback after both stages reach their configured
+        lower bounds.  The controller is keyed by backend, language, and
+        compact/advanced page through the existing Scaling Mode cache.
+        """
         if bool(getattr(self, "_main_ui_scaling_reflow", False)):
             return
         scaling_mode = bool(getattr(self, "_scaling_mode_enabled", False))
@@ -63464,7 +64780,7 @@ class LauncherApp:
         if not scaling_mode:
             self._main_ui_layout_scale = 1.0
             self._apply_main_ui_widget_scale(1.0)
-            self._main_ui_layout_available_size = None
+            self._apply_main_ui_font_scale(1.0)
             self._main_layout_cache.clear()
             self._main_viewport_layout_signature = None
             # Re-anchor the content against the restored, non-scaled toolbar
@@ -63517,16 +64833,23 @@ class LauncherApp:
                 cached_widget = float(
                     cached_layout.get("widget_scale", 1.0) or 1.0
                 )
+                cached_font = float(
+                    cached_layout.get("font_scale", cached_widget) or cached_widget
+                )
                 cached_layout_valid = bool(
                     cached_width > 1
                     and cached_height > 1
                     and math.isfinite(cached_spacing)
                     and math.isfinite(cached_widget)
+                    and math.isfinite(cached_font)
                     and MAIN_WINDOW_SCALING_MIN_SCALE
                     <= cached_spacing
                     <= MAIN_WINDOW_SCALING_MAX_SCALE
                     and MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE
                     <= cached_widget
+                    <= MAIN_WINDOW_SCALING_MAX_SCALE
+                    and MAIN_WINDOW_SCALING_MIN_FONT_SCALE
+                    <= cached_font
                     <= MAIN_WINDOW_SCALING_MAX_SCALE
                     and (
                         not cached_signature
@@ -63558,17 +64881,22 @@ class LauncherApp:
             self._main_ui_layout_scale = (
                 cached_spacing if replay_cached_layout else 1.0
             )
-            self._main_ui_layout_available_size = (width, height)
             self._main_layout_cache.clear()
             self._apply_main_ui_widget_scale(
                 cached_widget if replay_cached_layout else 1.0
+            )
+            self._apply_main_ui_font_scale(
+                cached_font if replay_cached_layout else 1.0
             )
             self._main_layout_cache.clear()
             self._main_viewport_layout_signature = None
             self._reflow_left_sections(flush_layout=True)
             self.root.update_idletasks()
 
-            for _spacing_pass in range(0 if replay_cached_layout else 6):
+            # Converge against both axes.  A compact page can eliminate the
+            # vertical bar by using spare horizontal space (or vice versa), so
+            # never terminate based solely on the first measured dimension.
+            for _spacing_pass in range(0 if replay_cached_layout else 10):
                 content_width, content_height = self._fit_main_window_to_content(
                     flush_layout=False
                 )
@@ -63577,7 +64905,7 @@ class LauncherApp:
                     width / max(1, int(content_width)),
                     height / max(1, int(content_height)),
                 )
-                if required_spacing_scale >= 0.998:
+                if required_spacing_scale >= 0.999:
                     break
                 current_spacing_scale = self._main_ui_spacing_scale_factor()
                 next_spacing_scale = max(
@@ -63587,7 +64915,7 @@ class LauncherApp:
                         current_spacing_scale * required_spacing_scale,
                     ),
                 )
-                if abs(next_spacing_scale - current_spacing_scale) < 0.003:
+                if abs(next_spacing_scale - current_spacing_scale) < 0.001:
                     break
                 self._main_ui_layout_scale = next_spacing_scale
                 # Reapply only grid spacing while widget dimensions and fonts
@@ -63601,7 +64929,7 @@ class LauncherApp:
             # Stage 2 begins only after Stage 1 cannot reduce whitespace any
             # further. It reduces widget padding, frame bounds and control
             # chrome while `_main_ui_font_scale_factor` keeps text unchanged.
-            for _pass in range(0 if replay_cached_layout else 6):
+            for _pass in range(0 if replay_cached_layout else 10):
                 content_width, content_height = self._fit_main_window_to_content(
                     flush_layout=False
                 )
@@ -63610,29 +64938,226 @@ class LauncherApp:
                     width / max(1, int(content_width)),
                     height / max(1, int(content_height)),
                 )
-                if required_widget_scale >= 0.998:
+                if required_widget_scale >= 0.999:
                     break
                 current_widget_scale = self._main_ui_scale_factor()
                 next_widget_scale = max(
                     MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE,
                     min(current_widget_scale, current_widget_scale * required_widget_scale),
                 )
-                if abs(next_widget_scale - current_widget_scale) < 0.003:
+                if abs(next_widget_scale - current_widget_scale) < 0.001:
                     break
                 self._apply_main_ui_widget_scale(next_widget_scale)
                 self._main_layout_cache.clear()
                 self._main_viewport_layout_signature = None
                 self._reflow_left_sections(flush_layout=True)
                 self.root.update_idletasks()
+
+            # Text is the final compacting stage. Keep it at 1.0 until
+            # whitespace and control chrome can no longer fit the page.
+            for _font_pass in range(0 if replay_cached_layout else 8):
+                content_width, content_height = self._fit_main_window_to_content(
+                    flush_layout=False
+                )
+                required_font_scale = min(
+                    1.0,
+                    width / max(1, int(content_width)),
+                    height / max(1, int(content_height)),
+                )
+                if required_font_scale >= 0.999:
+                    break
+                current_font_scale = self._main_ui_font_scale_factor()
+                next_font_scale = max(
+                    MAIN_WINDOW_SCALING_MIN_FONT_SCALE,
+                    min(current_font_scale, current_font_scale * required_font_scale),
+                )
+                if abs(next_font_scale - current_font_scale) < 0.001:
+                    break
+                self._apply_main_ui_font_scale(next_font_scale)
+                self._main_layout_cache.clear()
+                self._main_viewport_layout_signature = None
+                self._reflow_left_sections(flush_layout=True)
+                self.root.update_idletasks()
+
+            # Growth deliberately runs in the inverse order of compaction:
+            # text first, controls second, then whitespace.  Every stage owns
+            # exactly one metric family so an enlarged page never grows a
+            # button and its label in the same layout pass.
+            for _font_growth_pass in range(0 if replay_cached_layout else 8):
+                content_width, content_height = self._fit_main_window_to_content(
+                    flush_layout=False
+                )
+                width_ratio = width / max(1, int(content_width))
+                height_ratio = height / max(1, int(content_height))
+                if width_ratio <= 1.01 and height_ratio > 1.0:
+                    # When the page already spans the current window width,
+                    # treat spare height as real growth headroom instead of
+                    # freezing controls at their previous size and only
+                    # leaving a blank band below the footer.
+                    expansion = min(
+                        MAIN_WINDOW_SCALING_MAX_SCALE,
+                        max(1.0, height_ratio),
+                    )
+                else:
+                    expansion = min(
+                        MAIN_WINDOW_SCALING_MAX_SCALE,
+                        max(1.0, min(width_ratio, height_ratio)),
+                    )
+                current_font_scale = self._main_ui_font_scale_factor()
+                next_font_scale = min(
+                    MAIN_WINDOW_SCALING_MAX_SCALE,
+                    max(current_font_scale, current_font_scale * expansion),
+                )
+                if next_font_scale <= current_font_scale + 0.001:
+                    break
+                self._apply_main_ui_font_scale(next_font_scale)
+                self._main_layout_cache.clear()
+                self._main_viewport_layout_signature = None
+                self._reflow_left_sections(flush_layout=True)
+                self.root.update_idletasks()
+
+            for _widget_growth_pass in range(0 if replay_cached_layout else 10):
+                content_width, content_height = self._fit_main_window_to_content(
+                    flush_layout=False
+                )
+                width_ratio = width / max(1, int(content_width))
+                height_ratio = height / max(1, int(content_height))
+                if width_ratio <= 1.01 and height_ratio > 1.0:
+                    expansion = min(
+                        MAIN_WINDOW_SCALING_MAX_SCALE,
+                        max(1.0, height_ratio),
+                    )
+                else:
+                    expansion = min(
+                        MAIN_WINDOW_SCALING_MAX_SCALE,
+                        max(1.0, min(width_ratio, height_ratio)),
+                    )
+                current_widget_scale = self._main_ui_scale_factor()
+                next_widget_scale = min(
+                    MAIN_WINDOW_SCALING_MAX_SCALE,
+                    max(current_widget_scale, current_widget_scale * expansion),
+                )
+                if next_widget_scale <= current_widget_scale + 0.001:
+                    break
+                self._apply_main_ui_widget_scale(next_widget_scale)
+                self._main_layout_cache.clear()
+                self._main_viewport_layout_signature = None
+                self._reflow_left_sections(flush_layout=True)
+                self.root.update_idletasks()
+
+            for _spacing_growth_pass in range(0 if replay_cached_layout else 10):
+                content_width, content_height = self._fit_main_window_to_content(
+                    flush_layout=False
+                )
+                width_ratio = width / max(1, int(content_width))
+                height_ratio = height / max(1, int(content_height))
+                if width_ratio <= 1.01 and height_ratio > 1.0:
+                    expansion = min(
+                        MAIN_WINDOW_SCALING_MAX_SCALE,
+                        max(1.0, height_ratio),
+                    )
+                else:
+                    expansion = min(
+                        MAIN_WINDOW_SCALING_MAX_SCALE,
+                        max(1.0, min(width_ratio, height_ratio)),
+                    )
+                current_spacing_scale = self._main_ui_spacing_scale_factor()
+                next_spacing_scale = min(
+                    MAIN_WINDOW_SCALING_MAX_SCALE,
+                    max(current_spacing_scale, current_spacing_scale * expansion),
+                )
+                if next_spacing_scale <= current_spacing_scale + 0.001:
+                    break
+                self._main_ui_layout_scale = next_spacing_scale
+                self._main_layout_cache.clear()
+                self._main_viewport_layout_signature = None
+                self._reflow_left_sections(flush_layout=True)
+                self.root.update_idletasks()
+
+            # A later axis can still overflow after growth.  Correct it in the
+            # required compact order: whitespace, controls, then text.
+            for _spacing_correction_pass in range(0 if replay_cached_layout else 6):
+                content_width, content_height = self._fit_main_window_to_content(
+                    flush_layout=False
+                )
+                correction = min(
+                    1.0,
+                    width / max(1, int(content_width)),
+                    height / max(1, int(content_height)),
+                )
+                if correction >= 0.999:
+                    break
+                current_spacing_scale = self._main_ui_spacing_scale_factor()
+                next_spacing_scale = max(
+                    MAIN_WINDOW_SCALING_MIN_SCALE,
+                    min(current_spacing_scale, current_spacing_scale * correction),
+                )
+                if next_spacing_scale >= current_spacing_scale - 0.001:
+                    break
+                self._main_ui_layout_scale = next_spacing_scale
+                self._main_layout_cache.clear()
+                self._main_viewport_layout_signature = None
+                self._reflow_left_sections(flush_layout=True)
+                self.root.update_idletasks()
+
+            for _widget_correction_pass in range(0 if replay_cached_layout else 6):
+                content_width, content_height = self._fit_main_window_to_content(
+                    flush_layout=False
+                )
+                correction = min(
+                    1.0,
+                    width / max(1, int(content_width)),
+                    height / max(1, int(content_height)),
+                )
+                if correction >= 0.999:
+                    break
+                current_widget_scale = self._main_ui_scale_factor()
+                next_widget_scale = max(
+                    MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE,
+                    min(current_widget_scale, current_widget_scale * correction),
+                )
+                if next_widget_scale >= current_widget_scale - 0.001:
+                    break
+                self._apply_main_ui_widget_scale(next_widget_scale)
+                self._main_layout_cache.clear()
+                self._main_viewport_layout_signature = None
+                self._reflow_left_sections(flush_layout=True)
+                self.root.update_idletasks()
+
+            for _font_correction_pass in range(0 if replay_cached_layout else 6):
+                content_width, content_height = self._fit_main_window_to_content(
+                    flush_layout=False
+                )
+                correction = min(
+                    1.0,
+                    width / max(1, int(content_width)),
+                    height / max(1, int(content_height)),
+                )
+                if correction >= 0.999:
+                    break
+                current_font_scale = self._main_ui_font_scale_factor()
+                next_font_scale = max(
+                    MAIN_WINDOW_SCALING_MIN_FONT_SCALE,
+                    min(current_font_scale, current_font_scale * correction),
+                )
+                if next_font_scale >= current_font_scale - 0.001:
+                    break
+                self._apply_main_ui_font_scale(next_font_scale)
+                self._main_layout_cache.clear()
+                self._main_viewport_layout_signature = None
+                self._reflow_left_sections(flush_layout=True)
+                self.root.update_idletasks()
             self._fit_main_window_to_content(flush_layout=False)
             self._sync_toolbar_region_geometry()
-            if not bool(self.advanced_visible_var.get()):
-                # One final compact-only anchor pass prevents the process
-                # title from being left under a panel after cached scaling is
-                # replayed during startup or after a narrow resize settles.
-                self._position_content_after_toolbar(flush_layout=False)
-                self._reflow_left_sections(flush_layout=False)
-                self._sync_toolbar_region_geometry()
+            # Re-anchor once against the final toolbar geometry so the MAX /
+            # Blender process title cannot remain under a panel after scaling.
+            self._position_content_after_toolbar(flush_layout=False)
+            self._reflow_left_sections(flush_layout=False)
+            self._sync_toolbar_region_geometry()
+            # The final scrollbar choice must use live post-reflow rectangles,
+            # never the first unscaled request size captured by Tk.
+            self._settle_scaling_main_viewport_layout()
+            self._ensure_scaling_main_window_contains_content()
             self._persist_main_ui_scaling_layout_cache(width, height)
         finally:
             self._main_ui_scaling_reflow = False
@@ -63750,7 +65275,9 @@ class LauncherApp:
         except self.tk.TclError:
             pass
 
-        window = _create_managed_toplevel(self.root, activate=False)
+        window = _create_indexed_toplevel(
+            self.root, "popup.rename_value_history", activate=False
+        )
         scheduler = _managed_window_scheduler(self.root)
         try:
             window.wm_overrideredirect(True)
@@ -64628,7 +66155,9 @@ class LauncherApp:
         anchor = getattr(self, "rename_group", None)
         if anchor is None:
             return
-        window = _create_managed_toplevel(self.root, activate=False)
+        window = _create_indexed_toplevel(
+            self.root, "popup.rename_selection", activate=False
+        )
         self.rename_selection_notice_window = window
         scheduler = _managed_window_scheduler(self.root)
         try:
@@ -65191,6 +66720,7 @@ class LauncherApp:
             self._persist_toolbox_visibility(False, window=window)
         if window is None:
             return
+        self._unregister_managed_ui_surface("toolbox.main", window)
         if getattr(self, "toolbox_window", None) is window:
             self.toolbox_window = None
             self.scene_normals_tool_button = None
@@ -65229,8 +66759,9 @@ class LauncherApp:
             except self.tk.TclError:
                 pass
 
-        window = _create_managed_toplevel(self.root)
+        window = _create_indexed_toplevel(self.root, "toolbox.main")
         self.toolbox_window = window
+        self._register_managed_ui_surface("toolbox.main", window)
         setattr(window, "_pc_rehd_toolbox_page", "max")
         setattr(window, "_pc_rehd_stack_layer", MANAGED_WINDOW_TOOLBOX_LAYER)
         self._persist_toolbox_visibility(True, window=window)
@@ -65699,7 +67230,7 @@ class LauncherApp:
             except self.tk.TclError:
                 pass
 
-        window = _create_managed_toplevel(self.root)
+        window = _create_indexed_toplevel(self.root, "toolbox.blender")
         self.blender_toolbox_window = window
         setattr(window, "_pc_rehd_toolbox_page", "blender")
         setattr(window, "_pc_rehd_stack_layer", MANAGED_WINDOW_TOOLBOX_LAYER)
@@ -65979,7 +67510,7 @@ class LauncherApp:
             except self.tk.TclError:
                 pass
 
-        window = _create_managed_toplevel(self.root)
+        window = _create_indexed_toplevel(self.root, "tool.blender_node_map")
         self.blender_node_map_window = window
         setattr(window, "_pc_rehd_stack_layer", MANAGED_WINDOW_TOOLBOX_LAYER)
         window.title(self._tr("Blender节点映射表", "Blender Node Map"))
@@ -66316,7 +67847,9 @@ class LauncherApp:
         def success(rows: list[dict[str, str | int]]) -> None:
             if not self._owns_session_operation(session, action, generation):
                 return
-            window = _create_managed_toplevel(self.root)
+            window = _create_indexed_toplevel(
+                self.root, "tool.blender_compact_reference_legacy"
+            )
             self.blender_compact_name_reference_window = window
             setattr(window, "_pc_rehd_stack_layer", MANAGED_WINDOW_TOOLBOX_LAYER)
             window.title(self._tr("节点全名对照", "Full Node Name Reference"))
@@ -66855,7 +68388,11 @@ class LauncherApp:
                 return ball
         except self.tk.TclError:
             pass
-        ball = _create_managed_toplevel(self.root, activate=False)
+        ball = _create_indexed_toplevel(
+            self.root,
+            "popup.blender_compact_reference_floating_ball",
+            activate=False,
+        )
         setattr(ball, "_pc_rehd_stack_layer", MANAGED_WINDOW_FLOATING_BALL_LAYER)
         setattr(ball, "_pc_rehd_keep_owner_minimized", True)
         ball.title(self._tr("节点对照悬浮球", "Node Reference Floating Ball"))
@@ -67052,7 +68589,11 @@ class LauncherApp:
                 raw_selection, Mapping
             ):
                 raise ProtocolError("Blender node reference omitted its scene snapshot")
-            window = _create_managed_toplevel(self.root, activate=activate)
+            window = _create_indexed_toplevel(
+                self.root,
+                "tool.blender_compact_reference",
+                activate=activate,
+            )
             self.blender_compact_name_reference_window = window
             setattr(window, "_pc_rehd_stack_layer", MANAGED_WINDOW_TOOLBOX_LAYER)
             setattr(window, "_pc_rehd_keep_owner_minimized", True)
@@ -71422,7 +72963,7 @@ class LauncherApp:
             self._instance_copy_root_state_before_open = str(self.root.state()).casefold()
         except self.tk.TclError:
             self._instance_copy_root_state_before_open = "normal"
-        window = _create_managed_toplevel(self.root)
+        window = _create_indexed_toplevel(self.root, "tool.instance_copy")
         self.instance_copy_window = window
         setattr(window, "_pc_rehd_keep_owner_minimized", True)
         window.title(self._tr("复制 Max 场景 Instance", "Copy Max Scene Instances"))
@@ -71949,6 +73490,8 @@ class LauncherApp:
         self._seam_reopen_toolbox_on_close = False
         self.seam_window = None
         if window is not None:
+            self._unregister_managed_ui_surface("tool.seam_weight", window)
+        if window is not None:
             try:
                 setattr(window, "_pc_rehd_keep_owner_minimized", False)
                 if bool(window.winfo_exists()):
@@ -72001,8 +73544,11 @@ class LauncherApp:
                     self._close_toolbox(toolbox)
             except self.tk.TclError:
                 pass
-        window = _create_managed_toplevel(self.root, activate=True)
+        window = _create_indexed_toplevel(
+            self.root, "tool.seam_weight", activate=True
+        )
         self.seam_window = window
+        self._register_managed_ui_surface("tool.seam_weight", window)
         window.title(self._tr("接缝处权重统一", "Seam Weight Unify"))
         window.configure(background=self.colors["bg"])
         window.resizable(True, True)
@@ -73412,7 +74958,7 @@ class LauncherApp:
         self._message_editor_expanded = True
         self._message_editor_selected_id = str(document.get("selected_id", "") or "")
         self._message_editor_editing = False
-        window = _create_managed_toplevel(self.root)
+        window = _create_indexed_toplevel(self.root, "tool.message_editor")
         self.message_editor_window = window
         setattr(window, "_pc_rehd_stack_layer", MANAGED_WINDOW_PERSISTENT_LAYER)
         _managed_window_scheduler(self.root).observe_geometry(
@@ -73932,6 +75478,8 @@ class LauncherApp:
         self._scene_normals_probe_at = 0.0
         window = getattr(self, "scene_normals_window", None)
         if window is not None:
+            self._unregister_managed_ui_surface("tool.scene_normals", window)
+        if window is not None:
             _managed_window_scheduler(self.root).forget_geometry(window)
             self._capture_scene_normals_monitor_geometry(window)
         if remember_closed:
@@ -73962,8 +75510,9 @@ class LauncherApp:
                 pass
 
         self._scene_normals_monitor_generation += 1
-        window = _create_managed_toplevel(self.root)
+        window = _create_indexed_toplevel(self.root, "tool.scene_normals")
         self.scene_normals_window = window
+        self._register_managed_ui_surface("tool.scene_normals", window)
         setattr(window, "_pc_rehd_stack_layer", MANAGED_WINDOW_PERSISTENT_LAYER)
         _managed_window_scheduler(self.root).observe_geometry(
             window, self._snap_scene_normals_monitor
@@ -74722,7 +76271,9 @@ class LauncherApp:
             self.launcher_state.get("manual_texture_path_history", [])
         )
         self._manual_texture_history_rows = rows
-        window = _create_managed_toplevel(self.root)
+        window = _create_indexed_toplevel(
+            self.root, "dialog.manual_texture_history"
+        )
         self.manual_texture_history_window = window
         setattr(window, "_pc_rehd_stack_layer", MANAGED_WINDOW_DIALOG_LAYER)
         window.title(self._tr("贴图历史路径", "Texture Path History"))
@@ -77645,6 +79196,23 @@ class LauncherApp:
             except self.tk.TclError:
                 pass
 
+    def _restore_blender_mode_button_alignment(self) -> None:
+        """Keep the two-line Blender action label centered after toolbar rebuilds."""
+        button = getattr(self, "blender_mode_button", None)
+        if button is None:
+            return
+        try:
+            style_name = str(button.cget("style") or "BlenderMode.TButton")
+            style = self.ttk.Style(self.root)
+            style.configure(style_name, anchor="center", justify="center")
+            # ttk exposes justify both as a style setting and as a widget
+            # option.  Set the widget value as well so a stale theme/layout
+            # state cannot leave the second line visually left-aligned.
+            if "justify" in button.configure():
+                button.configure(justify="center")
+        except self.tk.TclError:
+            return
+
     def _apply_toolbar_action_layout(self) -> None:
         """Render the complete action stack from one backend-independent policy."""
         action_area = getattr(self, "toolbar_action_area", None)
@@ -77656,6 +79224,10 @@ class LauncherApp:
             self._set_widget_place_visible(action_area, False)
             self._position_blender_hierarchy_message_frame()
             return
+        # Anchor/justify are ttk style properties, not ttk.Button instance
+        # options.  Restore them through the current style, including a
+        # MainUI.* scaling variant, whenever this advanced action stack is built.
+        self._restore_blender_mode_button_alignment()
         blender_mode = bool(self.blender_mode_enabled)
         active_toolbox = (
             self.blender_toolbox_button if blender_mode else self.toolbox_button
@@ -77810,6 +79382,9 @@ class LauncherApp:
                     window_width=max(1, int(self.root.winfo_width())),
                     window_height=max(1, int(self.root.winfo_height())),
                 )
+                self._settle_scaling_main_viewport_layout(reset_origin=True)
+                self._ensure_scaling_main_window_contains_content()
+                self._reclaim_scaling_window_whitespace()
             except (self.tk.TclError, TypeError, ValueError):
                 pass
 
@@ -78021,7 +79596,6 @@ class LauncherApp:
                 self._set_widget_grid_visible(widget, True)
             self._populate_blender_executables()
             self._schedule_blender_executable_discovery()
-            self._apply_main_ui_scaled_process_layout()
             return
 
         if process_spacer is not None:
@@ -78122,62 +79696,6 @@ class LauncherApp:
             pady=(0, 0),
         )
         self._populate_max_executables()
-        self._apply_main_ui_scaled_process_layout()
-
-    def _apply_main_ui_scaled_process_layout(self) -> None:
-        """Wrap advanced process controls only while the main page is scaled."""
-        if not bool(getattr(self, "_scaling_mode_enabled", False)):
-            return
-        try:
-            if not bool(self.advanced_visible_var.get()):
-                return
-        except self.tk.TclError:
-            return
-        if self._scaling_mode_preserves_advanced_topology():
-            self._apply_main_ui_grid_metrics()
-            return
-        process_area = getattr(self, "toolbar_process_area", None)
-        if process_area is None:
-            return
-        try:
-            for column in range(7):
-                process_area.columnconfigure(column, weight=0, minsize=0)
-            process_area.columnconfigure(1, weight=1, minsize=0)
-            process_area.columnconfigure(4, weight=1, minsize=0)
-            compact_pad = self._scale_main_ui_spacing_metric(4, minimum=1)
-            self.model_process_label.grid_configure(
-                row=0, column=0, columnspan=1, sticky="w",
-                padx=(0, compact_pad), pady=0,
-            )
-            self.max_exe_combo.grid_configure(
-                row=0, column=1, columnspan=1, sticky="ew",
-                padx=(0, compact_pad), pady=0,
-            )
-            self.max_browse_button.grid_configure(
-                row=0, column=2, columnspan=1, sticky="ew",
-                padx=(0, compact_pad), pady=0,
-            )
-            self.pid_label.grid_configure(
-                row=1, column=0, columnspan=1, sticky="w",
-                padx=(0, compact_pad), pady=(compact_pad, 0),
-            )
-            self.pid_combo.grid_configure(
-                row=1, column=1, columnspan=1, sticky="ew",
-                padx=(0, compact_pad), pady=(compact_pad, 0),
-            )
-            self.pid_switch_button.grid_configure(
-                row=1, column=2, columnspan=1, sticky="ew",
-                padx=(0, compact_pad), pady=(compact_pad, 0),
-            )
-            self.launch_button.grid_configure(
-                row=1, column=3, columnspan=1, sticky="ew",
-                padx=(0, compact_pad), pady=(compact_pad, 0),
-            )
-            self._configure_widget_if_changed(self.max_exe_combo, width=12)
-            self._configure_widget_if_changed(self.pid_combo, width=12)
-            process_area.update_idletasks()
-        except (self.tk.TclError, TypeError, ValueError):
-            return
 
     def _refresh_filter_options(self) -> None:
         workspace = self._active_workspace()
@@ -78800,6 +80318,17 @@ class LauncherApp:
             self._schedule_main_window_geometry_commit(
                 target_mode, reset_origin=True
             )
+        if bool(getattr(self, "_scaling_mode_enabled", False)):
+            try:
+                self._apply_main_ui_scaling_policy(
+                    window_width=max(1, int(self.root.winfo_width())),
+                    window_height=max(1, int(self.root.winfo_height())),
+                )
+            except (self.tk.TclError, TypeError, ValueError):
+                pass
+            self._settle_scaling_main_viewport_layout(reset_origin=True)
+            self._ensure_scaling_main_window_contains_content()
+            self._reclaim_scaling_window_whitespace()
         return source_advanced_visible
 
     def _activate_blender_mode(self) -> None:
@@ -84939,7 +86468,9 @@ class LauncherApp:
 
         import tkinter.font as tkfont
 
-        window = _create_managed_toplevel(parent, activate=True)
+        window = _create_indexed_toplevel(
+            parent, "dialog.fvf_weight_capacity", activate=True
+        )
         window.title(self._tr("FVF 权重自动纠偏", "FVF Weight Auto-Correction"))
         window.configure(background=self.colors["bg"])
         window.resizable(True, True)
@@ -85293,7 +86824,9 @@ class LauncherApp:
         unmapped = [row for row in plan.get("unmapped", []) if isinstance(row, dict)]
         if not remaps and not unmapped:
             return
-        window = _create_managed_toplevel(self.root, activate=True)
+        window = _create_indexed_toplevel(
+            self.root, "dialog.mesh_slot_limit", activate=True
+        )
         window.title(self._tr("Mesh 槽位自动调整", "Mesh Slot Auto-Adjustment"))
         window.configure(background=self.colors["bg"])
         window.resizable(True, True)
@@ -87531,345 +89064,77 @@ def _centered_window_position(
     )
 
 
-class _DearPyGuiLauncher:
-    """Dear PyGui presentation layer over the existing Launcher contracts."""
+def run_ui(*, initial_target_pid: int = 0) -> int:
+    import tkinter as tk
 
-    _FONT_CANDIDATES = (
-        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "msyh.ttc",
-        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "NotoSansSC-VF.ttf",
-        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "simhei.ttf",
+    initial_foreground_pid = int(initial_target_pid) if int(initial_target_pid) > 0 else _foreground_window_pid()
+    _set_windows_launcher_app_id()
+    root = tk.Tk()
+    setattr(root, "_pc_rehd_startup_publish_complete", False)
+    root.withdraw()
+    _mask_window_until_themed(root)
+    _capture_launcher_original_window_icon(root)
+    app = LauncherApp(
+        root,
+        initial_foreground_pid=initial_foreground_pid,
+    )
+    _apply_native_window_theme(root, dark=bool(getattr(app, "_theme_dark", False)))
+    root.update_idletasks()
+
+    minimum_width, minimum_height = root.minsize()
+    requested_geometry = app._main_window_requested_geometry
+    if (
+        requested_geometry is not None
+        and requested_geometry[0] == app._main_window_size_mode
+    ):
+        final_width = max(int(minimum_width), int(requested_geometry[1]))
+        final_height = max(int(minimum_height), int(requested_geometry[2]))
+    else:
+        final_width = max(int(minimum_width), int(root.winfo_width()))
+        final_height = max(int(minimum_height), int(root.winfo_height()))
+    desired_x, desired_y = _centered_window_position(
+        final_width,
+        final_height,
+        root.winfo_screenwidth(),
+        root.winfo_screenheight(),
     )
 
-    def __init__(self) -> None:
-        import dearpygui.dearpygui as dpg
+    dark = bool(getattr(app, "_theme_dark", False))
+    _set_themed_window_geometry(
+        root,
+        f"{final_width}x{final_height}+{desired_x}+{desired_y}",
+        dark=dark,
+    )
+    _prepare_native_window_theme_restore(root, dark=dark)
+    window_scheduler = _managed_window_scheduler(root)
+    if window_scheduler.publish_root(dark=dark):
+        app._launcher_window_state = LAUNCHER_WINDOW_VISIBLE
+    else:
+        def publish_after_mainloop_starts() -> None:
+            if window_scheduler.publish_root(dark=dark):
+                app._launcher_window_state = LAUNCHER_WINDOW_VISIBLE
 
-        self.dpg = dpg
-        self.state = _load_launcher_state(DEFAULT_LOG_DIR)
-        self.language = str(self.state.get("ui_language_preference", "") or "").upper()
-        if self.language not in {"CN", "EN"}:
-            self.language = _detect_system_ui_language()
-        self.mode = "BLENDER" if bool(self.state.get("blender_mode_enabled", False)) else "MAX"
-        self.advanced = bool(self.state.get("advanced_options_visible", True))
-        self.scaling = bool(self.state.get("scaling_mode_enabled", False))
-        self.always_on_top = bool(self.state.get("always_on_top_enabled", True))
-        self.log_lines: list[str] = []
-        self._tags: dict[str, str] = {}
-        self._backend_root: Any | None = None
-        self._backend_app: LauncherApp | None = None
-        self._backend_pump_scheduled = False
-        self._source_dialog_tag = "pc_rehd_dpg_source_dialog"
-
-    def tr(self, cn: str, en: str) -> str:
-        return cn if self.language == "CN" else en
-
-    def tag(self, name: str) -> str:
-        value = f"pc_rehd_dpg_{name}"
-        self._tags[name] = value
-        return value
-
-    def log(self, message: str) -> None:
-        self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] {message}")
-        self.log_lines[:] = self.log_lines[-200:]
-        tag = self._tags.get("log")
-        if tag and self.dpg.does_item_exist(tag):
-            self.dpg.set_value(tag, "\n".join(self.log_lines))
-
-    def save(self) -> None:
-        self.state.update(
-            {
-                "ui_language_preference": self.language,
-                "blender_mode_enabled": self.mode == "BLENDER",
-                "advanced_options_visible": self.advanced,
-                "scaling_mode_enabled": self.scaling,
-                "always_on_top_enabled": self.always_on_top,
-            }
-        )
-        try:
-            _write_launcher_state(self.state, DEFAULT_LOG_DIR)
-        except (OSError, TypeError, ValueError) as exc:
-            self.log(f"Launcher state save failed: {exc}")
-
-    def _font(self) -> None:
-        path = next((item for item in self._FONT_CANDIDATES if item.is_file()), None)
-        if path is None:
-            self.log("微软雅黑字体未找到，使用默认字体")
-            return
-        with self.dpg.font_registry():
-            with self.dpg.font(str(path), 16) as font:
-                try:
-                    self.dpg.add_font_range_hint(self.dpg.mvFontRangeHint_Chinese_Full)
-                except (AttributeError, RuntimeError):
-                    pass
-        self.dpg.bind_font(font)
-        self.log(f"微软雅黑字体已加载: {path.name}")
-
-    def _theme(self) -> None:
-        dpg = self.dpg
-        with dpg.theme() as theme:
-            with dpg.theme_component(dpg.mvAll):
-                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (25, 27, 31, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (31, 34, 40, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (44, 48, 56, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_Button, (52, 86, 120, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (70, 113, 153, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (40, 68, 96, 255))
-                dpg.add_theme_color(dpg.mvThemeCol_Text, (235, 238, 242, 255))
-                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 3)
-                dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 6, 5)
-        dpg.bind_theme(theme)
-
-    def _dispatch(self, operation: str) -> None:
-        direct_handlers: dict[str, Callable[[], Any]] = {}
-        if operation == "import_mod":
-            direct_handlers[operation] = self._show_source_dialog
-        backend = self._ensure_backend()
-        if backend is not None:
-            direct_handlers.update(
-                {
-                    "launch_max": backend._launch_max,
-                    "switch_pid": backend._manual_switch_pid,
-                    "blender_mode": backend._activate_blender_mode,
-                    "export_mod": backend._request_mod_export,
-                }
-            )
-        direct_handler = direct_handlers.get(operation)
-        if direct_handler is not None:
-            try:
-                direct_handler()
-                self.log(f"{operation}: existing Launcher backend invoked")
-            except Exception as exc:
-                self.log(f"{operation}: backend failed: {type(exc).__name__}: {exc}")
-            return
-        try:
-            canonical = _canonical_operation_name(operation)
-            _operation_required_domains(canonical)
-        except (TypeError, ValueError, RuntimeError) as exc:
-            self.log(f"{operation}: {exc}")
-            return
-        handlers: dict[str, Callable[[], Any]] = {}
-        if backend is not None:
-            handlers.update(
-                {
-                    "inspect_scene": backend._inspect_active,
-                }
-            )
-        handler = handlers.get(canonical)
-        if handler is None:
-            self.log(f"{canonical}: contract accepted; UI adapter has no visible action yet")
-            return
-        try:
-            handler()
-            self.log(f"{canonical}: existing Launcher backend invoked")
-        except Exception as exc:
-            self.log(f"{canonical}: backend failed: {type(exc).__name__}: {exc}")
-
-    def _ensure_backend(self) -> LauncherApp | None:
-        if self._backend_app is not None:
-            return self._backend_app
-        try:
-            import tkinter as tk
-
-            root = tk.Tk()
-            root.withdraw()
-            app = LauncherApp(
-                root,
-                persist_message_editor=True,
-                persist_launcher_state=True,
-            )
-            app._start_runtime_services()
-            self._backend_root = root
-            self._backend_app = app
-            self._schedule_backend_pump()
-            self.log("Existing Launcher backend connected")
-            return app
-        except Exception as exc:
-            self.log(f"Existing Launcher backend unavailable: {type(exc).__name__}: {exc}")
-            return None
-
-    def _schedule_backend_pump(self) -> None:
-        if self._backend_pump_scheduled or not self.dpg.is_dearpygui_running():
-            return
-        self._backend_pump_scheduled = True
-        self.dpg.set_frame_callback(self.dpg.get_frame_count() + 2, self._pump_backend)
-
-    def _pump_backend(self, _sender: int = 0, _data: Any = None) -> None:
-        self._backend_pump_scheduled = False
-        root = self._backend_root
-        if root is not None:
-            try:
-                root.update()
-            except Exception:
-                self._backend_root = None
-                self._backend_app = None
-        if self.dpg.is_dearpygui_running():
-            self._schedule_backend_pump()
-
-    def _show_source_dialog(self) -> None:
-        self._ensure_backend()
-        if not self.dpg.does_item_exist(self._source_dialog_tag):
-            with self.dpg.file_dialog(
-                tag=self._source_dialog_tag,
-                show=False,
-                callback=self._on_source_selected,
-                width=760,
-                height=520,
-            ):
-                self.dpg.add_file_extension(".mod", color=(120, 190, 255, 255))
-                self.dpg.add_file_extension(".newmod", color=(120, 190, 255, 255))
-                self.dpg.add_file_extension(".*")
-        self.dpg.show_item(self._source_dialog_tag)
-
-    def _on_source_selected(self, _sender: int, app_data: dict[str, Any]) -> None:
-        source = str(app_data.get("file_path_name", "") or "").strip()
-        backend = self._backend_app
-        if not source or backend is None:
-            return
-        workspace = backend._active_workspace()
-        if workspace is None:
-            self.log("Import requires an active MAX/Blender session")
-            return
-        backend._set_workspace_source_mod(workspace, Path(source))
-        backend._import_mod()
-        self.log(f"Import queued: {source}")
-
-    def _panel_button(self, parent: str, label: str, operation: str) -> None:
-        self.dpg.add_button(parent=parent, label=label, callback=lambda _s, _a, op=operation: self._dispatch(op))
-
-    def _build_content(self) -> None:
-        dpg = self.dpg
-        content = self.tag("content")
-        with dpg.child_window(tag=content, parent=self._tags["root"], autosize_x=True, autosize_y=True, border=False):
-            with dpg.group(horizontal=True):
-                left = dpg.add_child_window(width=680, autosize_y=True, border=False)
-                right = dpg.add_child_window(width=300, autosize_y=True, border=False)
-            with dpg.group(parent=left):
-                with dpg.collapsing_header(label=self.tr("模型文件", "Model File"), default_open=True) as panel:
-                    self._panel_button(panel, self.tr("导入 MOD", "Import Mod"), "import_mod")
-                    self._panel_button(panel, self.tr("导出到 MOD", "Export To Mod"), "export_mod")
-                    for cn, en in (("导入法线", "Import Normals"), ("导入贴图", "Import Textures"), ("导入时重置场景", "Reset Scene on Import"), ("检查源文件", "Check Source"), ("导出 UV Map 2", "Export UV Map 2"), ("UV 半精度保护", "UV Half Safe"), ("日志模式", "Log Mode")):
-                        dpg.add_checkbox(parent=panel, label=self.tr(cn, en))
-                    dpg.add_text(self.tr("来源文件：未选择", "Source: none"), parent=panel)
-                with dpg.collapsing_header(label="RE6", default_open=True) as panel:
-                    with dpg.group(horizontal=True, parent=panel):
-                        self._panel_button(panel, self.tr("检查场景", "Inspect Scene"), "inspect_scene")
-                        self._panel_button(panel, self.tr("刷新", "Refresh"), "inspect_scene")
-                    dpg.add_text(self.tr("场景尚未同步", "Scene not inspected"), parent=panel)
-                    for operation, cn, en in (("scene_normals", "场景法线", "Scene Normals"), ("random_normals", "随机法线", "Random Normals"), ("auxiliary", "Python Bridge", "Python Bridge"), ("seam_weight", "接缝权重", "Seam Weight"), ("bone_tools", "骨骼工具", "Bone Tools")):
-                        self._panel_button(panel, self.tr(cn, en), operation)
-                with dpg.collapsing_header(label=self.tr("网格筛选", "Mesh Filtering"), default_open=True) as panel:
-                    dpg.add_checkbox(parent=panel, label=self.tr("隐藏退化面", "Hide degenerate"))
-                    dpg.add_checkbox(parent=panel, label=self.tr("隐藏 LOD 0", "Hide LOD 0"))
-                    with dpg.group(horizontal=True, parent=panel):
-                        dpg.add_combo(["", "LOD 0", "LOD 1", "LOD 2", "LOD 3"], label="LOD", width=145)
-                        dpg.add_combo(["", "Material 0", "Material 1"], label=self.tr("材质", "Material"), width=145)
-                    dpg.add_combo(["", "FVF 0", "FVF 1", "FVF 2"], label="Vertex FVF", parent=panel, width=-1)
-                with dpg.collapsing_header(label=self.tr("导出分组", "Export Buckets"), default_open=False) as panel:
-                    dpg.add_combo(["Position", "Normal", "UV", "Skin"], label=self.tr("Header 字段", "Header Field"), parent=panel, width=-1)
-                    for cn, en in (("Header 覆盖", "Mesh Header Override"), ("删除 Mesh", "Delete Meshes"), ("修改 Mesh", "Modified Meshes")):
-                        with dpg.group(horizontal=True, parent=panel):
-                            dpg.add_text(self.tr(cn, en))
-                            self._panel_button(panel, self.tr("清除", "Clear"), "health")
-            with dpg.group(parent=right):
-                dpg.add_text(self.tr("MAX 进程状态", "MAX Process Status"), color=(255, 183, 86, 255))
-                dpg.add_text(self.tr("未连接", "Not connected"))
-                self._panel_button(right, self.tr("启动 Max", "Launch Max"), "launch_max")
-                self._panel_button(right, self.tr("切换 PID", "Switch PID"), "switch_pid")
-                dpg.add_separator(parent=right)
-                dpg.add_checkbox(parent=right, label=self.tr("场景自动颜色", "Scene Auto Colors"))
-                self._panel_button(right, self.tr("工具箱", "Toolbox"), "toolbox")
-                self._panel_button(right, self.tr("重启脚本", "Restart Script"), "restart_script")
-                self._panel_button(right, self.tr("重置窗口大小", "Reset Window Size"), "reset_window")
-                dpg.add_separator(parent=right)
-                with dpg.collapsing_header(label=self.tr("高级选项", "Advanced Options"), parent=right, default_open=self.advanced) as panel:
-                    dpg.add_input_text(parent=panel, label=self.tr("日志目录", "Log Directory"), default_value=str(DEFAULT_LOG_DIR), width=-1)
-                    dpg.add_input_text(parent=panel, label=self.tr("长期缓存目录", "Long-term Cache Directory"), default_value=str(DEFAULT_LOG_DIR), width=-1)
-                    self._panel_button(panel, self.tr("导出设置", "Export Settings"), "export_sets")
-                    self._panel_button(panel, self.tr("Blender 工具箱", "Blender Toolbox"), "blender_toolbox")
-
-    def _rebuild_content(self) -> None:
-        content = self._tags.get("content")
-        if content and self.dpg.does_item_exist(content):
-            self.dpg.delete_item(content)
-            self._build_content()
-            log_tag = self._tags.get("log")
-            if log_tag and self.dpg.does_item_exist(log_tag):
-                self.dpg.move_item(content, parent=self._tags["root"], before=log_tag)
-
-    def _mode(self, _sender: int, value: str) -> None:
-        self.mode = str(value)
-        self._rebuild_content()
-        self.save()
-
-    def _language(self, _sender: int, value: str) -> None:
-        self.language = str(value)
-        self._rebuild_content()
-        self.save()
-
-    def _toggle_advanced(self, _sender: int, value: bool) -> None:
-        self.advanced = bool(value)
-        self._rebuild_content()
-        self.save()
-
-    def _toggle_scaling(self, _sender: int, value: bool) -> None:
-        self.scaling = bool(value)
-        self.save()
-
-    def _toggle_topmost(self, _sender: int, value: bool) -> None:
-        self.always_on_top = bool(value)
-        self.dpg.set_viewport_always_top(self.always_on_top)
-        self.save()
-
-    def build(self) -> None:
-        dpg = self.dpg
-        dpg.create_context()
-        self._theme()
-        dpg.create_viewport(title=APP_NAME, width=980, height=760, resizable=True)
-        self._font()
-        with dpg.window(tag=self.tag("root"), label=APP_NAME, no_collapse=True):
-            with dpg.group(horizontal=True):
-                dpg.add_text("PC-REHD Code X", color=(108, 181, 235, 255))
-                dpg.add_combo(["MAX", "BLENDER"], default_value=self.mode, width=120, callback=self._mode)
-                dpg.add_combo(["EN", "CN"], default_value=self.language, width=80, callback=self._language)
-                dpg.add_checkbox(label=self.tr("窗口置顶", "Always on top"), default_value=self.always_on_top, callback=self._toggle_topmost)
-                dpg.add_checkbox(label=self.tr("缩放模式", "Scaling Mode"), default_value=self.scaling, callback=self._toggle_scaling)
-                dpg.add_checkbox(label=self.tr("高级选项", "Advanced Options"), default_value=self.advanced, callback=self._toggle_advanced)
-            dpg.add_separator()
-            self._build_content()
-            dpg.add_separator()
-            dpg.add_text(self.tr("状态：空闲", "Status: Idle"))
-            dpg.add_input_text(tag=self.tag("log"), multiline=True, readonly=True, height=140, width=-1)
-        dpg.set_primary_window(self._tags["root"], True)
-        dpg.set_viewport_always_top(self.always_on_top)
-        dpg.setup_dearpygui()
-        dpg.show_viewport()
-        self.log("Dear PyGui 主界面已启动")
-
-
-def _run_dearpygui_ui() -> int:
-    ui = _DearPyGuiLauncher()
-    ui.build()
-    try:
-        ui.dpg.start_dearpygui()
-    finally:
-        ui.save()
-        if ui._backend_root is not None:
-            try:
-                ui._backend_root.destroy()
-            except Exception:
-                pass
-        ui.dpg.destroy_context()
+        root.after(0, publish_after_mainloop_starts)
+    app._apply_topmost()
+    app._start_runtime_services()
+    # The first frame is already published; warm reusable UI surfaces in
+    # short Tk slices so startup and pointer input never wait for the cache.
+    app._schedule_main_ui_preload()
+    # AI maintenance policy is explicit CLI work. Never run its fixed SHA table
+    # in a user's GUI session or let a stale review affect normal operations.
+    root.mainloop()
     return 0
 
 
-def run_ui(*, initial_target_pid: int = 0) -> int:
-    return _run_dearpygui_ui()
-
-
 def run_ui_smoke_test() -> dict[str, Any]:
-    raise RuntimeError("Launcher UI smoke is disabled in production")
+    if os.environ.get("PC_REHD_UI_SMOKE_TEST") != "1":
+        raise RuntimeError(
+            "Launcher UI smoke requires PC_REHD_UI_SMOKE_TEST=1"
+        )
     import tkinter as tk
 
-    _validate_policy_guards_sync()
+    if os.environ.get("PC_REHD_UI_SMOKE_TEST_POLICY") == "1":
+        _validate_policy_guards_sync()
     root = tk.Tk()
     root.withdraw()
     app = LauncherApp(
@@ -87878,6 +89143,208 @@ def run_ui_smoke_test() -> dict[str, Any]:
         persist_launcher_state=False,
     )
     root.update_idletasks()
+    resize_grip = app.main_resize_grip
+    if str(resize_grip.winfo_class()) != "Toplevel":
+        raise RuntimeError(
+            "Main resize grip must use a transparent managed Toplevel hit surface"
+        )
+    try:
+        resize_grip_alpha = float(resize_grip.attributes("-alpha"))
+    except tk.TclError as exc:
+        raise RuntimeError(
+            "Main resize grip must expose a transparent window alpha"
+        ) from exc
+    if abs(resize_grip_alpha) > 0.001 or not bool(resize_grip.overrideredirect()):
+        raise RuntimeError(
+            "Main resize grip must remain an invisible borderless hit surface"
+        )
+    ui_surfaces = app._ui_surface_snapshot()
+    ui_scheduler = _managed_window_scheduler(root)
+    if ui_scheduler.ui_surface_snapshot() != ui_surfaces:
+        raise RuntimeError(
+            "Launcher UI semantic registry is not owned by the UI scheduler"
+        )
+    transient_surface = _create_indexed_toplevel(
+        root, "popup.hover_tooltip", activate=False
+    )
+    root.update_idletasks()
+    transient_record = ui_scheduler.ui_surface_snapshot().get(
+        "popup.hover_tooltip"
+    )
+    if transient_record is None or not transient_record["widget_exists"]:
+        raise RuntimeError(
+            "Indexed Toplevel creation did not register its semantic surface"
+        )
+    transient_surface.destroy()
+    root.update_idletasks()
+    if "popup.hover_tooltip" in ui_scheduler.ui_surface_snapshot():
+        raise RuntimeError(
+            "Indexed Toplevel destruction did not unregister its semantic surface"
+        )
+    ui_control_plane = app._ui_control_plane_snapshot()
+    required_ui_catalog_entries = {
+        "main.viewport",
+        "main.toolbar",
+        "main.model_file",
+        "dialog.export_sets",
+        "toolbox.main",
+        "toolbox.blender",
+        "tool.instance_copy",
+        "tool.seam_weight",
+        "tool.message_editor",
+        "tool.scene_normals",
+        "dialog.choice",
+    }
+    catalog = ui_control_plane["catalog"]
+    behaviors = ui_control_plane["behaviors"]
+    if not behaviors:
+        raise RuntimeError("TTK UI control plane did not declare layout behaviors")
+    for behavior_id, record in behaviors.items():
+        source_locations = record["source_locations"]
+        if not source_locations or any(
+            int(location["source_line"]) <= 0
+            for location in source_locations
+        ):
+            raise RuntimeError(
+                "TTK UI control plane cannot locate a layout, scroll, or overlay behavior: "
+                f"{behavior_id}={record!r}"
+            )
+    undeclared_ui_behavior_methods = ui_control_plane["coverage"][
+        "undeclared_launcher_ui_behavior_methods"
+    ]
+    if undeclared_ui_behavior_methods:
+        raise RuntimeError(
+            "TTK layout, scroll, gesture, or overlay behavior is outside the UI control plane: "
+            f"{undeclared_ui_behavior_methods!r}"
+        )
+    toplevel_factories = ui_control_plane["toplevel_factories"]
+    if not toplevel_factories:
+        raise RuntimeError("TTK UI control plane did not declare Toplevel factories")
+    for factory_id, record in toplevel_factories.items():
+        if (
+            not record["surface_id"]
+            or int(record["source_line"]) <= 0
+            or record["surface_id"] not in catalog
+            or not record["uses_indexed_factory"]
+        ):
+            raise RuntimeError(
+                "TTK UI control plane cannot trace a Toplevel factory to a surface: "
+                f"{factory_id}={record!r}"
+            )
+    undeclared_toplevel_factories = ui_control_plane["coverage"][
+        "undeclared_toplevel_factories"
+    ]
+    if undeclared_toplevel_factories:
+        raise RuntimeError(
+            "TTK Toplevel factory is outside the UI control plane: "
+            f"{undeclared_toplevel_factories!r}"
+        )
+    widget_compositions = ui_control_plane["widget_compositions"]
+    if not widget_compositions:
+        raise RuntimeError("TTK UI control plane did not index widget compositions")
+    for composition_id, record in widget_compositions.items():
+        if (
+            not record["widgets"]
+            or int(record["source_line"]) <= 0
+            or not record["source_path"]
+            or record["classification"] == "shared-widget-composition"
+        ):
+            raise RuntimeError(
+                "TTK UI control plane cannot locate a widget composition: "
+                f"{composition_id}={record!r}"
+            )
+    ui_interactions = ui_control_plane["ui_interactions"]
+    if not ui_interactions:
+        raise RuntimeError("TTK UI control plane did not index event interactions")
+    for interaction_id, record in ui_interactions.items():
+        if int(record["source_line"]) <= 0 or not record["source_path"]:
+            raise RuntimeError(
+                "TTK UI control plane cannot locate an event interaction: "
+                f"{interaction_id}={record!r}"
+            )
+    missing_catalog_entries = sorted(required_ui_catalog_entries.difference(catalog))
+    if missing_catalog_entries:
+        raise RuntimeError(
+            "UI control plane is missing declared TTK surfaces: "
+            f"{missing_catalog_entries!r}"
+        )
+    for surface_id, record in catalog.items():
+        if not record["builder"] or int(record["source_line"]) <= 0:
+            raise RuntimeError(
+                "UI control plane cannot locate a TTK builder: "
+                f"{surface_id}={record!r}"
+            )
+    undeclared_gui_methods = ui_control_plane["coverage"][
+        "undeclared_launcher_gui_methods"
+    ]
+    if undeclared_gui_methods:
+        raise RuntimeError(
+            "TTK GUI builder is missing from the central UI control plane: "
+            f"{undeclared_gui_methods!r}"
+        )
+    required_ui_surfaces = {
+        "main.viewport",
+        "main.toolbar",
+        "main.model_file",
+        "main.rehd",
+        "main.mesh_rename",
+        "main.bridge",
+        "main.bone_tools",
+        "main.mesh_filter",
+        "main.footer",
+        "main.advanced_toggle",
+    }
+    missing_ui_surfaces = sorted(required_ui_surfaces.difference(ui_surfaces))
+    if missing_ui_surfaces:
+        raise RuntimeError(
+            "Launcher UI semantic registry lost required surfaces: "
+            f"{missing_ui_surfaces!r}"
+        )
+    for surface_id in required_ui_surfaces:
+        record = ui_surfaces[surface_id]
+        if record["window"] != "main" or not record["widget_exists"]:
+            raise RuntimeError(
+                "Launcher UI semantic registry returned an invalid main surface: "
+                f"{surface_id}={record!r}"
+            )
+    model_widget_tree = ui_surfaces["main.model_file"].get("widget_tree", ())
+    import_button_text = str(app.import_button.cget("text"))
+    if not any(
+        record.get("text") == import_button_text
+        and record.get("widget_exists")
+        for record in model_widget_tree
+    ):
+        raise RuntimeError(
+            "Model File semantic surface cannot locate its Import Mod control"
+        )
+    model_option_rows = app._model_option_row_snapshot()
+    expected_model_option_rows = {
+        "import_normals": (2, "import_normals_check", "import_normals_var", "blender_import_normals"),
+        "import_textures": (1, "import_textures_check", "import_textures_var", "import_textures"),
+        "reset_scene": (3, "reset_scene_on_import_check", "reset_scene_on_import_var", ""),
+        "check_source": (5, "", "check_source_var", "source"),
+        "export_map2": (6, "", "export_map2_var", "map2"),
+        "uv_half_safe": (7, "", "uv_half_safe_var", "uv_half"),
+        "log_mode": (8, "", "log_mode_var", ""),
+    }
+    for key, (row, control_attribute, variable_attribute, help_topic) in (
+        expected_model_option_rows.items()
+    ):
+        record = model_option_rows.get(key)
+        if record is None:
+            raise RuntimeError(f"Model option row is missing: {key}")
+        if (
+            record["row"] != row
+            or record["control_attribute"] != control_attribute
+            or record["variable_attribute"] != variable_attribute
+            or record["help_topic"] != help_topic
+            or record["control_plane"] != "TTK_UI_MODEL_OPTION_ROWS"
+            or not record["control_exists"]
+        ):
+            raise RuntimeError(
+                "Model option row changed its TTK contract: "
+                f"{key}={record!r}"
+            )
     if bool(app.reset_scene_on_import_var.get()):
         raise RuntimeError("Reset Scene on Import must be disabled by default")
     if str(app.reset_scene_on_import_check.cget("text")) != app._tr(
@@ -87895,11 +89362,13 @@ def run_ui_smoke_test() -> dict[str, Any]:
     root.update_idletasks()
     if bool(app._theme_dark) is not initial_dark or bool(app.dark_mode_var.get()) is not initial_dark:
         raise RuntimeError("Dark Mode button did not restore the previous theme")
-    if tuple(int(value) for value in root.resizable()) != (0, 1):
-        raise RuntimeError("Main window horizontal resizing must remain disabled")
+    if tuple(int(value) for value in root.resizable()) != (1, 1):
+        raise RuntimeError("Main window must remain resizable on both axes")
     for key, record in app._collapsible_sections.items():
-        if str(record["button"].cget("state")) != "disabled":
-            raise RuntimeError(f"{key} collapse button is active while Advanced Options is open")
+        if bool(record["button"].winfo_ismapped()):
+            raise RuntimeError(
+                f"{key} collapse button is visible while Advanced Options is open"
+            )
     app.advanced_toggle.invoke()
     root.update_idletasks()
     model_collapse = app._collapsible_sections["model"]["button"]
@@ -87917,6 +89386,80 @@ def run_ui_smoke_test() -> dict[str, Any]:
     root.update_idletasks()
     if not bool(app.advanced_visible_var.get()):
         raise RuntimeError("Advanced Options did not reopen after collapse smoke test")
+    # Scaling Mode regression: switching back to the compact page after a
+    # narrow resize must settle its live section bounds before the viewport
+    # decides whether scrollbars are needed.  A single idle pass is deliberate
+    # here; this catches stale pre-collapse content sizes instead of hiding the
+    # issue behind repeated event-loop pumping.
+    app.scaling_mode_var.set(True)
+    app._toggle_scaling_mode()
+    root.geometry("500x500")
+    # The smoke harness starts withdrawn; map the requested probe geometry
+    # before reading winfo_width/height so 1x1 staging bounds are not treated
+    # as a real Scaling Mode window.
+    root.deiconify()
+    # Mapping dispatches the real <Map>/<Configure> route that applies the
+    # Scaling Mode no-scroll containment pass.  ``update_idletasks`` alone
+    # only measures the staged widget tree and cannot exercise that route.
+    root.update()
+    scaling_advanced_bars = (
+        bool(app.main_viewport_hscroll.winfo_ismapped()),
+        bool(app.main_viewport_vscroll.winfo_ismapped()),
+    )
+    if scaling_advanced_bars != (False, False):
+        raise RuntimeError(
+            "Scaling Mode main page must not expose viewport scrollbars: "
+            f"advanced_bars={scaling_advanced_bars!r}"
+        )
+    # Scaling Mode promises a complete main surface inside the native window.
+    # Catch stale toolbar/request widths here instead of allowing a hidden
+    # Canvas overflow to masquerade as a successful no-scroll layout.
+    scaling_advanced_window = (
+        max(1, int(root.winfo_width())),
+        max(1, int(root.winfo_height())),
+    )
+    scaling_advanced_content = tuple(
+        max(1, int(value)) for value in app._main_viewport_content_size
+    )
+    if (
+        scaling_advanced_content[0] > scaling_advanced_window[0]
+        or scaling_advanced_content[1] > scaling_advanced_window[1]
+    ):
+        raise RuntimeError(
+            "Scaling Mode advanced page exceeds the window: "
+            f"content={scaling_advanced_content!r}, "
+            f"window={scaling_advanced_window!r}"
+        )
+    blender_style = app.ttk.Style(root)
+    blender_button_style = str(app.blender_mode_button.cget("style") or "BlenderMode.TButton")
+    # Regression: rebuilding Advanced Options must restore the BLENDER MODE
+    # button's centered two-line label even if a theme/layout transition left
+    # the shared style temporarily left-aligned.
+    blender_style.configure(blender_button_style, anchor="w", justify="left")
+    app._apply_toolbar_action_layout()
+    blender_button_anchor = str(blender_style.lookup(blender_button_style, "anchor") or "")
+    blender_button_justify = str(blender_style.lookup(blender_button_style, "justify") or "")
+    if blender_button_anchor != "center" or blender_button_justify != "center":
+        raise RuntimeError(
+            "Blender Mode button lost its centered text contract: "
+            f"anchor={blender_button_anchor!r}, justify={blender_button_justify!r}"
+        )
+    app.advanced_toggle.invoke()
+    root.update_idletasks()
+    compact_content_size = tuple(int(value) for value in app._main_viewport_content_size)
+    compact_window_size = (int(root.winfo_width()), int(root.winfo_height()))
+    compact_bars = (
+        bool(app.main_viewport_hscroll.winfo_ismapped()),
+        bool(app.main_viewport_vscroll.winfo_ismapped()),
+    )
+    if compact_bars != (False, False):
+        raise RuntimeError(
+            "Scaling Mode main page must not retain compact-page scrollbars: "
+            f"content={compact_content_size!r}, window={compact_window_size!r}, bars={compact_bars!r}"
+        )
+    app.scaling_mode_var.set(False)
+    app._toggle_scaling_mode()
+    root.update_idletasks()
     center_probe = _centered_window_position(640, 720, 1920, 1080)
     if center_probe != (640, 180):
         raise RuntimeError(
@@ -88002,7 +89545,6 @@ def run_ui_smoke_test() -> dict[str, Any]:
     )
     if (
         dark_mode_bounds[0] != topmost_bounds[0]
-        or dark_mode_bounds[2] != topmost_bounds[2]
         or dark_mode_bounds[1] < topmost_bounds[1] + topmost_bounds[3]
     ):
         raise RuntimeError(
@@ -88011,7 +89553,6 @@ def run_ui_smoke_test() -> dict[str, Any]:
         )
     if (
         floating_ball_bounds[0] != dark_mode_bounds[0]
-        or floating_ball_bounds[2] != dark_mode_bounds[2]
         or floating_ball_bounds[1]
         < dark_mode_bounds[1] + dark_mode_bounds[3]
     ):
@@ -88021,7 +89562,6 @@ def run_ui_smoke_test() -> dict[str, Any]:
         )
     if (
         restore_size_bounds[0] != floating_ball_bounds[0]
-        or restore_size_bounds[2] != floating_ball_bounds[2]
         or restore_size_bounds[1]
         < floating_ball_bounds[1] + floating_ball_bounds[3]
     ):
@@ -88059,7 +89599,7 @@ def run_ui_smoke_test() -> dict[str, Any]:
         toolbox_bounds[3],
     )
     full_toolbar_bottom = toolbar_y + int(app.toolbar.winfo_reqheight())
-    if int(app._content_top) >= full_toolbar_bottom + 10:
+    if int(app._content_top) > full_toolbar_bottom + 10:
         raise RuntimeError(
             "Main content still reserves the entire second toolbar row: "
             f"content_top={app._content_top}, toolbar_bottom={full_toolbar_bottom}"
@@ -88087,6 +89627,10 @@ def run_ui_smoke_test() -> dict[str, Any]:
                 f"{name} content overlaps the Toolbox button: "
                 f"content={bounds!r}, toolbox={toolbox_root_bounds!r}"
             )
+    # Managed Toplevels intentionally stay hidden while their Launcher owner
+    # is withdrawn.  Publish the smoke-test owner before testing that policy.
+    root.deiconify()
+    root.update()
     app.toolbox_button.invoke()
     root.update_idletasks()
     toolbox_window = app.toolbox_window
@@ -88095,6 +89639,16 @@ def run_ui_smoke_test() -> dict[str, Any]:
     managed_windows = getattr(root, "_pc_rehd_managed_windows", [])
     if toolbox_window not in managed_windows:
         raise RuntimeError("Toolbox popup bypassed the managed-window registry")
+    toolbox_surface = app._ui_surface_snapshot().get("toolbox.main")
+    if (
+        toolbox_surface is None
+        or toolbox_surface["window"] != "toolbox.max"
+        or not toolbox_surface["widget_exists"]
+    ):
+        raise RuntimeError(
+            "Toolbox is missing from the Launcher UI semantic registry: "
+            f"{toolbox_surface!r}"
+        )
     if (
         getattr(toolbox_window, "_pc_rehd_window_state", "")
         != MANAGED_WINDOW_VISIBLE
@@ -88135,7 +89689,14 @@ def run_ui_smoke_test() -> dict[str, Any]:
     auto_colors_button = toolbox_button_widgets[expected_auto_colors_off]
     if str(auto_colors_button.cget("style")) != "TButton":
         raise RuntimeError("Scene Auto Colors is not dark/off by default")
-    auto_colors_button.invoke()
+    if str(auto_colors_button.cget("state")) != "disabled":
+        raise RuntimeError(
+            "Scene Auto Colors must stay disabled while no Max session is active"
+        )
+    # Invocation is intentionally blocked without a live Max session. Exercise
+    # the same controller directly rather than manufacturing a fake session.
+    app._toggle_scene_auto_colors()
+    root.update_idletasks()
     expected_auto_colors_on = app._tr(
         "场景自动颜色 | 开", "Scene Auto Colors | On"
     )
@@ -88144,7 +89705,8 @@ def run_ui_smoke_test() -> dict[str, Any]:
         or str(auto_colors_button.cget("style")) != "Accent.TButton"
     ):
         raise RuntimeError("Scene Auto Colors did not enter its bright/on state")
-    auto_colors_button.invoke()
+    app._toggle_scene_auto_colors()
+    root.update_idletasks()
     if (
         str(auto_colors_button.cget("text")) != expected_auto_colors_off
         or str(auto_colors_button.cget("style")) != "TButton"
@@ -88352,13 +89914,30 @@ def run_ui_smoke_test() -> dict[str, Any]:
         != MANAGED_WINDOW_DESTROYED
     ):
         raise RuntimeError("Message Editor close did not dispose through the scheduler")
-    toolbox_button_widgets[expected_scene_normals].invoke()
+    scene_normals_button = toolbox_button_widgets[expected_scene_normals]
+    if str(scene_normals_button.cget("state")) != "disabled":
+        raise RuntimeError(
+            "Show Scene Normals must stay disabled while no Max session is active"
+        )
+    # The monitor itself intentionally supports its no-Max status surface.
+    # Exercise that pure UI path without bypassing the disabled entry policy.
+    app._show_scene_normals_monitor()
     root.update_idletasks()
     normals_window = app.scene_normals_window
     if normals_window is None or not bool(normals_window.winfo_exists()):
         raise RuntimeError("Show Scene Normals did not open its monitor window")
     if normals_window not in managed_windows:
         raise RuntimeError("Scene-normal monitor bypassed the managed-window registry")
+    normals_surface = app._ui_surface_snapshot().get("tool.scene_normals")
+    if (
+        normals_surface is None
+        or normals_surface["window"] != "tool.scene_normals"
+        or not normals_surface["widget_exists"]
+    ):
+        raise RuntimeError(
+            "Scene-normal monitor is missing from the Launcher UI semantic registry: "
+            f"{normals_surface!r}"
+        )
     if root.grab_current() is normals_window:
         raise RuntimeError("Scene-normal monitor became modal")
     if app._scene_normals_monitor_dock_side not in {"top", "bottom", "left", "right"}:
@@ -88380,7 +89959,13 @@ def run_ui_smoke_test() -> dict[str, Any]:
         "scene_count": str(app.scene_normals_all_count_var.get()),
     }
     app._close_scene_normals_monitor()
-    toolbox_button_widgets[expected_seam_tool].invoke()
+    seam_tool_button = toolbox_button_widgets[expected_seam_tool]
+    if str(seam_tool_button.cget("state")) != "disabled":
+        raise RuntimeError(
+            "Seam Weight Unify must stay disabled while no Max session is active"
+        )
+    # The exclusive seam window also owns a valid no-Max presentation state.
+    app._show_seam_weight_tool()
     seam_deadline = time.monotonic() + 0.75
     while time.monotonic() < seam_deadline:
         root.update()
@@ -88394,6 +89979,16 @@ def run_ui_smoke_test() -> dict[str, Any]:
         raise RuntimeError("Seam Weight Unify did not close the Toolbox")
     if seam_window not in managed_windows:
         raise RuntimeError("Seam Weight Unify bypassed the managed-window registry")
+    seam_surface = app._ui_surface_snapshot().get("tool.seam_weight")
+    if (
+        seam_surface is None
+        or seam_surface["window"] != "tool.seam_weight"
+        or not seam_surface["widget_exists"]
+    ):
+        raise RuntimeError(
+            "Seam Weight Unify is missing from the Launcher UI semantic registry: "
+            f"{seam_surface!r}"
+        )
     if not bool(getattr(seam_window, "_pc_rehd_keep_owner_minimized", False)):
         raise RuntimeError("Seam Weight Unify did not lock its Launcher owner minimized")
     if str(seam_window.attributes("-topmost")).casefold() in {"", "0", "false", "none"}:

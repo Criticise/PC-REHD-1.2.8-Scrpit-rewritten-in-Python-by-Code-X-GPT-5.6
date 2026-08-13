@@ -2437,6 +2437,229 @@ def _show_blocking_runtime_error_gui(message_text: str) -> bool:
     )
 
 
+def _classify_runtime_lock_owner_for_termination(
+    owner: dict[str, object] | None,
+    process: dict[str, object] | None,
+) -> dict[str, object]:
+    """Allow termination only for a verified Bootstrap/Launcher Python PID."""
+    metadata = dict(owner or {})
+    observed = dict(process or {})
+    try:
+        pid = int(metadata.get("pid", 0) or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    expected_executable = str(metadata.get("python_executable", "") or "").strip()
+    process_name = str(observed.get("process_name", "") or "").strip()
+    actual_executable = str(observed.get("executable_path", "") or "").strip()
+    command_line = str(observed.get("command_line", "") or "").strip()
+    executable_name = Path(actual_executable).name.casefold()
+    expected_markers = (
+        str(Path(__file__).resolve()).casefold(),
+        str((BASE_DIR / "PC-REHD Code X Launcher.py").resolve()).casefold(),
+    )
+    command_line_folded = command_line.casefold()
+    reasons: list[str] = []
+    if pid <= 0 or pid == os.getpid():
+        reasons.append("invalid-or-self-pid")
+    if observed.get("alive") is not True:
+        reasons.append("owner-not-alive")
+    if executable_name not in {"python.exe", "pythonw.exe"}:
+        reasons.append("not-python-executable")
+    if not expected_executable or actual_executable.casefold() != expected_executable.casefold():
+        reasons.append("executable-path-mismatch")
+    if not command_line or not any(marker in command_line_folded for marker in expected_markers):
+        reasons.append("bootstrap-launcher-command-not-confirmed")
+    return {
+        "eligible": not reasons,
+        "pid": pid,
+        "process_name": process_name,
+        "expected_executable": expected_executable,
+        "actual_executable": actual_executable,
+        "command_line": command_line,
+        "reasons": reasons,
+    }
+
+
+def _query_runtime_lock_owner_process(pid: int) -> dict[str, object]:
+    """Read one exact Windows PID; failure means it cannot be terminated by Bootstrap."""
+    if os.name != "nt" or int(pid) <= 0:
+        return {"alive": False, "error": "Windows process inspection is unavailable."}
+    query = (
+        "$p=Get-CimInstance Win32_Process -Filter 'ProcessId={0}' -ErrorAction Stop; "
+        "[pscustomobject]@{{alive=$true; process_name=$p.Name; executable_path=$p.ExecutablePath; "
+        "command_line=$p.CommandLine}} | ConvertTo-Json -Compress"
+    ).format(int(pid))
+    try:
+        completed = _run_hidden_subprocess(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                query,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3.0,
+        )
+        if completed.returncode != 0:
+            return {"alive": False, "error": completed.stderr[-1000:]}
+        payload = json.loads(completed.stdout.strip() or "{}")
+        return dict(payload) if isinstance(payload, dict) else {"alive": False}
+    except Exception as exc:
+        return {"alive": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _terminate_process_exact(pid: int) -> bool:
+    """Terminate exactly one already-verified PID and wait for its handle to close."""
+    if os.name != "nt" or int(pid) <= 0:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    process_terminate = 0x0001
+    synchronize = 0x00100000
+    wait_object_0 = 0x00000000
+    wait_timeout = 0x00000102
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(process_terminate | synchronize, False, int(pid))
+    if not handle:
+        return False
+    try:
+        if not kernel32.TerminateProcess(handle, 1):
+            return False
+        wait_result = int(kernel32.WaitForSingleObject(handle, 5000))
+        return wait_result in {wait_object_0, wait_timeout}
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _terminate_verified_runtime_lock_owner(
+    verification: dict[str, object],
+    *,
+    terminator: Callable[[int], bool] | None = None,
+) -> bool:
+    if verification.get("eligible") is not True:
+        return False
+    try:
+        pid = int(verification.get("pid", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    terminate = terminator or _terminate_process_exact
+    return bool(terminate(pid))
+
+
+def _ask_runtime_lock_owner_termination(owner: dict[str, object]) -> bool:
+    """Show only the explicit close-or-cancel choice after owner verification."""
+    pid = int(owner.get("pid", 0) or 0)
+    process = _query_runtime_lock_owner_process(pid)
+    verification = _classify_runtime_lock_owner_for_termination(owner, process)
+    if verification.get("eligible") is not True:
+        return False
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        root.title(runtime_ui_text("关闭占用进程", "Close blocking runtime process"))
+        root.configure(background="#111820")
+        root.resizable(False, False)
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        result = {"close": False}
+        frame = tk.Frame(root, background="#111820", padx=24, pady=20)
+        frame.pack(fill="both", expand=True)
+        tk.Label(
+            frame,
+            text=runtime_ui_text("检测到 Python 修复进程占用运行时锁。", "A Python repair process is holding the runtime lock."),
+            background="#111820",
+            foreground="#F4F7FA",
+            font=("Microsoft YaHei", 12, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+        detail = runtime_ui_text(
+            f"PID：{pid}\n进程：{verification.get('process_name', '')}\n程序路径：{verification.get('actual_executable', '')}\n\n是否关闭该进程并重试？",
+            f"PID: {pid}\nProcess: {verification.get('process_name', '')}\nExecutable: {verification.get('actual_executable', '')}\n\nClose this process and retry?",
+        )
+        owner_label = tk.Label(
+            frame,
+            text=runtime_ui_text(
+                f"占用者 PID {pid}    {verification.get('process_name', '')}",
+                f"Blocking PID {pid}    {verification.get('process_name', '')}",
+            ),
+            background="#1B2530",
+            foreground="#F59E0B",
+            font=("Microsoft YaHei", 15, "bold"),
+            anchor="w",
+            padx=14,
+            pady=10,
+        )
+        owner_label.pack(fill="x", pady=(0, 8))
+        tk.Label(
+            frame,
+            text=detail,
+            background="#1B2530",
+            foreground="#C8D1DB",
+            justify="left",
+            anchor="w",
+            wraplength=600,
+            padx=14,
+            pady=12,
+        ).pack(fill="x")
+        buttons = tk.Frame(frame, background="#111820")
+        buttons.pack(fill="x", pady=(16, 0))
+        tk.Button(
+            buttons,
+            text=runtime_ui_text("关闭占用进程并重试", "Close process and retry"),
+            command=lambda: (result.update(close=True), root.destroy()),
+            background="#F59E0B",
+            foreground="#111820",
+            relief="flat",
+            padx=14,
+            pady=8,
+        ).pack(side="left")
+        cancel = tk.Button(
+            buttons,
+            text=runtime_ui_text("取消", "Cancel"),
+            command=root.destroy,
+            background="#273646",
+            foreground="#F4F7FA",
+            relief="flat",
+            padx=24,
+            pady=8,
+        )
+        cancel.pack(side="right")
+        root.bind("<Escape>", lambda _event: root.destroy())
+        root.protocol("WM_DELETE_WINDOW", root.destroy)
+        root.update_idletasks()
+        width = max(650, int(root.winfo_reqwidth()))
+        height = max(220, int(root.winfo_reqheight()))
+        root.geometry(f"{width}x{height}+{max(0, (root.winfo_screenwidth() - width) // 2)}+{max(0, (root.winfo_screenheight() - height) // 2)}")
+        root.deiconify()
+        root.lift()
+        root.focus_force()
+        cancel.focus_set()
+        root.mainloop()
+        if result.get("close") is not True:
+            return False
+        return _terminate_verified_runtime_lock_owner(verification)
+    except Exception:
+        return False
+
+
 class _RequiredRuntimeInstallProgress:
     """Small non-modal status window for first-run exact-runtime installation."""
 
@@ -2844,10 +3067,22 @@ def ensure_required_python_runtime(
         raise RuntimeError(message)
     progress.begin_automatic_install()
     try:
-        upgrade = run_python_runtime_upgrade(
-            target_python=target_text,
-            force=True,
-        )
+        try:
+            upgrade = run_python_runtime_upgrade(
+                target_python=target_text,
+                force=True,
+            )
+        except RuntimeInstallLockTimeout as exc:
+            lock_path = Path(str(exc.report.get("lock_path", "") or ""))
+            if (
+                lock_path.name.casefold() != RUNTIME_INTERPRETER_UPDATE_LOCK_PATH.name.casefold()
+                or not _ask_runtime_lock_owner_termination(dict(exc.report.get("owner", {}) or {}))
+            ):
+                raise
+            upgrade = run_python_runtime_upgrade(
+                target_python=target_text,
+                force=True,
+            )
     except Exception as exc:
         progress.finish(success=False)
         message = (
