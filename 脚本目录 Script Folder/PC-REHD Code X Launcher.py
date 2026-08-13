@@ -1338,10 +1338,18 @@ GITHUB_SOURCE_UPDATE_TITLE_CLICK_SURFACE_ENABLED = False
 LAUNCHER_WINDOW_TITLE = "CAPCOM MT FRAMEWORK Script v0.1.2.8 Codex Python"
 GITHUB_SOURCE_UPDATE_TITLE_CN = "发现Github 源代码更新"
 GITHUB_SOURCE_UPDATE_TITLE_EN = "GitHub Source Update Available"
-GITHUB_LAUNCHER_SOURCE_METADATA_URL = (
+GITHUB_REPOSITORY_API_URL = (
     "https://api.github.com/repos/Criticise/"
     "PC-REHD-1.2.8-Scrpit-rewritten-in-Python-by-Code-X-GPT-5.6/"
-    "contents/PC-REHD%20Code%20X%20Launcher.py?ref=main"
+)
+GITHUB_LAUNCHER_SOURCE_TREE_URL = (
+    f"{GITHUB_REPOSITORY_API_URL}git/trees/main?recursive=1"
+)
+GITHUB_LAUNCHER_SOURCE_FILE_NAME = "PC-REHD Code X Launcher.py"
+# Kept at the repository root so builds released before dynamic discovery can
+# still compare their fixed Contents API path and open the current Release.
+GITHUB_LEGACY_LAUNCHER_SOURCE_COMPATIBILITY_PATH = (
+    GITHUB_LAUNCHER_SOURCE_FILE_NAME
 )
 GITHUB_RELEASE_PAGE_URL = (
     "https://github.com/Criticise/"
@@ -1349,7 +1357,7 @@ GITHUB_RELEASE_PAGE_URL = (
     "releases/tag/v1.0.0"
 )
 GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS = 20.0
-GITHUB_SOURCE_METADATA_MAX_BYTES = 32 * 1024
+GITHUB_SOURCE_METADATA_MAX_BYTES = 4 * 1024 * 1024
 LAUNCHER_SUPPORTED_PYTHON_MINORS = ((3, 14),)
 LAUNCHER_REQUIRED_PYTHON = (3, 14, 7)
 ISOLATED_PYTHON_ENVIRONMENT = {
@@ -9931,9 +9939,14 @@ def _fetch_github_launcher_source_blob_sha(
     *,
     opener: Callable[..., Any] | None = None,
 ) -> str:
-    """Return the Git blob SHA of the published Launcher source file."""
+    """Discover the published Launcher source file and return its Git blob SHA.
+
+    The repository layout is allowed to change.  The update probe deliberately
+    resolves the unique Launcher filename from the main-tree listing instead of
+    relying on a path baked into older release builds.
+    """
     request = urllib_request.Request(
-        GITHUB_LAUNCHER_SOURCE_METADATA_URL,
+        GITHUB_LAUNCHER_SOURCE_TREE_URL,
         headers={
             "Accept": "application/vnd.github+json",
             "User-Agent": f"{APP_NAME}/{LAUNCHER_BUILD_ID}",
@@ -9952,16 +9965,51 @@ def _fetch_github_launcher_source_blob_sha(
         ) as response:
             payload = response.read(GITHUB_SOURCE_METADATA_MAX_BYTES + 1)
     if len(payload) > GITHUB_SOURCE_METADATA_MAX_BYTES:
-        raise ValueError("GitHub Launcher source metadata exceeded the size limit")
+        raise ValueError("GitHub repository tree metadata exceeded the size limit")
     if not payload:
-        raise ValueError("GitHub returned empty Launcher source metadata")
+        raise ValueError("GitHub returned empty repository tree metadata")
     try:
         metadata = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"GitHub Launcher source metadata is invalid: {exc}") from exc
-    remote_blob_sha = str(metadata.get("sha", "")).strip().casefold()
+        raise ValueError(f"GitHub repository tree metadata is invalid: {exc}") from exc
+    if not isinstance(metadata, dict):
+        raise ValueError("GitHub repository tree metadata is not an object")
+    if bool(metadata.get("truncated", False)):
+        raise ValueError(
+            "GitHub repository tree metadata is truncated; Launcher source discovery is incomplete"
+        )
+    entries = metadata.get("tree") if isinstance(metadata, dict) else None
+    if not isinstance(entries, list):
+        raise ValueError("GitHub repository tree metadata has no file tree")
+    matches = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and str(entry.get("type", "") or "") == "blob"
+        and str(entry.get("path", "") or "").rsplit("/", 1)[-1]
+        == GITHUB_LAUNCHER_SOURCE_FILE_NAME
+    ]
+    canonical_matches = [
+        entry
+        for entry in matches
+        if str(entry.get("path", "") or "")
+        != GITHUB_LEGACY_LAUNCHER_SOURCE_COMPATIBILITY_PATH
+    ]
+    if len(canonical_matches) == 1:
+        selected_entry = canonical_matches[0]
+    elif len(matches) == 1:
+        # Preserve support for a repository that has not yet needed the
+        # root-level compatibility copy.
+        selected_entry = matches[0]
+    else:
+        paths = [str(entry.get("path", "") or "") for entry in matches]
+        raise ValueError(
+            "GitHub Launcher source discovery requires exactly one canonical file; "
+            f"found {len(canonical_matches)} canonical matches from {paths}"
+        )
+    remote_blob_sha = str(selected_entry.get("sha", "")).strip().casefold()
     if not re.fullmatch(r"[0-9a-f]{40}", remote_blob_sha):
-        raise ValueError("GitHub Launcher source metadata has no Git blob SHA")
+        raise ValueError("GitHub discovered Launcher source has no Git blob SHA")
     return remote_blob_sha
 
 
