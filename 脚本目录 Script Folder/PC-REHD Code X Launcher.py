@@ -44665,7 +44665,37 @@ def _run_memory_scene_signature_handoff_smoke() -> dict[str, Any]:
     signature_entry = getattr(writer, "memory_scene_signature", None)
     if not callable(signature_entry) or signed_contract["scene_signature"] != signature_entry(signed_contract):
         raise RuntimeError("Launcher did not hand Writer its canonical scene signature")
-    empty_rows: list[dict[str, Any]] = []
+    # Use the MAX duplicate-name fields here.  A blank receipt cannot expose a
+    # Launcher/Writer digest schema drift in the real MAX export route.
+    receipt_rows = [
+        {
+            "lane": "modify",
+            "scene_node_handle": 7007,
+            "scene_node": mesh["scene_node"],
+            "same_name_ordinal": 2,
+            "same_name_count": 3,
+            "mesh_slot": 7,
+            "mesh_slot_basis": "scene_name_authoritative",
+            "physical_mesh_slot": 7,
+            "display_mesh_slot": 7,
+            "scene_name_mesh_slot": 7,
+            "has_map2": True,
+            "has_skin": True,
+            "scene_vert_count": 123,
+            "scene_face_count": 45,
+            "source_face_count": 47,
+            "source_invalid_face_count": 2,
+            "blender_degenerate_header_only": True,
+            "lod_level": 1,
+            "material_id": 2,
+            "group_id": 3,
+            "display_mode": 4,
+            "mesh_type": 5,
+            "auto_header_only": False,
+            "source_passthrough": False,
+            "requires_selected_fbx": False,
+        }
+    ]
 
     def validate_contract(contract: dict[str, Any]) -> None:
         validate_request(
@@ -44675,14 +44705,14 @@ def _run_memory_scene_signature_handoff_smoke() -> dict[str, Any]:
             "request_id": "launcher-writer-signature-handoff-smoke",
             "target_max_pid": target_pid,
             "scene_contract": contract,
-            "bucket_rows": empty_rows,
+            "bucket_rows": receipt_rows,
             "bucket_receipt": {
                 "status": "ok",
                 "authority": "python_scene_name_handle_validation",
                 "scope": "export_buckets_name_handle_only",
                 "max_process_id": target_pid,
-                "rows": empty_rows,
-                "digest": digest_rows(target_pid, empty_rows),
+                "rows": receipt_rows,
+                "digest": _bucket_identity_digest(target_pid, receipt_rows),
             },
             }
         )

@@ -25674,6 +25674,8 @@ def _memory_bucket_identity_digest(max_process_id: int, rows: list[dict[str, Any
                 0,
             ),
             "scene_node": str(row.get("scene_node", "") or ""),
+            "same_name_ordinal": _int_or_default(row.get("same_name_ordinal"), 0),
+            "same_name_count": _int_or_default(row.get("same_name_count"), 1),
             "mesh_slot": _int_or_default(row.get("mesh_slot"), 0),
             "mesh_slot_basis": str(row.get("mesh_slot_basis", "") or ""),
             "physical_mesh_slot": _int_or_default(row.get("physical_mesh_slot"), 0),
