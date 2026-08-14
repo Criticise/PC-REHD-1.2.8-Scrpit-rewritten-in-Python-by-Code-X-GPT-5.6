@@ -54,13 +54,20 @@ The repository and Release package exclude the embedded Python runtime, generate
 
 | Path | Purpose |
 | --- | --- |
-| `PC-REHD Code X Launcher.py` | Main Launcher, UI, Agent orchestration, and tool routing. |
-| `codex_python_export_bridge.py` | Export bridge and `.MOD` writer path. |
-| `codex_re6_mod_import_fbx.py` | `.MOD` to FBX and import preparation path. |
-| `codex_fbx_probe.py` | FBX inspection and data-contract probing. |
-| `codex_python_runtime_bootstrap.py` | Python runtime installation and environment bootstrap. |
-| `PY依赖 PY Libs/` | Pinned Python dependencies and vendor source snapshots. |
-| `先点Bat文件 - Click Bat First.ps1` | Bootstrap and environment-validation entry point. |
+| `PC-REHD Code X Launcher.py` | Legacy update compatibility marker for builds that used the former root-level source path. |
+| `脚本目录 Script Folder/PC-REHD Code X Launcher.py` | Main Launcher, UI, Agent orchestration, and tool routing. |
+| `脚本目录 Script Folder/codex_python_export_bridge.py` | Export bridge and `.MOD` writer path. |
+| `脚本目录 Script Folder/codex_re6_mod_import_fbx.py` | `.MOD` to FBX and import preparation path. |
+| `脚本目录 Script Folder/codex_fbx_probe.py` | FBX inspection and data-contract probing. |
+| `脚本目录 Script Folder/codex_python_runtime_bootstrap.py` | Python runtime installation and environment bootstrap. |
+| `脚本目录 Script Folder/codex_re6_auxiliary_max_bridge.py` | 3ds Max support for SBC, ADR, and EMS auxiliary geometry. |
+| `脚本目录 Script Folder/codex_re6_scene_compatibility.py` | Shared RE6 import/export scene-compatibility rules. |
+| `脚本目录 Script Folder/codex_re6_tex_decode.py` | RE6 texture decoding utility. |
+| `脚本目录 Script Folder/codex_blender_fbx_texture_to_FBX_safe.py` | MMD-safe Blender FBX texture repair utility. |
+| `脚本目录 Script Folder/RELEASE_NOTES.md` | Release-page notes maintained with the source. |
+| `脚本目录 Script Folder/PY依赖 PY Libs/` | Pinned Python dependencies and vendor source snapshots. |
+| `脚本目录 Script Folder/先点Bat文件 - Click Bat First.ps1` | Bootstrap and environment-validation entry point. |
+| `脚本目录 Script Folder/一定要先点我安装Python - Click to Install Python First.bat` | Installs the required Python runtime. |
 
 ### Release Verification
 
@@ -69,7 +76,7 @@ Every GitHub Release includes `SHA256SUMS.txt` beside the downloadable archive. 
 Current SHA-256 for `RE6-PC-REHD-Code-X-v1.0.0.7z`:
 
 ```text
-83B749EEFB7A4F2D0CFF0FDCF27062CD568AF4472D0FEA4F099A98BEB6268BD0
+8BEA0E10441FF10F66FF9B9831BB9A772A1DAED2B0C0EE3D3C7ED35DB63B54DC
 ```
 
 Verify it in PowerShell:
@@ -179,13 +186,20 @@ PC-REHD Code X 是对 PC-REHD 1.2.8 脚本的 Python 重写版，旨在简化《
 
 | 路径 | 作用 |
 | --- | --- |
-| `PC-REHD Code X Launcher.py` | 主启动器、界面、Agent 调度与工具入口。 |
-| `codex_python_export_bridge.py` | 导出桥接与 `.MOD` 写入流程。 |
-| `codex_re6_mod_import_fbx.py` | `.MOD` 转 FBX 与导入准备流程。 |
-| `codex_fbx_probe.py` | FBX 检查与数据合同解析。 |
-| `codex_python_runtime_bootstrap.py` | Python 运行环境安装与初始化。 |
-| `PY依赖 PY Libs/` | 固定版本的 Python 依赖及供应商源码快照。 |
-| `先点Bat文件 - Click Bat First.ps1` | 启动前的环境初始化与检查入口。 |
+| `PC-REHD Code X Launcher.py` | 为仍使用旧根目录源码路径的版本提供更新兼容标记。 |
+| `脚本目录 Script Folder/PC-REHD Code X Launcher.py` | 主启动器、界面、Agent 调度与工具入口。 |
+| `脚本目录 Script Folder/codex_python_export_bridge.py` | 导出桥接与 `.MOD` 写入流程。 |
+| `脚本目录 Script Folder/codex_re6_mod_import_fbx.py` | `.MOD` 转 FBX 与导入准备流程。 |
+| `脚本目录 Script Folder/codex_fbx_probe.py` | FBX 检查与数据合同解析。 |
+| `脚本目录 Script Folder/codex_python_runtime_bootstrap.py` | Python 运行环境安装与初始化。 |
+| `脚本目录 Script Folder/codex_re6_auxiliary_max_bridge.py` | 3ds Max 的 SBC、ADR、EMS 辅助几何支持。 |
+| `脚本目录 Script Folder/codex_re6_scene_compatibility.py` | RE6 导入导出共用的场景兼容规则。 |
+| `脚本目录 Script Folder/codex_re6_tex_decode.py` | RE6 贴图解码工具。 |
+| `脚本目录 Script Folder/codex_blender_fbx_texture_to_FBX_safe.py` | 面向 MMD 的安全 Blender FBX 贴图修复工具。 |
+| `脚本目录 Script Folder/RELEASE_NOTES.md` | 与源代码一同维护的 Release 页面文案。 |
+| `脚本目录 Script Folder/PY依赖 PY Libs/` | 固定版本的 Python 依赖及供应商源码快照。 |
+| `脚本目录 Script Folder/先点Bat文件 - Click Bat First.ps1` | 启动前的环境初始化与检查入口。 |
+| `脚本目录 Script Folder/一定要先点我安装Python - Click to Install Python First.bat` | 安装所需的 Python 运行环境。 |
 
 ### 文件校验
 
@@ -194,7 +208,7 @@ PC-REHD Code X 是对 PC-REHD 1.2.8 脚本的 Python 重写版，旨在简化《
 当前 `RE6-PC-REHD-Code-X-v1.0.0.7z` 的 SHA-256：
 
 ```text
-83B749EEFB7A4F2D0CFF0FDCF27062CD568AF4472D0FEA4F099A98BEB6268BD0
+8BEA0E10441FF10F66FF9B9831BB9A772A1DAED2B0C0EE3D3C7ED35DB63B54DC
 ```
 
 在 PowerShell 中可使用以下命令校验：
