@@ -7,3 +7,4 @@
 - Merged duplicate same-name bones to prevent bone/MESH binding errors
 - Old update checkers always report an update; newer update-check mechanisms are enforced
 - MAX/Blender scene nodes one time no cache policy that might mislead; FBX exclusively decides geometry
+- Enhanced 3D software connectivity; 3ds Max startup `.py` files are always disabled.
