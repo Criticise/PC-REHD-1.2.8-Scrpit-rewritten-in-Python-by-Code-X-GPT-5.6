@@ -5,6 +5,6 @@
 - Fixed Blender hierarchy per import and export
 - Fixed Legacy4 FVF weight consistency per export
 - Merged duplicate same-name bones to prevent bone/MESH binding errors
+- Enhanced 3D software connectivity; 3ds Max startup .py files are always disabled.
 - Old update checkers always report an update; newer update-check mechanisms are enforced
 - MAX/Blender scene nodes one time no cache policy that might mislead; FBX exclusively decides geometry
-- Enhanced 3D software connectivity; 3ds Max startup `.py` files are always disabled.
