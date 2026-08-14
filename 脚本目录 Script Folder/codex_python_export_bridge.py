@@ -2008,7 +2008,10 @@ def _apply_writer_contract_defaults(job: dict[str, Any], contract: dict[str, Any
     for mesh in meshes:
         if not isinstance(mesh, dict):
             continue
-        if str(mesh.get("lane", "") or "").lower() != "modify":
+        if (
+            str(mesh.get("lane", "") or "").lower() != "modify"
+            or _mesh_uses_source_geometry(mesh)
+        ):
             continue
         if mesh.get("fbx_position_space") in {None, ""}:
             mesh["fbx_position_space"] = "local_object"
@@ -4457,11 +4460,11 @@ def _mark_unskinned_mesh_edit_export_fallback(
 
 
 def _mesh_allows_source_geometry_fallback(mesh_entry: dict[str, Any] | None) -> bool:
-    return (
-        isinstance(mesh_entry, dict)
-        and str(mesh_entry.get("lane", "") or "").lower() == "modify"
-        and not _mesh_has_skin(mesh_entry)
-    )
+    # A Modify Mesh with no usable FBX payload must not silently preserve the
+    # source geometry. Explicit Header-only routes use auto_header_only and do
+    # not pass through this fallback gate.
+    del mesh_entry
+    return False
 
 
 def _mark_mesh_source_passthrough(mesh_entry: dict[str, Any], reason: Any) -> None:
@@ -14542,6 +14545,64 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
     return payload
 
 
+def _max_fbx_route_protocol_is_required(
+    receipt: dict[str, Any],
+    job: dict[str, Any],
+) -> bool:
+    if str(job.get("fbx_backend_kind", "") or "") != "max_fbx":
+        return False
+    marker = receipt.get("route_marker")
+    return (
+        isinstance(marker, dict)
+        and str(marker.get("key", "") or "") == "CodexRe6FbxRouteHandle"
+        and str(marker.get("fbx_property", "") or "")
+        == "Model/Properties70/UDP3DSMAX"
+        and marker.get("restored") is True
+    )
+
+
+def _validate_max_fbx_route_contract(
+    job: dict[str, Any],
+    contract_meshes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Require an unambiguous UDP3DSMAX route marker for each Max Modify Mesh."""
+    expected_handles = sorted(
+        {
+            _int_or_default(mesh.get("scene_node_handle"), 0)
+            for mesh in job.get("meshes", [])
+            if isinstance(mesh, dict)
+            and str(mesh.get("lane", "") or "").lower() == "modify"
+            and not _mesh_uses_source_geometry(mesh)
+            and _int_or_default(mesh.get("scene_node_handle"), 0) > 0
+        }
+    )
+    routes: dict[int, list[dict[str, Any]]] = {}
+    for mesh in contract_meshes:
+        if not isinstance(mesh, dict):
+            continue
+        route_handle = _int_or_default(mesh.get("fbx_route_handle"), 0)
+        if route_handle > 0:
+            routes.setdefault(route_handle, []).append(mesh)
+    missing = [handle for handle in expected_handles if handle not in routes]
+    ambiguous = [handle for handle in expected_handles if len(routes.get(handle, [])) != 1]
+    if missing or ambiguous:
+        detail: list[str] = []
+        if missing:
+            detail.append("missing=" + ", ".join(str(handle) for handle in missing))
+        if ambiguous:
+            detail.append("ambiguous=" + ", ".join(str(handle) for handle in ambiguous))
+        raise ValueError(
+            "Max FBX route protocol mismatch (expected CodexRe6FbxRouteHandle in "
+            "UDP3DSMAX): " + " | ".join(detail)
+        )
+    return {
+        "status": "PASS",
+        "protocol": "CodexRe6FbxRouteHandle/UDP3DSMAX",
+        "expected_handles": expected_handles,
+        "matched_handles": expected_handles,
+    }
+
+
 def _ensure_contract_meshes(job: dict[str, Any], contract: dict[str, Any]) -> list[dict[str, Any]]:
     meshes = contract.get("meshes")
     if not isinstance(meshes, list):
@@ -14558,11 +14619,15 @@ def _ensure_contract_meshes(job: dict[str, Any], contract: dict[str, Any]) -> li
         1,
     )
 
+    by_handle: dict[int, dict[str, Any]] = {}
     by_slot: dict[int, dict[str, Any]] = {}
-    by_name: dict[str, dict[str, Any]] = {}
+    by_name: dict[str, list[dict[str, Any]]] = {}
     for mesh in meshes:
         if not isinstance(mesh, dict):
             continue
+        scene_handle = _int_or_default(mesh.get("scene_node_handle"), 0)
+        if scene_handle > 0 and scene_handle not in by_handle:
+            by_handle[scene_handle] = mesh
         mesh_slot = mesh.get("mesh_slot")
         if mesh_slot is not None:
             try:
@@ -14576,22 +14641,28 @@ def _ensure_contract_meshes(job: dict[str, Any], contract: dict[str, Any]) -> li
         ):
             key = _normalize_mesh_match_name(name_key)
             if key:
-                by_name[key] = mesh
+                candidates = by_name.setdefault(key, [])
+                if mesh not in candidates:
+                    candidates.append(mesh)
 
     for job_mesh in job.get("meshes", []):
         if not isinstance(job_mesh, dict):
             continue
         existing: dict[str, Any] | None = None
+        scene_handle = _int_or_default(job_mesh.get("scene_node_handle"), 0)
+        if scene_handle > 0:
+            existing = by_handle.get(scene_handle)
         mesh_slot = job_mesh.get("mesh_slot")
-        if mesh_slot is not None:
+        if existing is None and mesh_slot is not None:
             try:
                 existing = by_slot.get(int(mesh_slot))
             except Exception:
                 existing = None
         if existing is None:
             key = _normalize_mesh_match_name(job_mesh.get("scene_node"))
-            if key:
-                existing = by_name.get(key)
+            candidates = by_name.get(key, []) if key else []
+            if len(candidates) == 1:
+                existing = candidates[0]
         if existing is None:
             existing = dict(job_mesh)
             meshes.append(existing)
@@ -14611,9 +14682,13 @@ def _ensure_contract_meshes(job: dict[str, Any], contract: dict[str, Any]) -> li
                 by_slot[int(mesh_slot)] = existing
             except Exception:
                 pass
+        if scene_handle > 0:
+            by_handle[scene_handle] = existing
         scene_key = _normalize_mesh_match_name(existing.get("scene_node"))
         if scene_key:
-            by_name[scene_key] = existing
+            candidates = by_name.setdefault(scene_key, [])
+            if existing not in candidates:
+                candidates.append(existing)
     return meshes
 
 
@@ -15212,18 +15287,32 @@ def _preserve_unchanged_source_uvs_before_half_safe(
 
 def _build_fbx_contract_lookup(
     contract_meshes: list[dict[str, Any]],
-) -> tuple[dict[int, dict[str, Any]], dict[str, dict[str, Any]]]:
-    by_slot: dict[int, dict[str, Any]] = {}
-    by_name: dict[str, dict[str, Any]] = {}
+) -> tuple[dict[int, dict[str, Any] | None], dict[int, dict[str, Any] | None], dict[str, list[dict[str, Any]]]]:
+    by_route_handle: dict[int, dict[str, Any] | None] = {}
+    by_slot: dict[int, dict[str, Any] | None] = {}
+    by_name: dict[str, list[dict[str, Any]]] = {}
     for mesh in contract_meshes:
         if not isinstance(mesh, dict):
             continue
+        fbx_route_handle = _int_or_default(mesh.get("fbx_route_handle"), 0)
+        if fbx_route_handle > 0:
+            if (
+                fbx_route_handle in by_route_handle
+                and by_route_handle[fbx_route_handle] is not mesh
+            ):
+                by_route_handle[fbx_route_handle] = None
+            else:
+                by_route_handle[fbx_route_handle] = mesh
         mesh_slot_hint = mesh.get("mesh_slot_hint")
         if isinstance(mesh_slot_hint, dict):
             slot_value = mesh_slot_hint.get("slot")
             try:
-                if slot_value is not None and int(slot_value) not in by_slot:
-                    by_slot[int(slot_value)] = mesh
+                if slot_value is not None:
+                    slot = int(slot_value)
+                    if slot in by_slot and by_slot[slot] is not mesh:
+                        by_slot[slot] = None
+                    else:
+                        by_slot[slot] = mesh
             except Exception:
                 pass
         for name_key in (
@@ -15233,17 +15322,40 @@ def _build_fbx_contract_lookup(
             mesh.get("mesh_name_match"),
         ):
             normalized = _normalize_mesh_match_name(name_key)
-            if normalized and normalized not in by_name:
-                by_name[normalized] = mesh
-    return by_slot, by_name
+            if normalized:
+                candidates = by_name.setdefault(normalized, [])
+                if mesh not in candidates:
+                    candidates.append(mesh)
+    return by_route_handle, by_slot, by_name
 
 
 def _match_fbx_contract_mesh(
     target_mesh: dict[str, Any],
     *,
-    by_slot: dict[int, dict[str, Any]],
-    by_name: dict[str, dict[str, Any]],
+    by_route_handle: dict[int, dict[str, Any] | None],
+    by_slot: dict[int, dict[str, Any] | None],
+    by_name: dict[str, list[dict[str, Any]]],
+    require_explicit_route: bool = False,
 ) -> dict[str, Any] | None:
+    # FBX MaxHandle is not Max's Anim Handle. A Max export must use the
+    # temporary UDP3DSMAX route marker; no slot/name fallback may guess it.
+    scene_node_handle = _int_or_default(target_mesh.get("scene_node_handle"), 0)
+    if scene_node_handle > 0:
+        matched_by_route_handle = by_route_handle.get(scene_node_handle)
+        if isinstance(matched_by_route_handle, dict):
+            return matched_by_route_handle
+        if require_explicit_route:
+            return None
+
+    mesh_slot = target_mesh.get("mesh_slot")
+    if mesh_slot is not None:
+        try:
+            matched_by_slot = by_slot.get(int(mesh_slot))
+        except Exception:
+            matched_by_slot = None
+        if isinstance(matched_by_slot, dict):
+            return matched_by_slot
+
     for name_key in (
         target_mesh.get("scene_node"),
         target_mesh.get("node_name"),
@@ -15252,16 +15364,114 @@ def _match_fbx_contract_mesh(
         target_mesh.get("mesh_name_match"),
     ):
         normalized = _normalize_mesh_match_name(name_key)
-        if normalized and normalized in by_name:
-            return by_name[normalized]
-
-    mesh_slot = target_mesh.get("mesh_slot")
-    if mesh_slot is not None:
-        try:
-            return by_slot.get(int(mesh_slot))
-        except Exception:
-            return None
+        candidates = by_name.get(normalized, []) if normalized else []
+        if len(candidates) == 1:
+            return candidates[0]
     return None
+
+
+def _run_same_name_fbx_handle_regression_guard() -> dict[str, Any]:
+    """Prove duplicate Max names route by UDP3DSMAX Anim Handle, never by order."""
+    target_a = {
+        "lane": "modify",
+        "mesh_slot": 1,
+        "scene_node": "MESH_001",
+        "scene_node_handle": 111,
+    }
+    target_b = {
+        "lane": "modify",
+        "mesh_slot": 2,
+        "scene_node": "MESH_001",
+        "scene_node_handle": 222,
+    }
+    fbx_a = {
+        "node_name": "MESH_001",
+        "mesh_name": "MESH_001",
+        "fbx_model_id": 9001,
+        "fbx_max_handle": 90001,
+        "fbx_route_handle": 111,
+        "mesh_slot_hint": {"slot": 1},
+        "positions": [[1.0, 0.0, 0.0]],
+        "face_indices": [0, 0, 0],
+    }
+    fbx_b = {
+        "node_name": "MESH_001",
+        "mesh_name": "MESH_001",
+        "fbx_model_id": 9002,
+        "fbx_max_handle": 90002,
+        "fbx_route_handle": 222,
+        "mesh_slot_hint": {"slot": 2},
+        "positions": [[2.0, 0.0, 0.0]],
+        "face_indices": [0, 0, 0],
+    }
+    by_route_handle, by_slot, by_name = _build_fbx_contract_lookup([fbx_b, fbx_a])
+    if _match_fbx_contract_mesh(
+        target_a,
+        by_route_handle=by_route_handle,
+        by_slot=by_slot,
+        by_name=by_name,
+        require_explicit_route=True,
+    ) is not fbx_a:
+        raise RuntimeError("same-name Max Mesh A did not resolve by explicit route handle")
+    if _match_fbx_contract_mesh(
+        target_b,
+        by_route_handle=by_route_handle,
+        by_slot=by_slot,
+        by_name=by_name,
+        require_explicit_route=True,
+    ) is not fbx_b:
+        raise RuntimeError("same-name Max Mesh B did not resolve by explicit route handle")
+    name_only = {"scene_node": "MESH_001", "mesh_slot": 0}
+    if _match_fbx_contract_mesh(
+        name_only,
+        by_route_handle=by_route_handle,
+        by_slot=by_slot,
+        by_name=by_name,
+    ) is not None:
+        raise RuntimeError("ambiguous duplicate-name FBX match silently chose one Mesh")
+    duplicate_route = dict(fbx_b)
+    duplicate_route["fbx_route_handle"] = 111
+    duplicate_lookup = _build_fbx_contract_lookup([fbx_a, duplicate_route])
+    if duplicate_lookup[0].get(111) is not None:
+        raise RuntimeError("duplicate FBX route handle was not marked ambiguous")
+    no_route = dict(fbx_a)
+    no_route.pop("fbx_route_handle", None)
+    no_route_lookup = _build_fbx_contract_lookup([no_route])
+    if _match_fbx_contract_mesh(
+        target_a,
+        by_route_handle=no_route_lookup[0],
+        by_slot=no_route_lookup[1],
+        by_name=no_route_lookup[2],
+        require_explicit_route=True,
+    ) is not None:
+        raise RuntimeError("missing explicit Max route fell back to slot/name matching")
+
+    merge_job = {"meshes": [dict(target_a), dict(target_b)]}
+    merge_contract = {"meshes": [dict(target_a), dict(target_b)]}
+    _merge_fbx_contract_meshes(
+        merge_job,
+        merge_contract,
+        [],
+        [fbx_b, fbx_a],
+    )
+    merged_by_slot = {
+        _int_or_default(mesh.get("mesh_slot"), 0): mesh
+        for mesh in merge_contract["meshes"]
+    }
+    if (
+        merged_by_slot[1].get("positions") != fbx_a["positions"]
+        or merged_by_slot[2].get("positions") != fbx_b["positions"]
+    ):
+        raise RuntimeError("same-name Max Mesh geometry merged into the wrong MOD slot")
+    return {
+        "status": "PASS",
+        "same_name": True,
+        "route_handle_routing": True,
+        "ambiguous_name_rejected": True,
+        "duplicate_route_handle_detected": True,
+        "missing_route_rejected": True,
+        "independent_mod_slots": True,
+    }
 
 
 def _header_tokens_from_scene_name(scene_name: Any) -> dict[str, int | None]:
@@ -15325,7 +15535,9 @@ def _validate_header_bucket_scene_witnesses(
 
     fbx_contract_meshes = fbx_handoff.get("contract_meshes")
     fbx_contract_list = [mesh for mesh in fbx_contract_meshes if isinstance(mesh, dict)] if isinstance(fbx_contract_meshes, list) else []
-    fbx_by_slot, fbx_by_name = _build_fbx_contract_lookup(fbx_contract_list)
+    fbx_by_route_handle, fbx_by_slot, fbx_by_name = _build_fbx_contract_lookup(
+        fbx_contract_list
+    )
     fbx_status = str(fbx_handoff.get("status", "") or "")
     audits: list[dict[str, Any]] = []
 
@@ -15375,7 +15587,12 @@ def _validate_header_bucket_scene_witnesses(
             and _int_or_default(route.get("scene_face_count"), 0) > 0
             and str(job.get("fbx_backend_kind", "") or "") != "blender_fbx"
         )
-        fbx_witness = _match_fbx_contract_mesh(route, by_slot=fbx_by_slot, by_name=fbx_by_name)
+        fbx_witness = _match_fbx_contract_mesh(
+            route,
+            by_route_handle=fbx_by_route_handle,
+            by_slot=fbx_by_slot,
+            by_name=fbx_by_name,
+        )
         if fbx_witness is None and requires_fbx_witness:
             raise ValueError(
                 f"Bucket 1 Mesh {mesh_slot} has Max geometry but no matching FBX witness (FBX status={fbx_status or 'unknown'})"
@@ -15417,15 +15634,264 @@ def _validate_header_bucket_scene_witnesses(
     return audits
 
 
+def _mark_modify_routes_pending_fbx_probe(
+    scene_contract: dict[str, Any],
+    bucket_rows: list[dict[str, Any]],
+) -> None:
+    """Keep DCC topology observations as diagnostics until FBX Probe returns."""
+    modify_handles = {
+        _int_or_default(row.get("scene_node_handle"), 0)
+        for row in bucket_rows
+        if isinstance(row, dict)
+        and str(row.get("lane", "") or "").strip().lower() == "modify"
+        and _int_or_default(row.get("scene_node_handle"), 0) > 0
+    }
+
+    def mark_pending(row: dict[str, Any]) -> None:
+        if _int_or_default(row.get("scene_node_handle"), 0) not in modify_handles:
+            return
+        row.setdefault("scene_has_skin_reference", _as_bool(row.get("has_skin"), False))
+        row.setdefault("scene_vertex_count_reference", _int_or_default(row.get("scene_vert_count"), 0))
+        row.setdefault("scene_face_count_reference", _int_or_default(row.get("scene_face_count"), 0))
+        row["has_skin"] = False
+        row["scene_vert_count"] = 0
+        row["scene_face_count"] = 0
+        row["auto_header_only"] = False
+        row["source_passthrough"] = False
+        row["source_fallback_reason"] = ""
+        row["requires_selected_fbx"] = True
+        row["topology_authority"] = "fbx_probe_pending"
+        row.pop("re6_compatibility_schema", None)
+        row.pop("re6_compatibility_route", None)
+        row.pop("re6_compatibility_face_count_authority", None)
+
+    for collection_name in ("nodes", "meshes"):
+        for row in scene_contract.get(collection_name, []):
+            if isinstance(row, dict):
+                mark_pending(row)
+    for row in bucket_rows:
+        if isinstance(row, dict):
+            mark_pending(row)
+
+
+def _apply_fbx_probe_topology_routes(
+    job: dict[str, Any],
+    contract: dict[str, Any],
+    fbx_contract_meshes: list[dict[str, Any]],
+    *,
+    require_explicit_route: bool,
+) -> dict[str, Any]:
+    """Apply Modify routes from FBX topology, never from DCC scene metadata."""
+    by_route_handle, by_slot, by_name = _build_fbx_contract_lookup(fbx_contract_meshes)
+    job_by_handle = {
+        _int_or_default(row.get("scene_node_handle"), 0): row
+        for row in job.get("meshes", [])
+        if isinstance(row, dict) and _int_or_default(row.get("scene_node_handle"), 0) > 0
+    }
+    rows: list[dict[str, Any]] = []
+    for mesh in _ensure_contract_meshes(job, contract):
+        if not isinstance(mesh, dict) or str(mesh.get("lane", "") or "").lower() != "modify":
+            continue
+        handle = _int_or_default(mesh.get("scene_node_handle"), 0)
+        targets = [mesh]
+        job_mesh = job_by_handle.get(handle)
+        if isinstance(job_mesh, dict) and job_mesh is not mesh:
+            targets.append(job_mesh)
+        matched = _match_fbx_contract_mesh(
+            mesh,
+            by_route_handle=by_route_handle,
+            by_slot=by_slot,
+            by_name=by_name,
+            require_explicit_route=require_explicit_route,
+        )
+        reference_skin = _as_bool(mesh.get("scene_has_skin_reference"), False)
+        reference_vertices = _int_or_default(mesh.get("scene_vertex_count_reference"), 0)
+        reference_faces = _int_or_default(mesh.get("scene_face_count_reference"), 0)
+        if not isinstance(matched, dict):
+            rows.append(
+                {
+                    "scene_node_handle": handle,
+                    "scene_node": str(mesh.get("scene_node", "") or ""),
+                    "status": "fbx_match_missing",
+                    "scene_has_skin": reference_skin,
+                    "scene_vertex_count": reference_vertices,
+                    "scene_face_count": reference_faces,
+                }
+            )
+            continue
+        fbx_skin = _int_or_default(matched.get("skin_deformer_count"), 0) > 0
+        fbx_vertices = _int_or_default(
+            matched.get("vertex_count"),
+            len(matched.get("positions", [])) if isinstance(matched.get("positions"), list) else 0,
+        )
+        fbx_faces = _int_or_default(
+            matched.get("triangle_count"),
+            (len(matched.get("face_indices", [])) // 3)
+            if isinstance(matched.get("face_indices"), list)
+            else 0,
+        )
+        if fbx_skin and fbx_faces <= 0:
+            route = "skin_without_fbx_faces"
+            use_source = True
+        elif not fbx_skin and fbx_faces > 0:
+            route = "unskinned_with_fbx_faces"
+            use_source = True
+        else:
+            route = "fbx_geometry"
+            use_source = False
+        mismatch_fields: list[str] = []
+        if reference_skin != fbx_skin:
+            mismatch_fields.append("skin")
+        if reference_vertices != fbx_vertices:
+            mismatch_fields.append("vertices")
+        if reference_faces != fbx_faces:
+            mismatch_fields.append("faces")
+        for target in targets:
+            target["fbx_has_skin"] = fbx_skin
+            target["fbx_vertex_count"] = fbx_vertices
+            target["fbx_face_count"] = fbx_faces
+            target["has_skin"] = fbx_skin
+            target["scene_vert_count"] = fbx_vertices
+            target["scene_face_count"] = fbx_faces
+            target["auto_header_only"] = use_source
+            target["source_passthrough"] = use_source
+            target["source_fallback_reason"] = ""
+            target["requires_selected_fbx"] = not use_source
+            target["topology_authority"] = "fbx_probe"
+            target["fbx_topology_route"] = route
+        rows.append(
+            {
+                "scene_node_handle": handle,
+                "scene_node": str(mesh.get("scene_node", "") or ""),
+                "status": "ok",
+                "route": route,
+                "scene_has_skin": reference_skin,
+                "scene_vertex_count": reference_vertices,
+                "scene_face_count": reference_faces,
+                "fbx_has_skin": fbx_skin,
+                "fbx_vertex_count": fbx_vertices,
+                "fbx_face_count": fbx_faces,
+                "mismatch_fields": mismatch_fields,
+            }
+        )
+    mismatches = [row for row in rows if row.get("mismatch_fields")]
+    return {
+        "status": "ok",
+        "authority": "fbx_probe",
+        "rows": rows,
+        "mismatch_count": len(mismatches),
+        "mismatches": mismatches,
+    }
+
+
+def _run_fbx_probe_topology_authority_regression_guard() -> dict[str, Any]:
+    """Ensure DCC topology metadata can never route a Modify Mesh."""
+
+    def route_case(
+        *,
+        scene_skin: bool,
+        scene_vertices: int,
+        scene_faces: int,
+        fbx_skin: bool,
+        fbx_vertices: int,
+        fbx_faces: int,
+        expected_route: str,
+        expect_source: bool,
+    ) -> None:
+        mesh = {
+            "lane": "modify",
+            "scene_node": "Mesh_001_14D40020_LODx255_MatID:80_Group:0_DisplayMode:3_Type:65015",
+            "scene_node_handle": 101,
+            "mesh_slot": 1,
+            "scene_has_skin_reference": scene_skin,
+            "scene_vertex_count_reference": scene_vertices,
+            "scene_face_count_reference": scene_faces,
+            "has_skin": False,
+            "scene_vert_count": 0,
+            "scene_face_count": 0,
+            "auto_header_only": False,
+            "source_passthrough": False,
+            "requires_selected_fbx": True,
+        }
+        job = {"meshes": [copy.deepcopy(mesh)]}
+        contract = {"meshes": [copy.deepcopy(mesh)]}
+        fbx_mesh = {
+            "node_name": mesh["scene_node"],
+            "mesh_name": mesh["scene_node"],
+            "fbx_route_handle": 101,
+            "skin_deformer_count": 1 if fbx_skin else 0,
+            "vertex_count": fbx_vertices,
+            "triangle_count": fbx_faces,
+            "positions": [[0.0, 0.0, 0.0]] * fbx_vertices,
+            "face_indices": [0, 0, 0] * fbx_faces,
+        }
+        receipt = _apply_fbx_probe_topology_routes(
+            job,
+            contract,
+            [fbx_mesh],
+            require_explicit_route=True,
+        )
+        routed = contract["meshes"][0]
+        if (
+            routed.get("fbx_topology_route") != expected_route
+            or _as_bool(routed.get("source_passthrough"), False) is not expect_source
+            or _as_bool(routed.get("requires_selected_fbx"), False) is expect_source
+            or not receipt.get("rows", [{}])[0].get("mismatch_fields")
+        ):
+            raise RuntimeError("FBX Probe topology authority routing regressed")
+
+    # The original Max failure: stale PYMXS says unskinned/empty while FBX
+    # proves a skinned geometric Mesh.  The FBX result must win.
+    route_case(
+        scene_skin=False,
+        scene_vertices=0,
+        scene_faces=0,
+        fbx_skin=True,
+        fbx_vertices=3,
+        fbx_faces=1,
+        expected_route="fbx_geometry",
+        expect_source=False,
+    )
+    # Only facts from the current FBX may select the two source routes.
+    route_case(
+        scene_skin=False,
+        scene_vertices=3,
+        scene_faces=1,
+        fbx_skin=True,
+        fbx_vertices=3,
+        fbx_faces=0,
+        expected_route="skin_without_fbx_faces",
+        expect_source=True,
+    )
+    route_case(
+        scene_skin=True,
+        scene_vertices=3,
+        scene_faces=0,
+        fbx_skin=False,
+        fbx_vertices=3,
+        fbx_faces=1,
+        expected_route="unskinned_with_fbx_faces",
+        expect_source=True,
+    )
+    return {
+        "status": "PASS",
+        "authority": "fbx_probe",
+        "dcc_topology_diagnostic_only": True,
+        "max_handle_route_required": True,
+    }
+
+
 def _merge_fbx_contract_meshes(
     job: dict[str, Any],
     contract: dict[str, Any],
     source_mesh_headers: list[dict[str, Any]],
     fbx_contract_meshes: list[dict[str, Any]],
+    *,
+    require_explicit_route: bool = False,
 ) -> int:
     meshes = _ensure_contract_meshes(job, contract)
     source_fvf_map = _build_source_fvf_map(source_mesh_headers)
-    by_slot, by_name = _build_fbx_contract_lookup(fbx_contract_meshes)
+    by_route_handle, by_slot, by_name = _build_fbx_contract_lookup(fbx_contract_meshes)
     merged_count = 0
 
     for mesh in meshes:
@@ -15443,8 +15909,18 @@ def _merge_fbx_contract_meshes(
 
         if str(mesh.get("lane", "") or "").lower() != "modify":
             continue
+        # A Header-only/source route is decided from the current FBX topology.
+        # Do not let the generic FBX merge put geometry back into that route.
+        if _mesh_uses_source_geometry(mesh):
+            continue
 
-        matched = _match_fbx_contract_mesh(mesh, by_slot=by_slot, by_name=by_name)
+        matched = _match_fbx_contract_mesh(
+            mesh,
+            by_route_handle=by_route_handle,
+            by_slot=by_slot,
+            by_name=by_name,
+            require_explicit_route=require_explicit_route,
+        )
         if matched is None:
             continue
         if not isinstance(matched.get("positions"), list) or not isinstance(matched.get("face_indices"), list):
@@ -15488,6 +15964,14 @@ def _merge_fbx_contract_meshes(
             "mesh_name",
             "match_name",
             "mesh_name_match",
+            "fbx_model_id",
+            "fbx_model_name",
+            "fbx_model_type",
+            "fbx_max_handle",
+            "fbx_route_handle",
+            "fbx_route_protocol",
+            "fbx_parent_model_id",
+            "fbx_parent_name",
             "mesh_slot_hint",
             "lod_hint",
             "material_names",
@@ -17607,14 +18091,18 @@ def _run_required_fbx_geometry_regression_guard() -> dict[str, Any]:
         header_only_source,
     ):
         failures.append("an unskinned same-topology Mesh was silently downgraded to Header-only")
-    _require_fbx_geometry_for_requested_mesh_rewrites(
-        unskinned_job,
-        {"meshes": [{"lane": "modify", "mesh_slot": 1, "has_skin": False}]},
-        {"status": "missing_fbx_file"},
-        [header_only_source],
-    )
-    if not _as_bool(unskinned_job["meshes"][0].get("source_passthrough"), False):
-        failures.append("an unskinned FBX failure did not enter per-Mesh source fallback")
+    try:
+        _require_fbx_geometry_for_requested_mesh_rewrites(
+            unskinned_job,
+            {"meshes": [{"lane": "modify", "mesh_slot": 1, "has_skin": False}]},
+            {"status": "missing_fbx_file"},
+            [header_only_source],
+        )
+        failures.append("an unskinned FBX failure was accepted without geometry")
+    except ValueError:
+        pass
+    if _as_bool(unskinned_job["meshes"][0].get("source_passthrough"), False):
+        failures.append("an unskinned FBX failure silently preserved source geometry")
     auto_header_job = {
         "meshes": [
             {
@@ -17642,14 +18130,14 @@ def _run_required_fbx_geometry_regression_guard() -> dict[str, Any]:
         "mesh_rewrite_requires_fbx": True,
         "delete_remains_independent": True,
         "skin_zero_geometry_uses_header_only": True,
-        "unskinned_failure_isolated": True,
+        "unskinned_failure_rejected": True,
     }
 
 
 # Mandatory maintenance oracle for the two degenerate Bucket 3 paths. A future
-# writer change must preserve source geometry per slot, apply live Max Header
-# values, and keep unrelated Mesh rewrites alive when one optional Mesh fails.
-SPECIAL_MESH_SOURCE_FALLBACK_CONTRACT_REVISION = 1
+# writer change must preserve only explicit Header-only source geometry and
+# reject malformed geometry instead of silently exporting the source Mesh.
+SPECIAL_MESH_SOURCE_FALLBACK_CONTRACT_REVISION = 2
 
 
 def _run_special_mesh_source_fallback_regression_guard() -> dict[str, Any]:
@@ -17763,7 +18251,7 @@ def _run_special_mesh_source_fallback_regression_guard() -> dict[str, Any]:
         "face_indices": [0, 1, 9],
         **scene_header(3),
     }
-    contract_meshes = [auto_header_mesh, valid_unskinned_mesh, failing_unskinned_mesh]
+    contract_meshes = [auto_header_mesh, valid_unskinned_mesh]
     layout = _build_mod_rewrite_layout(
         synthetic_mod,
         {
@@ -17812,16 +18300,27 @@ def _run_special_mesh_source_fallback_regression_guard() -> dict[str, Any]:
         if output_vertex_chunk(2) == source_vertex_chunks[1]:
             failures.append("valid unskinned Editable Mesh geometry was not written")
         if output_vertex_chunk(3) != source_vertex_chunks[2] or output_face_chunk(3) != source_face_chunks[2]:
-            failures.append("failed unskinned Editable Mesh did not fall back to its own source geometry")
+            failures.append("unselected Mesh did not preserve its source geometry")
 
-    if not _as_bool(failing_unskinned_mesh.get("source_passthrough"), False):
-        failures.append("failed unskinned Editable Mesh was not marked for source fallback")
+    try:
+        _build_mod_rewrite_layout(
+            synthetic_mod,
+            {
+                "meshes": [dict(auto_header_mesh), dict(valid_unskinned_mesh), dict(failing_unskinned_mesh)],
+                "delete_mesh_slots": [],
+                "lod0_mesh_slots": [],
+            },
+            {"meshes": [auto_header_mesh, valid_unskinned_mesh, failing_unskinned_mesh]},
+        )
+        failures.append("malformed unskinned geometry was accepted without FBX payload")
+    except ValueError:
+        pass
     if layout.get("modified_mesh_slots") != [2]:
         failures.append(f"unrelated Mesh rewrite isolation changed: {layout.get('modified_mesh_slots')}")
     if [row.get("mesh_slot") for row in layout.get("auto_header_only_meshes", [])] != [1]:
         failures.append("automatic Header-only receipt lost Mesh slot 1")
-    if [row.get("mesh_slot") for row in layout.get("source_fallback_meshes", [])] != [3]:
-        failures.append("source fallback receipt lost Mesh slot 3")
+    if layout.get("source_fallback_meshes", []):
+        failures.append("ordinary export retained an automatic source-geometry fallback")
 
     if failures:
         raise RuntimeError("Special Mesh source-fallback regression gate failed: " + "; ".join(failures))
@@ -17830,8 +18329,8 @@ def _run_special_mesh_source_fallback_regression_guard() -> dict[str, Any]:
         "contract_revision": SPECIAL_MESH_SOURCE_FALLBACK_CONTRACT_REVISION,
         "skin_zero_geometry_header_only": True,
         "unskinned_geometry_written": True,
-        "single_mesh_failure_isolated": True,
-        "live_max_header_preserved_on_fallback": True,
+        "malformed_mesh_rejected": True,
+        "live_max_header_preserved": True,
     }
 
 
@@ -24255,6 +24754,16 @@ def _build_memory_export_txt(
     route_rows = route.get("bucket_rows") if isinstance(route.get("bucket_rows"), list) else request.get("bucket_rows", [])
     route_rows = [row for row in route_rows if isinstance(row, dict)]
     probe = payload.get("fbx_probe_log") if isinstance(payload.get("fbx_probe_log"), dict) else {}
+    topology_reconciliation = (
+        payload.get("fbx_topology_reconciliation")
+        if isinstance(payload.get("fbx_topology_reconciliation"), dict)
+        else {}
+    )
+    topology_rows = [
+        row
+        for row in topology_reconciliation.get("rows", [])
+        if isinstance(row, dict)
+    ]
     fbx_receipt = request.get("fbx_receipt") if isinstance(request.get("fbx_receipt"), dict) else {}
     material_detach = (
         fbx_receipt.get("material_detach")
@@ -24426,11 +24935,27 @@ def _build_memory_export_txt(
             f"UNMATCHED_FBX_COUNT={_int_or_default(probe.get('unmatched_fbx_count'), 0)}",
             f"UNMATCHED_MAX_COUNT={_int_or_default(probe.get('unmatched_max_count'), 0)}",
             f"ERROR={_export_log_scalar(probe.get('error'))}",
+            f"TOPOLOGY_AUTHORITY={_export_log_scalar(topology_reconciliation.get('authority'))}",
+            f"TOPOLOGY_REFERENCE_MISMATCH_COUNT={_int_or_default(topology_reconciliation.get('mismatch_count'), 0)}",
             "",
             "[AXES]",
             f"CONSISTENCY={_export_log_scalar(axes.get('status'))}",
         )
     )
+    for index, row in enumerate(topology_rows, start=1):
+        lines.append(
+            f"TOPOLOGY_{index:03d}=handle:{_int_or_default(row.get('scene_node_handle'), 0)}; "
+            f"name:{_export_log_scalar(row.get('scene_node'))}; "
+            f"status:{_export_log_scalar(row.get('status'))}; "
+            f"route:{_export_log_scalar(row.get('route'))}; "
+            f"scene_skin:{_export_log_scalar(row.get('scene_has_skin'))}; "
+            f"fbx_skin:{_export_log_scalar(row.get('fbx_has_skin'))}; "
+            f"scene_vertices:{_int_or_default(row.get('scene_vertex_count'), 0)}; "
+            f"fbx_vertices:{_int_or_default(row.get('fbx_vertex_count'), 0)}; "
+            f"scene_faces:{_int_or_default(row.get('scene_face_count'), 0)}; "
+            f"fbx_faces:{_int_or_default(row.get('fbx_face_count'), 0)}; "
+            f"difference:{_export_log_scalar(','.join(str(value) for value in row.get('mismatch_fields', [])))}"
+        )
     lines.extend(_axis_log_lines("LAUNCHER", axes.get("launcher")))
     lines.extend(_axis_log_lines("PROBE", axes.get("probe")))
     lines.extend(_axis_log_lines("WRITER", axes.get("writer")))
@@ -27149,6 +27674,24 @@ def _build_memory_export_job(
                 "has_skin": _as_bool(scene_mesh.get("has_skin"), False),
                 "scene_vert_count": _int_or_default(scene_mesh.get("scene_vert_count"), 0),
                 "scene_face_count": _int_or_default(scene_mesh.get("scene_face_count"), 0),
+                "scene_has_skin_reference": _as_bool(
+                    scene_mesh.get("scene_has_skin_reference", scene_mesh.get("has_skin")),
+                    False,
+                ),
+                "scene_vertex_count_reference": _int_or_default(
+                    scene_mesh.get(
+                        "scene_vertex_count_reference",
+                        scene_mesh.get("scene_vert_count"),
+                    ),
+                    0,
+                ),
+                "scene_face_count_reference": _int_or_default(
+                    scene_mesh.get(
+                        "scene_face_count_reference",
+                        scene_mesh.get("scene_face_count"),
+                    ),
+                    0,
+                ),
                 "source_face_count": _int_or_default(scene_mesh.get("source_face_count"), 0),
                 "source_invalid_face_count": _int_or_default(scene_mesh.get("source_invalid_face_count"), 0),
                 "blender_degenerate_header_only": _as_bool(
@@ -27237,6 +27780,24 @@ def _build_memory_export_job(
             ),
             "scene_face_count": _int_or_default(
                 scene_mesh.get("scene_face_count", bucket.get("scene_face_count")),
+                0,
+            ),
+            "scene_has_skin_reference": _as_bool(
+                scene_mesh.get("scene_has_skin_reference", scene_mesh.get("has_skin")),
+                False,
+            ),
+            "scene_vertex_count_reference": _int_or_default(
+                scene_mesh.get(
+                    "scene_vertex_count_reference",
+                    scene_mesh.get("scene_vert_count"),
+                ),
+                0,
+            ),
+            "scene_face_count_reference": _int_or_default(
+                scene_mesh.get(
+                    "scene_face_count_reference",
+                    scene_mesh.get("scene_face_count"),
+                ),
                 0,
             ),
             "source_face_count": _int_or_default(scene_mesh.get("source_face_count"), 0),
@@ -28651,10 +29212,13 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
     phase_started_at = started_at
     scene_contract, bucket_rows = _validate_memory_export_request(request)
     scene_backend = _memory_scene_backend(scene_contract)
-    compatibility_receipt = apply_export_compatibility_contract(
-        scene_contract,
-        clear_legacy_auto_route=scene_backend["kind"] == "blender_fbx",
-    )
+    _mark_modify_routes_pending_fbx_probe(scene_contract, bucket_rows)
+    compatibility_receipt = {
+        "status": "deferred_to_fbx_probe",
+        "authority": "fbx_probe_topology",
+        "matched_mesh_count": 0,
+        "matched_meshes": [],
+    }
     scene_contract["scene_signature"] = memory_scene_signature(scene_contract)
     live_scene_signature = str(scene_contract.get("scene_signature", "") or "")
     scene_contract, bucket_rows = _apply_mesh_name_authoritative_slots(
@@ -28773,6 +29337,9 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
     contract["mesh_slot_limit_skipped"] = [dict(row) for row in job["mesh_slot_limit_skipped"]]
     _mark_memory_source_missing_meshes(job, contract, source_mesh_headers)
     receipt = _validate_memory_fbx_receipt(request, job, contract)
+    require_explicit_max_route = _max_fbx_route_protocol_is_required(receipt, job)
+    job["require_explicit_max_fbx_route"] = require_explicit_max_route
+    contract["require_explicit_max_fbx_route"] = require_explicit_max_route
     _record_timing_phase(
         timing,
         "source_contract_build_seconds",
@@ -28831,39 +29398,59 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
         fbx_contract_meshes = fbx_handoff.get("contract_meshes")
         if not isinstance(fbx_contract_meshes, list) or not fbx_contract_meshes:
             raise RuntimeError("Max FBX geometry carrier contains no readable Mesh contract")
-        _merge_fbx_contract_meshes(
+        if require_explicit_max_route:
+            route_receipt = _validate_max_fbx_route_contract(job, fbx_contract_meshes)
+            job["max_fbx_route_receipt"] = dict(route_receipt)
+            contract["max_fbx_route_receipt"] = dict(route_receipt)
+        compatibility_receipt = _apply_fbx_probe_topology_routes(
             job,
             contract,
-            source_mesh_headers,
             fbx_contract_meshes,
+            require_explicit_route=require_explicit_max_route,
         )
-        missing_required: list[str] = []
-        for mesh in fbx_modify_meshes:
-            if isinstance(mesh.get("positions"), list) and mesh.get("positions"):
-                continue
-            mesh_name = str(mesh.get("scene_node", "") or "<unnamed>")
-            if _skip_memory_source_missing_mesh(
+        fbx_handoff["topology_reconciliation"] = copy.deepcopy(compatibility_receipt)
+        fbx_modify_meshes = [
+            mesh
+            for mesh in contract.get("meshes", [])
+            if isinstance(mesh, dict)
+            and str(mesh.get("lane", "") or "").lower() == "modify"
+            and not _mesh_uses_source_geometry(mesh)
+        ]
+        if fbx_modify_meshes:
+            _merge_fbx_contract_meshes(
                 job,
                 contract,
-                mesh,
-                "fbx_mesh_match_missing",
-            ):
-                continue
-            if _mesh_allows_source_geometry_fallback(mesh):
-                _mark_mesh_source_passthrough(mesh, "fbx_mesh_match_missing")
-                for job_mesh in job.get("meshes", []):
-                    if (
-                        isinstance(job_mesh, dict)
-                        and _int_or_default(job_mesh.get("scene_node_handle"), 0)
-                        == _int_or_default(mesh.get("scene_node_handle"), 0)
-                    ):
-                        _mark_mesh_source_passthrough(job_mesh, "fbx_mesh_match_missing")
-            else:
-                missing_required.append(mesh_name)
-        if missing_required:
-            raise RuntimeError(
-                "FBX geometry did not match required Skin Meshes: " + ", ".join(missing_required)
+                source_mesh_headers,
+                fbx_contract_meshes,
+                require_explicit_route=require_explicit_max_route,
             )
+            missing_required: list[str] = []
+            for mesh in fbx_modify_meshes:
+                if isinstance(mesh.get("positions"), list) and mesh.get("positions"):
+                    continue
+                mesh_name = str(mesh.get("scene_node", "") or "<unnamed>")
+                if _skip_memory_source_missing_mesh(
+                    job,
+                    contract,
+                    mesh,
+                    "fbx_mesh_match_missing",
+                ):
+                    continue
+                if _mesh_allows_source_geometry_fallback(mesh):
+                    _mark_mesh_source_passthrough(mesh, "fbx_mesh_match_missing")
+                    for job_mesh in job.get("meshes", []):
+                        if (
+                            isinstance(job_mesh, dict)
+                            and _int_or_default(job_mesh.get("scene_node_handle"), 0)
+                            == _int_or_default(mesh.get("scene_node_handle"), 0)
+                        ):
+                            _mark_mesh_source_passthrough(job_mesh, "fbx_mesh_match_missing")
+                else:
+                    missing_required.append(mesh_name)
+            if missing_required:
+                raise RuntimeError(
+                    "FBX geometry did not match required Modify Meshes: " + ", ".join(missing_required)
+                )
         fbx_axis_log = _build_fbx_axis_log(receipt.get("fbx_axes"), fbx_handoff.get("fbx_axes"))
         job["fbx_axis_log"] = fbx_axis_log
         contract["fbx_axis_log"] = fbx_axis_log
@@ -29069,6 +29656,7 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
         "output_sha256": output_sha256,
         "scene_signature": live_scene_signature,
         "scene_compatibility": copy.deepcopy(compatibility_receipt),
+        "fbx_topology_reconciliation": copy.deepcopy(compatibility_receipt),
         "route_digest": route_plan["route_digest"],
         "route_plan": route_plan,
         "write_status": final_status["write_status"],
@@ -30002,6 +30590,8 @@ if bool(globals().get("__codex_trusted_runtime_fast_load__", False)):
         "BONE_ADD_DELETE_V4_PARITY_REGRESSION_STATUS",
         "MEMORY_SCENE_CONTRACT_REGRESSION_STATUS",
         "CHECK_SOURCE_ADVISORY_REGRESSION_STATUS",
+        "SAME_NAME_FBX_HANDLE_REGRESSION_STATUS",
+        "FBX_PROBE_TOPOLOGY_AUTHORITY_REGRESSION_STATUS",
     ):
         globals()[_status_name] = dict(_trusted_fast_load_status)
 else:
@@ -30048,6 +30638,10 @@ else:
         BONE_ADD_DELETE_V4_PARITY_REGRESSION_STATUS = _run_bone_add_delete_v4_parity_regression_guard()
         MEMORY_SCENE_CONTRACT_REGRESSION_STATUS = _run_memory_scene_contract_regression_guard()
         CHECK_SOURCE_ADVISORY_REGRESSION_STATUS = _run_check_source_advisory_regression_guard()
+        SAME_NAME_FBX_HANDLE_REGRESSION_STATUS = _run_same_name_fbx_handle_regression_guard()
+        FBX_PROBE_TOPOLOGY_AUTHORITY_REGRESSION_STATUS = (
+            _run_fbx_probe_topology_authority_regression_guard()
+        )
     except Exception as exc:
         WRITER_MAINTENANCE_GATE_ERROR = exc
         if __name__ != "__main__":

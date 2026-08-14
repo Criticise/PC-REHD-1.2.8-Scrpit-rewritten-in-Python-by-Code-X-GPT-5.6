@@ -5738,6 +5738,7 @@ PYMXS_EXPORT_ALLOWED_RUNTIME_CALLS = (
     "rt.getNumFaces",
     "rt.getNumVerts",
     "rt.getUserProp",
+    "rt.getUserPropBuffer",
     "rt.maxOps.getNodeByHandle",
     "rt.maxOps.CollapseNodeTo",
     "rt.meshop.getMapSupport",
@@ -5748,6 +5749,8 @@ PYMXS_EXPORT_ALLOWED_RUNTIME_CALLS = (
     "rt.copy",
     "rt.skinOps.GetBoneName",
     "rt.skinOps.GetNumberBones",
+    "rt.setUserProp",
+    "rt.setUserPropBuffer",
 )
 PYMXS_EXPORT_ALLOWED_RUNTIME_VALUES = (
     "rt.Editable_Mesh",
@@ -5891,6 +5894,7 @@ _PYMXS_APPROVED_RUNTIME_CALLS = frozenset(
         "rt.setTVFace",
         "rt.setTVert",
         "rt.setUserProp",
+        "rt.setUserPropBuffer",
         "rt.showTextureMap",
         "rt.snapshotAsMesh",
         "rt.skinOps.GetBoneIDByListID",
@@ -17839,14 +17843,6 @@ def _max_scene_name_snapshot() -> dict[str, Any]:
         nodes_by_handle.clear()
 
 
-_MAX_VALIDATED_SCENE_NODE_CACHE: dict[str, Any] = {
-    "max_process_id": 0,
-    "digest": "",
-    "nodes_by_handle": {},
-    "selected_handles": [],
-}
-
-
 def _max_validated_scene_nodes_by_handle(rt: Any) -> dict[int, Any]:
     """Compatibility alias for the export name/Handle-only scene index."""
     return _max_export_scene_nodes_by_handle(rt)
@@ -17859,8 +17855,6 @@ def _max_scene_name_selection_snapshot(rt: Any) -> dict[str, Any]:
     can retain wrappers for nodes removed by Undo; Python compares these rows
     with the full-scene rows and discards identities that are not present.
     """
-
-    global _MAX_VALIDATED_SCENE_NODE_CACHE
 
     def rows_from(nodes: Any, *, preserve_order: bool) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -17894,21 +17888,6 @@ def _max_scene_name_selection_snapshot(rt: Any) -> dict[str, Any]:
     selected_rows = rows_from(selected_nodes, preserve_order=True)
     pid = os.getpid()
     digest = _scene_name_selection_snapshot_digest(pid, scene_rows, selected_rows)
-    selected_handles = [
-        int(row["handle"])
-        for row in selected_rows
-        if int(row["handle"]) in scene_nodes_by_handle
-        and str(
-            getattr(scene_nodes_by_handle[int(row["handle"])], "name", "") or ""
-        )
-        == str(row["name"])
-    ]
-    _MAX_VALIDATED_SCENE_NODE_CACHE = {
-        "max_process_id": pid,
-        "digest": digest,
-        "nodes_by_handle": scene_nodes_by_handle,
-        "selected_handles": selected_handles,
-    }
     return {
         "schema": "pc-rehd-scene-name-selection-snapshot-v1",
         "action": "probe_scene_names",
@@ -17921,121 +17900,6 @@ def _max_scene_name_selection_snapshot(rt: Any) -> dict[str, Any]:
         "digest": digest,
         "nodes": scene_rows,
         "selected_nodes": selected_rows,
-    }
-
-
-def _max_export_scene_node_cache(
-    rt: Any,
-    payload: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Resolve this export's approved Handles without a geometry or scene scan.
-
-    A preceding ``probe_scene_names`` request is useful as the authoritative
-    name/Handle contract, but a Rescue Worker replacement may occur between
-    that request and ``export_mod``.  The export command must therefore not
-    require a Python-module global from the preceding request.  It first uses
-    a matching resident cache when available; otherwise it resolves only the
-    already approved Bucket/selection Handles by ``getNodeByHandle`` and
-    checks each returned name against the snapshot carried by this request.
-    """
-    snapshot = payload.get("scene_name_selection_snapshot")
-    receipt = payload.get("prevalidated_bucket_receipt")
-    if not isinstance(snapshot, Mapping) or not isinstance(receipt, Mapping):
-        return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
-    try:
-        snapshot_pid = int(snapshot.get("max_process_id", 0) or 0)
-    except (TypeError, ValueError, OverflowError):
-        snapshot_pid = 0
-    snapshot_digest = str(snapshot.get("digest", "") or "").upper()
-    receipt_digest = str(
-        receipt.get("scene_name_snapshot_digest", "") or ""
-    ).upper()
-    if (
-        snapshot_pid != os.getpid()
-        or not snapshot_digest
-        or receipt_digest != snapshot_digest
-    ):
-        return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
-    snapshot_nodes: dict[int, str] = {}
-    for raw_row in snapshot.get("nodes", []):
-        if not isinstance(raw_row, Mapping):
-            return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
-        try:
-            handle = int(raw_row.get("handle", 0) or 0)
-        except (TypeError, ValueError, OverflowError):
-            return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
-        name = str(raw_row.get("name", "") or "")
-        if handle <= 0 or handle in snapshot_nodes:
-            return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
-        snapshot_nodes[handle] = name
-
-    receipt_rows = receipt.get("rows", [])
-    if not isinstance(receipt_rows, list):
-        return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
-    target_handles: set[int] = set()
-    for raw_row in receipt_rows:
-        if not isinstance(raw_row, Mapping):
-            return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
-        if (
-            str(raw_row.get("lane", "") or "").casefold() != "modify"
-            or not bool(raw_row.get("requires_selected_fbx", False))
-        ):
-            continue
-        try:
-            handle = int(raw_row.get("scene_node_handle", 0) or 0)
-        except (TypeError, ValueError, OverflowError):
-            return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
-        if handle <= 0 or snapshot_nodes.get(handle) != str(
-            raw_row.get("scene_node", "") or ""
-        ):
-            return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
-        target_handles.add(handle)
-
-    selected_handles: list[int] = []
-    for raw_row in snapshot.get("selected_nodes", []):
-        if not isinstance(raw_row, Mapping):
-            continue
-        try:
-            handle = int(raw_row.get("handle", 0) or 0)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if (
-            handle > 0
-            and snapshot_nodes.get(handle) == str(raw_row.get("name", "") or "")
-            and handle not in selected_handles
-        ):
-            selected_handles.append(handle)
-
-    cached = _MAX_VALIDATED_SCENE_NODE_CACHE
-    if (
-        int(cached.get("max_process_id", 0) or 0) != snapshot_pid
-        or str(cached.get("digest", "") or "").upper() != snapshot_digest
-        or not isinstance(cached.get("nodes_by_handle"), dict)
-    ):
-        # Do not enumerate rt.objects here.  Only the Handles that were
-        # frozen in the current export receipt may be resolved on demand.
-        nodes_by_handle: dict[int, Any] = {}
-        for handle in sorted(target_handles):
-            try:
-                node = rt.maxOps.getNodeByHandle(handle)
-                actual_handle = _max_node_handle(rt, node)
-                actual_name = str(getattr(node, "name", "") or "")
-            except Exception:
-                return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
-            if actual_handle != handle or actual_name != snapshot_nodes[handle]:
-                return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
-            nodes_by_handle[handle] = node
-        if not target_handles.issubset(nodes_by_handle):
-            return {"hit": False, "nodes_by_handle": {}, "selected_handles": []}
-        return {
-            "hit": True,
-            "nodes_by_handle": nodes_by_handle,
-            "selected_handles": [],
-        }
-    return {
-        "hit": True,
-        "nodes_by_handle": dict(cached["nodes_by_handle"]),
-        "selected_handles": selected_handles,
     }
 
 
@@ -21774,17 +21638,7 @@ def _max_bucket_identity_receipt(
     selected_source_sha256: Any = "",
     scene_name_snapshot: Mapping[str, Any] | None = None,
     max_process_id: Any = 0,
-    prevalidated_receipt: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    # The Max-side export path receives this already validated plan.  Keeping
-    # this fast path explicit prevents an old caller from silently falling
-    # back to per-node pymxs metadata reads.
-    if prevalidated_receipt is not None:
-        receipt = copy.deepcopy(dict(prevalidated_receipt))
-        if str(receipt.get("status", "") or "") != "ok":
-            raise ProtocolError("Prevalidated export Bucket receipt is not successful")
-        return receipt
-
     snapshot = dict(scene_name_snapshot or {})
     snapshot_pid = int(snapshot.get("max_process_id", 0) or 0)
     pid = int(max_process_id or snapshot_pid)
@@ -21861,9 +21715,11 @@ def _max_bucket_identity_receipt(
         blender_degenerate_header_only = bool(
             row.get("blender_degenerate_header_only", False)
         )
-        auto_header_only = bool(row.get("auto_header_only", False))
-        source_passthrough = bool(row.get("source_passthrough", False))
-        source_fallback_reason = str(row.get("source_fallback_reason", "") or "")
+        # A Modify lane always reaches the current FBX.  No old scene result
+        # may classify it as Header-only or source passthrough before Probe.
+        auto_header_only = False if lane == "modify" else bool(row.get("auto_header_only", False))
+        source_passthrough = False if lane == "modify" else bool(row.get("source_passthrough", False))
+        source_fallback_reason = "" if lane == "modify" else str(row.get("source_fallback_reason", "") or "")
         same_name_count = positive_int(row.get("same_name_count")) or 1
         same_name_ordinal = positive_int(row.get("same_name_ordinal"))
         if same_name_ordinal >= same_name_count:
@@ -21900,9 +21756,13 @@ def _max_bucket_identity_receipt(
                 "auto_header_only": auto_header_only,
                 "source_passthrough": source_passthrough,
                 "source_fallback_reason": source_fallback_reason,
-                "requires_selected_fbx": bool(
-                    row.get("requires_selected_fbx", lane == "modify")
-                ) and not auto_header_only and not source_passthrough,
+                "requires_selected_fbx": (
+                    True
+                    if lane == "modify"
+                    else bool(row.get("requires_selected_fbx", False))
+                    and not auto_header_only
+                    and not source_passthrough
+                ),
                 **parsed,
                 "source_fvf": source_fvf,
                 "parser_fvf": parser_fvf,
@@ -21945,6 +21805,56 @@ def _max_bucket_identity_receipt(
     }
 
 
+def _max_prepare_fbx_route_markers(
+    rt: Any,
+    nodes: list[Any],
+) -> list[tuple[Any, str, int]]:
+    """Temporarily preserve the actual Max Anim Handle in the exported FBX."""
+    marker_key = "CodexRe6FbxRouteHandle"
+    snapshots: list[tuple[Any, str, int]] = []
+    try:
+        for node in nodes:
+            handle = _max_node_handle(rt, node)
+            if handle <= 0:
+                raise RuntimeError("FBX route marker target has no Max Anim Handle")
+            original_buffer = str(rt.getUserPropBuffer(node) or "")
+            rt.setUserProp(node, marker_key, str(handle))
+            actual_text = str(rt.getUserProp(node, marker_key) or "").strip().strip('"')
+            if actual_text.casefold().endswith("p"):
+                actual_text = actual_text[:-1]
+            if actual_text != str(handle):
+                raise RuntimeError(
+                    f"Max did not retain the FBX route marker for Handle {handle}"
+                )
+            snapshots.append((node, original_buffer, handle))
+    except Exception:
+        restore_failures = _max_restore_fbx_route_markers(rt, snapshots)
+        if restore_failures:
+            raise RuntimeError(
+                "FBX route-marker setup failed and User Properties could not be restored: "
+                + " | ".join(restore_failures)
+            )
+        raise
+    return snapshots
+
+
+def _max_restore_fbx_route_markers(
+    rt: Any,
+    snapshots: list[tuple[Any, str, int]],
+) -> list[str]:
+    """Restore each complete User Property Buffer after the temporary FBX route export."""
+    failures: list[str] = []
+    for node, original_buffer, handle in reversed(snapshots):
+        try:
+            rt.setUserPropBuffer(node, original_buffer)
+            restored_buffer = str(rt.getUserPropBuffer(node) or "")
+            if restored_buffer != original_buffer:
+                raise RuntimeError("User Property Buffer verification mismatch")
+        except Exception as exc:
+            failures.append(f"Handle {handle}: {type(exc).__name__}: {exc}")
+    return failures
+
+
 def _max_export_fbx(
     path: Path,
     node_handles: list[int],
@@ -21956,6 +21866,7 @@ def _max_export_fbx(
     export_all_scene: bool = False,
     export_scene_handles: list[int] | None = None,
     export_scene_names: Mapping[Any, Any] | None = None,
+    route_node_handles: list[int] | None = None,
     embed_textures: bool = False,
     preserve_materials: bool = False,
 ) -> dict[str, Any]:
@@ -21987,6 +21898,29 @@ def _max_export_fbx(
         )
         receipt_handles = []
         receipt_names = {}
+    requested_route_handles = sorted(
+        {
+            int(value)
+            for value in (route_node_handles or [])
+            if int(value or 0) > 0
+        }
+    )
+    # A full-scene FBX cannot reuse the selected-node cache reliably. Resolve
+    # only the temporary route-marker targets from the current name+Handle
+    # snapshot; this is identity work, not a geometry scan.
+    route_nodes = _max_export_nodes_from_handles(
+        rt,
+        requested_route_handles,
+        cached_nodes_by_handle=cached_nodes_by_handle,
+    )
+    resolved_route_handles = sorted({_max_node_handle(rt, node) for node in route_nodes})
+    if resolved_route_handles != requested_route_handles:
+        raise RuntimeError(
+            "FBX route-marker targets no longer match the current Max scene: requested "
+            + ", ".join(str(handle) for handle in requested_route_handles)
+            + " | resolved "
+            + ", ".join(str(handle) for handle in resolved_route_handles)
+        )
     if not export_all_scene and not nodes:
         return {"status": "not_required", "path": "", "node_handles": []}
     cached_handle_by_identity = (
@@ -22043,11 +21977,13 @@ def _max_export_fbx(
     export_result: dict[str, Any] | None = None
     primary_error: Exception | None = None
     recovery_failures: list[str] = []
+    route_marker_snapshots: list[tuple[Any, str, int]] = []
     try:
         path.unlink(missing_ok=True)
         if not export_all_scene:
             rt.clearSelection()
             rt.select(nodes)
+        route_marker_snapshots = _max_prepare_fbx_route_markers(rt, route_nodes)
         previous_settings = _max_configure_fbx_export(
             rt, embed_textures=bool(embed_textures)
         )
@@ -22104,6 +22040,12 @@ def _max_export_fbx(
             "material_detach": material_detach_receipt,
             "materials_exported": bool(preserve_materials),
             "textures_embedded": bool(embed_textures),
+            "route_marker": {
+                "key": "CodexRe6FbxRouteHandle",
+                "fbx_property": "Model/Properties70/UDP3DSMAX",
+                "route_node_handles": list(requested_route_handles),
+                "restored": False,
+            },
             "fbx_axes": {
                 "status": "expected",
                 "signature": [0, 4, 3],
@@ -22120,6 +22062,15 @@ def _max_export_fbx(
         except OSError as cleanup_exc:
             recovery_failures.append(f"temporary FBX cleanup failed: {cleanup_exc}")
     finally:
+        route_restore_failures = _max_restore_fbx_route_markers(rt, route_marker_snapshots)
+        if export_result is not None:
+            route_marker_receipt = export_result.get("route_marker")
+            if isinstance(route_marker_receipt, dict):
+                route_marker_receipt["restored"] = not route_restore_failures
+        recovery_failures.extend(
+            f"FBX route-marker User Property restore failed: {failure}"
+            for failure in route_restore_failures
+        )
         material_restore_failures = _max_restore_fbx_export_materials(detached_materials)
         material_detach_receipt["restored_after_export"] = not material_restore_failures
         recovery_failures.extend(
@@ -22640,25 +22591,22 @@ def _max_prepare_export_map2_unwrap(
 
 def _max_export_mod(payload: dict[str, Any]) -> dict[str, Any]:
     bucket_rows = [row for row in payload.get("bucket_rows", []) if isinstance(row, dict)]
+    rt = _max_runtime()
+    # Export never receives an earlier Launcher scene snapshot. Build this
+    # transaction's complete current Max name/Handle set immediately before
+    # resolving buckets and routing the FBX carrier.
+    current_scene_snapshot = _max_scene_name_selection_snapshot(rt)
     bucket_receipt = _max_bucket_identity_receipt(
         bucket_rows,
-        prevalidated_receipt=payload.get("prevalidated_bucket_receipt"),
+        selected_source_sha256=payload.get("source_sha256", ""),
+        scene_name_snapshot=current_scene_snapshot,
+        max_process_id=os.getpid(),
     )
     requested_full_scene = bool(payload.get("export_all_scene", False))
-    # The Launcher hands this exact name/Handle cache to every export route.
-    # Map 2 preparation must resolve only the selected Modify Meshes from it;
-    # it must never add a fresh scene traversal before FBX export.
-    scene_node_cache = _max_export_scene_node_cache(_max_runtime(), payload)
-    cached_nodes_by_handle = (
-        scene_node_cache["nodes_by_handle"]
-        if bool(scene_node_cache.get("hit"))
-        else None
-    )
-    previous_selection_handles = (
-        list(scene_node_cache.get("selected_handles", []))
-        if bool(scene_node_cache.get("hit"))
-        else None
-    )
+    # The export path never reuses an earlier scene-node cache. Every identity
+    # lookup below reads the current Max name+Anim-Handle snapshot instead.
+    cached_nodes_by_handle = None
+    previous_selection_handles = None
     live_bucket_rows = list(bucket_receipt["rows"])
     raw_fbx_path = str(payload.get("fbx_path", "") or "").strip()
     requested_fbx_path = Path(raw_fbx_path).resolve() if raw_fbx_path else None
@@ -22683,11 +22631,6 @@ def _max_export_mod(payload: dict[str, Any]) -> dict[str, Any]:
         "nodes": [],
     }
     if export_map2 and modify_handles:
-        if cached_nodes_by_handle is None:
-            raise ProtocolError(
-                "UV Map 2 export requires the prevalidated Max name/Handle cache; "
-                "retry the export after the scene snapshot is refreshed"
-            )
         modify_names = {
             int(row["scene_node_handle"]): str(row.get("scene_node", "") or "")
             for row in geometry_rows
@@ -22713,10 +22656,9 @@ def _max_export_mod(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Unsupported Bones Edit export mode: {bone_export_mode!r}")
     bone_edit_enabled = bone_export_mode != "disabled"
     export_all_scene = requested_full_scene
-    include_skin_bones = bool(
-        bone_edit_enabled
-        or any(bool(row.get("has_skin", False)) for row in geometry_rows)
-    )
+    # Full-scene FBX already carries the scene hierarchy.  Do not inspect
+    # Max modifiers here merely to decide whether Skin bones are present.
+    include_skin_bones = bool(bone_edit_enabled or geometry_rows)
     if bone_edit_enabled and export_all_scene:
         bone_scope = {
             "bone_handles": [
@@ -22752,7 +22694,7 @@ def _max_export_mod(payload: dict[str, Any]) -> dict[str, Any]:
     if bone_edit_enabled and not bone_handles:
         raise RuntimeError("Bones Edit found no bone nodes in the current Max name snapshot")
     export_scene_rows = [
-        row for row in payload.get("export_scene_rows", []) if isinstance(row, dict)
+        row for row in current_scene_snapshot.get("nodes", []) if isinstance(row, dict)
     ]
     export_scene_handles = [
         int(row.get("handle", 0) or 0)
@@ -22765,7 +22707,7 @@ def _max_export_mod(payload: dict[str, Any]) -> dict[str, Any]:
         if int(row.get("handle", 0) or 0) > 0
     }
     if export_all_scene and not export_scene_handles:
-        raise ProtocolError("Full-scene FBX export received no cached scene name/Handle rows")
+        raise ProtocolError("Full-scene FBX export found no current Max scene name/Handle rows")
     fbx_receipt = {"status": "not_required", "path": "", "node_handles": []}
     export_handles = (
         list(export_scene_handles)
@@ -22782,6 +22724,7 @@ def _max_export_mod(payload: dict[str, Any]) -> dict[str, Any]:
             export_all_scene=True,
             export_scene_handles=export_scene_handles,
             export_scene_names=export_scene_names,
+            route_node_handles=modify_handles,
         )
         export_handles = []
     if export_handles:
@@ -22800,6 +22743,7 @@ def _max_export_mod(payload: dict[str, Any]) -> dict[str, Any]:
                 node_names=node_names,
                 cached_nodes_by_handle=cached_nodes_by_handle,
                 previous_selection_handles=previous_selection_handles,
+                route_node_handles=modify_handles,
             )
         except Exception as batch_exc:
             # A scene mutation between the name contract and this command can
@@ -22807,69 +22751,16 @@ def _max_export_mod(payload: dict[str, Any]) -> dict[str, Any]:
             # name/Handle snapshot; export must not enter liveness resolvers.
             cached_nodes_by_handle = None
             previous_selection_handles = None
-            required_rows = [row for row in geometry_rows if bool(row.get("has_skin", False))]
-            optional_rows = [row for row in geometry_rows if not bool(row.get("has_skin", False))]
-            accepted_handles: list[int] = list(bone_scope_handles)
-            fallback_rows: list[dict[str, Any]] = []
-
-            required_handles = sorted(
-                {
-                    *accepted_handles,
-                    *(int(row["scene_node_handle"]) for row in required_rows),
-                }
+            fbx_receipt = _max_export_fbx(
+                requested_fbx_path,
+                export_handles,
+                include_skin_bones=include_skin_bones,
+                node_names=node_names,
+                cached_nodes_by_handle=None,
+                previous_selection_handles=None,
+                route_node_handles=modify_handles,
             )
-            if required_handles:
-                _max_export_fbx(
-                    requested_fbx_path,
-                    required_handles,
-                    include_skin_bones=include_skin_bones,
-                    node_names=node_names,
-                    cached_nodes_by_handle=cached_nodes_by_handle,
-                    previous_selection_handles=previous_selection_handles,
-                )
-                accepted_handles = list(required_handles)
-
-            for row in optional_rows:
-                handle = int(row["scene_node_handle"])
-                candidate_handles = sorted({*accepted_handles, handle})
-                try:
-                    _max_export_fbx(
-                        requested_fbx_path,
-                        candidate_handles,
-                        include_skin_bones=include_skin_bones,
-                        node_names=node_names,
-                        cached_nodes_by_handle=cached_nodes_by_handle,
-                        previous_selection_handles=previous_selection_handles,
-                    )
-                except Exception as mesh_exc:
-                    reason = f"{type(mesh_exc).__name__}: {mesh_exc}"
-                    row["source_passthrough"] = True
-                    row["source_fallback_reason"] = reason
-                    row["requires_selected_fbx"] = False
-                    fallback_rows.append(
-                        {
-                            "scene_node": str(row.get("scene_node", "") or ""),
-                            "scene_node_handle": handle,
-                            "mesh_slot": int(row.get("mesh_slot", 0) or 0),
-                            "reason": reason,
-                        }
-                    )
-                else:
-                    accepted_handles.append(handle)
-
-            if accepted_handles:
-                fbx_receipt = _max_export_fbx(
-                    requested_fbx_path,
-                    sorted(set(accepted_handles)),
-                    include_skin_bones=include_skin_bones,
-                    node_names=node_names,
-                    cached_nodes_by_handle=cached_nodes_by_handle,
-                    previous_selection_handles=previous_selection_handles,
-                )
-            else:
-                fbx_receipt = {"status": "not_required", "path": "", "node_handles": []}
             fbx_receipt["batch_retry_reason"] = f"{type(batch_exc).__name__}: {batch_exc}"
-            fbx_receipt["source_fallback_meshes"] = fallback_rows
         if bone_edit_enabled:
             fbx_receipt["bone_export_mode"] = bone_export_mode
             fbx_receipt["bone_node_handles"] = bone_handles
@@ -43418,23 +43309,21 @@ def _resolve_mesh_name_authoritative_slot(
 # ============================================================================
 
 
-def _cached_export_scene_name_snapshot(
-    workspace: MaxWorkspaceState,
+def _current_export_scene_name_snapshot(
+    scene_contract: Mapping[str, Any],
     max_process_id: int,
 ) -> dict[str, Any]:
-    """Freeze the already monitored scene names for an export transaction.
-
-    Export Sets has already received and filtered the Max scene.  This helper
-    deliberately reads only Launcher state; it never asks Max for a second
-    name, selection, or liveness pass when the export button is pressed.
-    """
+    """Build a transaction snapshot from a scene scanned for this export."""
     pid = int(max_process_id or 0)
     if pid <= 0:
-        raise ProtocolError("Cached export scene snapshot has no Max PID")
+        raise ProtocolError("Current export scene snapshot has no Max PID")
+    contract_pid = int(scene_contract.get("max_process_id", 0) or 0)
+    if contract_pid != pid:
+        raise ProtocolError("Current export scene snapshot PID mismatch")
     rows_by_handle: dict[int, dict[str, Any]] = {}
-    raw_rows: list[Any] = list(workspace.scene_name_rows)
-    for raw_row in workspace.scene_contract.get("nodes", []):
-        raw_rows.append(raw_row)
+    raw_rows = scene_contract.get("nodes", [])
+    if not isinstance(raw_rows, list):
+        raise ProtocolError("Current export scene scan has no node rows")
     for raw_row in raw_rows:
         if not isinstance(raw_row, Mapping):
             continue
@@ -43452,8 +43341,8 @@ def _cached_export_scene_name_snapshot(
             continue
         name = str(
             raw_row.get(
-                "name",
-                raw_row.get("scene_node", ""),
+                "scene_node",
+                raw_row.get("name", ""),
             )
             or ""
         )
@@ -43465,12 +43354,10 @@ def _cached_export_scene_name_snapshot(
         rows_by_handle[handle] = {"handle": handle, "name": name}
     scene_rows = [rows_by_handle[handle] for handle in sorted(rows_by_handle)]
     if not scene_rows:
-        raise ProtocolError(
-            "Export requires a previously monitored full-scene name/Handle snapshot"
-        )
+        raise ProtocolError("Current export scene scan found no scene name/Handle rows")
     selected_candidates = (
-        workspace.scene_contract.get("selected_mesh_handles")
-        or workspace.scene_contract.get("selected_handles", [])
+        scene_contract.get("selected_mesh_handles")
+        or scene_contract.get("selected_handles", [])
     )
     selected_handles: set[int] = set()
     if isinstance(selected_candidates, list):
@@ -43490,8 +43377,8 @@ def _cached_export_scene_name_snapshot(
         "schema": "pc-rehd-scene-name-selection-snapshot-v1",
         "action": "probe_scene_names",
         "mode": "scene_name_selection_snapshot",
-        "authority": "launcher_cached_scene_name_handle_snapshot",
-        "scope": "cached_full_scene_name_handle_only",
+        "authority": "launcher_current_scene_scan_name_handle_snapshot",
+        "scope": "current_export_scene_name_handle_only",
         "max_process_id": pid,
         "node_count": len(scene_rows),
         "selected_node_count": len(selected_rows),
@@ -43503,7 +43390,7 @@ def _cached_export_scene_name_snapshot(
         "nodes": scene_rows,
         "selected_nodes": selected_rows,
         "scene_snapshot_complete": True,
-        "source": "workspace.scene_name_rows",
+        "source": "current_export_scene_contract",
     }
 
 
@@ -83230,10 +83117,8 @@ class LauncherApp:
             )
         contract["max_process_id"] = session.pid
         contract["blender_process_id"] = session.pid
-        contract, _compatibility_receipt = _apply_scene_export_compatibility_contract(
-            contract,
-            clear_legacy_auto_route=True,
-        )
+        # DCC observations are diagnostic only during export.  The current FBX
+        # Probe decides topology and the final Modify/source route after export.
         return contract
 
     def _blender_scene_dispatcher(
@@ -87235,13 +87120,6 @@ class LauncherApp:
             return
         blender_export = isinstance(session, ManagedBlenderSession)
         backend_label = "Blender" if blender_export else "Max"
-        if workspace.scene_contract:
-            workspace.scene_contract, _compatibility_receipt = (
-                _apply_scene_export_compatibility_contract(
-                    workspace.scene_contract,
-                    clear_legacy_auto_route=blender_export,
-                )
-            )
         active_export = self.export_transactions.snapshot_for_pid(session.pid)
         if active_export is not None:
             release_legacy_bucket_plan()
@@ -87318,7 +87196,8 @@ class LauncherApp:
             ).show()
             release_legacy_bucket_plan()
             return
-        invalid_name_rows = _find_nonstandard_re6_export_mesh_rows(_build_bucket_rows(workspace))
+        # Names are validated by the current Agent snapshot at export time.
+        invalid_name_rows: list[dict[str, Any]] = []
         if invalid_name_rows:
             self._show_nonstandard_re6_export_mesh_dialog(invalid_name_rows)
             self._set_status(self._tr("导出已停止：Mesh 名称不兼容", "Export stopped: incompatible Mesh names"), progress=0)
@@ -87369,8 +87248,17 @@ class LauncherApp:
             "writer_source": selected_source_mod,
         }
         source_rename_lock = threading.Lock()
-        bucket_rows = _build_bucket_rows(workspace)
-        export_workspace_snapshot = copy.deepcopy(workspace)
+        # Preserve only the user's current lane Handle choices.  The Agent
+        # reads current Max name/Handle state when it performs the export.
+        export_lane_buckets = {
+            lane: [
+                int(handle)
+                for handle in workspace.buckets.get(lane, [])
+                if int(handle or 0) > 0
+            ]
+            for lane in ("header", "delete", "modify")
+        }
+        source_scene_reference = copy.deepcopy(workspace.scene_contract)
         request_token = uuid.uuid4().hex
         log_directory = self._switch_bootstrap_health_log_directory(workspace.log_dir)
         log_dir = str(log_directory)
@@ -87378,14 +87266,6 @@ class LauncherApp:
         self.log_dir_var.set(log_dir)
         fbx_path = _fbx_log_path(log_directory, session.pid, "export", request_token)
 
-        modify_handles = [
-            int(row["scene_node_handle"])
-            for row in bucket_rows
-            if str(row.get("lane", "") or "").casefold() == "modify"
-            and int(row.get("scene_node_handle", 0) or 0) > 0
-        ]
-        requires_current_fbx = bool(modify_handles) or resolved_bone_mode != "disabled"
-        cached_scene_contract = copy.deepcopy(workspace.scene_contract)
         header_mode = int(workspace.header_mode)
         force_named_fvf_once = bool(self._force_named_fvf_once)
         options = {
@@ -87662,62 +87542,63 @@ class LauncherApp:
             )
             queue_export_progress(
                 "正在使用已确认的导出分组和场景快照",
-                "Using the confirmed Export Sets and scene snapshot",
+                "Preparing current-scene export",
                 24,
             )
-            operation_scene_contract = copy.deepcopy(cached_scene_contract)
-            operation_bucket_rows = copy.deepcopy(bucket_rows)
+            # Imported MOD metadata is retained for slot/header information;
+            # current Max scene identity is never taken from it.
+            operation_scene_contract = copy.deepcopy(source_scene_reference)
+            operation_scene_contract["max_process_id"] = int(session.pid)
+            operation_workspace = MaxWorkspaceState()
+            operation_workspace.buckets = copy.deepcopy(export_lane_buckets)
+            operation_workspace.slot_bindings = {}
+            operation_workspace.scene_contract = operation_scene_contract
+            operation_bucket_rows = _build_bucket_rows(operation_workspace)
             if blender_export:
                 operation_scene_contract = self._inspect_blender_scene(session)
-                operation_scene_contract, _compatibility_receipt = (
-                    _apply_scene_export_compatibility_contract(
-                        operation_scene_contract,
-                        clear_legacy_auto_route=True,
-                    )
-                )
-                operation_workspace = copy.deepcopy(export_workspace_snapshot)
-                _reconcile_workspace_scene(
-                    operation_workspace,
-                    operation_scene_contract,
-                )
+                operation_workspace = MaxWorkspaceState()
+                operation_workspace.buckets = copy.deepcopy(export_lane_buckets)
+                operation_workspace.slot_bindings = {}
+                operation_workspace.scene_contract = operation_scene_contract
                 operation_bucket_rows = _build_bucket_rows(operation_workspace)
-                scene_name_selection_snapshot = _cached_export_scene_name_snapshot(
-                    operation_workspace,
+                scene_name_selection_snapshot = _current_export_scene_name_snapshot(
+                    operation_scene_contract,
                     session.pid,
                 )
             else:
-                # Export UV Map 2 must use the Agent's current resident
-                # name/Handle cache.  This name-only preflight refreshes that
-                # cache before Bucket 3 is resolved for Unwrap UVW preparation
-                # and supplies the exact snapshot that the export command will
-                # later verify.  It intentionally does not inspect geometry.
+                # The Max export command performs one current name/selection/
+                # Handle scan immediately before it writes FBX route markers.
+                # There is no Launcher scene-result cache in this path.
                 queue_export_progress(
                     "MAX Agent 正在验证 Bucket 3 名称和 Handle",
                     "Max Agent is validating Bucket 3 names and Handles",
                     28,
                 )
-                _snapshot_request_id, scene_name_selection_snapshot = (
-                    self._request_max_scene_interface(
-                        session,
-                        "export.scene_names",
-                    )
+            if blender_export:
+                blender_bucket_receipt = _max_bucket_identity_receipt(
+                    operation_bucket_rows,
+                    selected_source_sha256=source_sha,
+                    scene_name_snapshot=scene_name_selection_snapshot,
+                    max_process_id=session.pid,
                 )
-                operation_scene_contract, _compatibility_receipt = (
-                    _apply_scene_export_compatibility_contract(
-                        operation_scene_contract,
-                    )
+                planned_bucket_rows = [
+                    dict(row)
+                    for row in blender_bucket_receipt.get("rows", [])
+                    if isinstance(row, dict)
+                ]
+            else:
+                # The Max command itself takes the one authoritative current
+                # name/selection/Handle snapshot before it writes the FBX.
+                # Do not hand it a cached or prevalidated scene result.
+                planned_bucket_rows = [dict(row) for row in operation_bucket_rows]
+            requires_current_fbx = (
+                any(
+                    str(row.get("lane", "") or "").casefold() == "modify"
+                    and int(row.get("scene_node_handle", 0) or 0) > 0
+                    for row in planned_bucket_rows
                 )
-            prevalidated_bucket_receipt = _max_bucket_identity_receipt(
-                operation_bucket_rows,
-                selected_source_sha256=source_sha,
-                scene_name_snapshot=scene_name_selection_snapshot,
-                max_process_id=session.pid,
+                or resolved_bone_mode != "disabled"
             )
-            planned_bucket_rows = [
-                dict(row)
-                for row in prevalidated_bucket_receipt.get("rows", [])
-                if isinstance(row, dict)
-            ]
             queue_export_progress(
                 f"{backend_label} 名称合同已返回，正在请求 FBX 几何载体",
                 f"{backend_label} name contract returned; requesting the FBX geometry carrier",
@@ -87809,7 +87690,7 @@ class LauncherApp:
                 max_result = {
                     "backend": "blender_bpy",
                     "scene_contract": copy.deepcopy(operation_scene_contract),
-                    "bucket_receipt": copy.deepcopy(prevalidated_bucket_receipt),
+                    "bucket_receipt": copy.deepcopy(blender_bucket_receipt),
                     "fbx_receipt": dict(fbx_receipt),
                     "fbx_path": str(fbx_receipt.get("path", "") or ""),
                     "axis_validation": copy.deepcopy(
@@ -87827,11 +87708,6 @@ class LauncherApp:
                     "bone_scope_node_names": dict(bone_scope_payload["node_names"]),
                     "source_sha256": source_sha,
                     "export_all_scene": requires_current_fbx,
-                    "export_scene_rows": copy.deepcopy(scene_name_selection_snapshot["nodes"]),
-                    "scene_name_selection_snapshot": copy.deepcopy(
-                        scene_name_selection_snapshot
-                    ),
-                    "prevalidated_bucket_receipt": prevalidated_bucket_receipt,
                 }
                 request_id, max_result = self._request_max_scene_interface(
                     session,
@@ -87852,30 +87728,24 @@ class LauncherApp:
                 "Preparing Mesh routes and slots",
                 56,
             )
-            bucket_receipt = copy.deepcopy(prevalidated_bucket_receipt)
+            # Max returns the name/Handle receipt generated immediately before
+            # FBX export.  It replaces any prior Launcher-side scene result.
+            returned_bucket_receipt = max_result.get("bucket_receipt")
+            if not isinstance(returned_bucket_receipt, dict):
+                raise ProtocolError(
+                    "Max export did not return its live Bucket identity receipt"
+                )
+            bucket_receipt = copy.deepcopy(returned_bucket_receipt)
             scene_contract, live_bucket_rows = _merge_live_bucket_receipt(
                 operation_scene_contract,
                 bucket_receipt,
                 planned_bucket_rows,
                 target_max_pid=session.pid,
-                expected_scene_name_snapshot_digest=str(
-                    scene_name_selection_snapshot.get("digest", "") or ""
+                expected_scene_name_snapshot_digest=(
+                    str(scene_name_selection_snapshot.get("digest", "") or "")
+                    if blender_export and scene_name_selection_snapshot is not None
+                    else ""
                 ),
-            )
-            scene_contract, scene_compatibility_receipt = (
-                _apply_scene_export_compatibility_contract(
-                    scene_contract,
-                    clear_legacy_auto_route=blender_export,
-                )
-            )
-            compatibility = _ensure_scene_compatibility_module_identity()
-            apply_rows = getattr(compatibility, "apply_export_compatibility_rows", None)
-            if not callable(apply_rows):
-                raise RuntimeError("Scene compatibility module has no bucket-row entry point")
-            apply_rows(
-                live_bucket_rows,
-                collection_name="meshes",
-                clear_legacy_auto_route=blender_export,
             )
             bucket_receipt["rows"] = [dict(row) for row in live_bucket_rows]
             bucket_receipt["digest"] = _bucket_identity_digest(
