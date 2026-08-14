@@ -54,7 +54,7 @@ The repository and Release package exclude the embedded Python runtime, generate
 
 | Path | Purpose |
 | --- | --- |
-| `PC-REHD Code X Launcher.py` | Legacy update compatibility marker for builds that used the former root-level source path. |
+| `脚本目录 Script Folder/` | Active source root containing the Launcher and all program modules. |
 | `脚本目录 Script Folder/PC-REHD Code X Launcher.py` | Main Launcher, UI, Agent orchestration, and tool routing. |
 | `脚本目录 Script Folder/codex_python_export_bridge.py` | Export bridge and `.MOD` writer path. |
 | `脚本目录 Script Folder/codex_re6_mod_import_fbx.py` | `.MOD` to FBX and import preparation path. |
@@ -68,6 +68,10 @@ The repository and Release package exclude the embedded Python runtime, generate
 | `脚本目录 Script Folder/PY依赖 PY Libs/` | Pinned Python dependencies and vendor source snapshots. |
 | `脚本目录 Script Folder/先点Bat文件 - Click Bat First.ps1` | Bootstrap and environment-validation entry point. |
 | `脚本目录 Script Folder/一定要先点我安装Python - Click to Install Python First.bat` | Installs the required Python runtime. |
+| `不装Python无法使用 - Can't run without Python .txt` | Python installation prerequisite. |
+| `请勿盲改任何这里的文件 - Don't Blindly Modify Any Files here .txt` | Editing safety notice. |
+| `问题汇总 - Readme Problem Solvers.txt` | Troubleshooting and known-issue notes. |
+| `PC-REHD Code X Launcher.py` | Legacy update marker; not the active Launcher or source entry point. |
 
 ### Release Verification
 
@@ -186,7 +190,7 @@ PC-REHD Code X 是对 PC-REHD 1.2.8 脚本的 Python 重写版，旨在简化《
 
 | 路径 | 作用 |
 | --- | --- |
-| `PC-REHD Code X Launcher.py` | 为仍使用旧根目录源码路径的版本提供更新兼容标记。 |
+| `脚本目录 Script Folder/` | 当前实际源码根目录，包含主启动器与全部程序模块。 |
 | `脚本目录 Script Folder/PC-REHD Code X Launcher.py` | 主启动器、界面、Agent 调度与工具入口。 |
 | `脚本目录 Script Folder/codex_python_export_bridge.py` | 导出桥接与 `.MOD` 写入流程。 |
 | `脚本目录 Script Folder/codex_re6_mod_import_fbx.py` | `.MOD` 转 FBX 与导入准备流程。 |
@@ -200,6 +204,10 @@ PC-REHD Code X 是对 PC-REHD 1.2.8 脚本的 Python 重写版，旨在简化《
 | `脚本目录 Script Folder/PY依赖 PY Libs/` | 固定版本的 Python 依赖及供应商源码快照。 |
 | `脚本目录 Script Folder/先点Bat文件 - Click Bat First.ps1` | 启动前的环境初始化与检查入口。 |
 | `脚本目录 Script Folder/一定要先点我安装Python - Click to Install Python First.bat` | 安装所需的 Python 运行环境。 |
+| `不装Python无法使用 - Can't run without Python .txt` | Python 安装前置说明。 |
+| `请勿盲改任何这里的文件 - Don't Blindly Modify Any Files here .txt` | 文件编辑安全提示。 |
+| `问题汇总 - Readme Problem Solvers.txt` | 常见问题与已知问题说明。 |
+| `PC-REHD Code X Launcher.py` | 旧版更新检查标记，不是主启动器或源码入口。 |
 
 ### 文件校验
 
