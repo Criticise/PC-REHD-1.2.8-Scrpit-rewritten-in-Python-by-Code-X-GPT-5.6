@@ -107,22 +107,6 @@ Root directory
     Installs the required Python runtime.
 ```
 
-### Release Verification
-
-Every GitHub Release includes `SHA256SUMS.txt` beside the downloadable archive. Verify the SHA-256 checksum before extracting or running the package.
-
-Current SHA-256 for `RE6-PC-REHD-Code-X-v1.0.0.7z`:
-
-```text
-8BEA0E10441FF10F66FF9B9831BB9A772A1DAED2B0C0EE3D3C7ED35DB63B54DC
-```
-
-Verify it in PowerShell:
-
-```powershell
-Get-FileHash .\RE6-PC-REHD-Code-X-v1.0.0.7z -Algorithm SHA256
-```
-
 ### License and Third-Party Components
 
 Project-authored Code X source was generated with AI assistance, then released after human review confirmed that the design and results met the intended expectations. It is released under the [Unlicense](LICENSE): anyone may use, modify, republish, redistribute, or otherwise use the project-authored code without restriction.
@@ -275,22 +259,6 @@ PC-REHD Code X 是对 PC-REHD 1.2.8 脚本的 Python 重写版，旨在简化《
 
   一定要先点我安装Python - Click to Install Python First.bat
     安装所需的 Python 运行环境。
-```
-
-### 文件校验
-
-每个 GitHub Release 都会在压缩包旁提供 `SHA256SUMS.txt`。下载后建议先校验 SHA-256，再解压或运行程序。
-
-当前 `RE6-PC-REHD-Code-X-v1.0.0.7z` 的 SHA-256：
-
-```text
-8BEA0E10441FF10F66FF9B9831BB9A772A1DAED2B0C0EE3D3C7ED35DB63B54DC
-```
-
-在 PowerShell 中可使用以下命令校验：
-
-```powershell
-Get-FileHash .\RE6-PC-REHD-Code-X-v1.0.0.7z -Algorithm SHA256
 ```
 
 ### 许可证与第三方组件
