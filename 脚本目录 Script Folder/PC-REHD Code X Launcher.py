@@ -1374,7 +1374,9 @@ AGENT_REQUEST_TIMEOUT = 300.0
 EXISTING_AGENT_CONNECT_WINDOW = 12.0
 EXISTING_AGENT_CONNECT_ATTEMPT_TIMEOUT = 2.5
 EXISTING_AGENT_CONNECT_RETRY_DELAY = 0.15
-SOFTWARE_RESTART_NOTICE_GRACE_SECONDS = 30.0
+# A DCC can still be loading startup code long after its main window exists.
+# A missing resident Agent descriptor is not a terminal connection result.
+SOFTWARE_RESTART_NOTICE_GRACE_SECONDS = 180.0
 AGENT_STARTUP_HOOK_RESCAN_INTERVAL = 5.0
 BUCKET_MESH_NAME_PROBE_INTERVAL = 0.35
 INSTANCE_COPY_SCENE_PROBE_INTERVAL = 0.7
@@ -2672,8 +2674,16 @@ LAUNCHER_ICON_STYLES = frozenset(
 EXPORT_SETS_WINDOW_SIZE_FILE_NAME = "PC_REHD_Code_X_Export_Sets_Window_Size.json"
 EXPORT_SETS_ORIGINAL_SIZE = (600, 997)
 LEGACY_AGENT_REGISTRY_DIR = DEFAULT_LOG_DIR / "agents"
-AGENT_STARTUP_LOADER = "PC_REHD_Code_X_Agent.py"
+# Max officially auto-loads MAXScript startup files, not Python files. Keep
+# the Python Agent source outside the startup folder and enter its existing
+# Rescue -> Work lifecycle through one generated .ms hook.
+AGENT_STARTUP_LEGACY_PY_LOADER = "PC_REHD_Code_X_Agent.py"
+# Do not depend on filename prefixes for startup order. Direct .py files in
+# scripts\startup can interrupt Max's remaining startup enumeration; the
+# generated entry therefore remains one ordinary .ms bootstrap.
 AGENT_STARTUP_MS_LOADER = "PC_REHD_Code_X_Agent.ms"
+AGENT_STARTUP_PREVIOUS_MS_LOADER = "00_PC_REHD_Code_X_Agent.ms"
+AGENT_STARTUP_PYTHON_BRIDGE = "PC_REHD_Code_X_Max_Bridge.py"
 MAX_AGENT_MINIMUM_PYTHON = (3, 10)
 MAX_AGENT_RUNTIME_PROBE_TIMEOUT_SECONDS = 30.0
 MAX_AGENT_RUNTIME_PROBE_CACHE_SECONDS = 300.0
@@ -5329,15 +5339,15 @@ IMPORT_EXPORT_PERFORMANCE_REVIEW_REQUIRED_FIELDS = (
     "reviewed_baseline_sha256",
 )
 IMPORT_EXPORT_PERFORMANCE_REVIEW = {
-    "review_id": "mod-full-scan-ui-C9D886AE884B",
+    "review_id": "max-startup-python-audit-CC584BA1B030",
     "does_this_change_slow_import_export": "NO",
     "affected_phase": (
-        "The full MOD scanner runs only after an explicit Toolbox click and never from normal import or export. The shared parser adds optional per-Mesh scan bounds; build_import_scene continues to omit them and retains its full-Mesh import route. No Agent, DCC, FBX, subprocess, or wait is added to import/export."
+        "Max startup-hook maintenance only. The Launcher performs a filename-and-extension scan plus a small generated .ms text comparison in its existing background hook check and returns before that check whenever import or export owns priority. No PYMXS scene read, FBX parse, geometry scan, subprocess, IPC wait, or user import/export phase is added."
     ),
     "timing_evidence": (
-        "Python 3.14.7 compile and the scanner regressions passed. On the real em4700.mod fixture, three normal build_import_scene runs produced 93 Meshes each in 1.615 s, 1.564 s, and 1.578 s (1.578 s median). The independent full scanner completed in 4.793 s and wrote a 94,256,038-byte report; it is not on the normal import/export path."
+        "Python syntax compilation passed. The protected refresh remains asynchronous and has an early _import_export_priority_active return, so this check cannot enter an active import/export. Its only new work is Path.iterdir, .py suffix filtering, and comparison of the generated .ms text; it does not read Max nodes, vertices, faces, normals, UVs, Skin, or FBX data."
     ),
-    "reviewed_baseline_sha256": "C9D886AE884BDF22812452E1A39CA928853126528F649759C0CF58B5544D2B06",
+    "reviewed_baseline_sha256": "484602DD9634691EEC7A0D19E6D1E905DE2989659ACD9EA47F7921CE5B65CF7D",
 }
 IMPORT_EXPORT_PERFORMANCE_PROTECTED_FUNCTIONS = (
     "_call_with_windows_thread_priority",
@@ -5449,7 +5459,7 @@ IMPORT_EXPORT_PERFORMANCE_FINGERPRINTS = {
     "LauncherApp._start_writer_process": "8140D5B16917B0AC06844074D7945401B3206CC3BA20F5A8EC5B9CF0612271DF",
     "LauncherApp._preload_writer_process": "7EFEEDC347BA17634F9B5F20E40C5D8871261B23FB64B4E63CABC931C5A4E04F",
     "LauncherApp._shutdown_writer_process": "4C22FEC0E5B6F5744A0D95A8A979E28ECE87111980EDD23948455F9349450FB1",
-    "LauncherApp._refresh_agent_startup_hooks": "41126D38FC4A98BA16D25DCADE745542DFDEA4647FCCFFD22C26CEA3E13361C1",
+    "LauncherApp._refresh_agent_startup_hooks": "04173894631416284E5FE3BBFEB29D241DC8ED59BF3F12B34072A54080839722",
     "LauncherApp._begin_session_operation": "2E888B8E13D00035B198CDABEF8E60A0824D1ABE5334041BBBC87CCD83972FB6",
     "LauncherApp._claim_import_export_priority": "1349C7413146959466C7129DF82603BBF25D9B10B14BAD9049F2F92863F72091",
     "LauncherApp._release_import_export_priority": "CF13E590DA431430F102C66D81D0356485E89B9E6A43286026C4F4DB0C99BA6D",
@@ -5522,7 +5532,7 @@ RESCUE_AGENT_MAINTENANCE_PROTECTED_FUNCTIONS = (
 # These values are never read by Launcher startup, Agent admission, Import, or Export.
 RESCUE_AGENT_MAINTENANCE_FINGERPRINTS = {
     "_rescue_agent_descriptor_tag": "4B265008E320D2B8482370BC890FB357EF3A4A891EA9E8CAAE155297417A4894",
-    "_read_rescue_agent_descriptor": "D34660C7281FCDAA46E354959A30491E07BCDC53D26DA069DA2EE1D669E892CD",
+    "_read_rescue_agent_descriptor": "866D1BCBC4351FF98574C2BC0F7A0277D85DF6CF498177EAAF3D838763BE45BB",
     "_make_rescue_request": "4AF7F4403E90029DAF32505D2B2F326886F9D0096C6372FA39ABDCA330543860",
     "_validate_rescue_request": "713D2DF2CFF3F1610599EC0DD832BD58912242DF91C2F930C55E942FB7D9C7D0",
     "_make_rescue_response": "BF6DCFF35DDBAA95CDD94A9BCB2F9B4BD351F81BF28B7ECCD5FDA5192C9A316A",
@@ -5546,7 +5556,7 @@ RESCUE_AGENT_MAINTENANCE_FINGERPRINTS = {
     "RescueAgent._load_worker_module": "F00604CF88BAF459CB4672DB3B6D53238A064B4956C9A0280784B0B9923971C5",
     "RescueAgent._ensure_worker_on_max_thread": "FB7394DC77C1454E7BE89362F55813D077F7A427EDEA2F4860F120BCF96BF11C",
     "PymxsAgent.begin_replacement_if_idle": "4EF84DA3FE177855DAC7568D22D6C17CD90FDF8DC77EECD54083B699654B5449",
-    "install_agent_startup_hooks": "C13A4F34D60E670F6821E04AFC9806EFB7FBA2A121E68D52C128FEFE8E77821D",
+    "install_agent_startup_hooks": "923DC0B0230FDC0BE8A0723A6CB8AEBB8764D707241CB0DE0639D76BBEDBEA11",
     "_start_work_agent_for_rescue": "5A4D0086B77E50B048A9E0B6C25F27F1DA8865CBACBD68D3FCA4F6AAEF3A18F5",
     "_start_rescue_agent_for_current_process": "0B5F1B021CC6C415DCB007C899209C6CB62B127513AB67DCD17FF4ABF6D3087F",
     "ManagedMaxSession.connect_existing": "596D0504950C4DC3F6D256E4D13AD5FC7A718A6F2955D09E8529624FB35237C0",
@@ -11791,8 +11801,10 @@ def _run_blender_agent_lifecycle_policy_guard() -> dict[str, Any]:
         if bootstrap_node is not None
         else ""
     )
-    if "_bootstrap_blender_agents_via_foreground_console" in bootstrap_function:
-        violations.append("Blender Agent bootstrap may open the Python Console")
+    # Blender DCC communication never uses MCP.  Its only recovery route is
+    # direct foreground-console bootstrap for the exact selected Blender PID.
+    if "_bootstrap_blender_agents_via_foreground_console" not in bootstrap_function:
+        violations.append("Blender Agent bootstrap lost its foreground-console recovery route")
     if hashlib.sha256(worker_bytes).hexdigest().upper() != contract["source_sha256"]:
         violations.append("Blender Worker bundle SHA-256 is not authoritative")
     if contract["component_revision"] not in worker_text:
@@ -11823,7 +11835,7 @@ def _run_blender_agent_lifecycle_policy_guard() -> dict[str, Any]:
         "worker_bytes": len(worker_bytes),
         "rescue_owns_worker_replacement": True,
         "rescue_scene_access": False,
-        "console_bootstrap": False,
+        "console_bootstrap": "foreground_exact_pid_only",
         "busy_worker_is_preserved": True,
     }
 
@@ -12284,6 +12296,50 @@ def _find_free_loopback_port() -> int:
         return int(listener.getsockname()[1])
 
 
+def _open_existing_named_memory_map(tagname: str, size: int) -> mmap.mmap | None:
+    """Open a descriptor only when its Windows mapping already exists.
+
+    ``mmap.mmap(-1, tagname=...)`` creates a new all-zero mapping when the
+    name is absent.  Launcher is a reader here, so that creation would race a
+    DCC Agent publishing the same descriptor.  Keep an OpenFileMapping handle
+    open until mmap has attached to the existing object.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenFileMappingW.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        ]
+        kernel32.OpenFileMappingW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenFileMappingW(0x0004, False, str(tagname))  # FILE_MAP_READ
+    except (AttributeError, OSError, ValueError):
+        return None
+    if not handle:
+        return None
+    try:
+        return mmap.mmap(
+            -1,
+            int(size),
+            tagname=str(tagname),
+            access=mmap.ACCESS_READ,
+        )
+    except (OSError, ValueError):
+        return None
+    finally:
+        try:
+            kernel32.CloseHandle(handle)
+        except (AttributeError, OSError):
+            pass
+
+
 def _agent_descriptor_tag(pid: int) -> str:
     value = int(pid)
     if value <= 0:
@@ -12356,14 +12412,10 @@ def _publish_agent_descriptor(pid: int, port: int, token: str) -> mmap.mmap:
 
 
 def _read_memory_agent_descriptor(pid: int) -> dict[str, Any] | None:
-    try:
-        mapping = mmap.mmap(
-            -1,
-            AGENT_DESCRIPTOR_MAP_BYTES,
-            tagname=_agent_descriptor_tag(pid),
-            access=mmap.ACCESS_READ,
-        )
-    except (OSError, ValueError):
+    mapping = _open_existing_named_memory_map(
+        _agent_descriptor_tag(pid), AGENT_DESCRIPTOR_MAP_BYTES
+    )
+    if mapping is None:
         return None
     try:
         raw_size = mapping.read(AGENT_DESCRIPTOR_HEADER.size)
@@ -12470,14 +12522,10 @@ def _publish_rescue_agent_descriptor(pid: int, port: int, token: str) -> mmap.mm
 
 
 def _read_rescue_agent_descriptor(pid: int) -> dict[str, Any] | None:
-    try:
-        mapping = mmap.mmap(
-            -1,
-            RESCUE_AGENT_DESCRIPTOR_MAP_BYTES,
-            tagname=_rescue_agent_descriptor_tag(pid),
-            access=mmap.ACCESS_READ,
-        )
-    except (OSError, ValueError):
+    mapping = _open_existing_named_memory_map(
+        _rescue_agent_descriptor_tag(pid), RESCUE_AGENT_DESCRIPTOR_MAP_BYTES
+    )
+    if mapping is None:
         return None
     try:
         raw_size = mapping.read(RESCUE_AGENT_DESCRIPTOR_HEADER.size)
@@ -12841,10 +12889,101 @@ def _max_startup_directories() -> list[Path]:
     ]
 
 
+def _direct_python_startup_hooks(directories: Iterable[Path]) -> list[Path]:
+    """Return direct Python files that Max must not enumerate as startup hooks."""
+    hooks: list[Path] = []
+    for directory in directories:
+        try:
+            entries = list(Path(directory).iterdir())
+        except OSError:
+            continue
+        hooks.extend(
+            entry
+            for entry in entries
+            if entry.is_file() and entry.suffix.casefold() == ".py"
+        )
+    return sorted(hooks, key=lambda path: str(path).casefold())
+
+
+def _disable_direct_python_startup_hooks(
+    directories: Iterable[Path],
+) -> list[dict[str, str]]:
+    """Reversibly disable direct Max startup Python files and record the audit."""
+    startup_directories = [Path(directory) for directory in directories]
+    audit_rows: list[dict[str, str]] = []
+    for source_path in _direct_python_startup_hooks(startup_directories):
+        disabled_path = source_path.with_name(f"{source_path.name}.disabled")
+        collision_index = 1
+        while disabled_path.exists():
+            disabled_path = source_path.with_name(
+                f"{source_path.name}.disabled.{collision_index}"
+            )
+            collision_index += 1
+        try:
+            source_path.rename(disabled_path)
+        except OSError as exc:
+            audit_rows.append(
+                {
+                    "status": "error",
+                    "source": str(source_path),
+                    "target": str(disabled_path),
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+        audit_rows.append(
+            {
+                "status": "disabled" if collision_index == 1 else "disabled_collision_suffix",
+                "source": str(source_path),
+                "target": str(disabled_path),
+                "detail": "Direct .py is not a supported Max startup hook.",
+            }
+        )
+    if audit_rows:
+        audit_path = DEFAULT_LOG_DIR / "max_startup_python_audit.json"
+        audit = {
+            "schema": "pc-rehd-code-x-max-startup-python-audit-v1",
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+            "startup_directories": [str(directory) for directory in startup_directories],
+            "entries": audit_rows,
+        }
+        try:
+            _atomic_write_json_document(audit_path, audit)
+        except (OSError, TypeError, ValueError):
+            pass
+        for row in audit_rows:
+            print(
+                f"[{APP_NAME}] Max startup Python {row['status']}: "
+                f"{row['source']} -> {row['target']} ({row['detail']})",
+                file=sys.stderr,
+            )
+    return audit_rows
+
+
+def _max_agent_startup_loader_text(bridge_path: Path) -> str:
+    bridge_literal = str(bridge_path.resolve())
+    return (
+        "-- Generated by PC-REHD Code X Launcher. MaxScript bootstrap for the resident Rescue and Work Agent.\n"
+        "try (\n"
+        f"    python.ExecuteFile @\"{bridge_literal}\"\n"
+        ") catch (\n"
+        "    format \"[PC-REHD Code X] Max Agent startup failed: %\\n\" (getCurrentException())\n"
+        ")\n"
+    )
+
+
+def _startup_hook_matches_expected(path: Path, expected_text: str) -> bool:
+    try:
+        return path.is_file() and path.read_text(encoding="utf-8") == expected_text
+    except OSError:
+        return False
+
+
 def install_agent_startup_hooks(directories: list[Path] | None = None) -> list[Path]:
     source_literal = ascii(str(Path(__file__).resolve()))
-    loader = (
-        "# Generated by PC-REHD Code X Launcher. Rescue owns Work Agent lifecycle.\n"
+    bridge_path = DEFAULT_LOG_DIR / AGENT_STARTUP_PYTHON_BRIDGE
+    bridge = (
+        "# Generated by PC-REHD Code X Launcher. Max startup Python bridge.\n"
         "import builtins\n"
         "import pathlib\n"
         "import sys\n"
@@ -12874,19 +13013,34 @@ def install_agent_startup_hooks(directories: list[Path] | None = None) -> list[P
         "    if not _worker_live:\n"
         "        _rescue.ensure_worker_local(source_path=_source)\n"
     )
+    loader = _max_agent_startup_loader_text(bridge_path)
     installed: list[Path] = []
     startup_directories = _max_startup_directories() if directories is None else list(directories)
+    _disable_direct_python_startup_hooks(startup_directories)
+    try:
+        bridge_path.parent.mkdir(parents=True, exist_ok=True)
+        if not _startup_hook_matches_expected(bridge_path, bridge):
+            bridge_path.write_text(bridge, encoding="utf-8", newline="\n")
+    except OSError:
+        return []
     for directory in startup_directories:
-        path = directory / AGENT_STARTUP_LOADER
         try:
-            if not path.is_file() or path.read_text(encoding="utf-8") != loader:
+            path = directory / AGENT_STARTUP_MS_LOADER
+            if not _startup_hook_matches_expected(path, loader):
                 path.write_text(loader, encoding="utf-8", newline="\n")
             installed.append(path)
-            legacy_ms_path = directory / AGENT_STARTUP_MS_LOADER
-            if legacy_ms_path.is_file():
-                legacy_text = legacy_ms_path.read_text(encoding="utf-8")
-                if legacy_text.startswith("-- Generated by PC-REHD Code X Launcher."):
-                    legacy_ms_path.unlink()
+            for legacy_name in (
+                AGENT_STARTUP_LEGACY_PY_LOADER,
+                AGENT_STARTUP_PREVIOUS_MS_LOADER,
+            ):
+                legacy_path = directory / legacy_name
+                if legacy_path.is_file():
+                    legacy_text = legacy_path.read_text(encoding="utf-8", errors="replace")
+                    if legacy_text.startswith((
+                        "# Generated by PC-REHD Code X Launcher.",
+                        "-- Generated by PC-REHD Code X Launcher.",
+                    )):
+                        legacy_path.unlink()
         except OSError:
             continue
     return installed
@@ -36147,14 +36301,11 @@ def _read_blender_agent_descriptor(
     )
     if not expected_protocol:
         return None
-    try:
-        mapping = mmap.mmap(
-            -1,
-            BLENDER_AGENT_DESCRIPTOR_MAP_BYTES,
-            tagname=_blender_agent_descriptor_tag(pid, normalized_role),
-            access=mmap.ACCESS_READ,
-        )
-    except (OSError, ValueError):
+    mapping = _open_existing_named_memory_map(
+        _blender_agent_descriptor_tag(pid, normalized_role),
+        BLENDER_AGENT_DESCRIPTOR_MAP_BYTES,
+    )
+    if mapping is None:
         return None
     try:
         raw_size = mapping.read(IPC_MESSAGE_HEADER.size)
@@ -36892,20 +37043,54 @@ def _bootstrap_blender_agents_for_pid(
         executable=_query_process_executable(exact_pid),
     )
     _ensure_blender_startup_bridge(process_info)
+
+    def dual_agents_ready(timeout: float = 0.0) -> bool:
+        if timeout > 0.0:
+            rescue = _wait_blender_agent_descriptor(
+                exact_pid, "rescue", timeout=timeout
+            )
+            worker = _wait_blender_agent_descriptor(
+                exact_pid, "worker", timeout=timeout
+            )
+        else:
+            rescue = _read_blender_agent_descriptor(exact_pid, "rescue")
+            worker = _read_blender_agent_descriptor(exact_pid, "worker")
+        return rescue is not None and worker is not None
+
+    if dual_agents_ready():
+        return exact_pid
     if wait_for_startup_bridge:
-        rescue = _wait_blender_agent_descriptor(
-            exact_pid, "rescue", timeout=BLENDER_AGENT_CONNECT_TIMEOUT
-        )
-        worker = _wait_blender_agent_descriptor(
-            exact_pid, "worker", timeout=2.0
-        )
-        if rescue is not None and worker is not None:
+        if dual_agents_ready(BLENDER_AGENT_CONNECT_TIMEOUT):
             return exact_pid
+
+    foreground_error = ""
+    if allow_foreground_activation:
+        try:
+            if _foreground_window_pid() != exact_pid:
+                activated, detail = _bring_process_window_to_front_with_retry(
+                    exact_pid,
+                    timeout_seconds=0.5,
+                    retry_interval_seconds=0.025,
+                )
+                if not activated:
+                    raise ConnectionError(str(detail or "Blender foreground activation failed"))
+            _bootstrap_blender_agents_via_foreground_console(exact_pid)
+            if dual_agents_ready(3.0):
+                return exact_pid
+            foreground_error = "foreground console did not publish both Agents"
+        except (ConnectionError, OSError, TimeoutError, ProtocolError, RuntimeError) as exc:
+            foreground_error = f"{type(exc).__name__}: {exc}"
+
     bridge_path = _blender_startup_bridge_path(process_info)
+    recovery_detail = (
+        f"; foreground bootstrap={foreground_error[:400]}"
+        if foreground_error
+        else ""
+    )
     raise BlenderAgentRestartRequiredError(
         f"Blender PID {exact_pid} was opened before the RE6 Blender startup "
         f"bridge was loaded. Restart only this Blender process once; "
-        f"bridge={bridge_path}"
+        f"bridge={bridge_path}{recovery_detail}"
     )
 
 
@@ -49653,6 +49838,7 @@ class LauncherApp:
         self.discovered_processes: dict[int, MaxProcessInfo] = {}
         self.agent_active_starting_pids: set[int] = set()
         self.connecting_pids: set[int] = set()
+        self.max_connection_retry_pending_pids: set[int] = set()
         self.foreground_connection_attempted_pids: set[int] = set()
         self.launching_pids: set[int] = set()
         self.max_launch_in_flight = False
@@ -50937,7 +51123,6 @@ class LauncherApp:
         normalized_software = str(software or "").strip() or "Software"
         key = self._software_restart_notice_key(normalized_software, exact_pid)
         message = self._software_restart_required_message(normalized_software)
-        self._set_status(message.replace("\n\n", " "), progress=0)
         if not force:
             if not self._software_still_needs_restart_notice(
                 normalized_software, exact_pid
@@ -50951,16 +51136,18 @@ class LauncherApp:
                 key, now
             )
             elapsed = now - float(first_seen)
-            if elapsed < SOFTWARE_RESTART_NOTICE_GRACE_SECONDS:
+            grace_seconds = SOFTWARE_RESTART_NOTICE_GRACE_SECONDS
+            if elapsed < grace_seconds:
                 self._schedule_software_restart_required_notice(
                     normalized_software,
                     exact_pid,
-                    SOFTWARE_RESTART_NOTICE_GRACE_SECONDS - elapsed,
+                    grace_seconds - elapsed,
                 )
                 return
         if not force and key in self._software_restart_notice_keys:
             return
         self._software_restart_notice_keys.add(key)
+        self._set_status(message.replace("\n\n", " "), progress=0)
         try:
             self._restore_launcher_foreground()
         except Exception:
@@ -51185,13 +51372,26 @@ class LauncherApp:
             directories = _max_startup_directories()
             signature = tuple(str(path).casefold() for path in directories)
             expected_paths = [
-                directory / AGENT_STARTUP_LOADER
+                directory / AGENT_STARTUP_MS_LOADER
                 for directory in directories
             ]
-            hooks_present = all(path.is_file() for path in expected_paths)
-            legacy_double_hooks_present = any(
-                (directory / AGENT_STARTUP_MS_LOADER).is_file()
+            expected_loader = _max_agent_startup_loader_text(
+                DEFAULT_LOG_DIR / AGENT_STARTUP_PYTHON_BRIDGE
+            )
+            hooks_present = all(
+                _startup_hook_matches_expected(path, expected_loader)
+                for path in expected_paths
+            )
+            legacy_hooks_present = any(
+                (directory / legacy_name).is_file()
                 for directory in directories
+                for legacy_name in (
+                    AGENT_STARTUP_LEGACY_PY_LOADER,
+                    AGENT_STARTUP_PREVIOUS_MS_LOADER,
+                )
+            )
+            direct_python_hooks_present = bool(
+                _direct_python_startup_hooks(directories)
             )
             current_revision = RESCUE_AGENT_COMPONENT_REVISION
             needs_install = (
@@ -51199,7 +51399,8 @@ class LauncherApp:
                 or previous_revision != current_revision
                 or not previous_complete
                 or not hooks_present
-                or legacy_double_hooks_present
+                or legacy_hooks_present
+                or direct_python_hooks_present
             )
             installed = install_agent_startup_hooks(directories) if needs_install else None
             return signature, installed, len(expected_paths)
@@ -64003,16 +64204,7 @@ class LauncherApp:
             if target_pid > 0:
                 self._schedule_blender_session_connect(
                     target_pid,
-                    present_error=False,
                     allow_foreground_bootstrap=False,
-                )
-                self._show_error(
-                    RuntimeError(
-                        self._tr(
-                            f"Blender PID {target_pid} 尚未完成 Worker 连接。如果这是首次接入且 Blender 已经提前打开，请只重启这一个 Blender；之后 Rescue 会自动维护 Worker。",
-                            f"Blender PID {target_pid} has not completed the Worker connection. If this is the first connection and this Blender was opened early, restart only this Blender once; Rescue will maintain Worker after that.",
-                        )
-                    )
                 )
                 return
             self._show_error(
@@ -81403,7 +81595,10 @@ class LauncherApp:
                 self.launching_pids.discard(launched_pid)
                 self.offline_pid = launched_pid if _pid_is_alive(launched_pid) else None
             self._refresh_pid_combo(force_discovery=True)
-            self._show_error(exc)
+            if launched_pid > 0 and _pid_is_alive(launched_pid):
+                self._schedule_max_agent_connect_retry(launched_pid, exc)
+            else:
+                self._show_error(exc)
 
         self._run_background(
             operation,
@@ -81446,6 +81641,7 @@ class LauncherApp:
         self.blender_launch_in_flight = True
         self.blender_launch_generation += 1
         launch_generation = self.blender_launch_generation
+        launch_pid_box = {"pid": 0}
 
         def operation() -> tuple[ManagedBlenderSession, dict[str, Any]]:
             bridge_path = _ensure_blender_startup_bridge(
@@ -81458,6 +81654,7 @@ class LauncherApp:
                 creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
             )
             pid = int(process.pid)
+            launch_pid_box["pid"] = pid
             process_info = BlenderProcessInfo(pid=pid, executable=executable)
             session = ManagedBlenderSession.connect_existing(
                 process_info,
@@ -81522,7 +81719,38 @@ class LauncherApp:
             if launch_generation != self.blender_launch_generation:
                 return
             self.blender_launch_in_flight = False
-            self._show_error(exc)
+            launched_pid = int(launch_pid_box.get("pid", 0) or 0)
+            if launched_pid <= 0 or not _pid_is_alive(launched_pid):
+                self._show_error(exc)
+                return
+            self.blender_discovered_processes[launched_pid] = BlenderProcessInfo(
+                pid=launched_pid,
+                executable=executable,
+            )
+            self.blender_requested_pid = launched_pid
+            self.blender_last_foreground_pid = launched_pid
+            self.blender_connection_retry_at[launched_pid] = time.monotonic() + 2.0
+            self._schedule_blender_pid_discovery(force=True)
+
+            def retry_connection() -> None:
+                if (
+                    not self.blender_mode_enabled
+                    or launched_pid in self.blender_sessions
+                    or launched_pid in self.blender_connecting_pids
+                    or not _pid_is_alive(launched_pid)
+                ):
+                    return
+                self._schedule_blender_session_connect(
+                    launched_pid,
+                    allow_foreground_bootstrap=(
+                        _foreground_window_pid() == launched_pid
+                    ),
+                )
+
+            try:
+                self.root.after(2000, retry_connection)
+            except self.tk.TclError:
+                pass
 
         self._run_background(
             operation,
@@ -81572,6 +81800,7 @@ class LauncherApp:
         workspace = session.workspace
         session.disconnect(reason)
         self.sessions.pop(pid, None)
+        self.max_connection_retry_pending_pids.discard(pid)
         self.foreground_connection_attempted_pids.discard(pid)
         if _pid_is_alive(pid):
             self.detached_session_workspaces[pid] = workspace
@@ -81676,10 +81905,12 @@ class LauncherApp:
         exact_pid = int(pid)
         if exact_pid <= 0:
             return
+        if exact_pid in self.max_connection_retry_pending_pids:
+            return
+        self.max_connection_retry_pending_pids.add(exact_pid)
         detail = f"{type(exc).__name__}: {exc}"
         if RESCUE_AGENT_MISSING_STATUS in detail:
             self._show_software_restart_required_notice("MAX", exact_pid)
-            return
         if self.active_pid is None and self.offline_pid == exact_pid:
             self._set_status(
                 self._tr(
@@ -81690,16 +81921,45 @@ class LauncherApp:
             )
 
         def release_retry() -> None:
-            if (
-                exact_pid not in self.sessions
-                and exact_pid in self.discovered_processes
-                and _pid_is_alive(exact_pid)
-            ):
-                self.foreground_connection_attempted_pids.discard(exact_pid)
+            self.max_connection_retry_pending_pids.discard(exact_pid)
+            if exact_pid in self.sessions:
+                return
+            if not _pid_is_alive(exact_pid):
+                return
+            if exact_pid not in self.discovered_processes:
+                # Launch failure can arrive before asynchronous PID discovery
+                # has published this still-running Max. Keep the PID queued
+                # until discovery catches up instead of requiring a restart.
+                self._refresh_pid_combo(force_discovery=True)
+                self._schedule_max_agent_connect_retry(
+                    exact_pid, exc, delay_ms=max(1500, int(delay_ms))
+                )
+                return
+            self.foreground_connection_attempted_pids.discard(exact_pid)
+            if exact_pid in self.connecting_pids or exact_pid in self.agent_active_starting_pids:
+                return
+            interactive, _status_code, _detail = _max_agent_interaction_state(exact_pid)
+            if not interactive:
+                self._schedule_max_agent_connect_retry(
+                    exact_pid, exc, delay_ms=max(1500, int(delay_ms))
+                )
+                return
+            if _read_agent_descriptor(exact_pid) is None:
+                if not self._schedule_active_agent_start(exact_pid):
+                    self._schedule_max_agent_connect_retry(
+                        exact_pid, exc, delay_ms=max(1500, int(delay_ms))
+                    )
+                return
+            self._schedule_existing_session_connect(exact_pid)
+            if exact_pid not in self.sessions and exact_pid not in self.connecting_pids:
+                self._schedule_max_agent_connect_retry(
+                    exact_pid, exc, delay_ms=max(1500, int(delay_ms))
+                )
 
         try:
             self.root.after(max(100, int(delay_ms)), release_retry)
         except self.tk.TclError:
+            self.max_connection_retry_pending_pids.discard(exact_pid)
             self.foreground_connection_attempted_pids.discard(exact_pid)
 
     def _schedule_active_agent_start(self, pid: int) -> bool:
@@ -81714,6 +81974,15 @@ class LauncherApp:
             return False
         if _read_rescue_agent_descriptor(exact_pid) is None:
             self._clear_active_agent_start(exact_pid)
+            missing_rescue_error = ConnectionError(
+                f"{RESCUE_AGENT_MISSING_STATUS}: Max PID {exact_pid} has no resident Rescue Agent"
+            )
+            # This path runs before a Work descriptor exists. Seed the same
+            # retry loop used by a failed handshake so foreground Max does not
+            # remain offline after the restart notice is dismissed.
+            self._schedule_max_agent_connect_retry(
+                exact_pid, missing_rescue_error, delay_ms=1500
+            )
             self._show_software_restart_required_notice("MAX", exact_pid)
             print(
                 f"[{APP_NAME}] {RESCUE_AGENT_MISSING_STATUS} | PID={exact_pid} | "
@@ -81839,7 +82108,6 @@ class LauncherApp:
         self,
         pid: int,
         *,
-        present_error: bool = False,
         allow_foreground_bootstrap: bool = False,
     ) -> None:
         exact_pid = int(pid)
@@ -81963,9 +82231,28 @@ class LauncherApp:
         def failure(exc: Exception) -> None:
             self.blender_connecting_pids.discard(exact_pid)
             restart_required = isinstance(exc, BlenderAgentRestartRequiredError)
-            self.blender_connection_retry_at[exact_pid] = time.monotonic() + (
-                30.0 if restart_required else 5.0
-            )
+            self.blender_connection_retry_at[exact_pid] = time.monotonic() + 2.0
+
+            def retry_connection() -> None:
+                if (
+                    not self.blender_mode_enabled
+                    or exact_pid in self.blender_sessions
+                    or exact_pid in self.blender_connecting_pids
+                    or exact_pid not in self.blender_discovered_processes
+                    or not _pid_is_alive(exact_pid)
+                ):
+                    return
+                self._schedule_blender_session_connect(
+                    exact_pid,
+                    allow_foreground_bootstrap=(
+                        _foreground_window_pid() == exact_pid
+                    ),
+                )
+
+            try:
+                self.root.after(2000, retry_connection)
+            except self.tk.TclError:
+                pass
             if self.blender_requested_pid == exact_pid and (
                 exact_pid not in self.blender_discovered_processes
                 or not _pid_is_alive(exact_pid)
@@ -81991,14 +82278,21 @@ class LauncherApp:
                 if restart_required
                 else f"Blender PID {exact_pid} Agent is not ready"
             )
-            self._set_status(
-                self._tr(status_cn, status_en),
-                progress=0,
-            )
+            if restart_required:
+                self._set_status(
+                    self._tr(
+                        f"Blender PID {exact_pid} 正在等待 Agent 启动，并会自动重试。",
+                        f"Blender PID {exact_pid} is waiting for its Agent and will retry automatically.",
+                    ),
+                    progress=0,
+                )
+            else:
+                self._set_status(
+                    self._tr(status_cn, status_en),
+                    progress=0,
+                )
             if restart_required:
                 self._show_software_restart_required_notice("Blender", exact_pid)
-            elif present_error:
-                self._show_error(exc)
             self._refresh_blender_pid_combo(use_cached_discovery=True)
 
         self._run_background(
@@ -82009,7 +82303,7 @@ class LauncherApp:
                 f"Connecting Blender PID {exact_pid}",
             ),
             on_error=failure,
-            quiet=not present_error,
+            quiet=True,
             track_busy=False,
         )
 
@@ -82182,7 +82476,11 @@ class LauncherApp:
             if self.blender_active_pid is None
             else 0
         )
-        allow_foreground_bootstrap = False
+        # Only bootstrap through Blender's Console when this exact target is
+        # already in front. Background discovery never steals keyboard input.
+        allow_foreground_bootstrap = (
+            candidate > 0 and int(foreground_pid) == int(candidate)
+        )
         if (
             candidate > 0
             and candidate in self.blender_sessions
@@ -82554,8 +82852,7 @@ class LauncherApp:
             self.blender_connection_retry_at.pop(pid, None)
             self._schedule_blender_session_connect(
                 pid,
-                present_error=True,
-                allow_foreground_bootstrap=False,
+                allow_foreground_bootstrap=True,
             )
 
         def failure(exc: Exception) -> None:
