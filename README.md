@@ -56,40 +56,55 @@ The repository and Release package exclude the embedded Python runtime, generate
 Root directory
   不装Python无法使用 - Can't run without Python .txt
     Python installation prerequisite.
+
   请勿盲改任何这里的文件 - Don't Blindly Modify Any Files here .txt
     Editing safety notice.
+
   问题汇总 - Readme Problem Solvers.txt
     Troubleshooting and known-issue notes.
+
   PC-REHD Code X Launcher.py
     Legacy update marker; not the active Launcher or source entry point.
 
 脚本目录 Script Folder/  (active source root)
-  1. PC-REHD Code X Launcher.py
-     Main Launcher, UI, Agent orchestration, and tool routing.
-  2. codex_python_export_bridge.py
-     Export bridge and .MOD writer path.
-  3. codex_re6_mod_import_fbx.py
-     .MOD to FBX and import preparation path.
-  4. codex_fbx_probe.py
-     FBX inspection and data-contract probing.
-  5. codex_python_runtime_bootstrap.py
-     Python runtime installation and environment bootstrap.
-  6. codex_re6_auxiliary_max_bridge.py
-     3ds Max support for SBC, ADR, and EMS auxiliary geometry.
-  7. codex_re6_scene_compatibility.py
-     Shared RE6 import/export scene-compatibility rules.
-  8. codex_re6_tex_decode.py
-     RE6 texture decoding utility.
-  9. codex_blender_fbx_texture_to_FBX_safe.py
-     MMD-safe Blender FBX texture repair utility.
-  10. RELEASE_NOTES.md
-      Release-page notes maintained with the source.
-  11. PY依赖 PY Libs/
-      Pinned Python dependencies and vendor source snapshots.
-  12. 先点Bat文件 - Click Bat First.ps1
-      Bootstrap and environment-validation entry point.
-  13. 一定要先点我安装Python - Click to Install Python First.bat
-      Installs the required Python runtime.
+  PC-REHD Code X Launcher.py
+    Main Launcher, UI, Agent orchestration, and tool routing.
+
+  codex_python_export_bridge.py
+    Export bridge and .MOD writer path.
+
+  codex_re6_mod_import_fbx.py
+    .MOD to FBX and import preparation path.
+
+  codex_fbx_probe.py
+    FBX inspection and data-contract probing.
+
+  codex_python_runtime_bootstrap.py
+    Python runtime installation and environment bootstrap.
+
+  codex_re6_auxiliary_max_bridge.py
+    3ds Max support for SBC, ADR, and EMS auxiliary geometry.
+
+  codex_re6_scene_compatibility.py
+    Shared RE6 import/export scene-compatibility rules.
+
+  codex_re6_tex_decode.py
+    RE6 texture decoding utility.
+
+  codex_blender_fbx_texture_to_FBX_safe.py
+    MMD-safe Blender FBX texture repair utility.
+
+  RELEASE_NOTES.md
+    Release-page notes maintained with the source.
+
+  PY依赖 PY Libs/
+    Pinned Python dependencies and vendor source snapshots.
+
+  先点Bat文件 - Click Bat First.ps1
+    Bootstrap and environment-validation entry point.
+
+  一定要先点我安装Python - Click to Install Python First.bat
+    Installs the required Python runtime.
 ```
 
 ### Release Verification
@@ -211,40 +226,55 @@ PC-REHD Code X 是对 PC-REHD 1.2.8 脚本的 Python 重写版，旨在简化《
 根目录
   不装Python无法使用 - Can't run without Python .txt
     Python 安装前置说明。
+
   请勿盲改任何这里的文件 - Don't Blindly Modify Any Files here .txt
     文件编辑安全提示。
+
   问题汇总 - Readme Problem Solvers.txt
     常见问题与已知问题说明。
+
   PC-REHD Code X Launcher.py
     旧版更新检查标记，不是主启动器或源码入口。
 
 脚本目录 Script Folder/  (当前实际源码根目录)
-  1. PC-REHD Code X Launcher.py
-     主启动器、界面、Agent 调度与工具入口。
-  2. codex_python_export_bridge.py
-     导出桥接与 .MOD 写入流程。
-  3. codex_re6_mod_import_fbx.py
-     .MOD 转 FBX 与导入准备流程。
-  4. codex_fbx_probe.py
-     FBX 检查与数据合同解析。
-  5. codex_python_runtime_bootstrap.py
-     Python 运行环境安装与初始化。
-  6. codex_re6_auxiliary_max_bridge.py
-     3ds Max 的 SBC、ADR、EMS 辅助几何支持。
-  7. codex_re6_scene_compatibility.py
-     RE6 导入导出共用的场景兼容规则。
-  8. codex_re6_tex_decode.py
-     RE6 贴图解码工具。
-  9. codex_blender_fbx_texture_to_FBX_safe.py
-     面向 MMD 的安全 Blender FBX 贴图修复工具。
-  10. RELEASE_NOTES.md
-      与源代码一同维护的 Release 页面文案。
-  11. PY依赖 PY Libs/
-      固定版本的 Python 依赖及供应商源码快照。
-  12. 先点Bat文件 - Click Bat First.ps1
-      启动前的环境初始化与检查入口。
-  13. 一定要先点我安装Python - Click to Install Python First.bat
-      安装所需的 Python 运行环境。
+  PC-REHD Code X Launcher.py
+    主启动器、界面、Agent 调度与工具入口。
+
+  codex_python_export_bridge.py
+    导出桥接与 .MOD 写入流程。
+
+  codex_re6_mod_import_fbx.py
+    .MOD 转 FBX 与导入准备流程。
+
+  codex_fbx_probe.py
+    FBX 检查与数据合同解析。
+
+  codex_python_runtime_bootstrap.py
+    Python 运行环境安装与初始化。
+
+  codex_re6_auxiliary_max_bridge.py
+    3ds Max 的 SBC、ADR、EMS 辅助几何支持。
+
+  codex_re6_scene_compatibility.py
+    RE6 导入导出共用的场景兼容规则。
+
+  codex_re6_tex_decode.py
+    RE6 贴图解码工具。
+
+  codex_blender_fbx_texture_to_FBX_safe.py
+    面向 MMD 的安全 Blender FBX 贴图修复工具。
+
+  RELEASE_NOTES.md
+    与源代码一同维护的 Release 页面文案。
+
+  PY依赖 PY Libs/
+    固定版本的 Python 依赖及供应商源码快照。
+
+  先点Bat文件 - Click Bat First.ps1
+    启动前的环境初始化与检查入口。
+
+  一定要先点我安装Python - Click to Install Python First.bat
+    安装所需的 Python 运行环境。
 ```
 
 ### 文件校验
