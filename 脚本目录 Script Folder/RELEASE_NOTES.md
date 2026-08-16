@@ -8,3 +8,4 @@
 - Enhanced 3D software connectivity; 3ds Max startup .py files are always disabled.
 - Old update checkers always report an update; newer update-check mechanisms are enforced
 - MAX/Blender scene nodes one time no cache policy that might mislead; FBX exclusively decides geometry
+- Fixed normal anomalies in RE6 FVF BB424024/BB424025.
