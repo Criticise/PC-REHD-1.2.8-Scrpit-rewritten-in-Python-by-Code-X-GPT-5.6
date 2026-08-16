@@ -604,6 +604,15 @@ WORLD_SHORT_REMAP_FVFS = {
     0xBB424025,
 }
 
+# Both BB4240x layouts store the final position as three shorts at [0:6] and
+# the normal direction as RGB bytes at [8:11].  The game-facing rule below is
+# deliberately independent of their divergent tangent lanes.
+BB4240X_FINAL_GEOMETRY_NORMAL_FVFS = {
+    0xBB424024,
+    0xBB424025,
+}
+BB4240X_FINAL_GEOMETRY_NORMAL_VERTEX_STRIDE = 36
+
 BONE_EDIT_MESH_LOCAL_BINDING_FVFS = {
     0x0CB68015,
     0x0CB68016,
@@ -3422,7 +3431,20 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             patched_vertex[uv2_offset : uv2_offset + 4] = source_uv2
             vertex_chunks[vertex_index] = bytes(patched_vertex)
 
-    source_normal_field_rows = mesh.get("source_normal_field_hex_rows")
+    normal_fidelity = mesh.get("normal_fidelity")
+    strict_fbx_corner_rows = (
+        isinstance(normal_fidelity, dict)
+        and str(normal_fidelity.get("status", "") or "") == "exact"
+        and str(normal_fidelity.get("mode", "") or "") == "binary_fbx_corner_layer"
+    )
+
+    # A strict corner table has already expanded every output vertex from the
+    # authored FBX corner stream. Source byte preservation is valid only for
+    # the old one-row-per-source-vertex route; applying it here silently
+    # overwrites the new normal/skin rows after they have been packed.
+    source_normal_field_rows = (
+        None if strict_fbx_corner_rows else mesh.get("source_normal_field_hex_rows")
+    )
     normal_offset = PACKED_NORMAL_OFFSET_BY_FVF.get(fvf)
     if isinstance(source_normal_field_rows, list) and normal_offset is not None:
         for vertex_index in range(min(len(vertex_chunks), len(source_normal_field_rows))):
@@ -3456,7 +3478,9 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             patched_vertex[field_start:field_end] = source_vertex[field_start:field_end]
             vertex_chunks[vertex_index] = bytes(patched_vertex)
 
-    source_skin_field_rows = mesh.get("source_skin_field_hex_rows")
+    source_skin_field_rows = (
+        None if strict_fbx_corner_rows else mesh.get("source_skin_field_hex_rows")
+    )
     if isinstance(source_skin_field_rows, list):
         skin_ranges = SOURCE_SKIN_FIELD_RANGES_BY_FVF.get(fvf, ())
         for vertex_index in range(min(len(vertex_chunks), len(source_skin_field_rows))):
@@ -11588,7 +11612,28 @@ def _apply_ordinary_export_source_ordered_skin_contract(
             # layout. A deliberate FVF rewrite must serialize the live FBX
             # weights against the selected layout instead.
             continue
-        source_owns_skin_fields = source_fvf in V4_NON_SCENE_SKIN_FVFS
+        # BB424024/25 normally retain their packed skin lanes from the source
+        # MOD because older scene snapshots did not expose those eight slots.
+        # A strict FBX corner-normal rebuild is different: one FBX position can
+        # become several export vertices, and the Probe has already expanded
+        # the FBX Skin rows to that exact vertex order.  Reusing source row
+        # ``source_vertex_indices[i]`` in that case confuses a source-position
+        # index with the current source-MOD vertex row (especially after a
+        # previous split export) and sends face vertices to unrelated bones.
+        normal_fidelity = mesh.get("normal_fidelity")
+        strict_corner_skin_authority = (
+            isinstance(normal_fidelity, dict)
+            and str(normal_fidelity.get("status", "") or "") == "exact"
+            and str(normal_fidelity.get("mode", "") or "") == "binary_fbx_corner_layer"
+            and isinstance(mesh.get("raw_bones"), list)
+            and isinstance(mesh.get("raw_weights"), list)
+            and len(mesh.get("raw_bones", [])) >= _get_semantic_vertex_count(mesh)
+            and len(mesh.get("raw_weights", [])) >= _get_semantic_vertex_count(mesh)
+        )
+        source_owns_skin_fields = (
+            source_fvf in V4_NON_SCENE_SKIN_FVFS
+            and not strict_corner_skin_authority
+        )
         skin_ranges = SOURCE_SKIN_FIELD_RANGES_BY_FVF.get(source_fvf)
         source_truth_rows = _read_source_mod_vertex_skin_truth_rows(mod_file, source_mesh_header)
         if not skin_ranges or not source_truth_rows:
@@ -11738,7 +11783,11 @@ def _apply_ordinary_export_source_ordered_skin_contract(
             "unchanged_rows": unchanged_rows,
             "changed_rows": changed_rows,
             "restored_zero_weight_fallback_rows": restored_zero_weight_fallback_rows,
-            "policy": "source_slot_order_with_exact_unchanged_bytes",
+            "policy": (
+                "fbx_corner_skin_with_source_palette"
+                if strict_corner_skin_authority
+                else "source_slot_order_with_exact_unchanged_bytes"
+            ),
         }
         applied_meshes += 1
     if source_bone_map_rows != original_bone_map_rows:
@@ -14466,11 +14515,13 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
             compare = handoff_payload.get("compare", {})
             contract_meshes = handoff_payload.get("contract_meshes")
             fbx_axes = handoff_payload.get("fbx_axes")
+            normal_fidelity = handoff_payload.get("normal_fidelity")
         else:
             summary = probe.summarize_fbx(fbx_path)
             compare = probe.compare_fbx_to_max_snapshot(summary, max_snapshot)
             contract_meshes = None
             fbx_axes = summary.get("fbx_axes") if isinstance(summary, dict) else None
+            normal_fidelity = None
             if hasattr(probe, "extract_fbx_mesh_contracts"):
                 try:
                     contract_meshes = probe.extract_fbx_mesh_contracts(fbx_path)
@@ -14540,6 +14591,10 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
         payload["contract_meshes"] = contract_meshes
     if isinstance(fbx_axes, dict):
         payload["fbx_axes"] = dict(fbx_axes)
+    if isinstance(normal_fidelity, list):
+        payload["normal_fidelity"] = [
+            dict(row) for row in normal_fidelity if isinstance(row, dict)
+        ]
     if contract_extract_error != "":
         payload["contract_extract_error"] = contract_extract_error
     return payload
@@ -15076,6 +15131,11 @@ def _preserve_semantically_unchanged_source_normal_bytes(
     preserved_count = 0
     for mesh in _ensure_contract_meshes(job, contract):
         if not isinstance(mesh, dict) or str(mesh.get("lane", "") or "").lower() != "modify":
+            continue
+        normal_fidelity = mesh.get("normal_fidelity")
+        if isinstance(normal_fidelity, dict) and str(normal_fidelity.get("status", "") or "") == "exact":
+            mesh.pop("source_normal_field_hex_rows", None)
+            mesh.pop("source_normal_bytes_preserved", None)
             continue
 
         source_slot = _int_or_default(mesh.get("mesh_slot"), 0)
@@ -15979,10 +16039,12 @@ def _merge_fbx_contract_meshes(
             "skin_deformer_count",
             "weight_rows_available",
             "positions",
+            "max_positions",
             "skinned_positions",
             "skinned_max_positions",
             "skinned_world_positions",
             "normals",
+            "max_normals",
             "skinned_normals",
             "skinned_max_normals",
             "skinned_is_local",
@@ -16005,9 +16067,16 @@ def _merge_fbx_contract_meshes(
             "fbx_geom_face_indices",
             "fbx_export_face_indices",
             "fbx_uv_channels",
+            "normal_fidelity",
         ):
             if key in matched:
                 mesh[key] = matched[key]
+        normal_fidelity = matched.get("normal_fidelity")
+        if isinstance(normal_fidelity, dict) and str(normal_fidelity.get("status", "") or "") == "exact":
+            # A raw FBX corner stream is the current source of truth.  Never
+            # let a cached source-MOD byte row override its authored normal.
+            mesh.pop("source_normal_field_hex_rows", None)
+            mesh.pop("source_normal_bytes_preserved", None)
         mesh["vert_count"] = len(mesh.get("positions", []))
         mesh["face_count"] = len(mesh.get("face_indices", []))
         merged_count += 1
@@ -16285,6 +16354,25 @@ def _apply_fbx_world_space_overrides(job: dict[str, Any], contract: dict[str, An
             continue
         if _mesh_requires_bones_plus_mesh_fbx_world_authority(mesh):
             # The immutable FBX authority already carries its tested world basis.
+            continue
+        normal_fidelity = mesh.get("normal_fidelity")
+        if isinstance(normal_fidelity, dict) and str(normal_fidelity.get("status", "") or "") == "exact":
+            # BB424024/25 keep their established WORLD OBJECT REMAP path.
+            # The strict Probe has already restored this Mesh's FBX node axes
+            # into max_positions, so make that exact table the explicit world
+            # input. Do not re-project it through the node matrix, and do not
+            # fall back to the stale scene-local world_positions table.
+            fvf = _parse_mesh_writer_fvf(mesh)
+            strict_max_positions = mesh.get("max_positions")
+            if (
+                _mesh_uses_world_short_remap(mesh, fvf)
+                and isinstance(strict_max_positions, list)
+                and strict_max_positions
+            ):
+                mesh["world_positions"] = [list(position) for position in strict_max_positions]
+                normal_fidelity["position_mode"] = "fbx_max_positions_world_remap"
+            else:
+                normal_fidelity["position_mode"] = "fbx_max_positions"
             continue
 
         fvf = _parse_mesh_writer_fvf(mesh)
@@ -20099,6 +20187,12 @@ def _build_source_missing_append_record(
         "face_bytes": face_bytes,
         "face_indices": face_indices,
         "mesh_is_modified": True,
+        "source_vertex_indices": (
+            list(mesh.get("source_vertex_indices", []))
+            if isinstance(mesh.get("source_vertex_indices"), list)
+            else []
+        ),
+        "scene_node": scene_name,
         "force_new_vertex_group": True,
         "source_missing_append": True,
         "appended_scene_mesh_key": append_key,
@@ -20212,6 +20306,215 @@ def _build_pre_mesh_bytes_for_job(mod_file: dict[str, Any], job: dict[str, Any])
         raise ValueError("Ordinary Skin palette override exceeds the source pre-Mesh table allocation")
     mutable_pre_mesh_bytes[relative_start:relative_end] = packed_rows
     return bytes(mutable_pre_mesh_bytes)
+
+
+def _encode_bb4240x_final_normal_rgb(vec: Any) -> bytes:
+    """Match the V03 face experiment's 0..253 RGB normal packing exactly."""
+    normal = _normalize_vec3(vec, (0.0, 0.0, 1.0))
+    return bytes(
+        max(0, min(253, int(round(127.0 + (127.0 * component)))))
+        for component in normal
+    )
+
+
+def _apply_bb4240x_final_geometry_normals(
+    vertex_bytes: bytes,
+    face_indices: list[int],
+    *,
+    fvf: int,
+    vertex_stride: int,
+    source_vertex_indices: Any,
+) -> tuple[bytes, dict[str, Any]]:
+    """Rebuild BB4240x normals from the final packed geometry without moving it.
+
+    FBX splits a source position at UV/normal seams.  Recomputing per split
+    row would create seams that the V03 MOD-side operation does not have, so
+    face-area sums are accumulated by the FBX source-position id and copied to
+    every final split row in that bucket.  Invalid handoff data is diagnostic
+    only: preserve the packed FBX normal and allow the export to continue.
+    """
+    original = bytes(vertex_bytes)
+    receipt: dict[str, Any] = {
+        "status": "SKIPPED",
+        "rule": "final_quantized_short_position_area_weighted_source_vertex",
+        "fvf": f"0x{fvf & 0xFFFFFFFF:08X}",
+        "vertex_stride": int(vertex_stride),
+        "vertex_count": 0,
+        "face_index_count": len(face_indices) if isinstance(face_indices, list) else 0,
+        "updated_vertex_count": 0,
+        "fallback_normal_count": 0,
+    }
+    if fvf not in BB4240X_FINAL_GEOMETRY_NORMAL_FVFS:
+        receipt["reason"] = "fvf_not_enabled"
+        return original, receipt
+    if vertex_stride != BB4240X_FINAL_GEOMETRY_NORMAL_VERTEX_STRIDE:
+        receipt["reason"] = "unexpected_vertex_stride"
+        return original, receipt
+    if len(original) % vertex_stride != 0:
+        receipt["reason"] = "unaligned_vertex_bytes"
+        return original, receipt
+
+    vertex_count = len(original) // vertex_stride
+    receipt["vertex_count"] = vertex_count
+    if vertex_count <= 0:
+        receipt["reason"] = "empty_vertex_table"
+        return original, receipt
+    if not isinstance(source_vertex_indices, list) or len(source_vertex_indices) != vertex_count:
+        receipt["reason"] = "source_vertex_indices_unavailable"
+        return original, receipt
+    if not isinstance(face_indices, list) or len(face_indices) < 3 or len(face_indices) % 3 != 0:
+        receipt["reason"] = "invalid_triangle_index_stream"
+        return original, receipt
+
+    source_ids: list[int] = []
+    for value in source_vertex_indices:
+        try:
+            source_id = int(value)
+        except (TypeError, ValueError, OverflowError):
+            receipt["reason"] = "non_integer_source_vertex_index"
+            return original, receipt
+        if source_id < 0:
+            receipt["reason"] = "negative_source_vertex_index"
+            return original, receipt
+        source_ids.append(source_id)
+    if any(not isinstance(index, int) or index < 0 or index >= vertex_count for index in face_indices):
+        receipt["reason"] = "face_index_out_of_range"
+        return original, receipt
+
+    positions = [
+        struct.unpack_from("<hhh", original, vertex_index * vertex_stride)
+        for vertex_index in range(vertex_count)
+    ]
+    accumulated: dict[int, list[float]] = {}
+    degenerate_triangles = 0
+    for face_offset in range(0, len(face_indices), 3):
+        first, second, third = face_indices[face_offset : face_offset + 3]
+        a, b, c = positions[first], positions[second], positions[third]
+        ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+        ac = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+        cross = (
+            (ab[1] * ac[2]) - (ab[2] * ac[1]),
+            (ab[2] * ac[0]) - (ab[0] * ac[2]),
+            (ab[0] * ac[1]) - (ab[1] * ac[0]),
+        )
+        if abs(cross[0]) + abs(cross[1]) + abs(cross[2]) <= 0.000000000001:
+            degenerate_triangles += 1
+        for vertex_index in (first, second, third):
+            bucket = accumulated.setdefault(source_ids[vertex_index], [0.0, 0.0, 0.0])
+            bucket[0] += cross[0]
+            bucket[1] += cross[1]
+            bucket[2] += cross[2]
+
+    output = bytearray(original)
+    updated_vertex_count = 0
+    fallback_normal_count = 0
+    for vertex_index, source_id in enumerate(source_ids):
+        normal_offset = (vertex_index * vertex_stride) + 8
+        total = accumulated.get(source_id, [0.0, 0.0, 0.0])
+        if abs(total[0]) + abs(total[1]) + abs(total[2]) <= 0.000000000001:
+            # This mirrors V03's zero-area fallback while preserving byte 11,
+            # which is a separate per-FVF state lane rather than normal RGB.
+            normal = _decode_source_packed_normal(bytes(output[normal_offset : normal_offset + 3]))
+            fallback_normal_count += 1
+        else:
+            normal = _normalize_vec3(total, (0.0, 0.0, 1.0))
+        packed_rgb = _encode_bb4240x_final_normal_rgb(normal)
+        if output[normal_offset : normal_offset + 3] != packed_rgb:
+            output[normal_offset : normal_offset + 3] = packed_rgb
+            updated_vertex_count += 1
+
+    receipt.update(
+        {
+            "status": "APPLIED",
+            "reason": "",
+            "triangle_count": len(face_indices) // 3,
+            "degenerate_triangle_count": degenerate_triangles,
+            "source_vertex_bucket_count": len(accumulated),
+            "updated_vertex_count": updated_vertex_count,
+            "fallback_normal_count": fallback_normal_count,
+            "normal_byte_range": "8:11",
+        }
+    )
+    return bytes(output), receipt
+
+
+def _run_bb4240x_final_geometry_normal_regression_guard() -> dict[str, Any]:
+    """Prove both BB FVF lanes share the same RGB-only final normal rule."""
+    failures: list[str] = []
+    source_ids = [0, 1, 2, 0, 2, 3]
+    face_indices = [0, 1, 2, 3, 4, 5]
+    positions = [
+        (0, 0, 0),
+        (100, 0, 0),
+        (0, 100, 0),
+        (0, 0, 0),
+        (0, 100, 0),
+        (0, 0, 100),
+    ]
+    rgb_by_fvf: dict[str, list[bytes]] = {}
+    for fvf, alpha in ((0xBB424024, 254), (0xBB424025, 127)):
+        fixture = bytearray(BB4240X_FINAL_GEOMETRY_NORMAL_VERTEX_STRIDE * len(positions))
+        for vertex_index, position in enumerate(positions):
+            offset = vertex_index * BB4240X_FINAL_GEOMETRY_NORMAL_VERTEX_STRIDE
+            struct.pack_into("<hhh", fixture, offset, *position)
+            fixture[offset + 6 : offset + 8] = bytes((31 + vertex_index, 63 + vertex_index))
+            fixture[offset + 8 : offset + 12] = bytes((17 + vertex_index, 33 + vertex_index, 49 + vertex_index, alpha))
+            fixture[offset + 12 : offset + BB4240X_FINAL_GEOMETRY_NORMAL_VERTEX_STRIDE] = bytes(
+                ((vertex_index * 29) + byte_index) & 0xFF
+                for byte_index in range(BB4240X_FINAL_GEOMETRY_NORMAL_VERTEX_STRIDE - 12)
+            )
+        original = bytes(fixture)
+        rebuilt, receipt = _apply_bb4240x_final_geometry_normals(
+            original,
+            list(face_indices),
+            fvf=fvf,
+            vertex_stride=BB4240X_FINAL_GEOMETRY_NORMAL_VERTEX_STRIDE,
+            source_vertex_indices=list(source_ids),
+        )
+        if receipt.get("status") != "APPLIED" or receipt.get("source_vertex_bucket_count") != 4:
+            failures.append(f"0x{fvf:08X} final normal rule did not apply to the seam fixture")
+        if receipt.get("updated_vertex_count", 0) <= 0:
+            failures.append(f"0x{fvf:08X} final normal rule did not change the fixture normals")
+        for byte_index, (before, after) in enumerate(zip(original, rebuilt)):
+            local_offset = byte_index % BB4240X_FINAL_GEOMETRY_NORMAL_VERTEX_STRIDE
+            if before != after and local_offset not in {8, 9, 10}:
+                failures.append(f"0x{fvf:08X} final normal rule modified byte lane {local_offset}")
+                break
+        alphas = [
+            rebuilt[(vertex_index * BB4240X_FINAL_GEOMETRY_NORMAL_VERTEX_STRIDE) + 11]
+            for vertex_index in range(len(positions))
+        ]
+        if alphas != [alpha] * len(positions):
+            failures.append(f"0x{fvf:08X} final normal rule modified byte 11")
+        rows = [
+            rebuilt[(vertex_index * BB4240X_FINAL_GEOMETRY_NORMAL_VERTEX_STRIDE) + 8 : (vertex_index * BB4240X_FINAL_GEOMETRY_NORMAL_VERTEX_STRIDE) + 11]
+            for vertex_index in range(len(positions))
+        ]
+        if rows[0] != rows[3] or rows[2] != rows[4]:
+            failures.append(f"0x{fvf:08X} split source rows did not share a reconstructed normal")
+        rgb_by_fvf[f"0x{fvf:08X}"] = rows
+
+    invalid_source = bytes(BB4240X_FINAL_GEOMETRY_NORMAL_VERTEX_STRIDE * 3)
+    unchanged, skipped = _apply_bb4240x_final_geometry_normals(
+        invalid_source,
+        [0, 1, 2],
+        fvf=0xBB424024,
+        vertex_stride=BB4240X_FINAL_GEOMETRY_NORMAL_VERTEX_STRIDE,
+        source_vertex_indices=[0, 1],
+    )
+    if unchanged != invalid_source or skipped.get("status") != "SKIPPED":
+        failures.append("BB4240x malformed source-index handoff did not preserve source normal bytes")
+    if rgb_by_fvf.get("0xBB424024") != rgb_by_fvf.get("0xBB424025"):
+        failures.append("BB424024 and BB424025 final RGB formulas diverged")
+    if failures:
+        raise RuntimeError("BB4240x final normal regression failed: " + "; ".join(failures))
+    return {
+        "status": "PASS",
+        "enabled_fvfs": [f"0x{fvf:08X}" for fvf in sorted(BB4240X_FINAL_GEOMETRY_NORMAL_FVFS)],
+        "formula": "final_quantized_short_position_area_weighted_source_vertex",
+        "rgb_only": True,
+        "malformed_handoff_is_non_blocking": True,
+    }
 
 
 def _build_mod_rewrite_layout(mod_file: dict[str, Any], job: dict[str, Any], contract: dict[str, Any]) -> dict[str, Any]:
@@ -20331,6 +20634,7 @@ def _build_mod_rewrite_layout(mod_file: dict[str, Any], job: dict[str, Any], con
             "header_override_commands": header_command_details,
             "modify_header_changes": modify_header_changes,
             "modified_mesh_slots": [],
+            "bb4240x_final_geometry_normals": [],
             "auto_header_only_meshes": _collect_source_preservation_rows(
                 source_mesh_headers, contract_meshes, flag="auto_header_only"
             ),
@@ -20370,6 +20674,7 @@ def _build_mod_rewrite_layout(mod_file: dict[str, Any], job: dict[str, Any], con
     source_to_output_slot: dict[int, int] = {}
     output_records: list[dict[str, Any]] = []
     appended_source_missing_meshes: list[dict[str, Any]] = []
+    bb4240x_final_geometry_normal_receipts: list[dict[str, Any]] = []
     vertex_offset = 0
 
     for source_slot, source_mesh_header in enumerate(source_mesh_headers, start=1):
@@ -20543,6 +20848,13 @@ def _build_mod_rewrite_layout(mod_file: dict[str, Any], job: dict[str, Any], con
                 "face_bytes": bytes(face_bytes),
                 "face_indices": list(face_indices),
                 "mesh_is_modified": mesh_is_modified,
+                "source_vertex_indices": (
+                    list(contract_mesh.get("source_vertex_indices", []))
+                    if isinstance(contract_mesh, dict)
+                    and isinstance(contract_mesh.get("source_vertex_indices"), list)
+                    else []
+                ),
+                "scene_node": str((contract_mesh or {}).get("scene_node", "") or ""),
                 "requested_display_slot": _source_record_requested_display_slot(contract_mesh),
                 "vertex_end_offset": vertex_offset + len(vertex_bytes),
             }
@@ -20581,6 +20893,36 @@ def _build_mod_rewrite_layout(mod_file: dict[str, Any], job: dict[str, Any], con
 
     if delete_slots and len(output_records) < 1:
         raise ValueError("Delete Selected aborted. At least one mesh record must remain in the output .mod.")
+
+    # This is intentionally after semantic packing (including WORLD OBJECT
+    # remap and Top4 Skin serialization), but before optional physical-slot
+    # splitting.  It consumes the exact short positions and triangle stream
+    # that will be emitted, and can only replace normal RGB bytes.
+    for record in output_records:
+        if record.get("mesh_is_modified") is not True:
+            continue
+        output_mesh_header = record.get("output_mesh_header")
+        if not isinstance(output_mesh_header, dict):
+            continue
+        fvf = _parse_fvf_int(output_mesh_header.get("fvf_info"))
+        if fvf not in BB4240X_FINAL_GEOMETRY_NORMAL_FVFS:
+            continue
+        record_face_indices = record.get("face_indices")
+        final_vertex_bytes, receipt = _apply_bb4240x_final_geometry_normals(
+            bytes(record.get("vertex_bytes", b"")),
+            list(record_face_indices) if isinstance(record_face_indices, list) else [],
+            fvf=fvf,
+            vertex_stride=_int_or_default(output_mesh_header.get("vert_stride"), 0),
+            source_vertex_indices=record.get("source_vertex_indices"),
+        )
+        record["vertex_bytes"] = final_vertex_bytes
+        receipt.update(
+            {
+                "mesh_slot": _int_or_default(record.get("source_slot"), 0),
+                "scene_node": str(record.get("scene_node", "") or ""),
+            }
+        )
+        bb4240x_final_geometry_normal_receipts.append(receipt)
 
     output_records, auto_split_meshes = _expand_oversized_modified_mesh_records(
         output_records,
@@ -20810,6 +21152,7 @@ def _build_mod_rewrite_layout(mod_file: dict[str, Any], job: dict[str, Any], con
         "header_override_commands": header_command_details,
         "modify_header_changes": modify_header_changes,
         "modified_mesh_slots": modified_mesh_slots,
+        "bb4240x_final_geometry_normals": bb4240x_final_geometry_normal_receipts,
         "uint16_vertex_group_restart_slots": uint16_vertex_group_restart_slots,
         "auto_split_meshes": auto_split_meshes,
         "auto_split_cdxm_display_map": auto_split_cdxm_display_map,
@@ -20943,6 +21286,7 @@ def _build_bone_edit_passthrough_layout(mod_file: dict[str, Any]) -> dict[str, A
         "modified_mesh_slots": [],
         "modify_header_changes": [],
         "auto_header_only_meshes": [],
+        "bb4240x_final_geometry_normals": [],
         "source_fallback_meshes": [],
         "auto_split_meshes": [],
         "auto_split_cdxm_display_map": [],
@@ -21341,6 +21685,7 @@ def _write_output_mod_with_bone_edit(
             "header_override_slots": mesh_layout["header_override_slots"],
             "header_override_commands": mesh_layout.get("header_override_commands", []),
             "modified_mesh_slots": mesh_layout["modified_mesh_slots"],
+            "bb4240x_final_geometry_normals": mesh_layout.get("bb4240x_final_geometry_normals", []),
             "modify_header_changes": mesh_layout.get("modify_header_changes", []),
             "auto_header_only_meshes": mesh_layout.get("auto_header_only_meshes", []),
             "source_fallback_meshes": mesh_layout.get("source_fallback_meshes", []),
@@ -21461,6 +21806,7 @@ def _write_output_mod_unlocked(
                 "header_override_slots": rewritten_layout["header_override_slots"],
                 "header_override_commands": rewritten_layout.get("header_override_commands", []),
                 "modified_mesh_slots": rewritten_layout["modified_mesh_slots"],
+                "bb4240x_final_geometry_normals": rewritten_layout.get("bb4240x_final_geometry_normals", []),
                 "modify_header_changes": rewritten_layout.get("modify_header_changes", []),
                 "auto_header_only_meshes": rewritten_layout.get("auto_header_only_meshes", []),
                 "source_fallback_meshes": rewritten_layout.get("source_fallback_meshes", []),
@@ -24621,6 +24967,21 @@ def _memory_export_probe_log(fbx_handoff: Any) -> dict[str, Any]:
     summary = handoff.get("summary") if isinstance(handoff.get("summary"), dict) else {}
     stats = summary.get("stats") if isinstance(summary.get("stats"), dict) else {}
     compare = handoff.get("compare") if isinstance(handoff.get("compare"), dict) else {}
+    normal_fidelity_rows = [
+        dict(row)
+        for row in handoff.get("normal_fidelity", [])
+        if isinstance(row, dict)
+    ]
+    if not normal_fidelity_rows:
+        normal_fidelity_rows = [
+            {
+                **dict(mesh.get("normal_fidelity", {})),
+                "node_name": str(mesh.get("node_name", "") or ""),
+                "mesh_name": str(mesh.get("mesh_name", "") or ""),
+            }
+            for mesh in handoff.get("contract_meshes", [])
+            if isinstance(mesh, dict) and isinstance(mesh.get("normal_fidelity"), dict)
+        ]
     return {
         "status": str(handoff.get("status", "not_required") or "not_required"),
         "fbx_path": str(handoff.get("fbx_path", "") or ""),
@@ -24635,6 +24996,13 @@ def _memory_export_probe_log(fbx_handoff: Any) -> dict[str, Any]:
         "contract_mesh_count": len(handoff.get("contract_meshes", []))
         if isinstance(handoff.get("contract_meshes"), list)
         else 0,
+        "normal_fidelity": normal_fidelity_rows,
+        "normal_fidelity_exact_count": sum(
+            1 for row in normal_fidelity_rows if str(row.get("status", "") or "") == "exact"
+        ),
+        "normal_fidelity_fallback_count": sum(
+            1 for row in normal_fidelity_rows if str(row.get("status", "") or "") == "fallback"
+        ),
         "error": str(handoff.get("error", "") or ""),
     }
 
@@ -24754,6 +25122,9 @@ def _build_memory_export_txt(
     route_rows = route.get("bucket_rows") if isinstance(route.get("bucket_rows"), list) else request.get("bucket_rows", [])
     route_rows = [row for row in route_rows if isinstance(row, dict)]
     probe = payload.get("fbx_probe_log") if isinstance(payload.get("fbx_probe_log"), dict) else {}
+    normal_fidelity_rows = [
+        row for row in probe.get("normal_fidelity", []) if isinstance(row, dict)
+    ]
     topology_reconciliation = (
         payload.get("fbx_topology_reconciliation")
         if isinstance(payload.get("fbx_topology_reconciliation"), dict)
@@ -24803,6 +25174,9 @@ def _build_memory_export_txt(
     ]
     appended_source_missing_rows = [
         row for row in operations.get("appended_source_missing_meshes", []) if isinstance(row, dict)
+    ]
+    bb4240x_final_normal_rows = [
+        row for row in operations.get("bb4240x_final_geometry_normals", []) if isinstance(row, dict)
     ]
     verify = payload.get("verify") if isinstance(payload.get("verify"), dict) else {}
     timing_payload = _normalize_timing_payload(payload.get("timing")) or {}
@@ -24931,6 +25305,8 @@ def _build_memory_export_txt(
             f"NODE_COUNT={_int_or_default(probe.get('node_count'), 0)}",
             f"SKIN_CLUSTER_COUNT={_int_or_default(probe.get('skin_cluster_count'), 0)}",
             f"CONTRACT_MESH_COUNT={_int_or_default(probe.get('contract_mesh_count'), 0)}",
+            f"NORMAL_FIDELITY_EXACT_COUNT={_int_or_default(probe.get('normal_fidelity_exact_count'), 0)}",
+            f"NORMAL_FIDELITY_FALLBACK_COUNT={_int_or_default(probe.get('normal_fidelity_fallback_count'), 0)}",
             f"MATCHED_MESH_COUNT={_int_or_default(probe.get('matched_mesh_count'), 0)}",
             f"UNMATCHED_FBX_COUNT={_int_or_default(probe.get('unmatched_fbx_count'), 0)}",
             f"UNMATCHED_MAX_COUNT={_int_or_default(probe.get('unmatched_max_count'), 0)}",
@@ -24942,6 +25318,25 @@ def _build_memory_export_txt(
             f"CONSISTENCY={_export_log_scalar(axes.get('status'))}",
         )
     )
+    lines.extend(("", "[FBX_NORMAL_FIDELITY]"))
+    for index, row in enumerate(normal_fidelity_rows, start=1):
+        lines.append(
+            f"MESH_{index:03d}=status:{_export_log_scalar(row.get('status'))}; "
+            f"mode:{_export_log_scalar(row.get('mode'))}; "
+            f"name:{_export_log_scalar(row.get('node_name') or row.get('mesh_name'))}; "
+            f"geometry:{_export_log_scalar(row.get('geometry_name'))}; "
+            f"mapping:{_export_log_scalar(row.get('normal_mapping'))}; "
+            f"reference:{_export_log_scalar(row.get('normal_reference'))}; "
+            f"input_positions:{_int_or_default(row.get('input_position_count'), 0)}; "
+            f"input_corners:{_int_or_default(row.get('input_corner_count'), 0)}; "
+            f"normal_values:{_int_or_default(row.get('normal_value_count'), 0)}; "
+            f"normal_indices:{_int_or_default(row.get('normal_index_count'), 0)}; "
+            f"output_vertices:{_int_or_default(row.get('output_vertex_count'), 0)}; "
+            f"output_corners:{_int_or_default(row.get('output_corner_count'), 0)}; "
+            f"normal_space:{_export_log_scalar(row.get('normal_space'))}; "
+            f"position_mode:{_export_log_scalar(row.get('position_mode'))}; "
+            f"reason:{_export_log_scalar(row.get('reason'))}"
+        )
     for index, row in enumerate(topology_rows, start=1):
         lines.append(
             f"TOPOLOGY_{index:03d}=handle:{_int_or_default(row.get('scene_node_handle'), 0)}; "
@@ -24993,6 +25388,7 @@ def _build_memory_export_txt(
             f"HEADER_OVERRIDE_SLOTS={_export_log_int_list(operations.get('header_override_slots'))}",
             f"FORCED_LOD0_SLOTS={_export_log_int_list(operations.get('forced_lod0_slots'))}",
             f"MODIFIED_SLOTS={_export_log_int_list(operations.get('modified_mesh_slots'))}",
+            f"BB4240X_FINAL_NORMAL_COUNT={len(bb4240x_final_normal_rows)}",
             f"UNSKINNED_MESH_EDIT_EXPORT_ENABLED={_export_log_scalar(unskinned_edit_receipt.get('enabled', False))}",
             f"UNSKINNED_MESH_EDIT_EXPORT_STAGED={_int_or_default(unskinned_edit_receipt.get('staged_mesh_count'), 0)}",
             f"UNSKINNED_MESH_EDIT_EXPORT_FALLBACK={_int_or_default(unskinned_edit_receipt.get('fallback_mesh_count'), 0)}",
@@ -25024,6 +25420,18 @@ def _build_memory_export_txt(
                 for row in appended_source_missing_rows
             ),
             f"AUTO_SPLIT_COUNT={len(operations.get('auto_split_meshes', [])) if isinstance(operations.get('auto_split_meshes'), list) else 0}",
+            *(
+                f"BB4240X_FINAL_NORMAL_{index:03d}=slot:{_int_or_default(row.get('mesh_slot'), 0)}; "
+                f"fvf:{_export_log_scalar(row.get('fvf'))}; status:{_export_log_scalar(row.get('status'))}; "
+                f"vertices:{_int_or_default(row.get('vertex_count'), 0)}; "
+                f"triangles:{_int_or_default(row.get('triangle_count'), 0)}; "
+                f"source_buckets:{_int_or_default(row.get('source_vertex_bucket_count'), 0)}; "
+                f"updated:{_int_or_default(row.get('updated_vertex_count'), 0)}; "
+                f"fallback:{_int_or_default(row.get('fallback_normal_count'), 0)}; "
+                f"reason:{_export_log_scalar(row.get('reason'))}; "
+                f"name:{_export_log_scalar(row.get('scene_node'))}"
+                for index, row in enumerate(bb4240x_final_normal_rows, start=1)
+            ),
             "",
             "[VERIFY]",
             f"STATUS={_export_log_scalar(payload.get('verify_status') or verify.get('status'))}",
@@ -30572,6 +30980,7 @@ if bool(globals().get("__codex_trusted_runtime_fast_load__", False)):
         "LEGACY_COMPACTED_RECOVERY_REGRESSION_STATUS",
         "SOURCE_SKIN_TRUTH_REGRESSION_STATUS",
         "SEMANTIC_WRITER_LAYOUT_REGRESSION_STATUS",
+        "BB4240X_FINAL_GEOMETRY_NORMAL_REGRESSION_STATUS",
         "ORDINARY_SKIN_ROUND_TRIP_REGRESSION_STATUS",
         "NON_BONE_EDIT_SKELETON_PRESERVATION_REGRESSION_STATUS",
         "REAL_PL0600_SKIN_REGRESSION_STATUS",
@@ -30616,6 +31025,7 @@ else:
         LEGACY_COMPACTED_RECOVERY_REGRESSION_STATUS = _run_legacy_compacted_recovery_regression_guard()
         SOURCE_SKIN_TRUTH_REGRESSION_STATUS = _run_source_skin_truth_regression_guard()
         SEMANTIC_WRITER_LAYOUT_REGRESSION_STATUS = _run_semantic_writer_layout_regression_guard()
+        BB4240X_FINAL_GEOMETRY_NORMAL_REGRESSION_STATUS = _run_bb4240x_final_geometry_normal_regression_guard()
         ORDINARY_SKIN_ROUND_TRIP_REGRESSION_STATUS = _run_ordinary_skin_round_trip_regression_guard()
         NON_BONE_EDIT_SKELETON_PRESERVATION_REGRESSION_STATUS = (
             _run_non_bone_edit_skeleton_preservation_regression_guard()
