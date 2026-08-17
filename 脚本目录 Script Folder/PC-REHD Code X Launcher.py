@@ -1337,7 +1337,7 @@ GITHUB_SOURCE_UPDATE_CHECK_ENABLED = True
 GITHUB_SOURCE_UPDATE_TITLE_CLICK_SURFACE_ENABLED = False
 LAUNCHER_WINDOW_TITLE = "CAPCOM MT FRAMEWORK Script v0.1.2.8 Codex Python"
 GITHUB_SOURCE_UPDATE_TITLE_CN = "发现Github 源码更新，点击此处打开Release 网页！"
-GITHUB_SOURCE_UPDATE_TITLE_EN = "GitHub Source Update Available"
+GITHUB_SOURCE_UPDATE_TITLE_EN = "GitHub Source Code Update Available. Click here to visit the Release page!"
 GITHUB_REPOSITORY_API_URL = (
     "https://api.github.com/repos/Criticise/"
     "PC-REHD-1.2.8-Scrpit-rewritten-in-Python-by-Code-X-GPT-5.6/"
