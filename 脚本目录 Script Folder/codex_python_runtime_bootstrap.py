@@ -210,7 +210,7 @@ PATCHED_UFBX_CONTRACT_FBX_SHA256 = "c7ee247dae12285f2a9ef99846b7c5a848602baac6a2
 PATCHED_UFBX_CONTRACT_BASELINE_SHA256 = "79b2d84a8fa916bd7371cf015078b915aeddf15ea034afdf943a607efc0aeecb"
 PATCHED_UFBX_APPROVED_SOURCE_FINGERPRINT = "tree-sha256:72eecc89c8a758e1ba816d92830bfaed37f754bc094c4963a9f25b3e5f063c01:18"
 MIN_DELETE_SELECTED_STABLE_SLOT_CONTRACT_REVISION = 2
-REQUIRED_RE6_MOD_IMPORT_FBX_CONTRACT_REVISION = 11
+REQUIRED_RE6_MOD_IMPORT_FBX_CONTRACT_REVISION = 12
 EXPORT_BRIDGE_REQUIRED_REGRESSION_STATUSES = (
     "OUTPUT_PATH_MUTEX_REGRESSION_STATUS",
     "SOURCE_ORDERED_SKIN_SELECTION_REGRESSION_STATUS",
@@ -230,6 +230,9 @@ EXPORT_BRIDGE_REQUIRED_REGRESSION_STATUSES = (
     "UINT16_VERTEX_GROUP_ROLLOVER_REGRESSION_STATUS",
     "PYMXS_GEOMETRY_BOUNDARY_REGRESSION_STATUS",
     "MEMORY_SCENE_CONTRACT_REGRESSION_STATUS",
+)
+EXPORT_BRIDGE_OPTIONAL_FIXTURE_REGRESSION_STATUSES = frozenset(
+    {"REAL_PL0600_SKIN_REGRESSION_STATUS"}
 )
 LOCAL_PILLOW_BUNDLE_DIR = FIXED_VENDOR_ROOT_DIR / "pillow_re6_v4"
 UPGRADE_PILLOW_BUNDLE_DIR = UPGRADE_VENDOR_ROOT_DIR / "pillow_re6_v4"
@@ -3514,22 +3517,26 @@ def _run_clean_export_bridge_contract_probe(
             "    bridge = load_exact('codex_python_export_bridge', writer_path)",
             "    import_module = load_exact('codex_re6_mod_import_fbx', import_path)",
             "    import codex_re6_scene_compatibility as compatibility",
+            "    writer_suite = bridge.run_writer_maintenance_regression_suite()",
+            "    import_suite = import_module.run_import_maintenance_regression_suite()",
             "    statuses = {name: getattr(bridge, name, None) for name in required_status_names}",
-            "    statuses_ready = all(isinstance(value, dict) and value.get('status') == 'PASS' for value in statuses.values())",
+            f"    optional_fixture_statuses = {EXPORT_BRIDGE_OPTIONAL_FIXTURE_REGRESSION_STATUSES!r}",
+            "    status_warnings = [name + ':' + str(value.get('status')) for name, value in statuses.items() if isinstance(value, dict) and value.get('status') == 'SKIP' and name in optional_fixture_statuses]",
+            "    statuses_ready = all(isinstance(value, dict) and (value.get('status') == 'PASS' or (value.get('status') == 'SKIP' and name in optional_fixture_statuses)) for name, value in statuses.items())",
             "    revision = int(getattr(bridge, 'DELETE_SELECTED_STABLE_SLOT_CONTRACT_REVISION', 0) or 0)",
             "    writer_entry_ready = callable(getattr(bridge, 'run_memory_export', None))",
             "    maintenance_error = getattr(bridge, 'WRITER_MAINTENANCE_GATE_ERROR', None)",
             "    import_revision = int(getattr(import_module, 'IMPORT_MODULE_CONTRACT_REVISION', 0) or 0)",
-            "    import_status = getattr(import_module, 'IMPORT_MODULE_REGRESSION_STATUS', None)",
+            "    import_status = import_suite",
             "    import_route_ready = callable(getattr(import_module, 'build_normal_route_table', None)) and callable(getattr(import_module, '_build_fbx_roots', None))",
             "    compatibility_ready = Path(str(getattr(compatibility, '__file__', '') or '')).resolve() == compatibility_path and callable(getattr(compatibility, 'describe_import_skin_compatibility', None)) and callable(getattr(compatibility, 'apply_export_compatibility_contract', None))",
             f"    import_ready = import_revision == {REQUIRED_RE6_MOD_IMPORT_FBX_CONTRACT_REVISION!r} and isinstance(import_status, dict) and import_status.get('status') == 'PASS' and import_route_ready",
             "    writer_origin = Path(str(getattr(bridge, '__file__', '') or '')).resolve()",
             "    import_origin = Path(str(getattr(import_module, '__file__', '') or '')).resolve()",
             "    bootstrap_origin = Path(str(getattr(bootstrap, '__file__', '') or '')).resolve()",
-            "    writer_ready = statuses_ready and writer_entry_ready and maintenance_error is None and revision >= 2 and writer_origin == writer_path",
+            "    writer_ready = isinstance(writer_suite, dict) and writer_suite.get('status') == 'PASS' and statuses_ready and writer_entry_ready and maintenance_error is None and revision >= 2 and writer_origin == writer_path",
             "    ready = writer_ready and import_ready and compatibility_ready and import_origin == import_path and bootstrap_origin == bootstrap_path",
-            f"    payload.update({{'ready': ready, 'revision': revision, 'writer_entry_ready': writer_entry_ready, 'writer_ready': writer_ready, 'regression_statuses': statuses, 'maintenance_error': '' if maintenance_error is None else repr(maintenance_error), 'writer_origin': str(writer_origin), 'import_revision': import_revision, 'required_import_revision': {REQUIRED_RE6_MOD_IMPORT_FBX_CONTRACT_REVISION!r}, 'import_regression_status': import_status, 'import_origin': str(import_origin), 'import_route_ready': import_route_ready, 'import_ready': import_ready, 'bootstrap_origin': str(bootstrap_origin), 'error_type': '' if ready else 'PythonWriterImporterContractRejected', 'error': '' if ready else 'Python writer/importer executable contract rejected; writer_ready=' + str(writer_ready) + '; import_ready=' + str(import_ready), 'traceback': ''}})",
+            f"    payload.update({{'ready': ready, 'revision': revision, 'writer_entry_ready': writer_entry_ready, 'writer_ready': writer_ready, 'writer_maintenance_suite': writer_suite, 'regression_statuses': statuses, 'maintenance_warnings': status_warnings, 'maintenance_error': '' if maintenance_error is None else repr(maintenance_error), 'writer_origin': str(writer_origin), 'import_revision': import_revision, 'required_import_revision': {REQUIRED_RE6_MOD_IMPORT_FBX_CONTRACT_REVISION!r}, 'import_maintenance_suite': import_suite, 'import_regression_status': import_status, 'import_origin': str(import_origin), 'import_route_ready': import_route_ready, 'import_ready': import_ready, 'bootstrap_origin': str(bootstrap_origin), 'error_type': '' if ready else 'PythonWriterImporterContractRejected', 'error': '' if ready else 'Python writer/importer executable contract rejected; writer_ready=' + str(writer_ready) + '; import_ready=' + str(import_ready), 'traceback': ''}})",
             "except BaseException as exc:",
             "    payload.update({'error_type': type(exc).__name__, 'error': str(exc), 'traceback': traceback.format_exc()})",
             "print(json.dumps(payload, ensure_ascii=False))",
@@ -3716,15 +3723,35 @@ def get_export_bridge_contract_report() -> dict[str, object]:
         import_spec.loader.exec_module(import_module)
         compatibility_module = sys.modules.get("codex_re6_scene_compatibility")
 
+        writer_suite_runner = getattr(module, "run_writer_maintenance_regression_suite", None)
+        if not callable(writer_suite_runner):
+            raise RuntimeError("Writer strict maintenance regression entry is missing")
+        writer_maintenance_suite = writer_suite_runner()
+        import_suite_runner = getattr(import_module, "run_import_maintenance_regression_suite", None)
+        if not callable(import_suite_runner):
+            raise RuntimeError("Importer strict maintenance regression entry is missing")
+        import_maintenance_suite = import_suite_runner()
+
         actual_revision = int(
             getattr(module, "DELETE_SELECTED_STABLE_SLOT_CONTRACT_REVISION", 0) or 0
         )
         status_report: dict[str, object] = {}
+        maintenance_warnings: list[str] = []
         statuses_ready = True
         for status_name in EXPORT_BRIDGE_REQUIRED_REGRESSION_STATUSES:
             status_value = getattr(module, status_name, None)
             status_report[status_name] = status_value
-            if not isinstance(status_value, dict) or status_value.get("status") != "PASS":
+            status_text = (
+                str(status_value.get("status", "") or "").upper()
+                if isinstance(status_value, dict)
+                else ""
+            )
+            if (
+                status_text == "SKIP"
+                and status_name in EXPORT_BRIDGE_OPTIONAL_FIXTURE_REGRESSION_STATUSES
+            ):
+                maintenance_warnings.append(f"{status_name}:SKIP")
+            elif status_text != "PASS":
                 statuses_ready = False
 
         writer_entry_ready = callable(getattr(module, "run_memory_export", None))
@@ -3732,7 +3759,7 @@ def get_export_bridge_contract_report() -> dict[str, object]:
         imported_origin = Path(str(getattr(module, "__file__", "") or "")).resolve()
         origin_ready = imported_origin == bridge_path.resolve()
         import_revision = int(getattr(import_module, "IMPORT_MODULE_CONTRACT_REVISION", 0) or 0)
-        import_regression_status = getattr(import_module, "IMPORT_MODULE_REGRESSION_STATUS", None)
+        import_regression_status = import_maintenance_suite
         import_origin = Path(str(getattr(import_module, "__file__", "") or "")).resolve()
         compatibility_origin = Path(
             str(getattr(compatibility_module, "__file__", "") or "")
@@ -3759,6 +3786,8 @@ def get_export_bridge_contract_report() -> dict[str, object]:
         writer_ready = (
             actual_revision >= MIN_DELETE_SELECTED_STABLE_SLOT_CONTRACT_REVISION
             and writer_entry_ready
+            and isinstance(writer_maintenance_suite, dict)
+            and writer_maintenance_suite.get("status") == "PASS"
             and statuses_ready
             and maintenance_error is None
             and origin_ready
@@ -3770,7 +3799,9 @@ def get_export_bridge_contract_report() -> dict[str, object]:
                 "delete_selected_stable_slot_contract_revision": actual_revision,
                 "writer_entry_ready": writer_entry_ready,
                 "writer_ready": writer_ready,
+                "writer_maintenance_suite": writer_maintenance_suite,
                 "regression_statuses": status_report,
+                "maintenance_warnings": maintenance_warnings,
                 "maintenance_error": (
                     "" if maintenance_error is None else repr(maintenance_error)
                 ),
@@ -3784,6 +3815,7 @@ def get_export_bridge_contract_report() -> dict[str, object]:
                     REQUIRED_RE6_MOD_IMPORT_FBX_CONTRACT_REVISION
                 ),
                 "re6_mod_import_fbx_regression_status": import_regression_status,
+                "import_maintenance_suite": import_maintenance_suite,
                 "re6_mod_import_fbx_origin": str(import_origin),
                 "re6_mod_import_fbx_route_ready": import_route_ready,
                 "re6_mod_import_fbx_ready": import_ready,

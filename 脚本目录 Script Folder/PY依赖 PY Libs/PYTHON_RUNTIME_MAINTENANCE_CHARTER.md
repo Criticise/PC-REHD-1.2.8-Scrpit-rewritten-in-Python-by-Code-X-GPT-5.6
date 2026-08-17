@@ -338,6 +338,50 @@ Performance rule:
 - if `log_mode` and non-log export are now roughly equal, the old “logging tax” was reduced successfully
 - the next real speed win must come from the main bridge/write/verify pipeline, not from JSON dependency swaps alone
 
+## AI Import/Export Consistency Gate
+
+Every AI maintenance change that renames, removes, moves, or changes the
+signature or semantics of a function must update all consumers in the same
+change. A definition-only edit is incomplete. Search the complete shipped tree,
+including Launcher, Bootstrap, Importer, Writer, Probe, `_vendor_fixed`,
+`_vendor_upgrade`, the active `_vendor_py/cpXXX` lane, and accelerator source or
+build copies. In particular, every `probe._private_api` call must resolve to a
+live definition in `codex_fbx_probe.py`.
+
+Run these explicit maintenance gates after any Importer, Writer, Probe,
+accelerator, contract-version, logging, or transport edit:
+
+```text
+python "PC-REHD Code X Launcher.py" --bug-control-scan
+python codex_python_runtime_bootstrap.py --accelerator-sync-check --json
+python "PC-REHD Code X Launcher.py" --writer-transport-smoke
+```
+
+The Launcher gate owns separate export and import reports. It must execute the
+strict Writer and Importer regression suites, clean-child source imports,
+contract-revision comparison, operation-stage coverage, and accelerator private
+API consumer resolution. Missing external fixtures remain explicit `SKIP`
+warnings; they are never rewritten as `PASS`. An installed but unapproved
+fixture remains a strict maintenance failure.
+
+Strict maintenance is AI-only. Normal module loading publishes `DEFERRED` (or a
+trusted fast-load receipt) and must not run a full regression suite. User
+Import, Export, GUI startup, and worker preload must never call or gate on the
+strict suites, source fingerprint inventories, policy smoke, or the BUG control
+scan. A maintenance failure may guide the AI, but it must not stop, delay, or
+disable an otherwise valid user operation.
+
+Runtime fault capture is Launcher-owned and in-memory. It may add or replace the
+Launcher BUG control section only inside the operation's existing
+`export_pid...txt` or `import_pid...txt`. Do not create a separate BUG control
+Python program, JSON report, second TXT report, or `REPORT_PATH` field. Keep the
+complete stage history, diagnosis, recovery, fingerprint, evidence, and
+traceback in that one primary TXT.
+
+After the gates pass, refresh every AI-maintained module SHA and protected
+function fingerprint affected by the edit. Those values are maintenance
+evidence only and must never become user runtime authority.
+
 ## Non-Negotiable Rules
 
 - No network dependency for an already healthy runtime

@@ -496,6 +496,22 @@ def _encode_re6_normal_key_from_fbx_corner(normal: Any) -> tuple[int, int, int]:
     return tuple(max(0, min(255, int((axis * 127.0) + 127.0))) for axis in game_normal)
 
 
+def _encode_re6_normal_key_from_fbx_local(normal: Any, node_to_world: Any) -> tuple[int, int, int]:
+    """Return the legacy/UFBX writer key after applying the Mesh node transform.
+
+    AI MAINTENANCE GATE: this compatibility API is consumed by the pure-Python
+    fallback and every ``codex_fbx_probe_accel`` bundle.  Keep it synchronized
+    with those callers when changing FBX normal-space handling.  The strict raw
+    polygon-corner path intentionally uses
+    ``_encode_re6_normal_key_from_fbx_corner()`` instead.
+    """
+    max_normal = _fbx_world_to_max_normal(
+        _transform_normal_row_major(normal, node_to_world)
+    )
+    game_normal = _max_normal_to_re6_game_normal(max_normal)
+    return tuple(max(0, min(255, int((axis * 127.0) + 127.0))) for axis in game_normal)
+
+
 def _max_import_matrix_from_fbx_matrix(matrix: Any) -> list[float] | None:
     prepared_transform = _prepare_row_major_transform(matrix)
     if len(prepared_transform.flat) < 16:

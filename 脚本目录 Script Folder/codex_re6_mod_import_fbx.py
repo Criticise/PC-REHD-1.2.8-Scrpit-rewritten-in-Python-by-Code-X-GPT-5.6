@@ -2385,6 +2385,7 @@ def build_import_scene(
     fix_processing_mode: str = FIX_PROCESSING_MODE_CODEX,
     reserved_scene_names: Iterable[str] | None = None,
     blender_compact_mesh_names: bool = False,
+    bug_control: Any | None = None,
 ) -> dict[str, Any]:
     """Parse one MOD into the common route/manifest scene model.
 
@@ -2392,6 +2393,8 @@ def build_import_scene(
     half-populated scene model.  It differs from legacy V4's direct scene
     creation, which could leave bounds/bones or partial Meshes after a failure.
     """
+    if bug_control is not None:
+        bug_control.advance("source_parse")
     if blender_compact_mesh_names:
         raise ValueError(
             "Blender compact Mesh names are retired; use complete RE6 Mesh Header names"
@@ -2585,6 +2588,7 @@ def build_blender_scene_data(
     texture_mode: str = "dds",
     texture_roots: Iterable[str | Path] = (),
     decode_directory: str | Path | None = None,
+    bug_control: Any | None = None,
 ) -> dict[str, Any]:
     """Build the direct MOD-to-Blender Scene Data contract.
 
@@ -2606,6 +2610,7 @@ def build_blender_scene_data(
         fix_processing_mode=fix_processing_mode,
         reserved_scene_names=reserved_scene_names,
         blender_compact_mesh_names=bool(blender_compact_mesh_names),
+        bug_control=bug_control,
     )
     meshes: list[dict[str, Any]] = []
     for raw_mesh in scene.get("meshes", []):
@@ -2627,6 +2632,8 @@ def build_blender_scene_data(
         "error": "",
     }
     if mrl_path:
+        if bug_control is not None:
+            bug_control.advance("texture_plan")
         try:
             normalized_mode = _normalize_mrl_texture_source_mode(texture_mode)
             if normalized_mode == "tex" and decode_directory is None:
@@ -4152,8 +4159,11 @@ def write_import_fbx(
     route_file_name: str = "",
     mrl_bindings: dict[int, dict[str, Any]] | None = None,
     normal_profile: str = FBX_NORMAL_PROFILE_MAX,
+    bug_control: Any | None = None,
 ) -> Path:
     """Write an FBX 7.4 scene with Max or Blender-safe explicit normals."""
+    if bug_control is not None:
+        bug_control.advance("fbx_build")
     target = _windows_lexical_full_path(output_path)
     roots = _build_fbx_roots(
         scene,
@@ -4269,7 +4279,7 @@ def _normal_route_identity_payload(route: dict[str, Any]) -> dict[str, Any]:
     return identity
 
 
-def build_import_artifacts(
+def _build_import_artifacts_impl(
     mod_path: str | Path,
     output_fbx: str | Path,
     *,
@@ -4285,6 +4295,7 @@ def build_import_artifacts(
     texture_mode: str = "dds",
     texture_roots: Iterable[str | Path] = (),
     pretty_json: bool = False,
+    bug_control: Any | None = None,
 ) -> dict[str, Any]:
     """Atomically build the FBX, mandatory normal route and full manifest."""
     output = _windows_lexical_full_path(output_fbx)
@@ -4299,11 +4310,14 @@ def build_import_artifacts(
         fix_processing_mode=fix_processing_mode,
         reserved_scene_names=reserved_scene_names,
         blender_compact_mesh_names=bool(blender_compact_mesh_names),
+        bug_control=bug_control,
     )
     mrl_texture_plan: dict[str, Any] | None = None
     mrl_bindings: dict[int, dict[str, Any]] | None = None
     decode_workspace: tempfile.TemporaryDirectory[str] | None = None
     if mrl_path is not None:
+        if bug_control is not None:
+            bug_control.advance("texture_plan")
         # Keep transient TEX-to-DDS media beside the generated FBX.  Launcher
         # supplies its active log directory as output.parent, never %TEMP%.
         decode_workspace = tempfile.TemporaryDirectory(
@@ -4332,6 +4346,8 @@ def build_import_artifacts(
         except Exception:
             decode_workspace.cleanup()
             raise
+    if bug_control is not None:
+        bug_control.advance("artifact_route")
     route = build_normal_route_table(scene)
     route.update(
         {
@@ -4356,10 +4372,13 @@ def build_import_artifacts(
             include_normals=include_normals,
             route_file_name=route_path.name,
             mrl_bindings=mrl_bindings,
+            bug_control=bug_control,
         )
     finally:
         if decode_workspace is not None:
             decode_workspace.cleanup()
+    if bug_control is not None:
+        bug_control.advance("artifact_sidecars")
     _atomic_json_write(route_path, route, pretty=pretty_json)
     route_file_sha256 = _sha256_file(route_path)
     receipt = _build_manifest_receipt(
@@ -4411,6 +4430,43 @@ def build_import_artifacts(
             else None
         ),
     }
+
+
+def build_import_artifacts(
+    mod_path: str | Path,
+    output_fbx: str | Path,
+    *,
+    normal_route_path: str | Path | None = None,
+    manifest_path: str | Path | None = None,
+    include_normals: bool = True,
+    fix_lp2: bool = False,
+    fix_dmc: bool = False,
+    fix_processing_mode: str = FIX_PROCESSING_MODE_CODEX,
+    reserved_scene_names: Iterable[str] | None = None,
+    blender_compact_mesh_names: bool = False,
+    mrl_path: str | Path | None = None,
+    texture_mode: str = "dds",
+    texture_roots: Iterable[str | Path] = (),
+    pretty_json: bool = False,
+) -> dict[str, Any]:
+    """Build the import artifacts; Launcher owns operation-wide BUG control."""
+    return _build_import_artifacts_impl(
+        mod_path,
+        output_fbx,
+        normal_route_path=normal_route_path,
+        manifest_path=manifest_path,
+        include_normals=include_normals,
+        fix_lp2=fix_lp2,
+        fix_dmc=fix_dmc,
+        fix_processing_mode=fix_processing_mode,
+        reserved_scene_names=reserved_scene_names,
+        blender_compact_mesh_names=blender_compact_mesh_names,
+        mrl_path=mrl_path,
+        texture_mode=texture_mode,
+        texture_roots=texture_roots,
+        pretty_json=pretty_json,
+        bug_control=None,
+    )
 
 
 def verify_fbx_artifact(output_fbx: str | Path, expected: dict[str, Any]) -> dict[str, Any]:
@@ -4718,7 +4774,9 @@ def _guard_require_all_normal_fvfs_reach_fbx() -> int:
     return len(normal_layouts)
 
 
-def _run_import_module_regression_guard() -> dict[str, Any]:
+def run_import_maintenance_regression_suite() -> dict[str, Any]:
+    """Run the strict importer regression suite only for explicit maintenance."""
+    global IMPORT_MODULE_REGRESSION_STATUS
     checks: dict[str, Any] = {}
     try:
         if len(FVF_LAYOUTS) != 45:
@@ -6348,14 +6406,23 @@ def _run_import_module_regression_guard() -> dict[str, Any]:
                 "direct_artifact_identity_contract": True,
             }
         )
-        return {"status": "PASS", "checks": checks}
+        result = {
+            "status": "PASS",
+            "strict": True,
+            "blocking_user_import": False,
+            "checks": checks,
+        }
     except Exception as exc:
-        return {
+        result = {
             "status": "FAIL",
+            "strict": True,
+            "blocking_user_import": False,
             "checks": checks,
             "error_type": type(exc).__name__,
             "error": str(exc),
         }
+    IMPORT_MODULE_REGRESSION_STATUS = result
+    return dict(result)
 
 
 if bool(globals().get("__codex_trusted_runtime_fast_load__", False)):
@@ -6363,9 +6430,14 @@ if bool(globals().get("__codex_trusted_runtime_fast_load__", False)):
         "status": "PASS",
         "mode": "trusted_source_sha_fast_load",
         "source_sha256": str(globals().get("__codex_source_sha256__", "") or ""),
+        "blocking_user_import": False,
     }
 else:
-    IMPORT_MODULE_REGRESSION_STATUS = _run_import_module_regression_guard()
+    IMPORT_MODULE_REGRESSION_STATUS = {
+        "status": "DEFERRED",
+        "mode": "explicit_maintenance_only",
+        "blocking_user_import": False,
+    }
 
 
 def build_cli() -> argparse.ArgumentParser:
@@ -6426,8 +6498,6 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 0
     started = time.perf_counter()
     try:
-        if IMPORT_MODULE_REGRESSION_STATUS.get("status") != "PASS":
-            raise RuntimeError("RE6 MOD import module regression guard failed: " + repr(IMPORT_MODULE_REGRESSION_STATUS))
         mod_path = _windows_lexical_full_path(args.mod)
         output_fbx = _windows_lexical_full_path(args.fbx)
         result = build_import_artifacts(

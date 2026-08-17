@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from functools import lru_cache
@@ -68,6 +69,126 @@ MEMORY_EXPORT_SAMPLE_RE = re.compile(
     r"^(?P<stem>(?:import|export)_pid[1-9]\d*_[0-9a-f]{32})\.(?P<ext>fbx|txt)$",
     re.IGNORECASE,
 )
+
+
+def _new_export_bug_receipt(request: dict[str, Any]) -> dict[str, Any]:
+    """Create a small cross-process stage receipt; Launcher owns diagnosis."""
+    return {
+        "revision": 1,
+        "operation": "export",
+        "status": "RUNNING",
+        "started_at": time.perf_counter(),
+        "failure_stage": "created",
+        "stages": [],
+        "request_id": str(request.get("request_id", "") or ""),
+        "process_id": _int_or_default(request.get("target_max_pid"), 0),
+    }
+
+
+def _advance_export_bug_receipt(receipt: dict[str, Any], stage: str) -> None:
+    try:
+        normalized = re.sub(r"[^a-z0-9_]+", "_", str(stage).casefold()).strip("_") or "unknown"
+        receipt["failure_stage"] = normalized
+        started = float(receipt.get("started_at", time.perf_counter()) or time.perf_counter())
+        receipt.setdefault("stages", []).append(
+            {
+                "name": normalized,
+                "at_ms": int(round((time.perf_counter() - started) * 1000.0)),
+            }
+        )
+    except Exception:
+        pass
+
+
+def _capture_export_bug_receipt(
+    receipt: dict[str, Any],
+    exc: BaseException,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        detail = str(exc)
+        traceback_text = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )[-12000:]
+        fingerprint = hashlib.sha256(
+            (
+                str(receipt.get("failure_stage", ""))
+                + "|"
+                + type(exc).__name__
+                + "|"
+                + detail
+                + "|"
+                + traceback_text[-4000:]
+            ).encode("utf-8", errors="replace")
+        ).hexdigest().upper()
+        receipt.update(
+            {
+                "status": "ERROR",
+                "elapsed_ms": int(
+                    round(
+                        (
+                            time.perf_counter()
+                            - float(receipt.get("started_at", time.perf_counter()))
+                        )
+                        * 1000.0
+                    )
+                ),
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": detail[:4000],
+                    "fingerprint": fingerprint,
+                    "traceback": traceback_text,
+                },
+                "extra": dict(extra or {}),
+            }
+        )
+    except Exception:
+        receipt.update(
+            {
+                "status": "ERROR",
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc)[:4000],
+                    "fingerprint": "",
+                    "traceback": "",
+                },
+            }
+        )
+    return dict(receipt)
+
+
+def _complete_export_bug_receipt(
+    receipt: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
+    _advance_export_bug_receipt(receipt, "complete")
+    started = float(receipt.get("started_at", time.perf_counter()) or time.perf_counter())
+    return {
+        "revision": 1,
+        "operation": "export",
+        "status": str(result.get("status", "OK") or "OK"),
+        "elapsed_ms": int(round((time.perf_counter() - started) * 1000.0)),
+        "stage_count": len(receipt.get("stages", [])),
+    }
+
+
+def _format_export_bug_receipt(receipt: dict[str, Any]) -> list[str]:
+    error = receipt.get("error") if isinstance(receipt.get("error"), dict) else {}
+    lines = [
+        f"REVISION={_int_or_default(receipt.get('revision'), 0)}",
+        f"STATUS={_export_log_scalar(receipt.get('status'))}",
+        f"FAILURE_STAGE={_export_log_scalar(receipt.get('failure_stage'))}",
+        f"TYPE={_export_log_scalar(error.get('type'))}",
+        f"DETAIL={_export_log_scalar(error.get('message'))}",
+        f"FINGERPRINT={_export_log_scalar(error.get('fingerprint'))}",
+    ]
+    for index, row in enumerate(receipt.get("stages", []), start=1):
+        if isinstance(row, dict):
+            lines.append(
+                f"STAGE_{index:02d}={_export_log_scalar(row.get('name'))}; at_ms:{_int_or_default(row.get('at_ms'), 0)}"
+            )
+    lines.extend(("TRACEBACK_BEGIN", str(error.get("traceback", "") or ""), "TRACEBACK_END"))
+    return lines
 
 
 class OutputPathBusyError(RuntimeError):
@@ -25198,6 +25319,18 @@ def _build_memory_export_txt(
     else:
         check_source_status = "UNKNOWN"
     status = "ERROR" if error is not None else str(payload.get("status", "UNKNOWN") or "UNKNOWN")
+    bug_control = (
+        request.get("_bug_control_failure")
+        if isinstance(request.get("_bug_control_failure"), dict)
+        else payload.get("bug_control")
+        if isinstance(payload.get("bug_control"), dict)
+        else {}
+    )
+    bug_diagnosis = (
+        bug_control.get("diagnosis")
+        if isinstance(bug_control.get("diagnosis"), dict)
+        else {}
+    )
     lines = [
         "PC-REHD CODE X EXPORT LOG",
         "FORMAT_VERSION=1",
@@ -25441,6 +25574,14 @@ def _build_memory_export_txt(
             f"WARN_COUNT={_int_or_default(verify.get('warn_count'), 0)}",
             f"ELAPSED_SECONDS={_float_or_default(payload.get('elapsed_seconds'), 0.0):.6f}",
             "",
+            "[BUG_CONTROL]",
+            f"REVISION={_int_or_default(bug_control.get('revision'), 0)}",
+            f"FAILURE_STAGE={_export_log_scalar(bug_control.get('failure_stage'))}",
+            f"CODE={_export_log_scalar(bug_diagnosis.get('code'))}",
+            f"CAUSE={_export_log_scalar(bug_diagnosis.get('cause'))}",
+            f"RECOVERY={_export_log_scalar(bug_diagnosis.get('recovery'))}",
+            f"ERROR_FINGERPRINT={_export_log_scalar((bug_control.get('error') or {}).get('fingerprint') if isinstance(bug_control.get('error'), dict) else '')}",
+            "",
             "[TIMING]",
             f"TOTAL_SECONDS={_float_or_default(timing_payload.get('total_seconds'), 0.0):.6f}",
             *(
@@ -25454,6 +25595,9 @@ def _build_memory_export_txt(
             "",
         )
     )
+    if bug_control:
+        lines.extend(("", "[BUG_CONTROL_FULL_REPORT]"))
+        lines.extend(_format_export_bug_receipt(bug_control))
     return "\r\n".join(lines)
 
 
@@ -25464,7 +25608,7 @@ def _write_memory_export_txt_log(
     error: BaseException | None = None,
 ) -> tuple[str, str]:
     options = request.get("export_options") if isinstance(request.get("export_options"), dict) else {}
-    if not _as_bool(options.get("log_mode"), False):
+    if error is None and not _as_bool(options.get("log_mode"), False):
         return "", ""
     try:
         target = _memory_export_log_target(request)
@@ -29614,10 +29758,16 @@ def _validate_memory_fbx_receipt(
     return dict(receipt)
 
 
-def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
+def _run_memory_export_impl(
+    request: dict[str, Any],
+    *,
+    bug_control: Any | None = None,
+) -> dict[str, Any]:
     started_at = time.perf_counter()
     timing: dict[str, Any] = {"phases": {}}
     phase_started_at = started_at
+    if bug_control is not None:
+        _advance_export_bug_receipt(bug_control, "request_validation")
     scene_contract, bucket_rows = _validate_memory_export_request(request)
     scene_backend = _memory_scene_backend(scene_contract)
     _mark_modify_routes_pending_fbx_probe(scene_contract, bucket_rows)
@@ -29671,6 +29821,8 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
     )
 
     phase_started_at = time.perf_counter()
+    if bug_control is not None:
+        _advance_export_bug_receipt(bug_control, "source_read_hash")
     expected_source_sha = str(request.get("source_sha256", "") or "").upper()
     source_mod_bytes = source_mod.read_bytes()
     actual_source_sha = hashlib.sha256(source_mod_bytes).hexdigest().upper()
@@ -29685,6 +29837,8 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
     )
 
     phase_started_at = time.perf_counter()
+    if bug_control is not None:
+        _advance_export_bug_receipt(bug_control, "route_plan")
     bucket_state = _memory_bucket_state_from_rows(bucket_rows)
     options = dict(request.get("export_options", {}))
     bone_export_mode = _memory_bone_export_mode(options)
@@ -29721,6 +29875,8 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
     )
 
     phase_started_at = time.perf_counter()
+    if bug_control is not None:
+        _advance_export_bug_receipt(bug_control, "source_contract")
     source_mod_file = read_mod_file(source_mod, data=source_mod_bytes)
     del source_mod_bytes
     source_mesh_headers = source_mod_file["mesh_headers"]
@@ -29763,6 +29919,8 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
     needs_fbx_handoff = bool(fbx_modify_meshes) or bone_edit_enabled
     if needs_fbx_handoff:
         phase_started_at = time.perf_counter()
+        if bug_control is not None:
+            _advance_export_bug_receipt(bug_control, "fbx_probe")
         fbx_handoff = _try_collect_fbx_handoff(job, source_mesh_headers)
         _record_timing_phase(
             timing,
@@ -29802,6 +29960,8 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
         _record_timing_phase(timing, "fbx_probe_seconds", 0.0)
 
     phase_started_at = time.perf_counter()
+    if bug_control is not None:
+        _advance_export_bug_receipt(bug_control, "fbx_merge")
     if fbx_modify_meshes:
         fbx_contract_meshes = fbx_handoff.get("contract_meshes")
         if not isinstance(fbx_contract_meshes, list) or not fbx_contract_meshes:
@@ -29896,6 +30056,8 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
         )
     writer_handoff["scene_contract"] = scene_contract
     phase_started_at = time.perf_counter()
+    if bug_control is not None:
+        _advance_export_bug_receipt(bug_control, "source_advisory")
     check_source_receipt = _evaluate_check_source_advisory(
         job,
         source_mesh_headers=source_mesh_headers,
@@ -29913,6 +30075,8 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
     )
 
     phase_started_at = time.perf_counter()
+    if bug_control is not None:
+        _advance_export_bug_receipt(bug_control, "contract_prepare")
     contract_prepare_started_at = phase_started_at
     contract = _prepare_memory_scene_contract(
         job,
@@ -29965,6 +30129,8 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
         0.0,
     )
     phase_started_at = time.perf_counter()
+    if bug_control is not None:
+        _advance_export_bug_receipt(bug_control, "mod_write")
     try:
         mod_write_info = write_output_mod(
             source_mod,
@@ -30005,6 +30171,8 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
     verify_status = "SKIP"
     verify_summary = ""
     phase_started_at = time.perf_counter()
+    if bug_control is not None:
+        _advance_export_bug_receipt(bug_control, "post_write_verify")
     if _as_bool(job.get("export_rules", {}).get("verify"), True):
         verify_payload = _run_post_write_diagnostics(
             job,
@@ -30024,6 +30192,8 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
         time.perf_counter() - phase_started_at,
     )
     phase_started_at = time.perf_counter()
+    if bug_control is not None:
+        _advance_export_bug_receipt(bug_control, "result_finalize")
     final_status = _finalize_bridge_status(
         write_status="OK",
         verify_status=verify_status,
@@ -30111,21 +30281,39 @@ def _run_memory_export_impl(request: dict[str, Any]) -> dict[str, Any]:
 
 def run_memory_export(request: dict[str, Any]) -> dict[str, Any]:
     """Run one live export and optionally retain one bounded human-readable TXT."""
-    _enter_writer_main_operation()
-    try:
-        max_process_id = int(request.get("target_max_pid", 0) or 0)
-    except (TypeError, ValueError):
-        max_process_id = 0
-    request_id = str(request.get("request_id", "") or "").strip()
+    bug_control = _new_export_bug_receipt(request)
+    writer_entered = False
     lease: dict[str, Any] | None = None
     try:
+        _advance_export_bug_receipt(bug_control, "writer_entry")
+        _enter_writer_main_operation()
+        writer_entered = True
+        try:
+            max_process_id = int(request.get("target_max_pid", 0) or 0)
+        except (TypeError, ValueError):
+            max_process_id = 0
+        request_id = str(request.get("request_id", "") or "").strip()
+        _advance_export_bug_receipt(bug_control, "output_lock")
         lease = _acquire_output_path_mutex(
             str(request.get("output_mod", "") or ""),
             max_process_id=max_process_id,
             request_id=request_id,
         )
-        payload = _run_memory_export_impl(request)
+        payload = _run_memory_export_impl(request, bug_control=bug_control)
     except Exception as exc:
+        bug_report = _capture_export_bug_receipt(
+            bug_control,
+            exc,
+            extra={
+                "output_lock_acquired": lease is not None,
+                "writer_operation_entered": writer_entered,
+            },
+        )
+        request["_bug_control_failure"] = bug_report
+        try:
+            setattr(exc, "_pc_rehd_bug_control", dict(bug_report))
+        except Exception:
+            pass
         log_path, log_warning = _write_memory_export_txt_log(request, error=exc)
         if log_warning:
             try:
@@ -30134,6 +30322,7 @@ def run_memory_export(request: dict[str, Any]) -> dict[str, Any]:
                 pass
         raise
     else:
+        payload["bug_control"] = _complete_export_bug_receipt(bug_control, payload)
         transient_statuses = {
             "OUTPUT_COLLISION",
             "MESH_SLOT_CHOICE_REQUIRED",
@@ -30154,7 +30343,8 @@ def run_memory_export(request: dict[str, Any]) -> dict[str, Any]:
             if lease is not None:
                 _release_output_path_mutex(lease)
         finally:
-            _leave_writer_main_operation()
+            if writer_entered:
+                _leave_writer_main_operation()
 
 
 def _run_output_path_mutex_regression_guard() -> dict[str, Any]:
@@ -30961,98 +31151,85 @@ def _run_memory_scene_contract_regression_guard() -> dict[str, Any]:
 
 WRITER_MAINTENANCE_GATE_ERROR: Exception | None = None
 
-# Import-time guards cover only the live-scene writer. Retired file-job and
-# per-export interpreter supervisor paths are intentionally absent.
-if bool(globals().get("__codex_trusted_runtime_fast_load__", False)):
-    _trusted_fast_load_status = {
-        "status": "PASS",
-        "mode": "trusted_source_sha_fast_load",
-        "source_sha256": str(globals().get("__codex_source_sha256__", "") or ""),
+_WRITER_MAINTENANCE_RUNNERS: tuple[tuple[str, Callable[[], dict[str, Any]]], ...] = (
+    ("OUTPUT_PATH_MUTEX_REGRESSION_STATUS", _run_output_path_mutex_regression_guard),
+    ("PC_REHD_128_WRITER_FVF_BOUNDARY_REGRESSION_STATUS", _run_pc_rehd_128_writer_fvf_boundary_regression_guard),
+    ("UNSKINNED_MESH_EDIT_EXPORT_REGRESSION_STATUS", _run_unskinned_mesh_edit_export_regression_guard),
+    ("FVF_WEIGHT_CAPACITY_POLICY_REGRESSION_STATUS", _run_fvf_weight_capacity_policy_regression_guard),
+    ("SOURCE_ORDERED_SKIN_SELECTION_REGRESSION_STATUS", _run_source_ordered_skin_selection_regression_guard),
+    ("CROSS_MOD_SKIN_COMPATIBILITY_REGRESSION_STATUS", _run_cross_mod_skin_compatibility_regression_guard),
+    ("PREPARED_64593023_WRITER_PASSTHROUGH_REGRESSION_STATUS", _run_prepared_64593023_writer_passthrough_regression_guard),
+    ("LEGACY_COMPACTED_RECOVERY_REGRESSION_STATUS", _run_legacy_compacted_recovery_regression_guard),
+    ("SOURCE_SKIN_TRUTH_REGRESSION_STATUS", _run_source_skin_truth_regression_guard),
+    ("SEMANTIC_WRITER_LAYOUT_REGRESSION_STATUS", _run_semantic_writer_layout_regression_guard),
+    ("BB4240X_FINAL_GEOMETRY_NORMAL_REGRESSION_STATUS", _run_bb4240x_final_geometry_normal_regression_guard),
+    ("ORDINARY_SKIN_ROUND_TRIP_REGRESSION_STATUS", _run_ordinary_skin_round_trip_regression_guard),
+    ("NON_BONE_EDIT_SKELETON_PRESERVATION_REGRESSION_STATUS", _run_non_bone_edit_skeleton_preservation_regression_guard),
+    ("REAL_PL0600_SKIN_REGRESSION_STATUS", _run_real_pl0600_skin_regression_guard),
+    ("ROUND_TRIP_BYTE_ALLOWLIST_REGRESSION_STATUS", _run_round_trip_byte_allowlist_regression_guard),
+    ("HEADER_BUCKET_AUTHORITY_REGRESSION_STATUS", _run_header_bucket_authority_regression_guard),
+    ("REQUIRED_FBX_GEOMETRY_REGRESSION_STATUS", _run_required_fbx_geometry_regression_guard),
+    ("SPECIAL_MESH_SOURCE_FALLBACK_REGRESSION_STATUS", _run_special_mesh_source_fallback_regression_guard),
+    ("BLENDER_BUCKET3_HEADER_ONLY_CLASSIFICATION_REGRESSION_STATUS", _run_blender_bucket3_header_only_classification_regression_guard),
+    ("STANDARD_RE6_EXPORT_MESH_NAME_REGRESSION_STATUS", _run_standard_re6_export_mesh_name_regression_guard),
+    ("MESH_SLOT_LIMIT_REGRESSION_STATUS", _run_mesh_slot_limit_regression_guard),
+    ("DELETE_SELECTED_STABLE_SLOT_REGRESSION_STATUS", _run_delete_selected_stable_slot_regression_guard),
+    ("UINT16_VERTEX_GROUP_ROLLOVER_REGRESSION_STATUS", _run_uint16_vertex_group_rollover_regression_guard),
+    ("PYMXS_GEOMETRY_BOUNDARY_REGRESSION_STATUS", _run_pymxs_geometry_boundary_regression_guard),
+    ("FBX_MAP2_AUTHORITY_REGRESSION_STATUS", _run_fbx_map2_authority_regression_guard),
+    ("BONES_PLUS_MESH_BINDING_REGRESSION_STATUS", _run_bones_plus_mesh_binding_regression_guard),
+    ("BONE_ADD_DELETE_V4_PARITY_REGRESSION_STATUS", _run_bone_add_delete_v4_parity_regression_guard),
+    ("MEMORY_SCENE_CONTRACT_REGRESSION_STATUS", _run_memory_scene_contract_regression_guard),
+    ("CHECK_SOURCE_ADVISORY_REGRESSION_STATUS", _run_check_source_advisory_regression_guard),
+    ("SAME_NAME_FBX_HANDLE_REGRESSION_STATUS", _run_same_name_fbx_handle_regression_guard),
+    ("FBX_PROBE_TOPOLOGY_AUTHORITY_REGRESSION_STATUS", _run_fbx_probe_topology_authority_regression_guard),
+)
+
+
+def run_writer_maintenance_regression_suite() -> dict[str, Any]:
+    """Run every strict Writer guard explicitly; never called by user export."""
+    global WRITER_MAINTENANCE_GATE_ERROR
+    failures: list[dict[str, str]] = []
+    skipped: list[str] = []
+    statuses: dict[str, dict[str, Any]] = {}
+    for status_name, runner in _WRITER_MAINTENANCE_RUNNERS:
+        try:
+            value = runner()
+            if not isinstance(value, dict):
+                raise TypeError(f"{status_name} returned no status object")
+        except Exception as exc:
+            value = {
+                "status": "FAIL",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "traceback": traceback.format_exc()[-12000:],
+            }
+            failures.append({"name": status_name, "error": f"{type(exc).__name__}: {exc}"})
+        if str(value.get("status", "") or "").upper() == "SKIP":
+            skipped.append(status_name)
+        elif str(value.get("status", "") or "").upper() != "PASS":
+            failures.append({"name": status_name, "error": str(value.get("error", "non-PASS status"))})
+        statuses[status_name] = value
+        globals()[status_name] = value
+    WRITER_MAINTENANCE_GATE_ERROR = (
+        RuntimeError("Writer maintenance regression failures: " + "; ".join(row["name"] for row in failures))
+        if failures
+        else None
+    )
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "strict": True,
+        "blocking_user_export": False,
+        "failures": failures,
+        "skipped": skipped,
+        "statuses": statuses,
     }
-    for _status_name in (
-        "OUTPUT_PATH_MUTEX_REGRESSION_STATUS",
-        "PC_REHD_128_WRITER_FVF_BOUNDARY_REGRESSION_STATUS",
-        "UNSKINNED_MESH_EDIT_EXPORT_REGRESSION_STATUS",
-        "FVF_WEIGHT_CAPACITY_POLICY_REGRESSION_STATUS",
-        "SOURCE_ORDERED_SKIN_SELECTION_REGRESSION_STATUS",
-        "CROSS_MOD_SKIN_COMPATIBILITY_REGRESSION_STATUS",
-        "PREPARED_64593023_WRITER_PASSTHROUGH_REGRESSION_STATUS",
-        "LEGACY_COMPACTED_RECOVERY_REGRESSION_STATUS",
-        "SOURCE_SKIN_TRUTH_REGRESSION_STATUS",
-        "SEMANTIC_WRITER_LAYOUT_REGRESSION_STATUS",
-        "BB4240X_FINAL_GEOMETRY_NORMAL_REGRESSION_STATUS",
-        "ORDINARY_SKIN_ROUND_TRIP_REGRESSION_STATUS",
-        "NON_BONE_EDIT_SKELETON_PRESERVATION_REGRESSION_STATUS",
-        "REAL_PL0600_SKIN_REGRESSION_STATUS",
-        "ROUND_TRIP_BYTE_ALLOWLIST_REGRESSION_STATUS",
-        "HEADER_BUCKET_AUTHORITY_REGRESSION_STATUS",
-        "REQUIRED_FBX_GEOMETRY_REGRESSION_STATUS",
-        "SPECIAL_MESH_SOURCE_FALLBACK_REGRESSION_STATUS",
-        "BLENDER_BUCKET3_HEADER_ONLY_CLASSIFICATION_REGRESSION_STATUS",
-        "STANDARD_RE6_EXPORT_MESH_NAME_REGRESSION_STATUS",
-        "MESH_SLOT_LIMIT_REGRESSION_STATUS",
-        "DELETE_SELECTED_STABLE_SLOT_REGRESSION_STATUS",
-        "UINT16_VERTEX_GROUP_ROLLOVER_REGRESSION_STATUS",
-        "PYMXS_GEOMETRY_BOUNDARY_REGRESSION_STATUS",
-        "FBX_MAP2_AUTHORITY_REGRESSION_STATUS",
-        "BONES_PLUS_MESH_BINDING_REGRESSION_STATUS",
-        "BONE_ADD_DELETE_V4_PARITY_REGRESSION_STATUS",
-        "MEMORY_SCENE_CONTRACT_REGRESSION_STATUS",
-        "CHECK_SOURCE_ADVISORY_REGRESSION_STATUS",
-        "SAME_NAME_FBX_HANDLE_REGRESSION_STATUS",
-        "FBX_PROBE_TOPOLOGY_AUTHORITY_REGRESSION_STATUS",
-    ):
-        globals()[_status_name] = dict(_trusted_fast_load_status)
-else:
-    try:
-        OUTPUT_PATH_MUTEX_REGRESSION_STATUS = _run_output_path_mutex_regression_guard()
-        PC_REHD_128_WRITER_FVF_BOUNDARY_REGRESSION_STATUS = (
-            _run_pc_rehd_128_writer_fvf_boundary_regression_guard()
-        )
-        UNSKINNED_MESH_EDIT_EXPORT_REGRESSION_STATUS = (
-            _run_unskinned_mesh_edit_export_regression_guard()
-        )
-        FVF_WEIGHT_CAPACITY_POLICY_REGRESSION_STATUS = (
-            _run_fvf_weight_capacity_policy_regression_guard()
-        )
-        SOURCE_ORDERED_SKIN_SELECTION_REGRESSION_STATUS = _run_source_ordered_skin_selection_regression_guard()
-        CROSS_MOD_SKIN_COMPATIBILITY_REGRESSION_STATUS = (
-            _run_cross_mod_skin_compatibility_regression_guard()
-        )
-        PREPARED_64593023_WRITER_PASSTHROUGH_REGRESSION_STATUS = (
-            _run_prepared_64593023_writer_passthrough_regression_guard()
-        )
-        LEGACY_COMPACTED_RECOVERY_REGRESSION_STATUS = _run_legacy_compacted_recovery_regression_guard()
-        SOURCE_SKIN_TRUTH_REGRESSION_STATUS = _run_source_skin_truth_regression_guard()
-        SEMANTIC_WRITER_LAYOUT_REGRESSION_STATUS = _run_semantic_writer_layout_regression_guard()
-        BB4240X_FINAL_GEOMETRY_NORMAL_REGRESSION_STATUS = _run_bb4240x_final_geometry_normal_regression_guard()
-        ORDINARY_SKIN_ROUND_TRIP_REGRESSION_STATUS = _run_ordinary_skin_round_trip_regression_guard()
-        NON_BONE_EDIT_SKELETON_PRESERVATION_REGRESSION_STATUS = (
-            _run_non_bone_edit_skeleton_preservation_regression_guard()
-        )
-        REAL_PL0600_SKIN_REGRESSION_STATUS = _run_real_pl0600_skin_regression_guard()
-        ROUND_TRIP_BYTE_ALLOWLIST_REGRESSION_STATUS = _run_round_trip_byte_allowlist_regression_guard()
-        HEADER_BUCKET_AUTHORITY_REGRESSION_STATUS = _run_header_bucket_authority_regression_guard()
-        REQUIRED_FBX_GEOMETRY_REGRESSION_STATUS = _run_required_fbx_geometry_regression_guard()
-        SPECIAL_MESH_SOURCE_FALLBACK_REGRESSION_STATUS = _run_special_mesh_source_fallback_regression_guard()
-        BLENDER_BUCKET3_HEADER_ONLY_CLASSIFICATION_REGRESSION_STATUS = (
-            _run_blender_bucket3_header_only_classification_regression_guard()
-        )
-        STANDARD_RE6_EXPORT_MESH_NAME_REGRESSION_STATUS = _run_standard_re6_export_mesh_name_regression_guard()
-        MESH_SLOT_LIMIT_REGRESSION_STATUS = _run_mesh_slot_limit_regression_guard()
-        DELETE_SELECTED_STABLE_SLOT_REGRESSION_STATUS = _run_delete_selected_stable_slot_regression_guard()
-        UINT16_VERTEX_GROUP_ROLLOVER_REGRESSION_STATUS = _run_uint16_vertex_group_rollover_regression_guard()
-        PYMXS_GEOMETRY_BOUNDARY_REGRESSION_STATUS = _run_pymxs_geometry_boundary_regression_guard()
-        FBX_MAP2_AUTHORITY_REGRESSION_STATUS = _run_fbx_map2_authority_regression_guard()
-        BONES_PLUS_MESH_BINDING_REGRESSION_STATUS = _run_bones_plus_mesh_binding_regression_guard()
-        BONE_ADD_DELETE_V4_PARITY_REGRESSION_STATUS = _run_bone_add_delete_v4_parity_regression_guard()
-        MEMORY_SCENE_CONTRACT_REGRESSION_STATUS = _run_memory_scene_contract_regression_guard()
-        CHECK_SOURCE_ADVISORY_REGRESSION_STATUS = _run_check_source_advisory_regression_guard()
-        SAME_NAME_FBX_HANDLE_REGRESSION_STATUS = _run_same_name_fbx_handle_regression_guard()
-        FBX_PROBE_TOPOLOGY_AUTHORITY_REGRESSION_STATUS = (
-            _run_fbx_probe_topology_authority_regression_guard()
-        )
-    except Exception as exc:
-        WRITER_MAINTENANCE_GATE_ERROR = exc
-        if __name__ != "__main__":
-            raise
+
+
+_initial_writer_status = {
+    "status": "PASS" if bool(globals().get("__codex_trusted_runtime_fast_load__", False)) else "DEFERRED",
+    "mode": "trusted_source_sha_fast_load" if bool(globals().get("__codex_trusted_runtime_fast_load__", False)) else "explicit_maintenance_only",
+    "blocking_user_export": False,
+}
+for _status_name, _runner in _WRITER_MAINTENANCE_RUNNERS:
+    globals()[_status_name] = dict(_initial_writer_status)

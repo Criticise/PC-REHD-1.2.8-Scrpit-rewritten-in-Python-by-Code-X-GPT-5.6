@@ -11,6 +11,7 @@ _EARLY_CONSOLE_CLI_ARGUMENTS = frozenset(
         "--policy-smoke",
         "--runtime-compat-smoke",
         "--writer-transport-smoke",
+        "--bug-control-scan",
     }
 )
 
@@ -93,7 +94,6 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
-
 
 import hashlib
 import heapq
@@ -2493,6 +2493,165 @@ WRITER_PROCESS_PROTOCOL = "pc-rehd-code-x-writer-process-v1"
 WRITER_PROCESS_TIMEOUT_SECONDS = 30 * 60.0
 WRITER_PROCESS_PRELOAD_TIMEOUT_SECONDS = 120.0
 
+BUG_CONTROL_REVISION = 1
+BUG_CONTROL_BEGIN = "[BUG_CONTROL_LAUNCHER_BEGIN]"
+BUG_CONTROL_END = "[BUG_CONTROL_LAUNCHER_END]"
+
+
+def _bug_text(value: Any, limit: int = 12000) -> str:
+    text = str(value or "").replace("\r", "\n")
+    return text if len(text) <= limit else text[: limit - 24] + "...<truncated>"
+
+
+def _classify_operation_bug(operation: str, exc: BaseException, stage: str) -> dict[str, Any]:
+    error_type = type(exc).__name__
+    detail = str(exc or "")
+    folded = f"{error_type} {detail}".casefold()
+    if "is not defined" in folded or error_type in {"NameError", "AttributeError"}:
+        return {
+            "code": "CODE_CONTRACT_DRIFT",
+            "cause": "A function changed while another import/export path still calls the old API.",
+            "recovery": "AI must run the strict cross-file consumer scan and update every caller together.",
+            "user_blocking": True,
+        }
+    if "source mod is missing" in folded or error_type == "FileNotFoundError":
+        return {
+            "code": f"{operation.upper()}_SOURCE_MISSING",
+            "cause": detail,
+            "recovery": "Keep the requested path in this TXT and let the user reselect it; never substitute another MOD.",
+            "user_blocking": True,
+        }
+    if operation == "export":
+        if "sha changed" in folded or "source mod sha" in folded:
+            code, recovery = "EXPORT_SOURCE_CHANGED", "Retry from a fresh source snapshot and retain both hashes in this TXT."
+        elif "mutex" in folded or "output path" in folded and "busy" in folded:
+            code, recovery = "EXPORT_OUTPUT_BUSY", "Return immediately as retryable; never wait indefinitely or overwrite another writer."
+        elif stage == "fbx_probe" or "fbx geometry carrier" in folded:
+            code, recovery = "EXPORT_FBX_READ_FAILED", "Use only the permitted per-Mesh source fallback and report Meshes that still require FBX geometry."
+        elif stage == "fbx_merge" or "did not match required modify" in folded:
+            code, recovery = "EXPORT_FBX_ROUTE_MISMATCH", "Inspect the exact Handle, Mesh slot and topology receipt; preserve unaffected source Meshes."
+        elif stage == "mod_write":
+            code, recovery = "EXPORT_MOD_WRITE_FAILED", "Preserve source and previous output; inspect the FVF and writer receipts below."
+        elif stage == "post_write_verify" or "verify" in folded:
+            code, recovery = "EXPORT_VERIFY_FAILED", "Use the Mesh/FVF verification rows below before accepting the generated NewMOD."
+        else:
+            code, recovery = "EXPORT_UNCLASSIFIED_FAILURE", "Use the stage, fingerprint and traceback below; add a regression after proving root cause."
+        return {"code": code, "cause": detail, "recovery": recovery, "user_blocking": code != "EXPORT_OUTPUT_BUSY"}
+    if stage == "source_parse" or any(token in folded for token in ("mesh header", "fvf", "mod header", "bone map")):
+        code, recovery = "IMPORT_MOD_PARSE_FAILED", "Use the exact section, offset, Mesh slot and FVF below; preserve unrelated source evidence."
+    elif stage == "texture_plan" or any(token in folded for token in ("mrl", "texture", "dds", "tex")):
+        code, recovery = "IMPORT_TEXTURE_OPTIONAL_FAILED", "Continue geometry import without textures whenever the existing contract permits it."
+    elif stage == "fbx_build" or "fbx" in folded:
+        code, recovery = "IMPORT_FBX_BUILD_FAILED", "Preserve source and partial FBX evidence, then inspect the last completed build stage."
+    elif stage in {"scene_transfer", "scene_apply"} or any(token in folded for token in ("max import", "blender import", "protocolerror", "scene contract")):
+        code, recovery = "IMPORT_SCENE_APPLY_FAILED", "Keep the handoff and PID receipt, and retry only the scene-apply stage when safe."
+    elif stage == "post_import_validation":
+        code, recovery = "IMPORT_POSTCHECK_FAILED", "Report the exact count, identity or SHA mismatch and leave imported scene data untouched."
+    else:
+        code, recovery = "IMPORT_UNCLASSIFIED_FAILURE", "Use the stage, fingerprint and traceback below; add a regression after proving root cause."
+    return {"code": code, "cause": detail, "recovery": recovery, "user_blocking": code != "IMPORT_TEXTURE_OPTIONAL_FAILED"}
+
+
+class _OperationBugControl:
+    """Launcher-owned in-memory controller; it never creates sidecar files."""
+
+    def __init__(self, operation: str, *, request_id: str, process_id: int, metadata: Mapping[str, Any] | None = None) -> None:
+        self.operation = str(operation).strip().casefold()
+        self.request_id = str(request_id or "")
+        self.process_id = max(0, int(process_id or 0))
+        self.metadata = dict(metadata or {})
+        self.started = time.perf_counter()
+        self.stage = "created"
+        self.stages: list[dict[str, Any]] = []
+        self.report: dict[str, Any] | None = None
+        self.advance("created")
+
+    def advance(self, stage: str, detail: str = "") -> None:
+        try:
+            self.stage = re.sub(r"[^a-z0-9_]+", "_", str(stage).casefold()).strip("_") or "unknown"
+            self.stages.append({"name": self.stage, "at_ms": int(round((time.perf_counter() - self.started) * 1000.0)), "detail": _bug_text(detail, 1000)})
+        except Exception:
+            pass
+
+    def import_remote_stages(self, receipt: Mapping[str, Any] | None) -> None:
+        if not isinstance(receipt, Mapping):
+            return
+        for row in receipt.get("stages", []):
+            if isinstance(row, Mapping):
+                self.stages.append({"name": str(row.get("name", "") or "unknown"), "at_ms": int(row.get("at_ms", 0) or 0), "detail": "writer_process"})
+        if str(receipt.get("failure_stage", "") or ""):
+            self.stage = str(receipt["failure_stage"])
+
+    def capture(self, exc: BaseException, *, extra: Mapping[str, Any] | None = None, traceback_text: str = "") -> dict[str, Any]:
+        if self.report is not None:
+            return dict(self.report)
+        trace = (traceback_text or "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))[-12000:]
+        fingerprint = hashlib.sha256(f"{self.operation}|{self.stage}|{type(exc).__name__}|{exc}|{trace[-4000:]}".encode("utf-8", errors="replace")).hexdigest().upper()
+        self.report = {
+            "revision": BUG_CONTROL_REVISION, "operation": self.operation, "status": "ERROR",
+            "time_local": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+            "request_id": self.request_id, "process_id": self.process_id,
+            "failure_stage": self.stage, "elapsed_ms": int(round((time.perf_counter() - self.started) * 1000.0)),
+            "diagnosis": _classify_operation_bug(self.operation, exc, self.stage),
+            "error": {"type": type(exc).__name__, "message": _bug_text(exc, 4000), "fingerprint": fingerprint, "traceback": trace},
+            "stages": list(self.stages), "metadata": dict(self.metadata), "extra": dict(extra or {}),
+        }
+        return dict(self.report)
+
+    def complete(self) -> dict[str, Any]:
+        self.advance("complete")
+        return {"revision": BUG_CONTROL_REVISION, "operation": self.operation, "status": "OK", "elapsed_ms": int(round((time.perf_counter() - self.started) * 1000.0)), "stage_count": len(self.stages)}
+
+
+def create_import_bug_controller(*, request_id: str, process_id: int, metadata: Mapping[str, Any] | None = None) -> _OperationBugControl:
+    return _OperationBugControl("import", request_id=request_id, process_id=process_id, metadata=metadata)
+
+
+def _format_bug_control_lines(report: Mapping[str, Any]) -> list[str]:
+    diagnosis = report.get("diagnosis") if isinstance(report.get("diagnosis"), Mapping) else {}
+    error = report.get("error") if isinstance(report.get("error"), Mapping) else {}
+    lines = [BUG_CONTROL_BEGIN, f"REVISION={report.get('revision', 0)}", f"OPERATION={report.get('operation', '')}", f"STATUS={report.get('status', '')}", f"TIME_LOCAL={report.get('time_local', '')}", f"REQUEST_ID={report.get('request_id', '')}", f"PROCESS_ID={report.get('process_id', 0)}", f"FAILURE_STAGE={report.get('failure_stage', '')}", f"ELAPSED_MS={report.get('elapsed_ms', 0)}", f"CODE={diagnosis.get('code', '')}", f"CAUSE={_bug_text(diagnosis.get('cause', ''), 4000)}", f"RECOVERY={_bug_text(diagnosis.get('recovery', ''), 4000)}", f"USER_BLOCKING={diagnosis.get('user_blocking', True)}", f"ERROR_TYPE={error.get('type', '')}", f"ERROR_DETAIL={_bug_text(error.get('message', ''), 4000)}", f"ERROR_FINGERPRINT={error.get('fingerprint', '')}", "", "[BUG_CONTROL_STAGES]"]
+    for index, row in enumerate(report.get("stages", []), start=1):
+        if isinstance(row, Mapping):
+            lines.append(f"STAGE_{index:02d}={row.get('name', '')}; at_ms:{row.get('at_ms', 0)}; detail:{_bug_text(row.get('detail', ''), 1000)}")
+    lines.extend(("", "[BUG_CONTROL_METADATA]", json.dumps(report.get("metadata", {}), ensure_ascii=False, sort_keys=True, default=str), json.dumps(report.get("extra", {}), ensure_ascii=False, sort_keys=True, default=str), "", "[BUG_CONTROL_TRACEBACK]", str(error.get("traceback", "") or ""), BUG_CONTROL_END))
+    return lines
+
+
+def _merge_bug_control_into_primary_txt(path: str | Path, report: Mapping[str, Any]) -> str:
+    """Append or replace one Launcher report in the operation's only TXT."""
+    target = Path(path)
+    try:
+        existing = target.read_text(encoding="utf-8-sig", errors="replace") if target.is_file() else ""
+        pattern = re.compile(re.escape(BUG_CONTROL_BEGIN) + r".*?" + re.escape(BUG_CONTROL_END), re.DOTALL)
+        existing = pattern.sub("", existing).rstrip()
+        block = "\r\n".join(_format_bug_control_lines(report))
+        combined = (existing + "\r\n\r\n" + block if existing else block) + "\r\n"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + f".{os.getpid()}.{time.monotonic_ns()}.tmp")
+        try:
+            temporary.write_bytes(b"\xef\xbb\xbf" + combined.encode("utf-8"))
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return ""
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def _export_primary_txt_path(request: Mapping[str, Any]) -> Path:
+    options = request.get("export_options") if isinstance(request.get("export_options"), Mapping) else {}
+    root_text = str(options.get("log_dir") or request.get("log_dir") or "").strip()
+    root = Path(root_text).expanduser() if root_text else Path(tempfile.gettempdir()) / "PC_REHD_Code_X"
+    for value in (request.get("fbx_path"), request.get("sample_fbx_path")):
+        if str(value or "").strip():
+            stem = Path(str(value)).stem
+            if stem.casefold().startswith("export_pid"):
+                return root / f"{stem}.txt"
+    pid = max(1, int(request.get("target_max_pid", 0) or 0))
+    token = hashlib.sha256(str(request.get("request_id", "") or "").encode("utf-8", errors="replace")).hexdigest()[:32]
+    return root / f"export_pid{pid}_{token}.txt"
+
 
 @dataclass(slots=True)
 class _WriterProcessWorker:
@@ -2614,6 +2773,952 @@ AGENT_COMMAND_OPERATIONS = {
     "manual_texture": "texture",
 }
 DEFAULT_LOG_DIR = Path(tempfile.gettempdir()) / "PC_REHD_Code_X"
+BUG_CONTROL_SCAN_SCHEMA = "pc-rehd-code-x-bug-control-scan-v1"
+BUG_CONTROL_EXPORT_REQUIRED_STAGES = frozenset(
+    {
+        "request_validation",
+        "output_lock",
+        "source_read_hash",
+        "route_plan",
+        "source_contract",
+        "fbx_probe",
+        "fbx_merge",
+        "contract_prepare",
+        "mod_write",
+        "post_write_verify",
+        "result_finalize",
+    }
+)
+BUG_CONTROL_IMPORT_REQUIRED_STAGES = frozenset(
+    {
+        "request_validation",
+        "scene_identity_snapshot",
+        "source_parse",
+        "texture_plan",
+        "fbx_build",
+        "artifact_verify",
+        "scene_transfer",
+        "scene_apply",
+        "post_import_validation",
+        "artifact_cleanup",
+    }
+)
+
+
+def _bug_control_scan_tree(path: Path) -> ast.Module:
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
+def _bug_control_scan_call_name(call: ast.Call) -> str:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return ""
+
+
+def _bug_control_scan_calls(path: Path) -> set[str]:
+    return {
+        name
+        for node in ast.walk(_bug_control_scan_tree(path))
+        if isinstance(node, ast.Call)
+        for name in (_bug_control_scan_call_name(node),)
+        if name
+    }
+
+
+def _bug_control_scan_function_names(path: Path, function_name: str) -> set[str]:
+    tree = _bug_control_scan_tree(path)
+    function = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == function_name
+        ),
+        None,
+    )
+    if function is None:
+        return set()
+    names = {node.id for node in ast.walk(function) if isinstance(node, ast.Name)}
+    names.update(node.attr for node in ast.walk(function) if isinstance(node, ast.Attribute))
+    return names
+
+
+def _bug_control_scan_literal_stages(paths: Iterable[Path]) -> set[str]:
+    stages: set[str] = set()
+    for path in paths:
+        for node in ast.walk(_bug_control_scan_tree(path)):
+            if not isinstance(node, ast.Call):
+                continue
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "advance"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                stages.add(str(node.args[0].value))
+            elif (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "_advance_export_bug_receipt"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                stages.add(str(node.args[1].value))
+    return stages
+
+
+def _bug_control_scan_python_component_paths() -> list[Path]:
+    dependency_root = MODULE_DIR / "PY依赖 PY Libs"
+    return sorted(
+        {
+            LAUNCHER_SOURCE_PATH.resolve(),
+            *(path.resolve() for path in MODULE_DIR.glob("codex_*.py") if path.is_file()),
+            *(
+                path.resolve()
+                for path in dependency_root.rglob("*.py")
+                if path.name == "__init__.py"
+                and {
+                    "codex_fbx_probe_accel",
+                    "codex_uv_layout_accel",
+                }
+                & {part.casefold() for part in path.parts}
+                and "__pycache__" not in {part.casefold() for part in path.parts}
+            ),
+        },
+        key=lambda value: str(value).casefold(),
+    )
+
+
+def _bug_control_scan_probe_consumer_paths() -> list[Path]:
+    return sorted(
+        {
+            path
+            for path in _bug_control_scan_python_component_paths()
+            if "codex_fbx_probe_accel" in {part.casefold() for part in path.parts}
+        },
+        key=lambda value: str(value).casefold(),
+    )
+
+
+def _bug_control_scan_code_index(operation: str) -> dict[str, Any]:
+    """Build a live file/line/consumer index directly from current source ASTs."""
+    normalized = str(operation or "").strip().casefold()
+    if normalized not in {"import", "export"}:
+        raise ValueError(f"Unsupported BUG control code index: {operation!r}")
+    runtime_operation = "import_mod" if normalized == "import" else "export_mod"
+    def runtime_path(value: str | Path) -> Path:
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = MODULE_DIR / candidate
+        return candidate.resolve()
+
+    component_paths = _bug_control_scan_python_component_paths()
+    paths = list(component_paths)
+    paths.extend(
+        runtime_path(path)
+        for path in OPERATION_RUNTIME_MODULE_PATHS[runtime_operation]
+    )
+    paths = list(dict.fromkeys(paths))
+
+    parsed: dict[Path, dict[str, Any]] = {}
+    definitions: list[dict[str, Any]] = []
+    reference_sites_by_leaf: dict[str, list[dict[str, Any]]] = {}
+    reference_keys: set[tuple[str, str, int, str, str]] = set()
+    source_literals: list[dict[str, Any]] = []
+
+    for path in paths:
+        source_bytes = path.read_bytes()
+        source = source_bytes.decode("utf-8-sig")
+        tree = ast.parse(source, filename=str(path))
+        parents: dict[ast.AST, ast.AST] = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+
+        def qualified_scope(node: ast.AST, *, include_self: bool) -> str:
+            current: ast.AST | None = node if include_self else parents.get(node)
+            names: list[str] = []
+            while current is not None:
+                if isinstance(
+                    current,
+                    (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+                ):
+                    names.append(current.name)
+                current = parents.get(current)
+            return ".".join(reversed(names)) or "<module>"
+
+        try:
+            path_text = str(path.relative_to(MODULE_DIR.resolve()))
+        except ValueError:
+            path_text = str(path)
+
+        def add_reference(
+            leaf: str,
+            node: ast.AST,
+            usage_kind: str,
+            *,
+            base: str = "",
+        ) -> None:
+            line = int(getattr(node, "lineno", 0) or 0)
+            caller = qualified_scope(node, include_self=False)
+            key = (leaf, path_text, line, caller, usage_kind)
+            if not leaf or key in reference_keys:
+                return
+            reference_keys.add(key)
+            reference_sites_by_leaf.setdefault(leaf, []).append(
+                {
+                    "path": path_text,
+                    "line": line,
+                    "caller": caller,
+                    "usage_kind": usage_kind,
+                    "base": base,
+                }
+            )
+
+        file_definitions: list[dict[str, Any]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            direct_calls: set[tuple[str, str]] = set()
+            symbol = qualified_scope(node, include_self=True)
+            for candidate in ast.walk(node):
+                if not isinstance(candidate, ast.Call):
+                    continue
+                if qualified_scope(candidate, include_self=False) != symbol:
+                    continue
+                if isinstance(candidate.func, ast.Name):
+                    direct_calls.add(("name", candidate.func.id))
+                elif (
+                    isinstance(candidate.func, ast.Attribute)
+                    and isinstance(candidate.func.value, ast.Name)
+                    and candidate.func.value.id in {"self", "cls"}
+                ):
+                    direct_calls.add(("member", candidate.func.attr))
+            row = {
+                "path": path_text,
+                "symbol": symbol,
+                "leaf": node.name,
+                "line_start": int(node.lineno),
+                "line_end": int(getattr(node, "end_lineno", node.lineno) or node.lineno),
+                "direct_calls": sorted(direct_calls),
+                "node": node,
+            }
+            file_definitions.append(row)
+            definitions.append(row)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                source_literals.append(
+                    {
+                        "path": path_text,
+                        "line": int(getattr(node, "lineno", 0) or 0),
+                        "caller": qualified_scope(node, include_self=False),
+                        "value": node.value,
+                    }
+                )
+            if not isinstance(node, ast.Call):
+                continue
+            leaf = _bug_control_scan_call_name(node)
+            if leaf:
+                if isinstance(node.func, ast.Name):
+                    usage_kind = "direct_call"
+                    base = ""
+                else:
+                    base = (
+                        node.func.value.id
+                        if isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        else ""
+                    )
+                    usage_kind = "member_call" if base in {"self", "cls"} else "attribute_call"
+                add_reference(leaf, node, usage_kind, base=base)
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                add_reference(str(node.args[1].value), node, "dynamic_lookup")
+            for keyword in node.keywords:
+                if str(keyword.arg or "").casefold() not in {
+                    "target",
+                    "callback",
+                    "func",
+                    "runner",
+                    "entrypoint",
+                }:
+                    continue
+                if isinstance(keyword.value, ast.Name):
+                    add_reference(keyword.value.id, keyword.value, "callback_reference")
+                elif isinstance(keyword.value, ast.Attribute):
+                    base = keyword.value.value.id if isinstance(keyword.value.value, ast.Name) else ""
+                    add_reference(
+                        keyword.value.attr,
+                        keyword.value,
+                        "callback_reference",
+                        base=base,
+                    )
+        parsed[path] = {
+            "path": path_text,
+            "sha256": hashlib.sha256(source_bytes).hexdigest().upper(),
+            "line_count": source.count("\n") + 1,
+            "definitions": file_definitions,
+        }
+
+    definitions_by_leaf: dict[str, list[dict[str, Any]]] = {}
+    for row in definitions:
+        definitions_by_leaf.setdefault(str(row["leaf"]), []).append(row)
+
+    selected_ids: set[int] = set()
+    primary_paths = set(component_paths)
+    launcher_keywords = (
+        ("export", "writer", "bug_control", "scene_contract", "fbx_probe")
+        if normalized == "export"
+        else ("import", "bug_control", "scene_contract", "texture", "mrl")
+    )
+    bootstrap_keywords = ("contract", "bridge", "accelerator", normalized)
+    for path, payload in parsed.items():
+        for row in payload["definitions"]:
+            folded = str(row["symbol"]).casefold()
+            if (
+                path in primary_paths
+                or path == LAUNCHER_SOURCE_PATH.resolve()
+                and any(token in folded for token in launcher_keywords)
+                or path == BOOTSTRAP_PATH.resolve()
+                and any(token in folded for token in bootstrap_keywords)
+            ):
+                selected_ids.add(id(row))
+
+    changed = True
+    while changed:
+        changed = False
+        for row in definitions:
+            if id(row) not in selected_ids:
+                continue
+            for call_kind, call_name in row["direct_calls"]:
+                candidates = definitions_by_leaf.get(str(call_name), [])
+                if call_kind == "member" and "." in str(row["symbol"]):
+                    owner = str(row["symbol"]).rsplit(".", 1)[0]
+                    targets = [
+                        candidate
+                        for candidate in candidates
+                        if candidate["path"] == row["path"]
+                        and candidate["symbol"] == f"{owner}.{call_name}"
+                    ]
+                else:
+                    same_file = [
+                        candidate
+                        for candidate in candidates
+                        if candidate["path"] == row["path"]
+                    ]
+                    targets = same_file if len(same_file) == 1 else (
+                        candidates if not same_file and len(candidates) == 1 else []
+                    )
+                for target in targets:
+                    if id(target) not in selected_ids:
+                        selected_ids.add(id(target))
+                        changed = True
+
+    required = (
+        {
+            (LAUNCHER_SOURCE_PATH.name, "LauncherApp._export_mod_active"),
+            (LAUNCHER_SOURCE_PATH.name, "_writer_process_entry"),
+            (WRITER_PATH.name, "run_memory_export"),
+            (WRITER_PATH.name, "_run_memory_export_impl"),
+            (WRITER_PATH.name, "run_writer_maintenance_regression_suite"),
+            (FBX_PROBE_PATH.name, "probe_fbx_handoff"),
+            (FBX_PROBE_PATH.name, "_encode_re6_normal_key_from_fbx_local"),
+        }
+        if normalized == "export"
+        else {
+            (LAUNCHER_SOURCE_PATH.name, "LauncherApp._import_mod_active"),
+            (LAUNCHER_SOURCE_PATH.name, "_build_import_fbx_in_memory_contract"),
+            (IMPORTER_PATH.name, "build_import_scene"),
+            (IMPORTER_PATH.name, "write_import_fbx"),
+            (IMPORTER_PATH.name, "build_import_artifacts"),
+            (IMPORTER_PATH.name, "run_import_maintenance_regression_suite"),
+        }
+    )
+    required_leaves = {symbol.rsplit(".", 1)[-1] for _path, symbol in required}
+    for literal in source_literals:
+        value = str(literal["value"])
+        for leaf in required_leaves:
+            if leaf not in value or not (
+                "getattr" in value or f"{leaf}(" in value or f"target={leaf}" in value
+            ):
+                continue
+            key = (
+                leaf,
+                str(literal["path"]),
+                int(literal["line"]),
+                str(literal["caller"]),
+                "source_literal_reference",
+            )
+            if key in reference_keys:
+                continue
+            reference_keys.add(key)
+            reference_sites_by_leaf.setdefault(leaf, []).append(
+                {
+                    "path": literal["path"],
+                    "line": literal["line"],
+                    "caller": literal["caller"],
+                    "usage_kind": "source_literal_reference",
+                    "base": "",
+                }
+            )
+    selected = [row for row in definitions if id(row) in selected_ids]
+    selected_keys = {(str(row["path"]), str(row["symbol"])) for row in selected}
+    missing_required = [
+        f"{path}:{symbol}"
+        for path, symbol in sorted(required)
+        if (path, symbol) not in selected_keys
+    ]
+    user_entry_symbols = (
+        {
+            (LAUNCHER_SOURCE_PATH.name, "LauncherApp._export_mod_active"),
+            (LAUNCHER_SOURCE_PATH.name, "_writer_process_entry"),
+            (WRITER_PATH.name, "run_memory_export"),
+            (WRITER_PATH.name, "_run_memory_export_impl"),
+        }
+        if normalized == "export"
+        else {
+            (LAUNCHER_SOURCE_PATH.name, "LauncherApp._import_mod_active"),
+            (LAUNCHER_SOURCE_PATH.name, "_build_import_fbx_in_memory_contract"),
+            (IMPORTER_PATH.name, "build_import_scene"),
+            (IMPORTER_PATH.name, "write_import_fbx"),
+            (IMPORTER_PATH.name, "build_import_artifacts"),
+        }
+    )
+    forbidden_user_calls = {
+        "_bug_control_scan_code_index",
+        "run_export_bug_control_scan",
+        "run_import_bug_control_scan",
+        "run_bug_control_scan",
+        "run_writer_maintenance_regression_suite",
+        "run_import_maintenance_regression_suite",
+    }
+    user_isolation_hits: list[dict[str, Any]] = []
+    for definition in definitions:
+        key = (str(definition["path"]), str(definition["symbol"]))
+        if key not in user_entry_symbols:
+            continue
+        for node in ast.walk(definition["node"]):
+            if not isinstance(node, ast.Call):
+                continue
+            call_name = _bug_control_scan_call_name(node)
+            if call_name not in forbidden_user_calls:
+                continue
+            user_isolation_hits.append(
+                {
+                    "path": definition["path"],
+                    "function": definition["symbol"],
+                    "line": int(getattr(node, "lineno", 0) or 0),
+                    "forbidden_call": call_name,
+                }
+            )
+    user_operation_isolation = {
+        "status": "PASS" if not user_isolation_hits else "FAIL",
+        "maintenance_failure_blocks_user_operation": False,
+        "forbidden_calls": sorted(forbidden_user_calls),
+        "hits": user_isolation_hits,
+    }
+    controller_names = {
+        "code_index": "_bug_control_scan_code_index",
+        "export_controller": "run_export_bug_control_scan",
+        "import_controller": "run_import_bug_control_scan",
+        "combined_controller": "run_bug_control_scan",
+    }
+    controller_locations = {
+        label: str(row["path"])
+        + ":"
+        + str(row["line_start"])
+        + "-"
+        + str(row["line_end"])
+        for label, symbol in controller_names.items()
+        for row in definitions
+        if row["path"] == LAUNCHER_SOURCE_PATH.name and row["symbol"] == symbol
+    }
+    missing_controllers = sorted(set(controller_names) - set(controller_locations))
+    operation_paths = {
+        operation_name: {
+            runtime_path(path)
+            for path in operation_values
+        }
+        for operation_name, operation_values in OPERATION_RUNTIME_MODULE_PATHS.items()
+    }
+    sources: list[dict[str, Any]] = []
+    for path, payload in parsed.items():
+        rows: list[dict[str, Any]] = []
+        for definition in payload["definitions"]:
+            if id(definition) not in selected_ids:
+                continue
+            leaf = str(definition["leaf"])
+            definition_count = len(definitions_by_leaf.get(leaf, []))
+            raw_consumers = reference_sites_by_leaf.get(leaf, [])
+            consumers = sorted(
+                (
+                    row
+                    for row in raw_consumers
+                    if (definition_count == 1 or row["path"] == definition["path"])
+                    and (
+                        row["usage_kind"] != "attribute_call"
+                        or leaf.startswith(("_", "run_", "build_", "write_", "probe_"))
+                    )
+                ),
+                key=lambda row: (
+                    str(row["path"]).casefold(),
+                    int(row["line"]),
+                    str(row["caller"]).casefold(),
+                ),
+            )
+            rows.append(
+                {
+                    "function": definition["symbol"],
+                    "line_start": definition["line_start"],
+                    "line_end": definition["line_end"],
+                    "location": (
+                        f"{definition['path']}:{definition['line_start']}-"
+                        f"{definition['line_end']}"
+                    ),
+                    "consumers": consumers,
+                    "ambiguous_definition_count": definition_count,
+                    "unresolved_attribute_call_count": sum(
+                        1
+                        for row in raw_consumers
+                        if row["usage_kind"] == "attribute_call" and row not in consumers
+                    ),
+                }
+            )
+        roles = sorted(
+            operation_name
+            for operation_name, operation_values in operation_paths.items()
+            if path in operation_values
+        )
+        if path == LAUNCHER_SOURCE_PATH.resolve():
+            roles.append("central_bug_controller")
+        if path == BOOTSTRAP_PATH.resolve():
+            roles.append("python_runtime_bootstrap")
+        if "codex_fbx_probe_accel" in {part.casefold() for part in path.parts}:
+            roles.append("fbx_probe_accelerator")
+        if "codex_uv_layout_accel" in {part.casefold() for part in path.parts}:
+            roles.append("uv_layout_accelerator")
+        control_tokens = (
+            "bug_control",
+            "maintenance",
+            "regression",
+            "contract",
+            "validate",
+            "verify",
+            "audit",
+            "guard",
+        )
+        control_functions = [
+            {
+                "function": row["function"],
+                "location": row["location"],
+            }
+            for row in rows
+            if any(token in str(row["function"]).casefold() for token in control_tokens)
+        ]
+        sources.append(
+            {
+                "path": payload["path"],
+                "sha256": payload["sha256"],
+                "line_count": payload["line_count"],
+                "source_index_location": f"{payload['path']}:1-{payload['line_count']}",
+                "function_count": len(rows),
+                "roles": sorted(set(roles)),
+                "control_function_count": len(control_functions),
+                "control_functions": control_functions,
+                "launcher_control_map": dict(controller_locations),
+                "functions": rows,
+            }
+        )
+    indexed_paths = {str(row["path"]) for row in sources}
+    expected_paths = {str(parsed[path]["path"]) for path in component_paths}
+    missing_components = sorted(expected_paths - indexed_paths)
+    index_errors = [*missing_required, *missing_controllers, *missing_components]
+    if user_isolation_hits:
+        index_errors.append("user_operation_calls_strict_maintenance")
+    component_control_map = [
+        {
+            "path": row["path"],
+            "source_index_location": row["source_index_location"],
+            "control_code_locations": [
+                value["location"] for value in row["control_functions"]
+            ],
+            "launcher_control_map": dict(controller_locations),
+        }
+        for row in sources
+    ]
+    return {
+        "status": "PASS" if not index_errors else "FAIL",
+        "operation": normalized,
+        "generated_from_current_source": True,
+        "scope": "all_first_party_python_components",
+        "central_control": controller_locations,
+        "component_control_map": component_control_map,
+        "source_count": len(sources),
+        "function_count": sum(int(row["function_count"]) for row in sources),
+        "missing_required": missing_required,
+        "missing_controllers": missing_controllers,
+        "missing_components": missing_components,
+        "user_operation_isolation": user_operation_isolation,
+        "sources": sources,
+    }
+
+
+def _bug_control_scan_probe_private_consumers() -> dict[str, Any]:
+    probe_tree = _bug_control_scan_tree(FBX_PROBE_PATH)
+    available = {
+        node.name
+        for node in probe_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    consumer_paths = _bug_control_scan_probe_consumer_paths()
+    consumers: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    for path in consumer_paths:
+        tree = _bug_control_scan_tree(path)
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "probe"
+                and node.attr.startswith("_")
+            ):
+                continue
+            row = {
+                "api": node.attr,
+                "path": str(path.relative_to(MODULE_DIR)),
+                "line": int(getattr(node, "lineno", 0) or 0),
+            }
+            consumers.append(row)
+            if node.attr not in available:
+                missing.append(row)
+    return {
+        "status": "PASS" if consumer_paths and not missing else "FAIL",
+        "source_count": len(consumer_paths),
+        "consumer_count": len(consumers),
+        "apis": sorted({str(row["api"]) for row in consumers}),
+        "missing": missing,
+    }
+
+
+def _bug_control_scan_shared_source_contract() -> dict[str, Any]:
+    paths = (LAUNCHER_SOURCE_PATH, WRITER_PATH, IMPORTER_PATH, BOOTSTRAP_PATH)
+    sources = {path.name: path.read_text(encoding="utf-8") for path in paths}
+    report_path_token = "REPORT" + "_PATH"
+    report_path_hits = sorted(
+        name for name, source in sources.items() if report_path_token in source
+    )
+    forbidden_programs = (
+        "codex_" + "bug_control_core.py",
+        "codex_" + "export_bug_control.py",
+        "codex_" + "import_bug_control.py",
+    )
+    forbidden_program_hits = sorted(
+        f"{name}:{forbidden}"
+        for name, source in sources.items()
+        for forbidden in forbidden_programs
+        if forbidden in source
+    )
+    return {
+        "status": "PASS" if not report_path_hits and not forbidden_program_hits else "FAIL",
+        "report_path_hits": report_path_hits,
+        "forbidden_program_hits": forbidden_program_hits,
+        "single_primary_txt_merge": (
+            "_merge_bug_control_into_primary_txt" in sources[LAUNCHER_SOURCE_PATH.name]
+            and BUG_CONTROL_BEGIN in sources[LAUNCHER_SOURCE_PATH.name]
+            and BUG_CONTROL_END in sources[LAUNCHER_SOURCE_PATH.name]
+        ),
+    }
+
+
+def _bug_control_scan_bridge_contract() -> dict[str, Any]:
+    bootstrap = _load_local_module(
+        "pc_rehd_bug_control_bootstrap",
+        BOOTSTRAP_PATH,
+        runtime_fast_load=False,
+    )
+    runner = getattr(bootstrap, "get_export_bridge_contract_report", None)
+    if not callable(runner):
+        raise RuntimeError("Bootstrap strict Writer/Importer contract entry is missing")
+    return dict(runner() or {})
+
+
+def _bug_control_scan_suite_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {
+            "status": "FAIL",
+            "check_count": 0,
+            "failure_count": 1,
+            "skipped": [],
+            "failures": [{"name": "suite", "error": "missing maintenance result"}],
+        }
+    status = str(value.get("status", "") or "UNKNOWN").upper()
+    raw_checks = value.get("statuses")
+    if not isinstance(raw_checks, Mapping):
+        raw_checks = value.get("checks")
+    checks = dict(raw_checks) if isinstance(raw_checks, Mapping) else {}
+    skipped = {
+        str(name)
+        for name in (value.get("skipped", []) or [])
+        if str(name).strip()
+    }
+    skipped.update(
+        str(name)
+        for name, check in checks.items()
+        if isinstance(check, Mapping)
+        and str(check.get("status", "") or "").upper() == "SKIP"
+    )
+    failures_by_name: dict[str, dict[str, str]] = {}
+    for index, row in enumerate(value.get("failures", []) or []):
+        if not isinstance(row, Mapping):
+            continue
+        name = str(row.get("name", "") or f"failure_{index + 1}")
+        failures_by_name.setdefault(
+            name,
+            {"name": name, "error": str(row.get("error", "") or "non-PASS status")},
+        )
+    if status != "PASS" and not failures_by_name:
+        name = str(value.get("error_type", "") or "suite")
+        failures_by_name[name] = {
+            "name": name,
+            "error": str(value.get("error", "") or f"maintenance status is {status}"),
+        }
+    failures = list(failures_by_name.values())
+    return {
+        "status": status,
+        "check_count": len(checks),
+        "failure_count": len(failures),
+        "skipped": sorted(skipped),
+        "failures": failures,
+    }
+
+
+def _bug_control_scan_result(
+    operation: str,
+    *,
+    checks: Mapping[str, Any],
+    errors: Iterable[str],
+    warnings: Iterable[str],
+    started: float,
+) -> dict[str, Any]:
+    normalized_errors = [str(value) for value in errors if str(value).strip()]
+    normalized_warnings = [str(value) for value in warnings if str(value).strip()]
+    return {
+        "schema": BUG_CONTROL_SCAN_SCHEMA,
+        "operation": str(operation),
+        "status": "PASS" if not normalized_errors else "FAIL",
+        "strict_ai_maintenance": True,
+        "blocking_user_operation": False,
+        "elapsed_seconds": round(time.perf_counter() - started, 6),
+        "errors": normalized_errors,
+        "warnings": normalized_warnings,
+        "checks": dict(checks),
+    }
+
+
+def run_export_bug_control_scan(
+    bridge_contract: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Strict export maintenance scan; never called by a user export."""
+    started = time.perf_counter()
+    checks: dict[str, Any] = {}
+    errors: list[str] = []
+    warnings: list[str] = []
+    try:
+        contract = dict(bridge_contract or _bug_control_scan_bridge_contract())
+        writer_suite = contract.get("writer_maintenance_suite")
+        clean_contract = (
+            dict(contract.get("clean_source_import", {}))
+            if isinstance(contract.get("clean_source_import"), Mapping)
+            else {}
+        )
+        checks["writer_maintenance_suite"] = _bug_control_scan_suite_summary(writer_suite)
+        checks["clean_writer_ready"] = clean_contract.get("writer_ready") is True
+        if not isinstance(writer_suite, Mapping) or writer_suite.get("status") != "PASS":
+            errors.append("Writer strict maintenance regression suite did not pass")
+        if contract.get("writer_ready") is not True:
+            errors.append(str(contract.get("error") or "Writer executable contract is not ready"))
+        if clean_contract.get("writer_ready") is not True:
+            errors.append(str(clean_contract.get("error") or "Clean copied Writer contract is not ready"))
+        warnings.extend(str(value) for value in contract.get("maintenance_warnings", []) or [])
+        warnings.extend(str(value) for value in clean_contract.get("maintenance_warnings", []) or [])
+
+        stages = _bug_control_scan_literal_stages((LAUNCHER_SOURCE_PATH, WRITER_PATH))
+        missing_stages = sorted(BUG_CONTROL_EXPORT_REQUIRED_STAGES - stages)
+        checks["stage_contract"] = {
+            "status": "PASS" if not missing_stages else "FAIL",
+            "observed": sorted(stages),
+            "missing": missing_stages,
+        }
+        if missing_stages:
+            errors.append("Export BUG controller lost stages: " + ", ".join(missing_stages))
+
+        code_index = _bug_control_scan_code_index("export")
+        checks["code_index"] = code_index
+        if code_index.get("status") != "PASS":
+            errors.append(
+                "Export code index lost required entries: "
+                + ", ".join(str(value) for value in code_index.get("missing_required", []) or [])
+            )
+
+        private_consumers = _bug_control_scan_probe_private_consumers()
+        checks["fbx_probe_private_consumers"] = private_consumers
+        if private_consumers.get("status") != "PASS":
+            errors.append(
+                "FBX Probe accelerator consumer API mismatch: "
+                + json.dumps(private_consumers.get("missing", []), ensure_ascii=False)
+            )
+
+        writer_calls = _bug_control_scan_calls(WRITER_PATH)
+        checks["maintenance_not_in_user_writer"] = (
+            "run_writer_maintenance_regression_suite" not in writer_calls
+        )
+        if "run_writer_maintenance_regression_suite" in writer_calls:
+            errors.append("Writer user module calls its strict maintenance suite")
+        shared_source = _bug_control_scan_shared_source_contract()
+        checks["single_primary_txt_contract"] = shared_source
+        if shared_source.get("status") != "PASS" or shared_source.get("single_primary_txt_merge") is not True:
+            errors.append("BUG controller output is no longer confined to the primary operation TXT")
+        checks["writer_transport_smoke_entry"] = callable(
+            globals().get("_run_writer_process_transport_smoke")
+        )
+        if checks["writer_transport_smoke_entry"] is not True:
+            errors.append("Writer transport smoke entry is missing")
+    except Exception as exc:
+        errors.append(f"{type(exc).__name__}: {exc}")
+        checks["traceback"] = traceback.format_exc()[-12000:]
+    return _bug_control_scan_result(
+        "export", checks=checks, errors=errors, warnings=warnings, started=started
+    )
+
+
+def run_import_bug_control_scan(
+    bridge_contract: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Strict import maintenance scan; never called by a user import."""
+    started = time.perf_counter()
+    checks: dict[str, Any] = {}
+    errors: list[str] = []
+    warnings: list[str] = []
+    try:
+        contract = dict(bridge_contract or _bug_control_scan_bridge_contract())
+        import_suite = contract.get("import_maintenance_suite")
+        clean_contract = (
+            dict(contract.get("clean_source_import", {}))
+            if isinstance(contract.get("clean_source_import"), Mapping)
+            else {}
+        )
+        checks["import_maintenance_suite"] = _bug_control_scan_suite_summary(import_suite)
+        checks["clean_import_ready"] = clean_contract.get("import_ready") is True
+        if not isinstance(import_suite, Mapping) or import_suite.get("status") != "PASS":
+            errors.append("Importer strict maintenance regression suite did not pass")
+        if contract.get("re6_mod_import_fbx_ready") is not True:
+            errors.append(str(contract.get("error") or "Importer executable contract is not ready"))
+        if clean_contract.get("import_ready") is not True:
+            errors.append(str(clean_contract.get("error") or "Clean copied Importer contract is not ready"))
+        revision = int(contract.get("re6_mod_import_fbx_contract_revision", 0) or 0)
+        required_revision = int(
+            contract.get("required_re6_mod_import_fbx_contract_revision", 0) or 0
+        )
+        checks["contract_revision"] = {
+            "status": "PASS" if revision == required_revision and revision > 0 else "FAIL",
+            "actual": revision,
+            "required": required_revision,
+        }
+        if revision != required_revision or revision <= 0:
+            errors.append(f"Importer contract revision mismatch: {revision} != {required_revision}")
+
+        importer = _load_local_module(
+            "pc_rehd_bug_control_importer_deferred",
+            IMPORTER_PATH,
+            runtime_fast_load=False,
+        )
+        deferred_status = getattr(importer, "IMPORT_MODULE_REGRESSION_STATUS", None)
+        checks["user_load_status"] = deferred_status
+        if not isinstance(deferred_status, Mapping) or deferred_status.get("status") != "DEFERRED":
+            errors.append("Normal Importer load ran or accepted a strict maintenance result")
+        if not callable(getattr(importer, "run_import_maintenance_regression_suite", None)):
+            errors.append("Importer explicit maintenance entry is missing")
+
+        importer_calls = _bug_control_scan_calls(IMPORTER_PATH)
+        importer_main_names = _bug_control_scan_function_names(IMPORTER_PATH, "main")
+        checks["maintenance_not_in_user_importer"] = (
+            "run_import_maintenance_regression_suite" not in importer_calls
+            and "IMPORT_MODULE_REGRESSION_STATUS" not in importer_main_names
+        )
+        if checks["maintenance_not_in_user_importer"] is not True:
+            errors.append("Importer user path still calls or gates on strict maintenance")
+
+        stages = _bug_control_scan_literal_stages((LAUNCHER_SOURCE_PATH, IMPORTER_PATH))
+        missing_stages = sorted(BUG_CONTROL_IMPORT_REQUIRED_STAGES - stages)
+        checks["stage_contract"] = {
+            "status": "PASS" if not missing_stages else "FAIL",
+            "observed": sorted(stages),
+            "missing": missing_stages,
+        }
+        if missing_stages:
+            errors.append("Import BUG controller lost stages: " + ", ".join(missing_stages))
+        code_index = _bug_control_scan_code_index("import")
+        checks["code_index"] = code_index
+        if code_index.get("status") != "PASS":
+            errors.append(
+                "Import code index lost required entries: "
+                + ", ".join(str(value) for value in code_index.get("missing_required", []) or [])
+            )
+        shared_source = _bug_control_scan_shared_source_contract()
+        checks["single_primary_txt_contract"] = shared_source
+        if shared_source.get("status") != "PASS" or shared_source.get("single_primary_txt_merge") is not True:
+            errors.append("BUG controller output is no longer confined to the primary operation TXT")
+    except Exception as exc:
+        errors.append(f"{type(exc).__name__}: {exc}")
+        checks["traceback"] = traceback.format_exc()[-12000:]
+    return _bug_control_scan_result(
+        "import", checks=checks, errors=errors, warnings=warnings, started=started
+    )
+
+
+def run_bug_control_scan() -> dict[str, Any]:
+    """Run both AI-only controllers without touching normal import/export paths."""
+    started = time.perf_counter()
+    try:
+        bridge_contract = _bug_control_scan_bridge_contract()
+        export_report = run_export_bug_control_scan(bridge_contract)
+        import_report = run_import_bug_control_scan(bridge_contract)
+    except Exception as exc:
+        failure = {
+            "schema": BUG_CONTROL_SCAN_SCHEMA,
+            "status": "FAIL",
+            "strict_ai_maintenance": True,
+            "blocking_user_operation": False,
+            "errors": [f"{type(exc).__name__}: {exc}"],
+            "traceback": traceback.format_exc()[-12000:],
+        }
+        export_report = dict(failure, operation="export")
+        import_report = dict(failure, operation="import")
+    return {
+        "schema": BUG_CONTROL_SCAN_SCHEMA,
+        "status": (
+            "PASS"
+            if export_report.get("status") == "PASS"
+            and import_report.get("status") == "PASS"
+            else "FAIL"
+        ),
+        "strict_ai_maintenance": True,
+        "blocking_user_operations": False,
+        "elapsed_seconds": round(time.perf_counter() - started, 6),
+        "export": export_report,
+        "import": import_report,
+    }
+
+
 EXPORT_PATH_HISTORY_FILE = DEFAULT_LOG_DIR / "PC_REHD_Code_X_Export_Path_History.txt"
 EXPORT_PATH_HISTORY_MAX_BYTES = 100 * 1024 * 1024
 EXPORT_SOURCE_MOD_FILE_PATTERN = "*.mod *.MOD *.newmod *.NewMOD *.NEWMOD"
@@ -5227,10 +6332,10 @@ def _run_export_transaction_registry_guard() -> dict[str, Any]:
 
 
 PYMXS_GEOMETRY_POLICY_VERSION = 9
-PYMXS_RUNTIME_API_POLICY_VERSION = 2
+PYMXS_RUNTIME_API_POLICY_VERSION = 3
 SKIN_IMPORT_POLICY_VERSION = 1
 SKIN_LIMIT_WRITER_FUNCTION = "_max_apply_authoritative_skin_limit"
-POPUP_FOREGROUND_POLICY_VERSION = 35
+POPUP_FOREGROUND_POLICY_VERSION = 36
 UI_QUALITY_POLICY_VERSION = 33
 MESH_SLOT_LIMIT_POLICY_VERSION = 3
 IMPORT_EXPORT_PERFORMANCE_POLICY_VERSION = 3
@@ -5339,15 +6444,15 @@ IMPORT_EXPORT_PERFORMANCE_REVIEW_REQUIRED_FIELDS = (
     "reviewed_baseline_sha256",
 )
 IMPORT_EXPORT_PERFORMANCE_REVIEW = {
-    "review_id": "max-startup-python-audit-CC584BA1B030",
+    "review_id": "bug-control-maintenance-E84112F79FC8",
     "does_this_change_slow_import_export": "NO",
     "affected_phase": (
-        "Max startup-hook maintenance only. The Launcher performs a filename-and-extension scan plus a small generated .ms text comparison in its existing background hook check and returns before that check whenever import or export owns priority. No PYMXS scene read, FBX parse, geometry scan, subprocess, IPC wait, or user import/export phase is added."
+        "Explicit AI maintenance only. --bug-control-scan runs strict Writer/Importer regressions, clean-child imports, contract and accelerator consumer checks only when a maintainer requests that CLI mode. Normal GUI startup, Import, Export and worker preload never call this scan."
     ),
     "timing_evidence": (
-        "Python syntax compilation passed. The protected refresh remains asynchronous and has an early _import_export_priority_active return, so this check cannot enter an active import/export. Its only new work is Path.iterdir, .py suffix filtering, and comparison of the generated .ms text; it does not read Max nodes, vertices, faces, normals, UVs, Skin, or FBX data."
+        "Normal Writer and Importer module loads publish DEFERRED maintenance status and complete without executing their full regression suites. The strict scan measured separately through its explicit console entry; no PYMXS scene read, FBX parse, subprocess wait, source fingerprint gate or maintenance suite was added to a user operation."
     ),
-    "reviewed_baseline_sha256": "484602DD9634691EEC7A0D19E6D1E905DE2989659ACD9EA47F7921CE5B65CF7D",
+    "reviewed_baseline_sha256": "E84112F79FC83B43B3C54A313A8F39C91872F8F23233F3744F150D06113D7294",
 }
 IMPORT_EXPORT_PERFORMANCE_PROTECTED_FUNCTIONS = (
     "_call_with_windows_thread_priority",
@@ -5480,7 +6585,7 @@ IMPORT_EXPORT_PERFORMANCE_FINGERPRINTS = {
     "LauncherApp._import_mod_active": "16F7595BB3B094A209E6419A30A4B4246164282849D2619648EE9DCF2CABD91C",
     "LauncherApp._export_mod_active": "9D5B2484DE86EFC47E423A2E78CBE3B016EB384F8514030CAFC7FB4293E66038",
     "LauncherApp._on_close": "6CE9CEC1425D821B4B726AB8EB340A9FC7EC2BA125DCE7A32CD4392E9F85180E",
-    "_main_impl": "2F54DB25CEDE0FA75410BC9FFDB3F529D8F389BF077528513233623244FB46EA",
+    "_main_impl": "07CD92C4AC24C03FA380A77B3F74BEA9DA6AAB113718C205F5EF18A77FC27E88",
     "_run_import_export_performance_policy_guard": "025C8A6547AAFFC452AEA36C7B1AEF82ADE22B8C8150B5190511D6DE5851ECD5",
     "_run_policy_guard_bundle": "FC1B59B90AC55618DE753A666D3473C2699DDA952ED23D0ABAAA99B48217207E",
     "_apply_policy_guard_bundle": "E376C2A3F6B930EE65CC55F1D013FC7B3DEEB345A891AD6DD8A785A05EE39F4A",
@@ -5489,11 +6594,11 @@ IMPORT_EXPORT_PERFORMANCE_FINGERPRINTS = {
 # It tells a maintainer that Importer/Writer changed without a recorded review.
 # User operations must never use these values as runtime trust or readiness.
 AI_MAINTENANCE_ONLY_MODULE_SHA256 = {
-    "codex_python_runtime_bootstrap.py": "B940C6BF2C7AFAF478CB522833857B28C31ED029756E129D2E01FBC862401A9A",
-    "codex_re6_mod_import_fbx.py": "4C84CCB110153D618019842475C3FDEAECE46458E059DD19CC7A49CC4A75AC7A",
-    "codex_python_export_bridge.py": "37CDEB4A4E5287D59BF650CD349379475F8DCC09E1B6604A0EE828A4F8BE4EC1",
+    "codex_python_runtime_bootstrap.py": "C6C1672ECA333C9DB625F2CBDD3C9C869F05767FAF5CD486F811535E2B004A80",
+    "codex_re6_mod_import_fbx.py": "D052E4F0008F75272C3131148016B4BABAD2EE2098E8BC1903E055D12CB2BE5D",
+    "codex_python_export_bridge.py": "C6808FD30182331FE2127054895C4C90ECF855C5AA421D4DD5B8D7D1DBE408BE",
     "codex_re6_scene_compatibility.py": "0F387A805643A060C90B0FB3C32A5A884F925E9C1D872A117DFB3681BB5E16CC",
-    "codex_fbx_probe.py": "B61710892A906038D166B9B133E09FBE5D93B02A63F7A12CD486924B105699C0",
+    "codex_fbx_probe.py": "EFD1F1D1728D77647780946BF7929335B809FCF7396C4AF2D241589EFA7E5BD4",
     "codex_re6_auxiliary_max_bridge.py": "63AFB27F36B4C318EB8A13F133C63BD0A225A2005C89908668FDC9A3D20F3E70",
     "codex_re6_tex_decode.py": "2C3D689B5CC7CFF59BEF3479CB0DF979B932DB6ED1204D9BF1AC6E04D603CD56",
 }
@@ -5740,7 +6845,6 @@ PYMXS_EXPORT_ALLOWED_RUNTIME_CALLS = (
     "rt.collapse.setcollapseto",
     "rt.collapse.setoutputtype",
     "rt.delete",
-    "rt.deleteModifier",
     "rt.exportFile",
     "rt.getAnimByHandle",
     "rt.getHandleByAnim",
@@ -5829,6 +6933,7 @@ _PYMXS_APPROVED_RUNTIME_CALLS = frozenset(
         "rt.Bitmaptexture",
         "rt.BitArray",
         "rt.Box",
+        "rt.Array",
         "rt.Edit_Mesh",
         "rt.FBXExporterGetParam",
         "rt.FBXExporterSetParam",
@@ -5844,6 +6949,7 @@ _PYMXS_APPROVED_RUNTIME_CALLS = frozenset(
         "rt.SceneExplorerManager.GetExplorerName",
         "rt.WeightedNormalsMod",
         "rt.addModifier",
+        "rt.addModifierWithLocalData",
         "rt.buildTVFaces",
         "rt.bezier_float",
         "rt.canConvertTo",
@@ -5858,7 +6964,6 @@ _PYMXS_APPROVED_RUNTIME_CALLS = frozenset(
         "rt.copy",
         "rt.convertTo",
         "rt.delete",
-        "rt.deleteModifier",
         "rt.deleteUserProp",
         "rt.dotNetClass",
         "rt.execute",
@@ -5879,16 +6984,20 @@ _PYMXS_APPROVED_RUNTIME_CALLS = frozenset(
         "rt.importFile",
         "rt.instance",
         "rt.inverse",
+        "rt.IsUndoDisabled",
         "rt.isValidNode",
         "rt.isProperty",
         "rt.matrix3",
+        "rt.max_modify_mode",
         "rt.maxOps.getNodeByHandle",
         "rt.maxOps.CollapseNodeTo",
         "rt.maxVersion",
         "rt.mesh",
+        "rt.meshop.getMapSupport",
         "rt.move",
         "rt.modPanel.setCurrentObject",
         "rt.nodeGetBoundingBox",
+        "rt.name",
         "rt.polyop.getFaceSelection",
         "rt.polyop.getFaceVerts",
         "rt.polyop.getVertSelection",
@@ -5900,6 +7009,7 @@ _PYMXS_APPROVED_RUNTIME_CALLS = frozenset(
         "rt.select",
         "rt.selectMore",
         "rt.setProperty",
+        "rt.setCommandPanelTaskMode",
         "rt.setSubMtl",
         "rt.setTVFace",
         "rt.setTVert",
@@ -5919,6 +7029,8 @@ _PYMXS_APPROVED_RUNTIME_CALLS = frozenset(
         "rt.skinOps.SelectVertices",
         "rt.skinOps.unNormalizeVertex",
         "rt.superClassOf",
+        "rt.theHold.DisableUndo",
+        "rt.theHold.enableUndo",
         "rt.uniqueName",
         "rt.unhide",
         "rt.hide",
@@ -5929,8 +7041,6 @@ _PYMXS_APPROVED_RUNTIME_CALLS = frozenset(
 )
 _PYMXS_OPTIONAL_RUNTIME_CALLS = frozenset(
     {
-        "rt.OpenPBRMaterial",
-        "rt.OpenPBR_Material",
         "rt.redrawViews",
     }
 )
@@ -5959,7 +7069,7 @@ _PYMXS_DYNAMIC_RUNTIME_ACCESS_BY_FUNCTION = {
     "_max_is_material_property": frozenset({"rt.isProperty"}),
     "_max_set_material_property": frozenset({"rt.setProperty"}),
     "_max_get_material_property": frozenset({"rt.getProperty"}),
-    "_max_mrl_material": frozenset({"rt.OpenPBRMaterial", "rt.OpenPBR_Material"}),
+    "_max_material_bitmap_scan": frozenset({"rt.execute"}),
 }
 
 
@@ -7001,7 +8111,20 @@ def _run_popup_foreground_policy_guard() -> dict[str, Any]:
     )
     queue_scroll_source = method_source(scheduler_methods.get("queue_scroll"))
     flush_scroll_source = method_source(scheduler_methods.get("flush_scroll"))
-    if "MANAGED_WINDOW_STAGING" not in show_source or "if activate:" not in show_source:
+    show_node = scheduler_methods.get("show")
+    activation_guarded = bool(
+        show_node is not None
+        and any(
+            isinstance(node, ast.If)
+            and any(
+                isinstance(name, ast.Name) and name.id == "activate"
+                for name in ast.walk(node.test)
+            )
+            and "request_activation" in leaf_call_names(node)
+            for node in ast.walk(show_node)
+        )
+    )
+    if "MANAGED_WINDOW_STAGING" not in show_source or not activation_guarded:
         violations.append("managed_scheduler_show_state_or_explicit_activation_missing")
     if "activate=False" not in restore_source:
         violations.append("managed_restore_can_steal_focus")
@@ -7131,6 +8254,9 @@ def _run_popup_foreground_policy_guard() -> dict[str, Any]:
     }
     activation_allowlist = {"_ManagedWindowScheduler.request_activation"}
     topmost_allowlist = {
+        "_ManagedWindowScheduler._window_topmost_state",
+        "_ManagedWindowScheduler._demote_window_for_native_dialog",
+        "_ManagedWindowScheduler.end_native_dialog",
         "_ManagedWindowScheduler.enforce_floating_ball",
         "_ManagedWindowScheduler.sync_topmost",
         "_run_managed_native_dialog",
@@ -39227,6 +40353,7 @@ def _build_import_fbx_in_memory_contract(
     texture_config: Mapping[str, Any] | None = None,
     normal_profile: str = "max",
     blender_compact_mesh_names: bool = False,
+    bug_control: Any | None = None,
 ) -> dict[str, Any]:
     if blender_compact_mesh_names:
         raise ValueError(
@@ -39250,6 +40377,7 @@ def _build_import_fbx_in_memory_contract(
         fix_processing_mode=normalized_fix_mode,
         reserved_scene_names=list(reserved_scene_names or []),
         blender_compact_mesh_names=bool(blender_compact_mesh_names),
+        bug_control=bug_control,
     )
     scene_include_normals = scene.get("options", {}).get("include_normals")
     if not isinstance(scene_include_normals, bool) or scene_include_normals != requested_include_normals:
@@ -39400,6 +40528,7 @@ def _build_import_fbx_in_memory_contract(
                                 route_file_name="",
                                 mrl_bindings=mrl_bindings,
                                 normal_profile=requested_normal_profile,
+                                bug_control=bug_control,
                             )
                             embedded_texture_written = True
                             texture_bound_mesh_slots = set(mrl_bindings)
@@ -39464,7 +40593,10 @@ def _build_import_fbx_in_memory_contract(
             include_normals=requested_include_normals,
             route_file_name="",
             normal_profile=requested_normal_profile,
+            bug_control=bug_control,
         )
+    if bug_control is not None:
+        bug_control.advance("artifact_verify")
     if not output_fbx.is_file() or output_fbx.stat().st_size <= 0:
         raise RuntimeError("Pure Python importer did not create an FBX payload")
     source_sha256 = str(scene.get("source", {}).get("sha256", "") or "").upper()
@@ -39622,6 +40754,7 @@ def _build_import_blender_scene_data_contract(
     fix_processing_mode: str = FIX_PROCESSING_MODE_CODEX,
     reserved_scene_names: list[str] | None = None,
     texture_config: Mapping[str, Any] | None = None,
+    bug_control: Any | None = None,
 ) -> dict[str, Any]:
     """Build Blender's direct-memory import contract without creating files.
 
@@ -39702,6 +40835,7 @@ def _build_import_blender_scene_data_contract(
         fix_processing_mode=normalized_fix_mode,
         reserved_scene_names=list(reserved_scene_names or []),
         blender_compact_mesh_names=False,
+        bug_control=bug_control,
         **texture_kwargs,
     )
     if not isinstance(scene_data, Mapping):
@@ -45401,6 +46535,11 @@ def _writer_process_entry(connection: Any) -> None:
                         "error_type": type(exc).__name__,
                         "error": str(exc),
                         "traceback": worker_traceback,
+                        "bug_control": (
+                            dict(getattr(exc, "_pc_rehd_bug_control", {}))
+                            if isinstance(getattr(exc, "_pc_rehd_bug_control", {}), dict)
+                            else {}
+                        ),
                         "worker_process_id": process_id,
                         "request_sequence": request_sequence,
                     }
@@ -50403,7 +51542,6 @@ class LauncherApp:
                     highlightthickness=0,
                     cursor="hand2",
                 )
-                window.transient(self.root)
                 # Keep the hit surface fully transparent.  A non-zero alpha
                 # still composites the panel colour over whatever is beneath
                 # it, which is visible as a mask on some Windows themes.
@@ -55796,7 +56934,6 @@ class LauncherApp:
             highlightthickness=0,
             cursor="size_nw_se",
         )
-        self.main_resize_grip.transient(root)
         # The native window is only a pointer hit target.  A Tk child frame
         # cannot be transparent, so keep this managed Toplevel at alpha zero.
         self.main_resize_grip.attributes("-alpha", 0.0)
@@ -81398,6 +82535,41 @@ class LauncherApp:
                 if worker_traceback:
                     detail += "\n\n" + worker_traceback[-12000:]
                 error = RuntimeError(detail)
+                export_bug_control = _OperationBugControl(
+                    "export",
+                    request_id=str(request.get("request_id", "") or ""),
+                    process_id=int(request.get("target_max_pid", 0) or 0),
+                    metadata={
+                        "source_mod": str(request.get("source_mod", "") or ""),
+                        "output_mod": str(request.get("output_mod", "") or ""),
+                        "fbx_path": str(request.get("fbx_path", "") or ""),
+                        "source_sha256": str(request.get("source_sha256", "") or ""),
+                    },
+                )
+                export_bug_control.import_remote_stages(
+                    response.get("bug_control")
+                    if isinstance(response.get("bug_control"), Mapping)
+                    else None
+                )
+                bug_report = export_bug_control.capture(
+                    error,
+                    extra={
+                        "writer_error_type": error_type,
+                        "worker_process_id": int(response.get("worker_process_id", 0) or 0),
+                        "request_sequence": int(response.get("request_sequence", 0) or 0),
+                    },
+                    traceback_text=worker_traceback,
+                )
+                txt_write_error = _merge_bug_control_into_primary_txt(
+                    _export_primary_txt_path(request),
+                    bug_report,
+                )
+                if txt_write_error:
+                    bug_report["primary_txt_write_error"] = txt_write_error
+                try:
+                    setattr(error, "_pc_rehd_bug_control", bug_report)
+                except Exception:
+                    pass
                 if _runtime_dependency_error_is_repairable(error):
                     discard_worker = True
                 raise error
@@ -85529,6 +86701,24 @@ class LauncherApp:
             if blender_direct
             else _fbx_log_path(log_directory, session.pid, "import", request_token)
         )
+        import_txt_path = (
+            fbx_path.with_suffix(".txt")
+            if fbx_path is not None
+            else log_directory / f"import_pid{session.pid}_{request_token}.txt"
+        )
+        import_bug_control = create_import_bug_controller(
+            request_id=request_token,
+            process_id=session.pid,
+            metadata={
+                "source_mod": str(source_mod),
+                "fbx_path": str(fbx_path or ""),
+                "backend": "blender_direct" if blender_direct else "fbx_handoff",
+                "include_normals": include_normals,
+                "reset_scene": reset_scene,
+                "fix_processing_mode": fix_processing_mode,
+            },
+        )
+        import_bug_control.advance("request_validation")
         import_started_at = time.perf_counter()
         generation = self._begin_session_operation(session, action)
         self._report_bootstrap_health_operation(
@@ -85613,6 +86803,7 @@ class LauncherApp:
 
         def operation() -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]:
             try:
+                import_bug_control.advance("scene_identity_snapshot")
                 if isinstance(session, ManagedBlenderSession):
                     planned_contract = self._inspect_blender_scene(session)
                     planned_name_snapshot = {
@@ -85651,6 +86842,7 @@ class LauncherApp:
                         fix_processing_mode=fix_processing_mode,
                         reserved_scene_names=planned_reserved_names,
                         texture_config=texture_config,
+                        bug_control=import_bug_control,
                     )
                 else:
                     if fbx_path is None:
@@ -85666,6 +86858,7 @@ class LauncherApp:
                         texture_config=texture_config,
                         blender_compact_mesh_names=False,
                         normal_profile=fbx_normal_profile,
+                        bug_control=import_bug_control,
                     )
                 import_failure_state["source_sha256"] = str(
                     import_receipt.get("source_sha256", "") or ""
@@ -85675,6 +86868,8 @@ class LauncherApp:
                         import_receipt.get("fbx_sha256", "") or ""
                     )
                 capture_import_file_evidence()
+                import_bug_control.advance("scene_transfer")
+                import_bug_control.advance("scene_apply")
                 if blender_direct:
                     request_id = uuid.uuid4().hex
                     result = self._blender_scene_dispatcher(session).import_scene_data(
@@ -85783,6 +86978,7 @@ class LauncherApp:
                             result["viewport_focus"]["followup_request_id"] = (
                                 focus_request_id
                             )
+                import_bug_control.advance("post_import_validation")
                 return request_id, result, import_receipt, planned_name_snapshot
             except Exception as exc:
                 import_failure_state["exception_type"] = type(exc).__name__
@@ -85791,8 +86987,16 @@ class LauncherApp:
                     traceback.format_exception(type(exc), exc, exc.__traceback__)
                 )[-12000:]
                 capture_import_file_evidence()
+                report = import_bug_control.capture(
+                    exc,
+                    extra=dict(import_failure_state),
+                    traceback_text=str(import_failure_state.get("traceback", "") or ""),
+                )
+                import_failure_state["bug_control"] = report
+                _merge_bug_control_into_primary_txt(import_txt_path, report)
                 raise
             finally:
+                import_bug_control.advance("artifact_cleanup")
                 if not blender_direct:
                     try:
                         if fbx_path is None:
@@ -85838,6 +87042,7 @@ class LauncherApp:
                 self._release_import_export_priority(session, action, generation)
                 return
             request_id, result, import_receipt, planned_name_snapshot = value
+            import_bug_control.complete()
 
             def record_blender_hierarchy_coverage(
                 hierarchy: dict[str, Any], imported_mesh_count: int
@@ -86467,6 +87672,18 @@ class LauncherApp:
                     exc.receipt.get("failure_domain", "")
                     or import_failure_state["failure_domain"]
                 )
+            report = import_bug_control.capture(
+                exc,
+                extra=dict(import_failure_state),
+                traceback_text=traceback_text,
+            )
+            import_failure_state["bug_control"] = report
+            txt_write_error = _merge_bug_control_into_primary_txt(
+                import_txt_path,
+                report,
+            )
+            if txt_write_error:
+                import_failure_state["bug_control_txt_error"] = txt_write_error
             failure_detail = f"{type(exc).__name__}: {exc}"
             if traceback_text:
                 failure_detail += "\n" + traceback_text
@@ -90340,6 +91557,7 @@ def build_cli() -> argparse.ArgumentParser:
     parser.add_argument("--policy-smoke", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--runtime-compat-smoke", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--writer-transport-smoke", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--bug-control-scan", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--target-pid", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--recovery-restart-pid", type=int, default=0, help=argparse.SUPPRESS)
     return parser
@@ -90358,6 +91576,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
     # GUI and business operations must not wait for Bootstrap maintenance.
     # The explicit runtime-compat mode above remains the sole full A/B check.
     _require_supported_launcher_python()
+    if args.bug_control_scan:
+        payload = run_bug_control_scan()
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0 if payload.get("status") == "PASS" else 1
     if args.writer_transport_smoke:
         print(json.dumps(_run_writer_process_transport_smoke(), ensure_ascii=False))
         return 0
