@@ -1336,7 +1336,7 @@ GITHUB_SOURCE_UPDATE_CHECK_ENABLED = True
 # Keep the update text in the title, but do not create that overlay.
 GITHUB_SOURCE_UPDATE_TITLE_CLICK_SURFACE_ENABLED = False
 LAUNCHER_WINDOW_TITLE = "CAPCOM MT FRAMEWORK Script v0.1.2.8 Codex Python"
-GITHUB_SOURCE_UPDATE_TITLE_CN = "发现Github 源代码更新"
+GITHUB_SOURCE_UPDATE_TITLE_CN = "发现Github 源码更新，点击此处打开Release 网页！"
 GITHUB_SOURCE_UPDATE_TITLE_EN = "GitHub Source Update Available"
 GITHUB_REPOSITORY_API_URL = (
     "https://api.github.com/repos/Criticise/"
