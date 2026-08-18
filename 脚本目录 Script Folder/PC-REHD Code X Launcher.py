@@ -2492,6 +2492,11 @@ RESCUE_AGENT_DESCRIPTOR_TAG_PREFIX = "Local\\PC_REHD_Code_X_Rescue_"
 WRITER_PROCESS_PROTOCOL = "pc-rehd-code-x-writer-process-v1"
 WRITER_PROCESS_TIMEOUT_SECONDS = 30 * 60.0
 WRITER_PROCESS_PRELOAD_TIMEOUT_SECONDS = 120.0
+# A preload timeout happens before the Writer receives a `run` envelope, so a
+# discarded worker can be replaced without risking a duplicate MOD write.
+WRITER_PROCESS_PRELOAD_RETRY_LIMIT = 1
+WRITER_PROCESS_PRELOAD_RETRY_BACKOFF_SECONDS = (0.5,)
+WRITER_PRELOAD_FAILURE_SCHEMA = "pc-rehd-code-x-writer-preload-failure-v1"
 
 BUG_CONTROL_REVISION = 1
 BUG_CONTROL_BEGIN = "[BUG_CONTROL_LAUNCHER_BEGIN]"
@@ -2526,6 +2531,8 @@ def _classify_operation_bug(operation: str, exc: BaseException, stage: str) -> d
             code, recovery = "EXPORT_SOURCE_CHANGED", "Retry from a fresh source snapshot and retain both hashes in this TXT."
         elif "mutex" in folded or "output path" in folded and "busy" in folded:
             code, recovery = "EXPORT_OUTPUT_BUSY", "Return immediately as retryable; never wait indefinitely or overwrite another writer."
+        elif "writer preload did not reach ready" in folded or "writer process terminated before ready" in folded:
+            code, recovery = "EXPORT_WRITER_PRELOAD_TIMEOUT", "Inspect the Writer preload evidence stage and the runtime-lock regression; discard the stalled Worker and retry with a fresh process."
         elif stage == "fbx_probe" or "fbx geometry carrier" in folded:
             code, recovery = "EXPORT_FBX_READ_FAILED", "Use only the permitted per-Mesh source fallback and report Meshes that still require FBX geometry."
         elif stage == "fbx_merge" or "did not match required modify" in folded:
@@ -2550,6 +2557,94 @@ def _classify_operation_bug(operation: str, exc: BaseException, stage: str) -> d
     else:
         code, recovery = "IMPORT_UNCLASSIFIED_FAILURE", "Use the stage, fingerprint and traceback below; add a regression after proving root cause."
     return {"code": code, "cause": detail, "recovery": recovery, "user_blocking": code != "IMPORT_TEXTURE_OPTIONAL_FAILED"}
+
+
+def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return tuple(chain)
+
+
+def _is_writer_preload_failure(exc: BaseException) -> bool:
+    """Return true only for failures that happened before a write request."""
+    for candidate in _exception_chain(exc):
+        if bool(getattr(candidate, "_pc_rehd_writer_preload_failure", False)):
+            return True
+        folded = f"{type(candidate).__name__} {candidate}".casefold()
+        if "writer preload did not reach ready" in folded:
+            return True
+        if "writer process terminated before ready" in folded:
+            return True
+    return False
+
+
+def _writer_preload_failure_details(exc: BaseException) -> dict[str, Any]:
+    for candidate in _exception_chain(exc):
+        details = getattr(candidate, "_pc_rehd_writer_preload_details", None)
+        if isinstance(details, Mapping):
+            return dict(details)
+    return {
+        "schema": WRITER_PRELOAD_FAILURE_SCHEMA,
+        "safe_to_retry": True,
+        "error_type": type(exc).__name__,
+        "error": _bug_text(exc, 4000),
+    }
+
+
+def _attach_writer_preload_bug_control(
+    exc: BaseException,
+    request: Mapping[str, Any],
+    failures: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Record a transport-only failure in the operation's existing TXT."""
+    existing = getattr(exc, "_pc_rehd_bug_control", None)
+    if isinstance(existing, dict) and existing:
+        return dict(existing)
+    controller = _OperationBugControl(
+        "export",
+        request_id=str(request.get("request_id", "") or ""),
+        process_id=int(request.get("target_max_pid", 0) or 0),
+        metadata={
+            "source_mod": str(request.get("source_mod", "") or ""),
+            "output_mod": str(request.get("output_mod", "") or ""),
+            "fbx_path": str(request.get("fbx_path", "") or ""),
+            "source_sha256": str(request.get("source_sha256", "") or ""),
+        },
+    )
+    controller.advance("request_validation", "Writer request was not sent yet")
+    normalized_failures = [dict(row) for row in failures if isinstance(row, Mapping)]
+    controller.advance(
+        "writer_preload",
+        f"safe retry boundary; failed_attempts={len(normalized_failures)}",
+    )
+    report = controller.capture(
+        exc,
+        extra={
+            "retry_count": max(0, len(normalized_failures) - 1),
+            "preload_failures": normalized_failures[-WRITER_PROCESS_PRELOAD_RETRY_LIMIT - 1 :],
+            "safe_to_retry": True,
+            "write_request_sent": False,
+        },
+        traceback_text="".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )[-12000:],
+    )
+    txt_error = _merge_bug_control_into_primary_txt(
+        _export_primary_txt_path(request),
+        report,
+    )
+    if txt_error:
+        report["primary_txt_write_error"] = txt_error
+    try:
+        setattr(exc, "_pc_rehd_bug_control", report)
+    except Exception:
+        pass
+    return report
 
 
 class _OperationBugControl:
@@ -2777,6 +2872,7 @@ BUG_CONTROL_SCAN_SCHEMA = "pc-rehd-code-x-bug-control-scan-v1"
 BUG_CONTROL_EXPORT_REQUIRED_STAGES = frozenset(
     {
         "request_validation",
+        "writer_preload",
         "output_lock",
         "source_read_hash",
         "route_plan",
@@ -3080,7 +3176,7 @@ def _bug_control_scan_code_index(operation: str) -> dict[str, Any]:
         if normalized == "export"
         else ("import", "bug_control", "scene_contract", "texture", "mrl")
     )
-    bootstrap_keywords = ("contract", "bridge", "accelerator", normalized)
+    bootstrap_keywords = ("contract", "bridge", "accelerator", "runtime_lock", normalized)
     for path, payload in parsed.items():
         for row in payload["definitions"]:
             folded = str(row["symbol"]).casefold()
@@ -3127,11 +3223,17 @@ def _bug_control_scan_code_index(operation: str) -> dict[str, Any]:
         {
             (LAUNCHER_SOURCE_PATH.name, "LauncherApp._export_mod_active"),
             (LAUNCHER_SOURCE_PATH.name, "_writer_process_entry"),
+            (LAUNCHER_SOURCE_PATH.name, "_is_writer_preload_failure"),
+            (LAUNCHER_SOURCE_PATH.name, "_attach_writer_preload_bug_control"),
+            (LAUNCHER_SOURCE_PATH.name, "LauncherApp._ensure_writer_worker_ready"),
+            (LAUNCHER_SOURCE_PATH.name, "LauncherApp._run_writer_in_process"),
+            (LAUNCHER_SOURCE_PATH.name, "LauncherApp._run_writer_request_once"),
             (WRITER_PATH.name, "run_memory_export"),
             (WRITER_PATH.name, "_run_memory_export_impl"),
             (WRITER_PATH.name, "run_writer_maintenance_regression_suite"),
             (FBX_PROBE_PATH.name, "probe_fbx_handoff"),
             (FBX_PROBE_PATH.name, "_encode_re6_normal_key_from_fbx_local"),
+            (BOOTSTRAP_PATH.name, "run_runtime_lock_metadata_regression"),
         }
         if normalized == "export"
         else {
@@ -3355,6 +3457,31 @@ def _bug_control_scan_code_index(operation: str) -> dict[str, Any]:
         }
         for row in sources
     ]
+    incident_index = {}
+    if normalized == "export":
+        def source_location(symbol: str) -> str:
+            for source in sources:
+                for function in source.get("functions", []):
+                    if str(function.get("function", "")) == symbol:
+                        return str(function.get("location", ""))
+            return ""
+
+        incident_index["writer_preload_timeout"] = {
+            "failure_code": "EXPORT_WRITER_PRELOAD_TIMEOUT",
+            "failure_stage": "writer_preload",
+            "safe_retry": True,
+            "write_request_sent": False,
+            "retry_limit": WRITER_PROCESS_PRELOAD_RETRY_LIMIT,
+            "primary_txt_writer": "_merge_bug_control_into_primary_txt",
+            "locations": {
+                "preload_failure_classifier": source_location("_is_writer_preload_failure"),
+                "preload_bug_capture": source_location("_attach_writer_preload_bug_control"),
+                "worker_ready_handshake": source_location("LauncherApp._ensure_writer_worker_ready"),
+                "retry_boundary": source_location("LauncherApp._run_writer_in_process"),
+                "single_attempt": source_location("LauncherApp._run_writer_request_once"),
+                "primary_txt_merge": source_location("_merge_bug_control_into_primary_txt"),
+            },
+        }
     return {
         "status": "PASS" if not index_errors else "FAIL",
         "operation": normalized,
@@ -3362,6 +3489,7 @@ def _bug_control_scan_code_index(operation: str) -> dict[str, Any]:
         "scope": "all_first_party_python_components",
         "central_control": controller_locations,
         "component_control_map": component_control_map,
+        "incident_index": incident_index,
         "source_count": len(sources),
         "function_count": sum(int(row["function_count"]) for row in sources),
         "missing_required": missing_required,
@@ -3436,6 +3564,39 @@ def _bug_control_scan_shared_source_contract() -> dict[str, Any]:
             and BUG_CONTROL_BEGIN in sources[LAUNCHER_SOURCE_PATH.name]
             and BUG_CONTROL_END in sources[LAUNCHER_SOURCE_PATH.name]
         ),
+    }
+
+
+def _bug_control_scan_writer_preload_recovery() -> dict[str, Any]:
+    """Strictly verify the safe retry boundary for the Writer bootstrap lane."""
+    source = LAUNCHER_SOURCE_PATH.read_text(encoding="utf-8")
+    required_tokens = (
+        "WRITER_PROCESS_PRELOAD_RETRY_LIMIT",
+        "WRITER_PROCESS_PRELOAD_RETRY_BACKOFF_SECONDS",
+        "WRITER_PRELOAD_FAILURE_SCHEMA",
+        "_is_writer_preload_failure",
+        "_writer_preload_failure_details",
+        "_attach_writer_preload_bug_control",
+        "writer_transport_recovery",
+        "_pc_rehd_writer_preload_failure",
+        "write_request_sent",
+        '"writer_preload"',
+    )
+    missing = [token for token in required_tokens if token not in source]
+    retry_limit_ok = WRITER_PROCESS_PRELOAD_RETRY_LIMIT >= 1
+    return {
+        "status": "PASS" if not missing and retry_limit_ok else "FAIL",
+        "schema": WRITER_PRELOAD_FAILURE_SCHEMA,
+        "required_tokens": list(required_tokens),
+        "missing": missing,
+        "retry_limit": WRITER_PROCESS_PRELOAD_RETRY_LIMIT,
+        "retry_limit_ok": retry_limit_ok,
+        "safe_boundary": {
+            "failure_stage": "writer_preload",
+            "write_request_sent": False,
+            "automatic_retry": True,
+            "primary_txt_only": True,
+        },
     }
 
 
@@ -3550,6 +3711,56 @@ def run_export_bug_control_scan(
             errors.append(str(clean_contract.get("error") or "Clean copied Writer contract is not ready"))
         warnings.extend(str(value) for value in contract.get("maintenance_warnings", []) or [])
         warnings.extend(str(value) for value in clean_contract.get("maintenance_warnings", []) or [])
+
+        bootstrap = _ensure_bootstrap_module_identity()
+        runtime_lock_runner = getattr(bootstrap, "run_runtime_lock_metadata_regression", None)
+        runtime_lock_report = (
+            dict(runtime_lock_runner() or {})
+            if callable(runtime_lock_runner)
+            else {"status": "FAIL", "error": "Bootstrap runtime-lock regression entry is missing"}
+        )
+        checks["runtime_lock_metadata"] = runtime_lock_report
+        if runtime_lock_report.get("status") != "PASS":
+            errors.append(
+                "Runtime lock metadata regression failed: "
+                + json.dumps(runtime_lock_report, ensure_ascii=False, default=str)
+            )
+
+        writer_preload_source = LAUNCHER_SOURCE_PATH.read_text(encoding="utf-8")
+        required_preload_stages = {
+            "preload_started",
+            "preload_runtime_started",
+            "runtime_ready",
+            "preload_probe_started",
+            "preload_probe_ready",
+            "preload_writer_started",
+            "preload_writer_ready",
+            "preload_callbacks_started",
+            "preload_ready",
+        }
+        missing_preload_stages = sorted(
+            stage
+            for stage in required_preload_stages
+            if f'"{stage}"' not in writer_preload_source
+            and f"'{stage}'" not in writer_preload_source
+        )
+        checks["writer_preload_observability"] = {
+            "status": "PASS" if not missing_preload_stages else "FAIL",
+            "required": sorted(required_preload_stages),
+            "missing": missing_preload_stages,
+        }
+        if missing_preload_stages:
+            errors.append(
+                "Writer preload evidence lost stages: " + ", ".join(missing_preload_stages)
+            )
+
+        preload_recovery = _bug_control_scan_writer_preload_recovery()
+        checks["writer_preload_recovery"] = preload_recovery
+        if preload_recovery.get("status") != "PASS":
+            errors.append(
+                "Writer preload recovery contract failed: "
+                + ", ".join(str(value) for value in preload_recovery.get("missing", []) or [])
+            )
 
         stages = _bug_control_scan_literal_stages((LAUNCHER_SOURCE_PATH, WRITER_PATH))
         missing_stages = sorted(BUG_CONTROL_EXPORT_REQUIRED_STAGES - stages)
@@ -46205,12 +46416,14 @@ def _writer_process_entry(connection: Any) -> None:
     request_sequence = 0
     _write_writer_process_evidence(process_id, "preload_started")
     try:
+        _write_writer_process_evidence(process_id, "preload_runtime_started")
         export_runtime = _ensure_export_runtime_domain_ready()
         _write_writer_process_evidence(
             process_id,
             "runtime_ready",
             export_runtime=export_runtime,
         )
+        _write_writer_process_evidence(process_id, "preload_probe_started")
         writer_probe = _load_operation_dependency("export_mod", "writer_probe")
         probe_runtime = dict(writer_probe.get_fbx_probe_runtime_status())
         if probe_runtime.get("status") != "ok":
@@ -46225,9 +46438,16 @@ def _writer_process_entry(connection: Any) -> None:
                     "detail": json.dumps(probe_runtime, ensure_ascii=False, default=str),
                 },
             )
+        _write_writer_process_evidence(
+            process_id,
+            "preload_probe_ready",
+            fbx_probe_runtime=probe_runtime,
+        )
+        _write_writer_process_evidence(process_id, "preload_writer_started")
         writer = _load_operation_dependency("export_mod", "writer")
         if not callable(getattr(writer, "run_memory_export", None)):
             raise RuntimeError("codex_python_export_bridge.py has no run_memory_export() entry")
+        _write_writer_process_evidence(process_id, "preload_writer_ready")
 
         # The Writer returns advisory receipts; only the Launcher Tk thread may
         # render them. Creating Tk roots from Writer background threads leaves
@@ -46240,6 +46460,7 @@ def _writer_process_entry(connection: Any) -> None:
             "_show_check_source_notice_async",
             "_show_map2_fallback_notice_async",
         )
+        _write_writer_process_evidence(process_id, "preload_callbacks_started")
         for callback_name in headless_callbacks:
             if not callable(getattr(writer, callback_name, None)):
                 raise RuntimeError(f"Writer headless callback is missing: {callback_name}")
@@ -82429,11 +82650,27 @@ class LauncherApp:
                 if evidence
                 else ""
             )
-            raise RuntimeError(
+            error = RuntimeError(
                 "Writer process terminated before READY "
                 f"(worker_pid={int(process.pid or 0)}, exit_code={exit_code!r}, "
                 f"error={type(exc).__name__}: {exc}{evidence_detail})"
-            ) from exc
+            )
+            details = {
+                "schema": WRITER_PRELOAD_FAILURE_SCHEMA,
+                "safe_to_retry": True,
+                "write_request_sent": False,
+                "worker_pid": int(process.pid or 0),
+                "exit_code": exit_code,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "evidence": dict(evidence),
+            }
+            try:
+                setattr(error, "_pc_rehd_writer_preload_failure", True)
+                setattr(error, "_pc_rehd_writer_preload_details", details)
+            except Exception:
+                pass
+            raise error from exc
 
         if (
             not isinstance(response, dict)
@@ -82464,24 +82701,70 @@ class LauncherApp:
         return process, connection
 
     def _run_writer_in_process(self, request: dict[str, Any]) -> dict[str, Any]:
-        try:
-            return self._run_writer_request_once(request)
-        except Exception as exc:
-            if not _runtime_dependency_error_is_repairable(exc):
-                raise
-            recovery = _ensure_export_runtime_domain_ready()
-            result = self._run_writer_request_once(request)
-            if isinstance(result, dict):
-                result.setdefault(
-                    "automatic_runtime_recovery",
-                    {
+        preload_failures: list[dict[str, Any]] = []
+        runtime_recovery: dict[str, Any] | None = None
+        runtime_recovery_attempted = False
+        attempt = 0
+        while True:
+            try:
+                result = self._run_writer_request_once(request)
+                if isinstance(result, dict) and preload_failures:
+                    result = dict(result)
+                    result["writer_transport_recovery"] = {
+                        "schema": WRITER_PRELOAD_FAILURE_SCHEMA,
                         "status": "PASS",
-                        "attempted": True,
-                        "operation": "export_mod",
-                        "runtime": recovery,
-                    },
-                )
-            return result
+                        "retry_count": len(preload_failures),
+                        "discarded_workers": [
+                            int(row.get("worker_pid", 0) or 0)
+                            for row in preload_failures
+                            if int(row.get("worker_pid", 0) or 0) > 0
+                        ],
+                        "write_request_sent": False,
+                    }
+                if isinstance(result, dict) and runtime_recovery is not None:
+                    result.setdefault(
+                        "automatic_runtime_recovery",
+                        {
+                            "status": "PASS",
+                            "attempted": True,
+                            "operation": "export_mod",
+                            "runtime": runtime_recovery,
+                        },
+                    )
+                return result
+            except Exception as exc:
+                if _is_writer_preload_failure(exc):
+                    details = _writer_preload_failure_details(exc)
+                    details["attempt"] = attempt + 1
+                    preload_failures.append(details)
+                    if attempt < WRITER_PROCESS_PRELOAD_RETRY_LIMIT:
+                        delay_index = min(
+                            attempt,
+                            len(WRITER_PROCESS_PRELOAD_RETRY_BACKOFF_SECONDS) - 1,
+                        )
+                        if delay_index >= 0:
+                            time.sleep(
+                                max(
+                                    0.0,
+                                    float(
+                                        WRITER_PROCESS_PRELOAD_RETRY_BACKOFF_SECONDS[
+                                            delay_index
+                                        ]
+                                    ),
+                                )
+                            )
+                        attempt += 1
+                        continue
+                    _attach_writer_preload_bug_control(
+                        exc,
+                        request,
+                        preload_failures,
+                    )
+                    raise
+                if runtime_recovery_attempted or not _runtime_dependency_error_is_repairable(exc):
+                    raise
+                runtime_recovery_attempted = True
+                runtime_recovery = _ensure_export_runtime_domain_ready()
 
     def _run_writer_request_once(self, request: dict[str, Any]) -> dict[str, Any]:
         message_id = uuid.uuid4().hex

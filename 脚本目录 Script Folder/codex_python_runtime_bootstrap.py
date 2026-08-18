@@ -460,7 +460,16 @@ def _runtime_install_lock(
     lock_path: Path = RUNTIME_INSTALL_LOCK_PATH,
 ):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_file = lock_path.open("a+b")
+    # Do not use append mode here.  ``a+b`` forces every write to the end of
+    # the file on Windows, so the owner record and the release marker were
+    # concatenated forever despite seek(0)/truncate().  That eventually made
+    # the metadata unreadable and hid the process holding the shared lock.
+    lock_fd = os.open(
+        str(lock_path),
+        os.O_CREAT | os.O_RDWR,
+        0o666,
+    )
+    lock_file = os.fdopen(lock_fd, "r+b")
     acquired = False
     windows_lock = None
     posix_lock = None
@@ -640,6 +649,32 @@ def get_runtime_lock_report(*, lock_path: Path = RUNTIME_INSTALL_LOCK_PATH) -> d
             except OSError:
                 pass
         lock_file.close()
+
+
+def run_runtime_lock_metadata_regression() -> dict[str, object]:
+    """Strict maintenance check: lock ownership must overwrite, never append."""
+    with tempfile.TemporaryDirectory(prefix="pc-rehd-runtime-lock-regression-") as raw_root:
+        lock_path = Path(raw_root) / "runtime.lock"
+        sizes: list[int] = []
+        for _ in range(4):
+            with _runtime_install_lock(timeout_seconds=2.0, lock_path=lock_path):
+                pass
+            sizes.append(lock_path.stat().st_size)
+        released_metadata = _runtime_lock_metadata_from_file(lock_path)
+        released_report = get_runtime_lock_report(lock_path=lock_path)
+    size_stable = bool(sizes) and max(sizes) - min(sizes) <= 8
+    released = (
+        released_metadata == {}
+        and released_report.get("state") == "unlocked"
+        and released_report.get("os_lock_held") is False
+    )
+    return {
+        "status": "PASS" if size_stable and released else "FAIL",
+        "sizes": sizes,
+        "size_stable": size_stable,
+        "released_metadata": released_metadata,
+        "released_report": released_report,
+    }
 
 
 @contextmanager
@@ -8400,6 +8435,21 @@ def run_bootstrap_self_tests() -> dict[str, object]:
     source_path = Path(__file__).resolve()
     with tempfile.TemporaryDirectory(prefix="codex-v4-bootstrap-selftest-") as temp_text:
         temp_root = Path(temp_text)
+
+        lock_metadata_regression = run_runtime_lock_metadata_regression()
+        lock_metadata_ready = lock_metadata_regression.get("status") == "PASS"
+        test_results.append(
+            {
+                "name": "runtime-lock-metadata-rewrite",
+                "ready": lock_metadata_ready,
+                "report": lock_metadata_regression,
+            }
+        )
+        if lock_metadata_ready is not True:
+            raise AssertionError(
+                "Runtime lock metadata rewrite regression failed: "
+                + repr(lock_metadata_regression)
+            )
 
         import_runtime_root = temp_root / "import-must-not-create"
         import_code = (
