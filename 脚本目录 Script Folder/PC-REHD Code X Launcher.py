@@ -1461,6 +1461,7 @@ RESCUE_AGENT_BUILTIN_NAME = "_PC_REHD_CODE_X_RESCUE_AGENT"
 WORK_AGENT_MODULE_PREFIX = "_pc_rehd_work_agent_"
 RESCUE_AGENT_MODULE_PREFIX = "_pc_rehd_rescue_runtime_"
 WINDOWED_RELAUNCH_ENV = "PC_REHD_CODE_X_WINDOWED_RELAUNCH"
+LAUNCHER_SINGLETON_HANDOFF_ENV = "PC_REHD_CODE_X_SINGLETON_HANDOFF"
 KEEP_CONSOLE_ENV = "PC_REHD_CODE_X_KEEP_CONSOLE"
 POLICY_VALIDATION_REVISION_ENV = "PC_REHD_CODE_X_POLICY_REVISION"
 CONSOLE_CLI_ARGUMENTS = _EARLY_CONSOLE_CLI_ARGUMENTS
@@ -2717,18 +2718,18 @@ def _merge_bug_control_into_primary_txt(path: str | Path, report: Mapping[str, A
     """Append or replace one Launcher report in the operation's only TXT."""
     target = Path(path)
     try:
-        existing = target.read_text(encoding="utf-8-sig", errors="replace") if target.is_file() else ""
-        pattern = re.compile(re.escape(BUG_CONTROL_BEGIN) + r".*?" + re.escape(BUG_CONTROL_END), re.DOTALL)
-        existing = pattern.sub("", existing).rstrip()
-        block = "\r\n".join(_format_bug_control_lines(report))
-        combined = (existing + "\r\n\r\n" + block if existing else block) + "\r\n"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(target.name + f".{os.getpid()}.{time.monotonic_ns()}.tmp")
-        try:
-            temporary.write_bytes(b"\xef\xbb\xbf" + combined.encode("utf-8"))
-            os.replace(temporary, target)
-        finally:
-            temporary.unlink(missing_ok=True)
+        with _public_file_lock(target):
+            existing = target.read_text(encoding="utf-8-sig", errors="replace") if target.is_file() else ""
+            pattern = re.compile(re.escape(BUG_CONTROL_BEGIN) + r".*?" + re.escape(BUG_CONTROL_END), re.DOTALL)
+            existing = pattern.sub("", existing).rstrip()
+            block = "\r\n".join(_format_bug_control_lines(report))
+            combined = (existing + "\r\n\r\n" + block if existing else block) + "\r\n"
+            temporary = target.with_name(target.name + f".{os.getpid()}.{time.monotonic_ns()}.tmp")
+            try:
+                temporary.write_bytes(b"\xef\xbb\xbf" + combined.encode("utf-8"))
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
         return ""
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"
@@ -2738,11 +2739,32 @@ def _export_primary_txt_path(request: Mapping[str, Any]) -> Path:
     options = request.get("export_options") if isinstance(request.get("export_options"), Mapping) else {}
     root_text = str(options.get("log_dir") or request.get("log_dir") or "").strip()
     root = Path(root_text).expanduser() if root_text else Path(tempfile.gettempdir()) / "PC_REHD_Code_X"
-    for value in (request.get("fbx_path"), request.get("sample_fbx_path")):
-        if str(value or "").strip():
-            stem = Path(str(value)).stem
-            if stem.casefold().startswith("export_pid"):
-                return root / f"{stem}.txt"
+    candidates = [
+        Path(str(value)).expanduser()
+        for value in (request.get("fbx_path"), request.get("sample_fbx_path"))
+        if str(value or "").strip()
+    ]
+    # Prefer the public Chinese-named Export artifact when Max also returns
+    # an internal export_pid receipt path. Evidence must land beside the
+    # public FBX that the user can inspect.
+    candidates.sort(
+        key=lambda candidate: (
+            0
+            if candidate.suffix.casefold() == ".fbx"
+            and candidate.stem.casefold().startswith("导出 +")
+            else 1
+        )
+    )
+    for candidate in candidates:
+        stem = candidate.stem
+        if (
+            candidate.suffix.casefold() == ".fbx"
+            and (
+                stem.casefold().startswith("export_pid")
+                or stem.casefold().startswith("导出 +")
+            )
+        ):
+            return candidate.with_suffix(".txt")
     pid = max(1, int(request.get("target_max_pid", 0) or 0))
     token = hashlib.sha256(str(request.get("request_id", "") or "").encode("utf-8", errors="replace")).hexdigest()[:32]
     return root / f"export_pid{pid}_{token}.txt"
@@ -2754,21 +2776,22 @@ class _WriterProcessWorker:
 
     process: Any
     connection: Any
+    evidence_sink: Any | None = None
     ready: bool = False
     busy: bool = False
 
 
 SAMPLE_KEEP_GROUPS = 3
 SAMPLE_FILE_RE = re.compile(
-    r"^(?P<stem>(?:import|export)_pid[1-9]\d*_[0-9a-f]{32})\.(?P<ext>fbx|txt)$",
+    r"^(?P<stem>(?:import|export)_pid[1-9]\d*_[0-9a-f]{32}|(?:导入 \+ [1-9]\d* Import FBX|导出 \+ [1-9]\d* Export FBX)(?: \+ [1-9]\d*)?)\.(?P<ext>fbx|txt)$",
     re.IGNORECASE,
 )
 IMPORT_FBX_FILE_RE = re.compile(
-    r"^import_pid(?P<pid>[1-9]\d*)_[0-9a-f]{32}\.fbx$",
+    r"^(?:import_pid(?P<legacy_pid>[1-9]\d*)_[0-9a-f]{32}|导入 \+ (?P<public_pid>[1-9]\d*) Import FBX(?: \+ [1-9]\d*)?)\.fbx$",
     re.IGNORECASE,
 )
 IMPORT_FBX_MEDIA_DIRECTORY_RE = re.compile(
-    r"^import_pid(?P<pid>[1-9]\d*)_[0-9a-f]{32}\.fbm$",
+    r"^(?:import_pid(?P<legacy_pid>[1-9]\d*)_[0-9a-f]{32}|导入 \+ (?P<public_pid>[1-9]\d*) Import FBX(?: \+ [1-9]\d*)?)\.fbm$",
     re.IGNORECASE,
 )
 IMPORT_FBX_MEDIA_DIRECTORY_KEEP_COUNT = 3
@@ -3933,7 +3956,38 @@ def run_bug_control_scan() -> dict[str, Any]:
 EXPORT_PATH_HISTORY_FILE = DEFAULT_LOG_DIR / "PC_REHD_Code_X_Export_Path_History.txt"
 EXPORT_PATH_HISTORY_MAX_BYTES = 100 * 1024 * 1024
 EXPORT_SOURCE_MOD_FILE_PATTERN = "*.mod *.MOD *.newmod *.NewMOD *.NEWMOD"
-BOOTSTRAP_HEALTH_LOG_FILE_NAME = "PC_REHD_Code_X_Bootstrap_Health.txt"
+PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME = "Long Term Cache"
+PUBLIC_LONG_TERM_CACHE_FILE_NAME = "RE6 Long Term Cache 脚本长期缓存.txt"
+PUBLIC_BOOTSTRAP_HEALTH_LOG_FILE_NAME = (
+    "Bootstrap RE6 Script Health check 脚本健康度日志.txt"
+)
+LEGACY_BOOTSTRAP_HEALTH_LOG_FILE_NAME = "PC_REHD_Code_X_Bootstrap_Health.txt"
+PUBLIC_IMPORT_DIRECTORY_NAME = "导入 Import"
+PUBLIC_EXPORT_DIRECTORY_NAME = "导出 Export"
+PUBLIC_IMPORT_LOG_FILE_NAME = "导入日志 Import Log.txt"
+PUBLIC_EXPORT_LOG_FILE_NAME = "导出日志 Export Log.txt"
+BOOTSTRAP_HEALTH_LOG_FILE_NAME = PUBLIC_BOOTSTRAP_HEALTH_LOG_FILE_NAME
+PUBLIC_CACHE_SECTION_NAMES = frozenset(
+    {
+        "launcher_state",
+        "export_sets_window",
+        "message_editor",
+        "export_path_history",
+        "blender_node_maps",
+        "startup_audit",
+    }
+)
+PUBLIC_JSON_MIGRATION_NAMES = frozenset(
+    {
+        "PC_REHD_Code_X_Launcher_State.json",
+        "PC_REHD_Code_X_Export_Sets_Window_Size.json",
+        "PC_REHD_Code_X_Message_History.txt",
+        "PC_REHD_Code_X_Blender_Hierarchy_AutoRepair.json",
+        "max_startup_python_audit.json",
+    }
+)
+_PUBLIC_TXT_LOCK = threading.RLock()
+_PUBLIC_FBX_RESERVATION_LOCK = threading.RLock()
 HEALTH_REPORT_CLOSE_FLUSH_SECONDS = 2.0
 MESSAGE_EDITOR_HISTORY_FILE_NAME = "PC_REHD_Code_X_Message_History.txt"
 MESSAGE_EDITOR_STATE_SCHEMA = "pc-rehd-code-x-message-editor-v2"
@@ -3951,11 +4005,12 @@ MAIN_WINDOW_ADVANCED_MIN_HEIGHT = 360
 MAIN_WINDOW_COLLAPSED_MIN_WIDTH = 260
 MAIN_WINDOW_COLLAPSED_MIN_HEIGHT = 270
 MAIN_WINDOW_ADVANCED_ORIGINAL_SIZE = (792, 1039)
+WINDOW_OFFSCREEN_STAGE_COORDINATE = 20000
 MAIN_WINDOW_SCALING_MIN_SCALE = 0.08
 MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE = 0.32
 MAIN_WINDOW_SCALING_MIN_FONT_SCALE = 0.7
 MAIN_WINDOW_SCALING_MAX_SCALE = 1.35
-MAIN_UI_SCALING_LAYOUT_CACHE_VERSION = "scaling-layout-v8-global-main-window"
+MAIN_UI_SCALING_LAYOUT_CACHE_VERSION = "scaling-layout-v12-axis-aware-fill"
 MAIN_RESIZE_GRIP_SIZE = 18
 MAIN_RESIZE_GRIP_EXPANDED_SIZE = 34
 MAIN_UI_PRELOAD_SLICE_MS = 6
@@ -3967,6 +4022,137 @@ RENAME_VALUE_HISTORY_DEFAULTS = ("0", "255", "2")
 RENAME_VALUE_HISTORY_LIMIT = 20
 RENAME_VALUE_HISTORY_VISIBLE_ROWS = 8
 MESH_RENAME_FIELDS = frozenset(("lod", "mat", "group", "display"))
+
+
+@dataclass(frozen=True, slots=True)
+class MainUiScalingMeasurement:
+    """One Tk-main-thread measurement used by the pure scaling solver."""
+
+    width: int
+    height: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "width", max(1, int(self.width)))
+        object.__setattr__(self, "height", max(1, int(self.height)))
+
+
+@dataclass(frozen=True, slots=True)
+class MainUiScalingSnapshot:
+    """Immutable target and stage measurements for one scaling transaction."""
+
+    target_width: int
+    target_height: int
+    baseline: MainUiScalingMeasurement
+    spacing_floor: MainUiScalingMeasurement
+    widget_floor: MainUiScalingMeasurement
+    font_floor: MainUiScalingMeasurement
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "target_width", max(1, int(self.target_width)))
+        object.__setattr__(self, "target_height", max(1, int(self.target_height)))
+
+
+def _main_ui_scaling_stage_pressure(
+    target_width: int,
+    target_height: int,
+    start: MainUiScalingMeasurement,
+    floor: MainUiScalingMeasurement,
+) -> float:
+    """Return the tightest-axis progress between two measured stages."""
+    return max(
+        _main_ui_scaling_axis_pressure(target_width, start.width, floor.width),
+        _main_ui_scaling_axis_pressure(target_height, start.height, floor.height),
+    )
+
+
+def _main_ui_scaling_axis_pressure(
+    target: int,
+    start: int,
+    floor: int,
+) -> float:
+    """Return compaction pressure for one independent measured axis."""
+    target_value = int(target)
+    start_value = int(start)
+    floor_value = int(floor)
+    span = start_value - floor_value
+    if span <= 0:
+        return 1.0 if target_value < floor_value else 0.0
+    return max(
+        0.0,
+        min(1.0, (start_value - target_value) / span),
+    )
+
+
+def _solve_main_ui_scaling_snapshot(
+    snapshot: MainUiScalingSnapshot,
+) -> dict[str, float]:
+    """Solve all three final UI factors from one measured snapshot."""
+    # Spacing must fit the tightest axis, but horizontal button chrome should
+    # follow the available width. The old solver used both axes for every
+    # stage, so a short window forced widget_scale to 0.32 even when there was
+    # ample horizontal room (the tiny-controls/empty-panel bug).
+    spacing_pressure = _main_ui_scaling_stage_pressure(
+        snapshot.target_width,
+        snapshot.target_height,
+        snapshot.baseline,
+        snapshot.spacing_floor,
+    )
+    widget_pressure = _main_ui_scaling_axis_pressure(
+        snapshot.target_width,
+        snapshot.spacing_floor.width,
+        snapshot.widget_floor.width,
+    )
+    font_pressure = _main_ui_scaling_axis_pressure(
+        snapshot.target_height,
+        snapshot.widget_floor.height,
+        snapshot.font_floor.height,
+    )
+
+    # A collapsed page has a deliberately narrow natural measurement. Use the
+    # original Launcher width as a stable reference so the factor is based on
+    # the user's window, not on a target-width-dependent responsive stage.
+    reference_width = max(
+        int(snapshot.baseline.width), int(MAIN_WINDOW_ADVANCED_ORIGINAL_SIZE[0])
+    )
+    width_ratio = float(snapshot.target_width) / max(1, reference_width)
+    height_ratio = float(snapshot.target_height) / max(
+        1, int(snapshot.baseline.height)
+    )
+    width_expansion = max(
+        1.0,
+        min(MAIN_WINDOW_SCALING_MAX_SCALE, width_ratio),
+    )
+    tight_expansion = max(
+        1.0,
+        min(MAIN_WINDOW_SCALING_MAX_SCALE, min(width_ratio, height_ratio)),
+    )
+
+    def stage_scale(
+        minimum: float,
+        pressure: float,
+        expansion: float,
+    ) -> float:
+        if pressure <= 0.0:
+            return expansion
+        return 1.0 - (1.0 - minimum) * pressure
+
+    return {
+        "spacing_scale": stage_scale(
+            MAIN_WINDOW_SCALING_MIN_SCALE,
+            spacing_pressure,
+            tight_expansion,
+        ),
+        "widget_scale": stage_scale(
+            MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE,
+            widget_pressure,
+            width_expansion,
+        ),
+        "font_scale": stage_scale(
+            MAIN_WINDOW_SCALING_MIN_FONT_SCALE,
+            font_pressure,
+            tight_expansion,
+        ),
+    }
 
 
 def _ui_layout_cache_key(language: object, surface: object, mode: object) -> str:
@@ -3999,7 +4185,12 @@ AGENT_STARTUP_LEGACY_PY_LOADER = "PC_REHD_Code_X_Agent.py"
 # generated entry therefore remains one ordinary .ms bootstrap.
 AGENT_STARTUP_MS_LOADER = "PC_REHD_Code_X_Agent.ms"
 AGENT_STARTUP_PREVIOUS_MS_LOADER = "00_PC_REHD_Code_X_Agent.ms"
-AGENT_STARTUP_PYTHON_BRIDGE = "PC_REHD_Code_X_Max_Bridge.py"
+# Retired sidecar name kept only so a generated copy can be removed safely
+# after the direct `.ms` hook has been installed.
+AGENT_STARTUP_LEGACY_PYTHON_BRIDGE = "PC_REHD_Code_X_Max_Bridge.py"
+AGENT_STARTUP_LEGACY_PYTHON_BRIDGE_HEADER = (
+    "# Generated by PC-REHD Code X Launcher. Max startup Python bridge."
+)
 MAX_AGENT_MINIMUM_PYTHON = (3, 10)
 MAX_AGENT_RUNTIME_PROBE_TIMEOUT_SECONDS = 30.0
 MAX_AGENT_RUNTIME_PROBE_CACHE_SECONDS = 300.0
@@ -4649,8 +4840,7 @@ def _launcher_source_sha256(source_bytes: bytes) -> str:
 
 
 def _launcher_state_path(log_directory: str | Path | None = None) -> Path:
-    root = Path(log_directory).expanduser() if str(log_directory or "").strip() else DEFAULT_LOG_DIR
-    return root.resolve(strict=False) / LAUNCHER_STATE_FILE_NAME
+    return _public_long_term_cache_path(log_directory)
 
 
 def _normalize_long_term_cache_directory(value: str | Path | None) -> Path:
@@ -4662,28 +4852,399 @@ def _normalize_long_term_cache_directory(value: str | Path | None) -> Path:
         return Path(os.path.abspath(os.fspath(root)))
 
 
+def _public_log_root(log_directory: str | Path | None = None) -> Path:
+    raw = str(log_directory or "").strip()
+    root = _normalize_long_term_cache_directory(raw if raw else DEFAULT_LOG_DIR)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _public_long_term_cache_directory(log_directory: str | Path | None = None) -> Path:
+    candidate = Path(str(log_directory or "")).expanduser() if str(log_directory or "").strip() else None
+    if candidate is not None and candidate.name.casefold() == PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME.casefold():
+        target = candidate.resolve(strict=False)
+    else:
+        target = _public_log_root(log_directory) / PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _public_long_term_cache_path(log_directory: str | Path | None = None) -> Path:
+    return _public_long_term_cache_directory(log_directory) / PUBLIC_LONG_TERM_CACHE_FILE_NAME
+
+
+def _public_bootstrap_health_log_path(log_directory: str | Path | None = None) -> Path:
+    return _public_long_term_cache_directory(log_directory) / PUBLIC_BOOTSTRAP_HEALTH_LOG_FILE_NAME
+
+
+def _consolidate_legacy_bootstrap_health_log(log_directory: str | Path | None = None) -> Path:
+    cache_directory = _public_long_term_cache_directory(log_directory)
+    legacy_path = cache_directory / LEGACY_BOOTSTRAP_HEALTH_LOG_FILE_NAME
+    target_path = cache_directory / PUBLIC_BOOTSTRAP_HEALTH_LOG_FILE_NAME
+    if legacy_path.resolve(strict=False) == target_path.resolve(strict=False) or not legacy_path.is_file():
+        return target_path
+    try:
+        legacy_text = legacy_path.read_text(encoding="utf-8-sig", errors="replace").strip()
+        existing_text = target_path.read_text(encoding="utf-8-sig", errors="replace").strip() if target_path.is_file() else ""
+        combined = existing_text
+        if legacy_text:
+            combined = (combined + "\n\n" if combined else "") + legacy_text
+        _public_atomic_write_text(target_path, combined + "\n")
+        legacy_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return target_path
+
+
+def _public_operation_directory(log_directory: str | Path | None, operation: str) -> Path:
+    kind = str(operation or "").strip().casefold()
+    if kind == "import":
+        name = PUBLIC_IMPORT_DIRECTORY_NAME
+    elif kind == "export":
+        name = PUBLIC_EXPORT_DIRECTORY_NAME
+    else:
+        raise ValueError(f"Unsupported public operation: {operation!r}")
+    target = _public_long_term_cache_directory(log_directory) / name
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _public_operation_log_path(log_directory: str | Path | None, operation: str) -> Path:
+    kind = str(operation or "").strip().casefold()
+    if kind == "import":
+        filename = PUBLIC_IMPORT_LOG_FILE_NAME
+    elif kind == "export":
+        filename = PUBLIC_EXPORT_LOG_FILE_NAME
+    else:
+        raise ValueError(f"Unsupported public operation: {operation!r}")
+    return _public_operation_directory(log_directory, kind) / filename
+
+
+@contextmanager
+def _public_file_lock(path: str | Path):
+    target = Path(path)
+    lock_path = target.with_name(f".{target.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _PUBLIC_TXT_LOCK:
+        with lock_path.open("a+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            locked = False
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                    locked = True
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    locked = True
+                yield
+            finally:
+                if locked:
+                    if os.name == "nt":
+                        import msvcrt
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _public_atomic_write_text(path: str | Path, text: str) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(
+        f".{target.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        temporary.write_text(str(text), encoding="utf-8", newline="\n")
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
+def _public_scalar_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, Path):
+        return str(value)
+    return str(value).replace("\r", "\\r").replace("\n", "\\n")
+
+
+def _public_field_name(value: Any) -> str:
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("=", "\\=")
+    )
+
+
+def _public_flatten_value(value: Any, prefix: str = "") -> list[str]:
+    if isinstance(value, Mapping):
+        if not value:
+            return [f"{prefix}={{}}"] if prefix else []
+        lines: list[str] = []
+        for key in sorted(value, key=lambda item: str(item)):
+            key_text = _public_field_name(key)
+            child = f"{prefix}.{key_text}" if prefix else key_text
+            lines.extend(_public_flatten_value(value[key], child))
+        return lines
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return [f"{prefix}=[]"] if prefix else []
+        lines: list[str] = []
+        for index, item in enumerate(value):
+            child = f"{prefix}[{index}]" if prefix else f"[{index}]"
+            lines.extend(_public_flatten_value(item, child))
+        return lines
+    return [f"{prefix}={_public_scalar_text(value)}"] if prefix else []
+
+
+def _public_section_block(section: str, value: Mapping[str, Any]) -> str:
+    normalized = str(section or "").strip()
+    if normalized not in PUBLIC_CACHE_SECTION_NAMES:
+        raise ValueError(f"Unsupported public cache section: {section!r}")
+    payload = dict(value) if isinstance(value, Mapping) else {}
+    lines = [
+        f"[{normalized}]",
+        f"UPDATED_AT={time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime())}",
+    ]
+    lines.extend(_public_flatten_value(payload))
+    lines.append(
+        "DATA_JSON="
+        + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    )
+    lines.append(f"[/{normalized}]")
+    return "\n".join(lines)
+
+
+def _public_read_cache_section(log_directory: str | Path | None, section: str) -> dict[str, Any] | None:
+    path = _public_long_term_cache_path(log_directory)
+    if not path.is_file():
+        return None
+    normalized = str(section or "").strip()
+    pattern = re.compile(
+        rf"(?ms)^\[{re.escape(normalized)}\]\r?\n.*?^\[/{re.escape(normalized)}\]\s*"
+    )
+    try:
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return None
+    match = pattern.search(text)
+    if match is None:
+        return None
+    for line in match.group(0).splitlines():
+        if line.startswith("DATA_JSON="):
+            try:
+                value = json.loads(line[len("DATA_JSON="):])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            return dict(value) if isinstance(value, Mapping) else None
+    return None
+
+
+def _write_public_cache_section(log_directory: str | Path | None, section: str, value: Mapping[str, Any]) -> Path:
+    path = _public_long_term_cache_path(log_directory)
+    normalized = str(section or "").strip()
+    if normalized not in PUBLIC_CACHE_SECTION_NAMES:
+        raise ValueError(f"Unsupported public cache section: {section!r}")
+    pattern = re.compile(
+        rf"(?ms)^\[{re.escape(normalized)}\]\r?\n.*?^\[/{re.escape(normalized)}\]\s*"
+    )
+    block = _public_section_block(normalized, value)
+    with _public_file_lock(path):
+        try:
+            existing = path.read_text(encoding="utf-8-sig", errors="replace") if path.is_file() else ""
+        except OSError:
+            existing = ""
+        existing = pattern.sub("", existing).rstrip()
+        combined = (existing + "\n\n" if existing else "") + block + "\n"
+        return _public_atomic_write_text(path, "# RE6 Long Term Cache 脚本长期缓存\n" + combined)
+
+
+def _append_public_text_block(path: str | Path, lines: Iterable[str]) -> Path:
+    target = Path(path)
+    block = "\n".join(_public_scalar_text(line) for line in lines).strip("\n")
+    with _public_file_lock(target):
+        existing = target.read_text(encoding="utf-8-sig", errors="replace") if target.is_file() else ""
+        prefix = existing.rstrip()
+        combined = (prefix + "\n\n" if prefix else "") + block + "\n"
+        return _public_atomic_write_text(target, combined)
+
+
+def _public_operation_log_block(operation: str, process_id: int, request_id: str, status: str, details: Mapping[str, Any] | None = None) -> list[str]:
+    kind = str(operation or "").strip().casefold()
+    title = "导入日志 Import Log" if kind == "import" else "导出日志 Export Log"
+    lines = [
+        f"[{title}]",
+        f"TIME_LOCAL={time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime())}",
+        f"OPERATION={kind}",
+        f"PID={int(process_id or 0)}",
+        f"REQUEST_ID={_public_scalar_text(request_id)}",
+        f"STATUS={_public_scalar_text(status).upper()}",
+    ]
+    if isinstance(details, Mapping):
+        lines.extend(_public_flatten_value(dict(details), "DETAIL"))
+    lines.append("[END_OPERATION]")
+    return lines
+
+
+def _append_public_operation_log(log_directory: str | Path | None, operation: str, process_id: int, request_id: str, status: str, details: Mapping[str, Any] | None = None) -> Path:
+    return _append_public_text_block(
+        _public_operation_log_path(log_directory, operation),
+        _public_operation_log_block(operation, process_id, request_id, status, details),
+    )
+
+
+def _public_fbx_base_stem(process_id: int, operation: str, suffix_number: int = 0) -> str:
+    kind = str(operation or "").strip().casefold()
+    if kind not in {"import", "export"}:
+        raise ValueError(f"Unsupported public FBX operation: {operation!r}")
+    label = "导入" if kind == "import" else "导出"
+    suffix = "" if suffix_number <= 0 else f" + {suffix_number:02d}"
+    return f"{label} + {int(process_id)} {kind.title()} FBX{suffix}"
+
+
+def _reserve_public_fbx_artifact_paths(log_directory: str | Path | None, process_id: int, operation: str) -> tuple[Path, Path]:
+    pid = int(process_id or 0)
+    if pid <= 0:
+        raise ValueError("Public FBX artifact path requires a positive modeling-process PID")
+    directory = _public_operation_directory(log_directory, operation)
+    lock_path = _public_operation_log_path(log_directory, operation)
+    with _public_file_lock(lock_path):
+        for suffix_number in range(0, 10000):
+            stem = _public_fbx_base_stem(pid, operation, suffix_number)
+            fbx_path = directory / f"{stem}.fbx"
+            txt_path = directory / f"{stem}.txt"
+            reservation_path = directory / f".{stem}.reserve"
+            if any(
+                (directory / f"{stem}{extension}").exists()
+                for extension in (".fbx", ".txt", ".json", ".fbm", ".signal")
+            ):
+                continue
+            try:
+                descriptor = os.open(
+                    reservation_path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+                os.close(descriptor)
+            except FileExistsError:
+                continue
+            return fbx_path, txt_path
+    raise RuntimeError("Unable to reserve a collision-free public FBX stem")
+
+
+def _release_public_fbx_reservation(path: str | Path | None) -> bool:
+    """Remove the private reservation marker without touching public artifacts."""
+    raw_path = str(path or "").strip()
+    if not raw_path:
+        return False
+    marker = Path(raw_path).with_name(f".{Path(raw_path).stem}.reserve")
+    try:
+        existed = marker.is_file()
+        marker.unlink(missing_ok=True)
+        return existed
+    except OSError:
+        return False
+
+
+def _convert_public_json_to_txt(source: str | Path, target: str | Path | None = None) -> Path:
+    source_path = Path(source)
+    if source_path.suffix.casefold() != ".json":
+        raise ValueError(f"Public JSON conversion requires a .json source: {source_path}")
+    raw_text = source_path.read_text(encoding="utf-8-sig")
+    payload = json.loads(raw_text)
+    target_path = Path(target) if target is not None else source_path.with_suffix(".txt")
+    lines = [
+        "PC-REHD CODE X PUBLIC JSON CONVERSION",
+        "FORMAT_VERSION=1",
+        f"SOURCE_JSON={source_path.name}",
+        f"TIME_LOCAL={time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime())}",
+    ]
+    if isinstance(payload, Mapping):
+        lines.extend(_public_flatten_value(dict(payload)))
+    else:
+        lines.extend(_public_flatten_value({"value": payload}))
+    with _public_file_lock(target_path):
+        _public_atomic_write_text(target_path, "\n".join(lines) + "\n")
+    source_path.unlink()
+    return target_path
+
+
+def _write_public_operation_receipt_txt(path: str | Path, *, operation: str, process_id: int, request_id: str, status: str, fbx_path: str | Path | None = None, details: Mapping[str, Any] | None = None) -> Path:
+    lines = [
+        "PC-REHD CODE X OPERATION RECEIPT",
+        "FORMAT_VERSION=1",
+        f"OPERATION={_public_scalar_text(operation)}",
+        f"STATUS={_public_scalar_text(status).upper()}",
+        f"PID={int(process_id or 0)}",
+        f"REQUEST_ID={_public_scalar_text(request_id)}",
+        f"FBX_PATH={_public_scalar_text(fbx_path or '')}",
+    ]
+    if isinstance(details, Mapping):
+        lines.extend(_public_flatten_value(dict(details), "DETAIL"))
+    return _append_public_text_block(path, lines)
+
+
+def _publish_public_export_receipt_txt(
+    source: str | Path | None,
+    target: str | Path,
+    *,
+    process_id: int,
+    request_id: str,
+    fbx_path: str | Path,
+    details: Mapping[str, Any] | None = None,
+) -> Path:
+    target_path = Path(target)
+    source_path = Path(source) if str(source or "").strip() else None
+    if source_path is not None and source_path.is_file():
+        payload = source_path.read_text(encoding="utf-8-sig", errors="replace")
+        with _public_file_lock(target_path):
+            _public_atomic_write_text(target_path, payload.rstrip() + "\n")
+        if source_path.resolve(strict=False) != target_path.resolve(strict=False):
+            source_path.unlink(missing_ok=True)
+        return target_path
+    return _write_public_operation_receipt_txt(
+        target_path,
+        operation="export",
+        process_id=process_id,
+        request_id=request_id,
+        status="OK",
+        fbx_path=fbx_path,
+        details=details,
+    )
+
+
+
 def _long_term_cache_locator_path() -> Path:
-    return DEFAULT_LOG_DIR.resolve(strict=False) / LONG_TERM_CACHE_LOCATOR_FILE_NAME
+    return _public_long_term_cache_path(DEFAULT_LOG_DIR)
 
 
 def _load_long_term_cache_directory(
     fallback_state: Mapping[str, Any] | None = None,
 ) -> Path:
-    locator_path = _long_term_cache_locator_path()
-    try:
-        payload = (
-            json.loads(locator_path.read_text(encoding="utf-8"))
-            if locator_path.is_file()
-            else {}
-        )
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
-        payload = {}
     selected = ""
-    if (
-        isinstance(payload, dict)
-        and str(payload.get("schema", "") or "") == LONG_TERM_CACHE_LOCATOR_SCHEMA
-    ):
-        selected = str(payload.get("directory", "") or "").strip()
+    cached = _public_read_cache_section(DEFAULT_LOG_DIR, "launcher_state")
+    if isinstance(cached, Mapping):
+        selected = str(cached.get("log_directory", "") or "").strip()
+    locator_path = DEFAULT_LOG_DIR / LONG_TERM_CACHE_LOCATOR_FILE_NAME
+    if not selected:
+        try:
+            payload = json.loads(locator_path.read_text(encoding="utf-8")) if locator_path.is_file() else {}
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict) and str(payload.get("schema", "") or "") == LONG_TERM_CACHE_LOCATOR_SCHEMA:
+            selected = str(payload.get("directory", "") or "").strip()
     if not selected and isinstance(fallback_state, Mapping):
         selected = str(fallback_state.get("log_directory", "") or "").strip()
     return _normalize_long_term_cache_directory(selected)
@@ -4691,25 +5252,9 @@ def _load_long_term_cache_directory(
 
 def _write_long_term_cache_directory_locator(directory: str | Path) -> Path:
     selected = _normalize_long_term_cache_directory(directory)
-    path = _long_term_cache_locator_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
-    payload = {
-        "schema": LONG_TERM_CACHE_LOCATOR_SCHEMA,
-        "directory": str(selected),
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
-    }
-    try:
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    existing = _public_read_cache_section(DEFAULT_LOG_DIR, "launcher_state") or {}
+    existing["log_directory"] = str(selected)
+    _write_public_cache_section(DEFAULT_LOG_DIR, "launcher_state", existing)
     return selected
 
 
@@ -4719,37 +5264,36 @@ def _migrate_long_term_cache_files(
 ) -> list[str]:
     source = _normalize_long_term_cache_directory(source_directory)
     target = _normalize_long_term_cache_directory(target_directory)
-    if source == target:
-        return []
     migrated: list[str] = []
-    for filename in (
-        LAUNCHER_STATE_FILE_NAME,
-        EXPORT_SETS_WINDOW_SIZE_FILE_NAME,
-        MESSAGE_EDITOR_HISTORY_FILE_NAME,
-        EXPORT_PATH_HISTORY_FILE.name,
-    ):
+    legacy_sections = (
+        (LAUNCHER_STATE_FILE_NAME, "launcher_state"),
+        (EXPORT_SETS_WINDOW_SIZE_FILE_NAME, "export_sets_window"),
+        (MESSAGE_EDITOR_HISTORY_FILE_NAME, "message_editor"),
+    )
+    for filename, section in legacy_sections:
         source_path = source / filename
-        target_path = target / filename
-        if not source_path.is_file() or target_path.exists():
+        if not source_path.is_file() or _public_read_cache_section(target, section) is not None:
             continue
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target_path.with_name(
-            f".{target_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-        )
         try:
-            shutil.copy2(source_path, temporary)
-            os.replace(temporary, target_path)
-            migrated.append(filename)
-        finally:
-            temporary.unlink(missing_ok=True)
+            raw = json.loads(source_path.read_text(encoding="utf-8"))
+            if isinstance(raw, Mapping):
+                _write_public_cache_section(target, section, dict(raw))
+                migrated.append(filename)
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            continue
+    history_path = source / EXPORT_PATH_HISTORY_FILE.name
+    if history_path.is_file() and _public_read_cache_section(target, "export_path_history") is None:
+        paths = _load_export_path_history(history_file=history_path)
+        if paths:
+            _write_public_cache_section(target, "export_path_history", {"paths": paths})
+            migrated.append(history_path.name)
     return migrated
 
 
 def _export_path_history_path(
     log_directory: str | Path | None = None,
 ) -> Path:
-    root = _normalize_long_term_cache_directory(log_directory)
-    return root / EXPORT_PATH_HISTORY_FILE.name
+    return _public_long_term_cache_path(log_directory)
 
 
 def _normalize_manual_texture_path(
@@ -4817,8 +5361,7 @@ def _normalize_mrl_path_history(raw: Any) -> list[str]:
 
 
 def _export_sets_window_size_path(log_directory: str | Path | None = None) -> Path:
-    root = Path(log_directory).expanduser() if str(log_directory or "").strip() else DEFAULT_LOG_DIR
-    return root.resolve(strict=False) / EXPORT_SETS_WINDOW_SIZE_FILE_NAME
+    return _public_long_term_cache_path(log_directory)
 
 
 def _normalize_export_sets_window_size(raw: Any) -> list[int]:
@@ -4831,11 +5374,14 @@ def _normalize_export_sets_window_size(raw: Any) -> list[int]:
 
 
 def _load_export_sets_window_size(log_directory: str | Path | None = None) -> list[int]:
-    path = _export_sets_window_size_path(log_directory)
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
-        raw = {}
+    raw = _public_read_cache_section(log_directory, "export_sets_window") or {}
+    if not raw:
+        legacy_root = _normalize_long_term_cache_directory(log_directory)
+        legacy_path = legacy_root / EXPORT_SETS_WINDOW_SIZE_FILE_NAME
+        try:
+            raw = json.loads(legacy_path.read_text(encoding="utf-8")) if legacy_path.is_file() else {}
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            raw = {}
     return _normalize_export_sets_window_size(raw)
 
 
@@ -4845,24 +5391,7 @@ def _write_export_sets_window_size(
     size = _normalize_export_sets_window_size([width, height])
     if not size:
         return []
-    path = _export_sets_window_size_path(log_directory)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
-    try:
-        temporary.write_text(
-            json.dumps({"size": size}, ensure_ascii=False, sort_keys=True) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        os.replace(temporary, path)
-    finally:
-        try:
-            if temporary.exists():
-                temporary.unlink()
-        except OSError:
-            pass
+    _write_public_cache_section(log_directory, "export_sets_window", {"size": size})
     return size
 
 
@@ -4941,32 +5470,100 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
     raw_window_sizes = source.get("main_window_sizes", {})
     if not isinstance(raw_window_sizes, dict):
         raw_window_sizes = {}
-    main_window_sizes: dict[str, list[int]] = {}
-    for cache_key in ("main:normal:expanded", "main:normal:collapsed", "main:scaling"):
-        raw_size = raw_window_sizes.get(cache_key, [])
-        try:
-            width, height = int(raw_size[0]), int(raw_size[1])
-        except (IndexError, TypeError, ValueError):
-            main_window_sizes[cache_key] = []
-        else:
-            main_window_sizes[cache_key] = (
-                [width, height] if width > 0 and height > 0 else []
-            )
     raw_window_signatures = source.get("main_window_layout_signatures", {})
     if not isinstance(raw_window_signatures, dict):
         raw_window_signatures = {}
+    raw_window_positions = source.get("main_window_positions", {})
+    if not isinstance(raw_window_positions, dict):
+        raw_window_positions = {}
+
+    # Expanded and compact pages are separate surfaces even when Scaling Mode
+    # is enabled. A single main:scaling slot used to let the expanded page's
+    # wide geometry become the compact page's default after a restart.
+    window_cache_keys = (
+        "main:normal:expanded",
+        "main:normal:collapsed",
+        "main:scaling:expanded",
+        "main:scaling:collapsed",
+    )
+
+    def normalize_window_size(raw_size: Any) -> list[int]:
+        try:
+            width, height = int(raw_size[0]), int(raw_size[1])
+        except (IndexError, TypeError, ValueError):
+            return []
+        return [width, height] if width > 0 and height > 0 else []
+
+    def normalize_window_position(raw_position: Any) -> list[int]:
+        try:
+            pos_x, pos_y = int(raw_position[0]), int(raw_position[1])
+        except (IndexError, TypeError, ValueError):
+            return []
+        # +20000,+20000 is the temporary hidden-paint coordinate used by
+        # _show_themed_window. It is never a user position and must not
+        # survive a restart as the Launcher's saved location.
+        if (
+            pos_x >= WINDOW_OFFSCREEN_STAGE_COORDINATE
+            or pos_y >= WINDOW_OFFSCREEN_STAGE_COORDINATE
+        ):
+            return []
+        return [pos_x, pos_y] if pos_x >= -100000 and pos_y >= -100000 else []
+
+    main_window_sizes: dict[str, list[int]] = {
+        cache_key: normalize_window_size(raw_window_sizes.get(cache_key, []))
+        for cache_key in window_cache_keys
+    }
+    main_window_positions: dict[str, list[int]] = {
+        cache_key: normalize_window_position(raw_window_positions.get(cache_key, []))
+        for cache_key in window_cache_keys
+    }
     main_window_layout_signatures = {
         cache_key: str(raw_window_signatures.get(cache_key, "") or "")
-        for cache_key in ("main:normal:expanded", "main:normal:collapsed", "main:scaling")
+        for cache_key in window_cache_keys
     }
+
+    # Migrate the old unified Scaling slot once. Its signature tells us which
+    # page produced it; if no signature was stored, treat it as expanded (the
+    # historical Scaling page was the advanced page). Never copy it to the
+    # compact slot, because that is exactly the oversized-window regression.
+    legacy_scaling_signature = str(
+        raw_window_signatures.get("main:scaling", "") or ""
+    )
+    legacy_scaling_mode = (
+        "collapsed" if "mode=collapsed" in legacy_scaling_signature else "expanded"
+    )
+    legacy_scaling_key = f"main:scaling:{legacy_scaling_mode}"
+    if not main_window_sizes[legacy_scaling_key]:
+        main_window_sizes[legacy_scaling_key] = normalize_window_size(
+            raw_window_sizes.get("main:scaling", [])
+        )
+    if not main_window_positions[legacy_scaling_key]:
+        main_window_positions[legacy_scaling_key] = normalize_window_position(
+            raw_window_positions.get("main:scaling", [])
+        )
+    if not main_window_layout_signatures[legacy_scaling_key]:
+        main_window_layout_signatures[legacy_scaling_key] = legacy_scaling_signature
+    for scaling_mode in ("expanded", "collapsed"):
+        scaling_key = f"main:scaling:{scaling_mode}"
+        scaling_signature = main_window_layout_signatures[scaling_key]
+        if scaling_signature and f"mode={scaling_mode}" not in scaling_signature:
+            # A stale signature is worse than an empty one: it can make a
+            # geometry from the other page look valid during startup replay.
+            main_window_layout_signatures[scaling_key] = ""
 
     raw_scaling_layout_cache = source.get("main_ui_scaling_layout_cache", {})
     if not isinstance(raw_scaling_layout_cache, dict):
         raw_scaling_layout_cache = {}
     main_ui_scaling_layout_cache: dict[str, dict[str, Any]] = {}
-    unified_key = "main:scaling"
-    raw_entry = raw_scaling_layout_cache.get(unified_key, {})
-    if isinstance(raw_entry, dict):
+    # Scaling factors are valid only for the exact page/language/topology
+    # contract that produced them.  Older builds stored one mutable
+    # ``main:scaling`` entry, so loading that entry must not silently make it
+    # the factor for every page.  Context-keyed entries are retained
+    # independently; a legacy unified entry is migrated only when it already
+    # carries the full v10 context signature.
+    for raw_cache_key, raw_entry in raw_scaling_layout_cache.items():
+        if not isinstance(raw_entry, dict):
+            continue
         try:
             cached_width = int(raw_entry.get("width", 0) or 0)
             cached_height = int(raw_entry.get("height", 0) or 0)
@@ -4974,34 +5571,75 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
             widget_scale = float(raw_entry.get("widget_scale", 1.0) or 1.0)
             font_scale = float(raw_entry.get("font_scale", 1.0) or 1.0)
         except (TypeError, ValueError):
-            pass
+            continue
+        signature = str(raw_entry.get("signature", "") or "").strip()
+        if (
+            cached_width <= 0
+            or cached_height <= 0
+            or not math.isfinite(spacing_scale)
+            or not math.isfinite(widget_scale)
+            or not math.isfinite(font_scale)
+            or not (
+                MAIN_WINDOW_SCALING_MIN_SCALE
+                <= spacing_scale
+                <= MAIN_WINDOW_SCALING_MAX_SCALE
+            )
+            or not (
+                MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE
+                <= widget_scale
+                <= MAIN_WINDOW_SCALING_MAX_SCALE
+            )
+            or not (
+                MAIN_WINDOW_SCALING_MIN_FONT_SCALE
+                <= font_scale
+                <= MAIN_WINDOW_SCALING_MAX_SCALE
+            )
+            or not signature.startswith(f"{MAIN_UI_SCALING_LAYOUT_CACHE_VERSION}|")
+            or any(
+                marker not in signature
+                for marker in (
+                    "backend=",
+                    "lang=",
+                    "mode=",
+                    "sections=",
+                    "compact=",
+                    "tk=",
+                )
+            )
+        ):
+            continue
+        raw_cache_key = str(raw_cache_key or "")
+        if raw_cache_key == "main:scaling":
+            # Migrate a pre-keyed entry only if its signature is already
+            # context-rich.  Plain v9 entries were global and are discarded
+            # by the version/marker checks above.
+            cache_key = f"main:scaling|{signature}"
+        elif raw_cache_key.startswith("main:scaling|"):
+            # Canonicalize the key from the entry signature so a malformed
+            # suffix cannot alias another context.
+            cache_key = f"main:scaling|{signature}"
         else:
-            if (
-                cached_width > 0
-                and cached_height > 0
-                and math.isfinite(spacing_scale)
-                and math.isfinite(widget_scale)
-                and math.isfinite(font_scale)
-                and MAIN_WINDOW_SCALING_MIN_SCALE <= spacing_scale <= MAIN_WINDOW_SCALING_MAX_SCALE
-                and MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE <= widget_scale <= MAIN_WINDOW_SCALING_MAX_SCALE
-                and MAIN_WINDOW_SCALING_MIN_FONT_SCALE <= font_scale <= MAIN_WINDOW_SCALING_MAX_SCALE
-                and str(raw_entry.get("signature", "") or "") == MAIN_UI_SCALING_LAYOUT_CACHE_VERSION
-            ):
-                main_ui_scaling_layout_cache[unified_key] = {
-                    "width": cached_width,
-                    "height": cached_height,
-                    "spacing_scale": spacing_scale,
-                    "widget_scale": widget_scale,
-                    "font_scale": font_scale,
-                    "signature": MAIN_UI_SCALING_LAYOUT_CACHE_VERSION,
-                }
+            continue
+        main_ui_scaling_layout_cache[cache_key] = {
+            "width": cached_width,
+            "height": cached_height,
+            "spacing_scale": spacing_scale,
+            "widget_scale": widget_scale,
+            "font_scale": font_scale,
+            "signature": signature,
+        }
     raw_window_default_modes = source.get("main_window_default_modes", {})
     if not isinstance(raw_window_default_modes, dict):
         raw_window_default_modes = {}
     main_window_default_modes = {
         cache_key: bool(raw_window_default_modes.get(cache_key, False))
-        for cache_key in ("main:normal:expanded", "main:normal:collapsed", "main:scaling")
+        for cache_key in window_cache_keys
     }
+    legacy_default_key = f"main:scaling:{legacy_scaling_mode}"
+    if legacy_default_key not in raw_window_default_modes:
+        main_window_default_modes[legacy_default_key] = bool(
+            raw_window_default_modes.get("main:scaling", False)
+        )
     try:
         export_sets_scroll_position = float(
             source.get("export_sets_scroll_position", 0.0) or 0.0
@@ -5021,22 +5659,41 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
     collapsed_sections = normalize_collapsed_sections(
         source.get("collapsed_sections", {})
     )
+    raw_max_collapsed_sections = normalize_collapsed_sections(
+        source.get("max_collapsed_sections", {})
+    )
+    raw_blender_collapsed_sections = normalize_collapsed_sections(
+        source.get("blender_collapsed_sections", {})
+    )
     # One development build incorrectly used the mode-panel Collapse button
     # to persist all three content sections as collapsed. Repair that exact
     # legacy state once; the new button owns only its own panel.
-    if (
+    repair_legacy_all_collapsed_sections = bool(
         "compact_mode_panel_collapsed" not in source
-        and all(collapsed_sections.values())
-    ):
+        and (
+            all(collapsed_sections.values())
+            or all(raw_max_collapsed_sections.values())
+            or all(raw_blender_collapsed_sections.values())
+        )
+    )
+    if repair_legacy_all_collapsed_sections:
         collapsed_sections = {key: False for key in collapsed_sections}
     compact_mode_panel_collapsed = bool(
         source.get("compact_mode_panel_collapsed", False)
     )
-    max_collapsed_sections = normalize_collapsed_sections(
-        source.get("max_collapsed_sections", collapsed_sections)
+    max_collapsed_sections = (
+        {key: False for key in raw_max_collapsed_sections}
+        if repair_legacy_all_collapsed_sections
+        else normalize_collapsed_sections(
+            source.get("max_collapsed_sections", collapsed_sections)
+        )
     )
-    blender_collapsed_sections = normalize_collapsed_sections(
-        source.get("blender_collapsed_sections", collapsed_sections)
+    blender_collapsed_sections = (
+        {key: False for key in raw_blender_collapsed_sections}
+        if repair_legacy_all_collapsed_sections
+        else normalize_collapsed_sections(
+            source.get("blender_collapsed_sections", collapsed_sections)
+        )
     )
     max_compact_mode_panel_collapsed = bool(
         source.get("max_compact_mode_panel_collapsed", compact_mode_panel_collapsed)
@@ -5290,6 +5947,7 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
         "scene_normals_dock_offset": scene_normals_dock_offset,
         "main_window_sizes": main_window_sizes,
         "main_window_layout_signatures": main_window_layout_signatures,
+        "main_window_positions": main_window_positions,
         "main_window_default_modes": main_window_default_modes,
         "main_ui_scaling_layout_cache": main_ui_scaling_layout_cache,
         "export_sets_scroll_position": export_sets_scroll_position,
@@ -5321,11 +5979,14 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
 
 
 def _load_launcher_state(log_directory: str | Path | None = None) -> dict[str, Any]:
-    path = _launcher_state_path(log_directory)
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
-        raw = {}
+    raw = _public_read_cache_section(log_directory, "launcher_state") or {}
+    if not raw:
+        legacy_root = _normalize_long_term_cache_directory(log_directory)
+        legacy_path = legacy_root / LAUNCHER_STATE_FILE_NAME
+        try:
+            raw = json.loads(legacy_path.read_text(encoding="utf-8")) if legacy_path.is_file() else {}
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            raw = {}
     return _normalize_launcher_state(raw)
 
 
@@ -5333,24 +5994,7 @@ def _write_launcher_state(
     state: dict[str, Any], log_directory: str | Path | None = None
 ) -> dict[str, Any]:
     normalized = _normalize_launcher_state(state)
-    path = _launcher_state_path(log_directory)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
-    try:
-        temporary.write_text(
-            json.dumps(normalized, ensure_ascii=False, sort_keys=True) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        os.replace(temporary, path)
-    finally:
-        try:
-            if temporary.exists():
-                temporary.unlink()
-        except OSError:
-            pass
+    _write_public_cache_section(log_directory, "launcher_state", normalized)
     return normalized
 
 
@@ -5364,8 +6008,7 @@ def _embedded_message_editor_document() -> dict[str, Any]:
 
 
 def _message_editor_history_path(log_directory: str | Path | None = None) -> Path:
-    root = Path(log_directory).expanduser() if str(log_directory or "").strip() else DEFAULT_LOG_DIR
-    return root.resolve(strict=False) / MESSAGE_EDITOR_HISTORY_FILE_NAME
+    return _public_long_term_cache_path(log_directory)
 
 
 def _normalize_message_editor_snapshot(raw: Any, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -5465,13 +6108,16 @@ def _load_message_editor_state(log_directory: str | Path | None = None) -> dict[
             "visible": False,
         },
     }
-    path = _message_editor_history_path(log_directory)
-    try:
-        raw_text = path.read_text(encoding="utf-8") if path.is_file() else ""
-        first_line = raw_text.splitlines()[0] if raw_text else ""
-        raw = json.loads(first_line) if first_line else {}
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
-        raw = {}
+    raw = _public_read_cache_section(log_directory, "message_editor") or {}
+    if not raw:
+        legacy_root = _normalize_long_term_cache_directory(log_directory)
+        path = legacy_root / MESSAGE_EDITOR_HISTORY_FILE_NAME
+        try:
+            raw_text = path.read_text(encoding="utf-8") if path.is_file() else ""
+            first_line = raw_text.splitlines()[0] if raw_text else ""
+            raw = json.loads(first_line) if first_line else {}
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            raw = {}
     if not isinstance(raw, dict):
         return default
     raw_document = raw.get("document")
@@ -5564,8 +6210,6 @@ def _write_message_editor_history(
     expanded_height: int = 360,
     visible: bool = False,
 ) -> bool:
-    path = _message_editor_history_path(log_directory)
-    temporary: Path | None = None
     payload = {
         "schema": MESSAGE_EDITOR_STATE_SCHEMA,
         "document": _normalize_message_editor_snapshot(document),
@@ -5587,48 +6231,10 @@ def _write_message_editor_history(
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
     }
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        header = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        lines = [
-            "PC-REHD Code X Message Editor - latest 3 undo and redo versions",
-            "The live document is stored here and is embedded in PC-REHD Code X Launcher.py when the editor closes.",
-        ]
-        for index, item in enumerate(reversed(payload["history"]), start=1):
-            lines.extend(("", f"===== HISTORY {index} / {len(payload['history'])} ====="))
-            entries = item.get("entries", [])
-            if not entries:
-                lines.append("[No messages]")
-            for entry_index, entry in enumerate(entries, start=1):
-                marker = " *" if entry.get("id") == item.get("selected_id") else ""
-                lines.extend((
-                    f"----- MESSAGE {entry_index}{marker} -----",
-                    str(entry.get("title", "")),
-                    str(entry.get("body", "")),
-                ))
-        for index, item in enumerate(reversed(payload["redo"]), start=1):
-            lines.extend(("", f"===== REDO {index} / {len(payload['redo'])} ====="))
-            entries = item.get("entries", [])
-            if not entries:
-                lines.append("[No messages]")
-            for entry_index, entry in enumerate(entries, start=1):
-                marker = " *" if entry.get("id") == item.get("selected_id") else ""
-                lines.extend((
-                    f"----- MESSAGE {entry_index}{marker} -----",
-                    str(entry.get("title", "")),
-                    str(entry.get("body", "")),
-                ))
-        temporary.write_text(header + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
-        os.replace(temporary, path)
+        _write_public_cache_section(log_directory, "message_editor", payload)
         return True
     except (OSError, TypeError, ValueError):
         return False
-    finally:
-        if temporary is not None:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
 
 
 def _emergency_health_log_roots(preferred: str | Path | None = None) -> list[Path]:
@@ -5662,70 +6268,29 @@ def _write_emergency_health_issue(
     """Write one classified issue without importing Bootstrap or other project modules."""
     last_error = ""
     for root in _emergency_health_log_roots(preferred_log_dir):
-        log_path = root / BOOTSTRAP_HEALTH_LOG_FILE_NAME
-        temporary: Path | None = None
+        log_path = _public_bootstrap_health_log_path(root)
         try:
-            root.mkdir(parents=True, exist_ok=True)
-            try:
-                state = json.loads(log_path.read_text(encoding="utf-8")) if log_path.is_file() else {}
-            except Exception:
-                state = {}
-            if not isinstance(state, dict):
-                state = {}
-            active = state.setdefault("active_issues", {})
-            if not isinstance(active, dict):
-                active = {}
-                state["active_issues"] = active
-            state.setdefault("schema", "pc-rehd-code-x-health-log-v2")
-            state.setdefault("description", "Only current error incidents and permanent major-bug alarms are retained.")
-            state.setdefault("major_bug_alarms", {})
             error_type = type(error).__name__.upper()
             action_key = re.sub(r"[^A-Z0-9_]+", "_", str(action).upper()).strip("_") or "UNKNOWN"
-            category = f"LAUNCHER_EMERGENCY:{action_key}:{error_type}"
-            now = time.time()
-            timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
-            record = active.get(category)
-            if not isinstance(record, dict):
-                record = {
-                    "category": category,
-                    "severity": "ERROR",
-                    "first_seen_epoch": now,
-                    "first_seen": timestamp,
-                    "occurrences": 0,
-                }
-                active[category] = record
-            record.update(
-                {
-                    "summary": f"Launcher could not complete {action} and the normal Bootstrap reporter was unavailable.",
-                    "details": {
-                        "action": str(action),
-                        "max_process_id": max(0, int(max_process_id or 0)),
-                        "request_id": str(request_id),
-                        "operation_error": str(detail),
-                        "reporter_error": f"{type(error).__name__}: {error}",
-                        "traceback": traceback.format_exc()[-4000:],
-                    },
-                    "last_seen_epoch": now,
-                    "last_seen": timestamp,
-                    "occurrences": int(record.get("occurrences", 0) or 0) + 1,
-                }
+            _append_public_text_block(
+                log_path,
+                [
+                    "[BOOTSTRAP EMERGENCY HEALTH]",
+                    f"TIME_LOCAL={time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime())}",
+                    f"ACTION={_public_scalar_text(action)}",
+                    f"ACTION_KEY={action_key}",
+                    f"ERROR_TYPE={error_type}",
+                    f"MAX_PROCESS_ID={int(max_process_id or 0)}",
+                    f"REQUEST_ID={_public_scalar_text(request_id)}",
+                    f"DETAIL={_public_scalar_text(detail)}",
+                    f"REPORTER_ERROR={_public_scalar_text(error)}",
+                    f"TRACEBACK={_public_scalar_text(traceback.format_exc()[-4000:])}",
+                    "[END_BOOTSTRAP_EMERGENCY_HEALTH]",
+                ],
             )
-            state["updated"] = timestamp
-            temporary = log_path.with_name(f".{log_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-            temporary.write_text(
-                json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True, default=str),
-                encoding="utf-8",
-            )
-            os.replace(temporary, log_path)
             return str(log_path)
         except Exception as fallback_error:
             last_error = f"{type(fallback_error).__name__}: {fallback_error}"
-        finally:
-            if temporary is not None:
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
     try:
         print(
             f"[{APP_NAME}] emergency health log failed | action={action} | "
@@ -6158,7 +6723,12 @@ def _normalized_output_path_identity(path: str | Path) -> tuple[str, str]:
     return os.path.normcase(display_path), display_path
 
 
-def _try_acquire_export_named_mutex(scope: str, identity: str) -> tuple[dict[str, Any] | None, str]:
+def _try_acquire_export_named_mutex(
+    scope: str,
+    identity: str,
+    *,
+    wait_ms: int = 0,
+) -> tuple[dict[str, Any] | None, str]:
     """Acquire a crash-released Windows mutex without creating lock files."""
     if os.name != "nt":
         return {"handle": 0, "name": "", "abandoned": False}, ""
@@ -6177,7 +6747,9 @@ def _try_acquire_export_named_mutex(scope: str, identity: str) -> tuple[dict[str
     handle = kernel32.CreateMutexW(None, False, name)
     if not handle:
         raise OSError(ctypes.get_last_error(), f"CreateMutexW failed for {name}")
-    wait_result = int(kernel32.WaitForSingleObject(handle, 0))
+    wait_result = int(
+        kernel32.WaitForSingleObject(handle, max(0, min(5000, int(wait_ms or 0))))
+    )
     if wait_result in {0x00000000, 0x00000080}:  # WAIT_OBJECT_0 / WAIT_ABANDONED
         return {
             "handle": handle,
@@ -6207,6 +6779,63 @@ def _release_export_named_mutex(lease: dict[str, Any] | None) -> None:
             raise OSError(ctypes.get_last_error(), f"ReleaseMutex failed for {lease.get('name', '')}")
     finally:
         kernel32.CloseHandle(handle)
+
+
+_LAUNCHER_SINGLETON_LOCK = threading.Lock()
+_LAUNCHER_SINGLETON_LEASE: dict[str, Any] | None = None
+
+
+def _acquire_launcher_singleton(*, wait_ms: int | None = None) -> bool:
+    """Keep one GUI Launcher per installation directory.
+
+    A restart starts the replacement before the old Tk loop has finished its
+    health handoff, so the handoff mode waits briefly for the old mutex owner.
+    Normal duplicate launches fail fast before creating any Tk resources.
+    """
+    global _LAUNCHER_SINGLETON_LEASE
+    acquired = False
+    with _LAUNCHER_SINGLETON_LOCK:
+        if _LAUNCHER_SINGLETON_LEASE is not None:
+            acquired = True
+        else:
+            if wait_ms is None:
+                wait_ms = (
+                    5000
+                    if _environment_flag_enabled(LAUNCHER_SINGLETON_HANDOFF_ENV)
+                    else 0
+                )
+            try:
+                lease, _mutex_name = _try_acquire_export_named_mutex(
+                    "LauncherSingleton",
+                    os.path.normcase(str(MODULE_DIR)),
+                    wait_ms=max(0, int(wait_ms)),
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                print(
+                    f"[{APP_NAME}] could not acquire Launcher singleton: {exc}",
+                    file=sys.stderr,
+                )
+                lease = None
+            if lease is not None:
+                _LAUNCHER_SINGLETON_LEASE = lease
+                acquired = True
+    return acquired
+
+
+def _release_launcher_singleton() -> None:
+    global _LAUNCHER_SINGLETON_LEASE
+    with _LAUNCHER_SINGLETON_LOCK:
+        lease = _LAUNCHER_SINGLETON_LEASE
+        _LAUNCHER_SINGLETON_LEASE = None
+    if lease is None:
+        return
+    try:
+        _release_export_named_mutex(lease)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        print(
+            f"[{APP_NAME}] could not release Launcher singleton: {exc}",
+            file=sys.stderr,
+        )
 
 
 class _ExportTransactionRegistry:
@@ -6775,7 +7404,7 @@ IMPORT_EXPORT_PERFORMANCE_FINGERPRINTS = {
     "LauncherApp._start_writer_process": "8140D5B16917B0AC06844074D7945401B3206CC3BA20F5A8EC5B9CF0612271DF",
     "LauncherApp._preload_writer_process": "7EFEEDC347BA17634F9B5F20E40C5D8871261B23FB64B4E63CABC931C5A4E04F",
     "LauncherApp._shutdown_writer_process": "4C22FEC0E5B6F5744A0D95A8A979E28ECE87111980EDD23948455F9349450FB1",
-    "LauncherApp._refresh_agent_startup_hooks": "04173894631416284E5FE3BBFEB29D241DC8ED59BF3F12B34072A54080839722",
+    "LauncherApp._refresh_agent_startup_hooks": "56CCE6D0F02AF522E559D3B12F6CCED18C1054AE955AC9A3A1EA83D17F95B129",
     "LauncherApp._begin_session_operation": "2E888B8E13D00035B198CDABEF8E60A0824D1ABE5334041BBBC87CCD83972FB6",
     "LauncherApp._claim_import_export_priority": "1349C7413146959466C7129DF82603BBF25D9B10B14BAD9049F2F92863F72091",
     "LauncherApp._release_import_export_priority": "CF13E590DA431430F102C66D81D0356485E89B9E6A43286026C4F4DB0C99BA6D",
@@ -6805,7 +7434,7 @@ IMPORT_EXPORT_PERFORMANCE_FINGERPRINTS = {
 # It tells a maintainer that Importer/Writer changed without a recorded review.
 # User operations must never use these values as runtime trust or readiness.
 AI_MAINTENANCE_ONLY_MODULE_SHA256 = {
-    "codex_python_runtime_bootstrap.py": "C6C1672ECA333C9DB625F2CBDD3C9C869F05767FAF5CD486F811535E2B004A80",
+    "codex_python_runtime_bootstrap.py": "E3894AD710C79D762C953FEC2D9FA98F8AB10F435AE45970FDB30EBF0B7D88CB",
     "codex_re6_mod_import_fbx.py": "D052E4F0008F75272C3131148016B4BABAD2EE2098E8BC1903E055D12CB2BE5D",
     "codex_python_export_bridge.py": "C6808FD30182331FE2127054895C4C90ECF855C5AA421D4DD5B8D7D1DBE408BE",
     "codex_re6_scene_compatibility.py": "0F387A805643A060C90B0FB3C32A5A884F925E9C1D872A117DFB3681BB5E16CC",
@@ -6872,10 +7501,10 @@ RESCUE_AGENT_MAINTENANCE_FINGERPRINTS = {
     "RescueAgent._load_worker_module": "F00604CF88BAF459CB4672DB3B6D53238A064B4956C9A0280784B0B9923971C5",
     "RescueAgent._ensure_worker_on_max_thread": "FB7394DC77C1454E7BE89362F55813D077F7A427EDEA2F4860F120BCF96BF11C",
     "PymxsAgent.begin_replacement_if_idle": "4EF84DA3FE177855DAC7568D22D6C17CD90FDF8DC77EECD54083B699654B5449",
-    "install_agent_startup_hooks": "923DC0B0230FDC0BE8A0723A6CB8AEBB8764D707241CB0DE0639D76BBEDBEA11",
+    "install_agent_startup_hooks": "3E33EA3685508DC91A26BB766ACA4507C418260FF05157C90A6D74785FE874A2",
     "_start_work_agent_for_rescue": "5A4D0086B77E50B048A9E0B6C25F27F1DA8865CBACBD68D3FCA4F6AAEF3A18F5",
     "_start_rescue_agent_for_current_process": "0B5F1B021CC6C415DCB007C899209C6CB62B127513AB67DCD17FF4ABF6D3087F",
-    "ManagedMaxSession.connect_existing": "596D0504950C4DC3F6D256E4D13AD5FC7A718A6F2955D09E8529624FB35237C0",
+    "ManagedMaxSession.connect_existing": "4BACB8F381337D79CB8C45D1FA88CD6481FE06674D44DA7688ED728354A2F530",
 }
 IMPORT_EXPORT_PERFORMANCE_MODULE_SHA256 = {
     IMPORTER_PATH.name: AI_MAINTENANCE_ONLY_MODULE_SHA256[IMPORTER_PATH.name],
@@ -9017,15 +9646,14 @@ def _valid_sha256_text(value: object) -> str:
 
 
 def _blender_node_map_cache_directory(log_directory: str | Path) -> Path:
-    root = _normalize_long_term_cache_directory(log_directory)
-    return root / BLENDER_NODE_MAP_DIRECTORY_NAME
+    return _public_long_term_cache_directory(log_directory)
 
 
 def _blender_node_map_cache_path(log_directory: str | Path, node_map_id: object) -> Path:
     normalized_id = str(node_map_id or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{32}", normalized_id):
         raise ValueError("Blender node map ID is invalid")
-    return _blender_node_map_cache_directory(log_directory) / f"{normalized_id}.json"
+    return _public_long_term_cache_path(log_directory)
 
 
 def _atomic_write_json_document(path: Path, value: Mapping[str, Any]) -> None:
@@ -9100,18 +9728,22 @@ def _write_blender_node_map(log_directory: str | Path, node_map: Mapping[str, An
     value = copy.deepcopy(dict(node_map))
     if str(value.get("schema", "") or "") != BLENDER_NODE_MAP_SCHEMA:
         raise ValueError("Blender node map schema is invalid")
-    path = _blender_node_map_cache_path(log_directory, value.get("node_map_id"))
+    node_map_id = str(value.get("node_map_id", "") or "").strip().lower()
+    cached = _public_read_cache_section(log_directory, "blender_node_maps") or {}
+    maps = cached.get("maps", {}) if isinstance(cached, Mapping) else {}
+    maps = dict(maps) if isinstance(maps, Mapping) else {}
     value["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
-    _atomic_write_json_document(path, value)
-    return path
+    maps[node_map_id] = value
+    _write_public_cache_section(log_directory, "blender_node_maps", {"maps": maps})
+    return _public_long_term_cache_path(log_directory)
 
 
 def _load_blender_node_map(log_directory: str | Path, node_map_id: object) -> dict[str, Any] | None:
     try:
-        path = _blender_node_map_cache_path(log_directory, node_map_id)
-        if not path.is_file():
-            return None
-        value = json.loads(path.read_text(encoding="utf-8"))
+        normalized_id = str(node_map_id or "").strip().lower()
+        cached = _public_read_cache_section(log_directory, "blender_node_maps") or {}
+        maps = cached.get("maps", {}) if isinstance(cached, Mapping) else {}
+        value = maps.get(normalized_id) if isinstance(maps, Mapping) else None
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
         return None
     if not isinstance(value, dict):
@@ -10050,20 +10682,24 @@ def _run_ui_quality_policy_guard() -> dict[str, Any]:
             "self._commit_main_window_geometry(",
         ),
         "_toggle_collapsible_section": (
-            "self._reflow_left_sections(flush_layout=False)",
-            "self._refresh_main_viewport_layout()",
-            "self._settle_scaling_main_viewport_layout()",
+            "self._apply_main_ui_scaling_policy(",
+            "fit_to_content=not bool(",
         ),
         "_toggle_compact_mode_panel": (
-            "self._reflow_left_sections(flush_layout=False)",
-            "self._refresh_main_viewport_layout()",
+            "self._apply_main_ui_scaling_policy(",
+            "fit_to_content=not scaling_mode",
         ),
         "_toggle_scaling_mode": (
             "self._scaling_mode_enabled",
-            "self._fit_main_window_to_content(",
-            "self._apply_main_window_geometry(",
-            "self._settle_scaling_main_viewport_layout(",
-            "self._enforce_scaling_main_page_minimum(",
+            "self._restore_main_window_size(",
+            "self._apply_main_ui_scaling_policy(",
+            "force_reset=True",
+        ),
+        "_apply_main_ui_scaling_policy": (
+            "self._measure_main_ui_scaling_snapshot(",
+            "_solve_main_ui_scaling_snapshot(",
+            "self._commit_main_ui_scaling_snapshot(",
+            "self._main_ui_scaling_transaction(",
         ),
         "_apply_advanced_visibility": (
             "self._schedule_main_window_geometry_commit(",
@@ -13633,6 +14269,35 @@ def _find_free_loopback_port() -> int:
         return int(listener.getsockname()[1])
 
 
+def _max_agent_launch_command(
+    executable: str | Path,
+    *,
+    startup_hook_ready: bool = True,
+) -> list[str]:
+    """Build the Max command, using the direct hook whenever it is ready.
+
+    The generated MaxScript startup hook is the single Agent bootstrap. Passing
+    the 4 MB Launcher as a PythonHost script as well makes Max compile and
+    execute it a second time during the same startup, which can race the hook
+    and delay descriptor publication. ``-U PythonHost`` remains so Max uses
+    its embedded Python host; the hook then calls ``python.Execute`` directly.
+    The source argument remains a compatibility fallback for an unavailable or
+    unwritable user profile, so that such a profile fails fast at handshake
+    rather than silently losing its Agent.
+    """
+    command = [str(Path(executable).resolve()), "-U", "PythonHost"]
+    if not startup_hook_ready:
+        command.append(str(Path(__file__).resolve()))
+    return command
+
+
+def _max_handshake_failure_requires_worker_replacement(exc: Exception) -> bool:
+    """Separate a dead endpoint from a temporarily delayed Max receipt."""
+    if isinstance(exc, (ProtocolError, AgentCommandError)):
+        return True
+    return isinstance(exc, MaxIpcTransportError) and " IPC connection failed:" in str(exc)
+
+
 def _open_existing_named_memory_map(tagname: str, size: int) -> mmap.mmap | None:
     """Open a descriptor only when its Windows mapping already exists.
 
@@ -14226,6 +14891,53 @@ def _max_startup_directories() -> list[Path]:
     ]
 
 
+def _max_startup_directories_for_executable(executable: Path) -> list[Path]:
+    """Resolve the current user's Max startup folders for one executable.
+
+    This intentionally uses the executable's installed year and the already
+    known Autodesk profile layout. It avoids launching a second Python probe
+    during the small preflight window immediately before Max starts.
+    """
+    local_app_data = str(os.environ.get("LOCALAPPDATA", "") or "").strip()
+    if not local_app_data:
+        return []
+    executable_text = str(Path(executable).resolve())
+    version_match = re.search(r"(?i)3ds\s*max\s*(20\d{2})", executable_text)
+    version = version_match.group(1) if version_match is not None else ""
+    if not version:
+        return []
+    root = Path(local_app_data) / "Autodesk" / "3dsMax"
+    pattern = f"{version} - 64bit/*/scripts/startup"
+    try:
+        candidates = list(root.glob(pattern))
+    except OSError:
+        return []
+    return sorted(
+        {candidate.resolve() for candidate in candidates if candidate.is_dir()},
+        key=lambda value: str(value).casefold(),
+    )
+
+
+def _ensure_max_startup_hook_for_executable(executable: Path) -> list[Path]:
+    """Synchronously install and verify the direct MS bootstrap for Max.
+
+    Launching only starts after this preflight returns. That closes the race in
+    which the asynchronous profile scan is still writing the hook while Max is
+    already enumerating startup scripts.
+    """
+    directories = _max_startup_directories_for_executable(Path(executable))
+    if not directories:
+        return []
+    installed = install_agent_startup_hooks(directories)
+    expected = [directory / AGENT_STARTUP_MS_LOADER for directory in directories]
+    if len(installed) != len(expected) or not all(
+        _startup_hook_matches_expected(path, _max_agent_startup_loader_text(LAUNCHER_SOURCE_PATH))
+        for path in expected
+    ):
+        return []
+    return installed
+
+
 def _direct_python_startup_hooks(directories: Iterable[Path]) -> list[Path]:
     """Return direct Python files that Max must not enumerate as startup hooks."""
     hooks: list[Path] = []
@@ -14277,7 +14989,6 @@ def _disable_direct_python_startup_hooks(
             }
         )
     if audit_rows:
-        audit_path = DEFAULT_LOG_DIR / "max_startup_python_audit.json"
         audit = {
             "schema": "pc-rehd-code-x-max-startup-python-audit-v1",
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
@@ -14285,7 +14996,7 @@ def _disable_direct_python_startup_hooks(
             "entries": audit_rows,
         }
         try:
-            _atomic_write_json_document(audit_path, audit)
+            _write_public_cache_section(DEFAULT_LOG_DIR, "startup_audit", audit)
         except (OSError, TypeError, ValueError):
             pass
         for row in audit_rows:
@@ -14297,12 +15008,42 @@ def _disable_direct_python_startup_hooks(
     return audit_rows
 
 
-def _max_agent_startup_loader_text(bridge_path: Path) -> str:
-    bridge_literal = str(bridge_path.resolve())
+def _retire_legacy_max_startup_bridge() -> bool:
+    """Remove only a Bridge file that this Launcher generated."""
+    bridge_path = DEFAULT_LOG_DIR / AGENT_STARTUP_LEGACY_PYTHON_BRIDGE
+    try:
+        if not bridge_path.is_file():
+            return False
+        with bridge_path.open("r", encoding="utf-8", errors="replace") as stream:
+            first_line = stream.readline().strip()
+        if first_line != AGENT_STARTUP_LEGACY_PYTHON_BRIDGE_HEADER:
+            return False
+        bridge_path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _max_agent_startup_python_text(source_path: Path) -> str:
+    encoded_source = Path(source_path).resolve().as_posix().encode("utf-8").hex()
     return (
-        "-- Generated by PC-REHD Code X Launcher. MaxScript bootstrap for the resident Rescue and Work Agent.\n"
+        "import os,pathlib,sys,types;"
+        f"_s=pathlib.Path(bytes.fromhex('{encoded_source}').decode('utf-8'));"
+        "_n='_pc_rehd_rescue_runtime_'+str(os.getpid());"
+        "_m=types.ModuleType(_n);_m.__file__=str(_s);sys.modules[_n]=_m;"
+        "exec(compile(_s.read_bytes(),str(_s),'exec'),_m.__dict__);"
+        "_m._start_rescue_agent_from_max_startup(source_path=_s)"
+    )
+
+
+def _max_agent_startup_loader_text(source_path: Path) -> str:
+    startup_python = _max_agent_startup_python_text(source_path)
+    source_comment = Path(source_path).resolve().as_posix()
+    return (
+        "-- Generated by PC-REHD Code X Launcher. Direct MaxScript bootstrap for the resident Rescue and Work Agent.\n"
+        f"-- Launcher source: {source_comment}\n"
         "try (\n"
-        f"    python.ExecuteFile @\"{bridge_literal}\"\n"
+        f"    python.Execute \"{startup_python}\"\n"
         ") catch (\n"
         "    format \"[PC-REHD Code X] Max Agent startup failed: %\\n\" (getCurrentException())\n"
         ")\n"
@@ -14316,50 +15057,20 @@ def _startup_hook_matches_expected(path: Path, expected_text: str) -> bool:
         return False
 
 
+def _legacy_install_agent_startup_hooks_disabled(directories: list[Path] | None = None) -> list[Path]:
+    return install_agent_startup_hooks(directories)
+
+
+
 def install_agent_startup_hooks(directories: list[Path] | None = None) -> list[Path]:
-    source_literal = ascii(str(Path(__file__).resolve()))
-    bridge_path = DEFAULT_LOG_DIR / AGENT_STARTUP_PYTHON_BRIDGE
-    bridge = (
-        "# Generated by PC-REHD Code X Launcher. Max startup Python bridge.\n"
-        "import builtins\n"
-        "import pathlib\n"
-        "import sys\n"
-        "import types\n"
-        "import os\n"
-        f"_source = pathlib.Path({source_literal})\n"
-        "_rescue = getattr(builtins, '_PC_REHD_CODE_X_RESCUE_AGENT', None)\n"
-        "_rescue_live = (\n"
-        "    _rescue is not None\n"
-        "    and callable(getattr(_rescue, 'is_live', None))\n"
-        "    and _rescue.is_live()\n"
-        ")\n"
-        "if not _rescue_live:\n"
-        "    _module_name = '_pc_rehd_rescue_runtime_' + str(os.getpid())\n"
-        "    _module = types.ModuleType(_module_name)\n"
-        "    _module.__file__ = str(_source)\n"
-        "    sys.modules[_module_name] = _module\n"
-        "    exec(compile(_source.read_bytes(), str(_source), 'exec'), _module.__dict__)\n"
-        "    _module._start_rescue_agent_for_current_process()\n"
-        "else:\n"
-        "    _worker = getattr(builtins, '_PC_REHD_CODE_X_WORK_AGENT', None)\n"
-        "    _worker_stop = getattr(_worker, 'stop_event', None)\n"
-        "    _worker_live = (\n"
-        "        _worker is not None\n"
-        "        and not bool(getattr(_worker_stop, 'is_set', lambda: True)())\n"
-        "    )\n"
-        "    if not _worker_live:\n"
-        "        _rescue.ensure_worker_local(source_path=_source)\n"
-    )
-    loader = _max_agent_startup_loader_text(bridge_path)
+    """Install the direct MaxScript hook and retire the generated sidecar."""
+    source_path = Path(__file__).resolve()
+    loader = _max_agent_startup_loader_text(source_path)
     installed: list[Path] = []
-    startup_directories = _max_startup_directories() if directories is None else list(directories)
+    startup_directories = (
+        _max_startup_directories() if directories is None else list(directories)
+    )
     _disable_direct_python_startup_hooks(startup_directories)
-    try:
-        bridge_path.parent.mkdir(parents=True, exist_ok=True)
-        if not _startup_hook_matches_expected(bridge_path, bridge):
-            bridge_path.write_text(bridge, encoding="utf-8", newline="\n")
-    except OSError:
-        return []
     for directory in startup_directories:
         try:
             path = directory / AGENT_STARTUP_MS_LOADER
@@ -14372,14 +15083,20 @@ def install_agent_startup_hooks(directories: list[Path] | None = None) -> list[P
             ):
                 legacy_path = directory / legacy_name
                 if legacy_path.is_file():
-                    legacy_text = legacy_path.read_text(encoding="utf-8", errors="replace")
-                    if legacy_text.startswith((
-                        "# Generated by PC-REHD Code X Launcher.",
-                        "-- Generated by PC-REHD Code X Launcher.",
-                    )):
+                    legacy_text = legacy_path.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    if legacy_text.startswith(
+                        (
+                            "# Generated by PC-REHD Code X Launcher.",
+                            "-- Generated by PC-REHD Code X Launcher.",
+                        )
+                    ):
                         legacy_path.unlink()
         except OSError:
             continue
+    if startup_directories and len(installed) == len(startup_directories):
+        _retire_legacy_max_startup_bridge()
     return installed
 
 
@@ -23469,6 +24186,8 @@ def _max_export_fbx(
     primary_error: Exception | None = None
     recovery_failures: list[str] = []
     route_marker_snapshots: list[tuple[Any, str, int]] = []
+    reservation_path = path.with_name(f".{path.stem}.reserve")
+    reservation_owned = reservation_path.is_file()
     try:
         path.unlink(missing_ok=True)
         if not export_all_scene:
@@ -23587,6 +24306,12 @@ def _max_export_fbx(
             except Exception as selection_exc:
                 recovery_failures.append(f"Max selection restore failed: {selection_exc}")
         _max_release_transient_runtime(rt)
+        if reservation_owned and export_result is not None:
+            # Once the public FBX exists, the allocator cannot reuse this stem
+            # even after the private marker is removed.  On failure, keep the
+            # marker until the Launcher writes the terminal ERROR TXT so a
+            # concurrent request cannot claim the stem in that handoff gap.
+            _release_public_fbx_reservation(path)
     if primary_error is not None:
         if recovery_failures:
             raise RuntimeError(
@@ -25659,6 +26384,29 @@ def _start_rescue_agent_for_current_process(
     return rescue
 
 
+def _start_rescue_agent_from_max_startup(
+    *,
+    source_path: Path | None = None,
+) -> RescueAgent:
+    """Start the resident Agent from the direct MaxScript bootstrap."""
+    import builtins
+
+    resolved_source = Path(source_path or LAUNCHER_SOURCE_PATH).resolve()
+    existing = getattr(builtins, RESCUE_AGENT_BUILTIN_NAME, None)
+    rescue_live = (
+        existing is not None
+        and callable(getattr(existing, "is_live", None))
+        and existing.is_live()
+    )
+    if not rescue_live:
+        return _start_rescue_agent_for_current_process(source_path=resolved_source)
+
+    worker = _current_work_agent()
+    if not _work_agent_is_live(worker):
+        existing.ensure_worker_local(source_path=resolved_source)
+    return existing
+
+
 def _start_agent_for_current_process() -> PymxsAgent:
     _start_rescue_agent_for_current_process()
     agent = _current_work_agent()
@@ -26548,12 +27296,14 @@ TTK_UI_BEHAVIOR_CATALOG: dict[str, TtkUiBehaviorSpec] = {
                 "_settle_scaling_main_viewport_layout",
                 "_sync_main_viewport_scrollregion",
                 "_on_main_viewport_canvas_configure",
+                "_finalize_main_ui_startup_layout",
                 "_finalize_main_window_layout_after_map",
                 "_measure_main_viewport_content_bounds",
                 "_main_window_layout_signature",
                 "_main_window_layout_signature_matches",
                 "_sync_canvas_scrollregion_from_bbox",
                 "_position_content_after_toolbar", "_reflow_left_sections",
+                "_apply_main_ui_vertical_fill",
             ),
             "all-modes",
         ),
@@ -26561,9 +27311,11 @@ TTK_UI_BEHAVIOR_CATALOG: dict[str, TtkUiBehaviorSpec] = {
             "layout.main.scaling", "layout", "LauncherApp",
             "Unified main-window scaling state, cache, and widget metrics.",
             (
-                "_main_scaling_snapshot_cache_key",
-                "_main_window_unscaled_natural_size_cache_key",
-                "_main_ui_scaling_layout_signature", "_main_ui_resize_interaction_active",
+                 "_main_scaling_snapshot_cache_key",
+                 "_main_window_unscaled_natural_size_cache_key",
+                 "_main_ui_scaling_layout_signature", "_main_ui_resize_interaction_active",
+                "_main_ui_scaling_layout_cache_key",
+                "_invalidate_main_ui_scaling_schedule",
                 "_resize_main_viewport_surface_for_live_gesture",
                 "_schedule_main_live_resize_commit", "_schedule_main_ui_scaling_reflow",
                 "_main_ui_scale_factor", "_main_ui_font_scale_factor",
@@ -26574,9 +27326,12 @@ TTK_UI_BEHAVIOR_CATALOG: dict[str, TtkUiBehaviorSpec] = {
                 "_scaling_visible_widget_size", "_scaling_section_required_height",
                 "_raise_scaling_main_content_layers", "_capture_pre_scaling_window_size",
                 "_restore_pre_scaling_window_size",
-                "_persist_main_ui_scaling_layout_cache",
-                "_prime_main_ui_scaling_cache", "_toggle_scaling_mode",
-                "_apply_main_ui_scaling_policy", "_settle_scaling_main_viewport_layout",
+                 "_persist_main_ui_scaling_layout_cache",
+                 "_prime_main_ui_scaling_cache", "_toggle_scaling_mode",
+                 "_main_ui_scaling_transaction", "_layout_main_ui_scaling_stage",
+                 "_measure_main_ui_scaling_snapshot",
+                 "_commit_main_ui_scaling_snapshot",
+                 "_apply_main_ui_scaling_policy", "_settle_scaling_main_viewport_layout",
                 "_ensure_scaling_main_window_contains_content",
                 "_reclaim_scaling_window_whitespace",
                 "_enforce_scaling_main_page_minimum",
@@ -39757,7 +40512,11 @@ class ManagedMaxSession:
         # the fresh descriptor published by this exact Max PID.
         environment[PORT_ENV] = "0"
         environment[TOKEN_ENV] = token
-        command = [str(exe), "-U", "PythonHost", str(Path(__file__).resolve())]
+        startup_hook_ready = bool(_ensure_max_startup_hook_for_executable(exe))
+        command = _max_agent_launch_command(
+            exe,
+            startup_hook_ready=startup_hook_ready,
+        )
         process = subprocess.Popen(command, env=environment, cwd=str(exe.parent))
         if int(process.pid) <= 0:
             raise RuntimeError("3ds Max launch returned PID=0")
@@ -40006,7 +40765,17 @@ class ManagedMaxSession:
                     continue
             except (ConnectionError, OSError, TimeoutError, ProtocolError, RuntimeError) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
-                if not replacement_attempted:
+                # A current named-memory descriptor proves that this Work
+                # Agent still owns its endpoint. Max can delay a health or
+                # compatibility receipt while its main thread is loading or
+                # busy; replacing the Worker on that transient timeout adds a
+                # full Launcher recompile and turns a short pause into a much
+                # longer reconnect. Replace only after a valid reply exposes
+                # an actual protocol/admission failure.
+                worker_contract_failed = (
+                    _max_handshake_failure_requires_worker_replacement(exc)
+                )
+                if not replacement_attempted and worker_contract_failed:
                     try:
                         _ensure_rescue_worker_for_pid(
                             pid,
@@ -41667,37 +42436,46 @@ def _resolve_log_directory(path_text: str = "") -> Path:
 def _fbx_log_path(log_directory: Path, max_pid: int, operation: str, request_token: str) -> Path:
     pid = int(max_pid)
     if pid <= 0:
-        raise ValueError("FBX log path requires a positive Max PID")
+        raise ValueError("FBX log path requires a positive modeling-process PID")
     kind = str(operation or "").strip().casefold()
     if kind not in {"import", "export"}:
         raise ValueError(f"Unsupported FBX log operation: {operation}")
     token = str(request_token or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{32}", token):
         raise ValueError("FBX sample token must be a 32-character UUID hex value")
-    output = log_directory / f"{kind}_pid{pid}_{token}.fbx"
-    output.parent.mkdir(parents=True, exist_ok=True)
+    output, _receipt_path = _reserve_public_fbx_artifact_paths(log_directory, pid, kind)
     return output
 
 
 def _prune_sample_groups(log_directory: str | Path, *, keep_groups: int = SAMPLE_KEEP_GROUPS) -> list[str]:
-    """Keep the newest generated FBX/TXT stems globally across every Max PID."""
-    root = Path(log_directory)
-    if keep_groups < 0 or not root.is_dir():
+    """Keep newest generated FBX/TXT stems across the public operation folders."""
+    root = Path(log_directory).expanduser().resolve(strict=False)
+    scan_roots: list[Path] = []
+    for candidate in (
+        root,
+        _public_operation_directory(root, "import"),
+        _public_operation_directory(root, "export"),
+    ):
+        resolved = candidate.resolve(strict=False)
+        if resolved not in scan_roots and resolved.is_dir():
+            scan_roots.append(resolved)
+    if keep_groups < 0 or not scan_roots:
         return []
     groups: dict[str, dict[str, Any]] = {}
-    for child in root.iterdir():
-        if not child.is_file():
-            continue
-        match = SAMPLE_FILE_RE.fullmatch(child.name)
-        if match is None:
-            continue
-        stem = match.group("stem").casefold()
-        record = groups.setdefault(stem, {"mtime": 0.0, "files": []})
-        record["files"].append(child)
-        try:
-            record["mtime"] = max(float(record["mtime"]), child.stat().st_mtime)
-        except OSError:
-            pass
+    for scan_root in scan_roots:
+        for child in scan_root.iterdir():
+            if not child.is_file():
+                continue
+            match = SAMPLE_FILE_RE.fullmatch(child.name)
+            if match is None:
+                continue
+            stem = f"{str(scan_root).casefold()}::{match.group('stem').casefold()}"
+            record = groups.setdefault(stem, {"mtime": 0.0, "files": []})
+            record["files"].append(child)
+            try:
+                record["mtime"] = max(float(record["mtime"]), child.stat().st_mtime)
+            except OSError:
+                pass
     keep = {
         stem
         for stem, _record in sorted(
@@ -41726,7 +42504,12 @@ def _cleanup_import_fbx_artifacts(
     retain_fbx_path: str | Path | None,
     auto_cleanup_enabled: bool = True,
 ) -> dict[str, Any]:
-    """Keep recent generated import media folders for saved Max scenes."""
+    """Keep recent generated import media folders for saved Max scenes.
+
+    New public FBX artifacts live in ``Long Term Cache/导入 Import``.  The
+    legacy root is still scanned so an upgrade can clean abandoned artifacts
+    created before the public layout migration.
+    """
     receipt: dict[str, Any] = {
         "retained_import_fbx": "",
         "removed_fbm_directory_count": 0,
@@ -41738,9 +42521,14 @@ def _cleanup_import_fbx_artifacts(
     pid = int(max_process_id or 0)
     try:
         root = Path(log_directory).expanduser().resolve(strict=False)
+        scan_roots: list[Path] = []
+        for candidate in (root, _public_operation_directory(root, "import")):
+            resolved = candidate.resolve(strict=False)
+            if resolved not in scan_roots and resolved.is_dir():
+                scan_roots.append(resolved)
     except OSError:
         return receipt
-    if not root.is_dir():
+    if not scan_roots:
         return receipt
     retain_path: Path | None = None
     if retain_fbx_path is not None:
@@ -41750,28 +42538,32 @@ def _cleanup_import_fbx_artifacts(
             candidate = None
         if (
             candidate is not None
-            and candidate.parent == root
+            and candidate.parent in scan_roots
             and IMPORT_FBX_FILE_RE.fullmatch(candidate.name) is not None
             and pid > 0
-            and int(IMPORT_FBX_FILE_RE.fullmatch(candidate.name).group("pid")) == pid
         ):
-            retain_path = candidate
+            match = IMPORT_FBX_FILE_RE.fullmatch(candidate.name)
+            if match is not None:
+                pid_text = match.group("legacy_pid") or match.group("public_pid")
+                if int(pid_text or 0) == pid:
+                    retain_path = candidate
     media_directories: list[tuple[int, str, Path]] = []
-    for child in root.iterdir():
-        media_match = IMPORT_FBX_MEDIA_DIRECTORY_RE.fullmatch(child.name)
-        if (
-            media_match is not None
-            and child.is_dir()
-            and not child.is_symlink()
-        ):
-            try:
-                media_directories.append(
-                    (int(child.stat().st_mtime_ns), child.name.casefold(), child)
-                )
-            except OSError as exc:
-                receipt["errors"].append(
-                    f"{child.name}: {type(exc).__name__}: {exc}"
-                )
+    for scan_root in scan_roots:
+        for child in scan_root.iterdir():
+            media_match = IMPORT_FBX_MEDIA_DIRECTORY_RE.fullmatch(child.name)
+            if (
+                media_match is not None
+                and child.is_dir()
+                and not child.is_symlink()
+            ):
+                try:
+                    media_directories.append(
+                        (int(child.stat().st_mtime_ns), str(child).casefold(), child)
+                    )
+                except OSError as exc:
+                    receipt["errors"].append(
+                        f"{child.name}: {type(exc).__name__}: {exc}"
+                    )
     media_directories.sort(key=lambda row: (row[0], row[1]), reverse=True)
     if auto_cleanup_enabled:
         retained_media_directories = media_directories[
@@ -43800,6 +44592,16 @@ def _write_export_path_history(
     *,
     history_file: Path = EXPORT_PATH_HISTORY_FILE,
 ) -> list[str]:
+    if history_file.name.casefold() == PUBLIC_LONG_TERM_CACHE_FILE_NAME.casefold():
+        cache_root = history_file.parent.parent
+        _write_public_cache_section(cache_root, "export_path_history", {"paths": paths})
+        return [
+            normalized
+            for normalized in (
+                _normalized_export_directory(raw_path) for raw_path in paths
+            )
+            if normalized
+        ]
     history_file.parent.mkdir(parents=True, exist_ok=True)
     kept: list[str] = []
     identities: set[str] = set()
@@ -43829,6 +44631,18 @@ def _load_export_path_history(
     *,
     history_file: Path = EXPORT_PATH_HISTORY_FILE,
 ) -> list[str]:
+    if history_file.name.casefold() == PUBLIC_LONG_TERM_CACHE_FILE_NAME.casefold():
+        cached = _public_read_cache_section(history_file.parent.parent, "export_path_history") or {}
+        raw_paths = cached.get("paths", []) if isinstance(cached, Mapping) else []
+        raw_paths = raw_paths if isinstance(raw_paths, (list, tuple)) else []
+        return [
+            normalized
+            for normalized in (
+                _normalized_export_directory(raw_path)
+                for raw_path in raw_paths
+            )
+            if normalized
+        ]
     if not history_file.is_file():
         return []
     try:
@@ -46368,44 +47182,185 @@ def _runtime_dependency_error_is_repairable(exc: BaseException) -> bool:
     return "ufbx" in text and any(marker in text for marker in native_markers)
 
 
-def _writer_process_evidence_path(process_id: int) -> Path:
-    return Path(tempfile.gettempdir()) / "PC_REHD_Code_X" / f"writer_process_{int(process_id)}.pending.json"
+_WRITER_PROCESS_EVIDENCE_SCHEMA = "pc-rehd-code-x-writer-process-evidence-v2"
+_WRITER_PROCESS_EVIDENCE_LOCK = threading.Lock()
+_WRITER_PROCESS_EVIDENCE_MEMORY: dict[int, dict[str, Any]] = {}
+_WRITER_PROCESS_EVIDENCE_SINKS: dict[int, Any] = {}
+_WRITER_PROCESS_EVIDENCE_SINK: Any | None = None
 
 
-def _write_writer_process_evidence(process_id: int, stage: str, **details: Any) -> None:
-    path = _writer_process_evidence_path(process_id)
+def _register_writer_process_evidence_sink(process_id: int, sink: Any) -> None:
+    if int(process_id or 0) <= 0 or sink is None:
+        return
+    with _WRITER_PROCESS_EVIDENCE_LOCK:
+        _WRITER_PROCESS_EVIDENCE_SINKS[int(process_id)] = sink
+
+
+def _unregister_writer_process_evidence_sink(process_id: int) -> Any | None:
+    with _WRITER_PROCESS_EVIDENCE_LOCK:
+        return _WRITER_PROCESS_EVIDENCE_SINKS.pop(int(process_id or 0), None)
+
+
+def _writer_process_evidence_sink_for_write(
+    process_id: int,
+    explicit_sink: Any | None,
+) -> Any | None:
+    if explicit_sink is not None:
+        return explicit_sink
+    if _WRITER_PROCESS_EVIDENCE_SINK is not None:
+        return _WRITER_PROCESS_EVIDENCE_SINK
+    with _WRITER_PROCESS_EVIDENCE_LOCK:
+        return _WRITER_PROCESS_EVIDENCE_SINKS.get(int(process_id or 0))
+
+
+def _writer_process_evidence_sink_for_consume(
+    process_id: int,
+    explicit_sink: Any | None,
+) -> Any | None:
+    if explicit_sink is not None:
+        return explicit_sink
+    with _WRITER_PROCESS_EVIDENCE_LOCK:
+        return _WRITER_PROCESS_EVIDENCE_SINKS.get(int(process_id or 0))
+
+
+def _write_writer_process_evidence(
+    process_id: int,
+    stage: str,
+    *,
+    evidence_sink: Any | None = None,
+    **details: Any,
+) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema": "pc-rehd-code-x-writer-process-evidence-v1",
+            "schema": _WRITER_PROCESS_EVIDENCE_SCHEMA,
             "process_id": int(process_id),
             "stage": str(stage or "unknown"),
             "timestamp": time.time(),
             **details,
         }
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temporary, path)
+        with _WRITER_PROCESS_EVIDENCE_LOCK:
+            _WRITER_PROCESS_EVIDENCE_MEMORY[int(process_id)] = payload
+        sink = _writer_process_evidence_sink_for_write(process_id, evidence_sink)
+        if sink is not None:
+            try:
+                sink.put(payload)
+            except Exception:
+                pass
     except Exception:
         pass
 
 
-def _consume_writer_process_evidence(process_id: int) -> dict[str, Any]:
-    path = _writer_process_evidence_path(process_id)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else {}
-    except Exception:
-        return {}
-    finally:
+def _writer_process_evidence_snapshot(process_id: int) -> dict[str, Any]:
+    """Return the latest child-local evidence for embedding in a response."""
+    with _WRITER_PROCESS_EVIDENCE_LOCK:
+        payload = _WRITER_PROCESS_EVIDENCE_MEMORY.get(int(process_id or 0))
+        return dict(payload) if isinstance(payload, Mapping) else {}
+
+
+def _drain_writer_process_evidence_sink(sink: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    while True:
         try:
-            path.unlink(missing_ok=True)
+            if hasattr(sink, "get_nowait"):
+                candidate = sink.get_nowait()
+            elif hasattr(sink, "_reader") and sink._reader.poll():
+                candidate = sink.get()
+            elif hasattr(sink, "empty") and not sink.empty():
+                candidate = sink.get()
+            else:
+                break
+        except queue.Empty:
+            break
+        except (EOFError, OSError):
+            break
+        except Exception:
+            break
+        if isinstance(candidate, Mapping):
+            rows.append(dict(candidate))
+    return rows
+
+
+def _writer_process_evidence_timestamp(payload: Mapping[str, Any]) -> float:
+    try:
+        value = float(payload.get("timestamp", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) else 0.0
+
+
+def _writer_process_evidence_txt_lines(payload: Mapping[str, Any]) -> list[str]:
+    reserved = {"schema", "process_id", "stage", "timestamp"}
+    lines = [
+        "[WRITER_PROCESS_EVIDENCE]",
+        f"SCHEMA={_public_scalar_text(payload.get('schema', _WRITER_PROCESS_EVIDENCE_SCHEMA))}",
+        f"PROCESS_ID={_public_scalar_text(payload.get('process_id', 0))}",
+        f"STAGE={_public_scalar_text(payload.get('stage', 'unknown'))}",
+        f"TIMESTAMP={_public_scalar_text(payload.get('timestamp', ''))}",
+    ]
+    for key in sorted(str(name) for name in payload if str(name) not in reserved):
+        value = payload.get(key)
+        normalized_key = re.sub(r"[^A-Za-z0-9_]+", "_", key).strip("_").upper() or "DETAIL"
+        if isinstance(value, (Mapping, list, tuple)):
+            lines.extend(_public_flatten_value({normalized_key: value}))
+        else:
+            lines.append(f"{normalized_key}={_public_scalar_text(value)}")
+    lines.append("[END_WRITER_PROCESS_EVIDENCE]")
+    return lines
+
+
+def _consume_writer_process_evidence(
+    process_id: int,
+    *,
+    evidence_sink: Any | None = None,
+    evidence_payload: Mapping[str, Any] | None = None,
+    export_txt_path: str | Path | None = None,
+) -> dict[str, Any]:
+    latest: dict[str, Any] = {}
+
+    def consider(candidate: Any) -> None:
+        nonlocal latest
+        if not isinstance(candidate, Mapping):
+            return
+        try:
+            candidate_process_id = int(candidate.get("process_id", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if candidate_process_id != int(process_id or 0):
+            return
+        normalized = dict(candidate)
+        if not latest or _writer_process_evidence_timestamp(normalized) >= _writer_process_evidence_timestamp(latest):
+            latest = normalized
+
+    sink = _writer_process_evidence_sink_for_consume(process_id, evidence_sink)
+    if sink is not None:
+        for candidate in _drain_writer_process_evidence_sink(sink):
+            consider(candidate)
+    if isinstance(evidence_payload, Mapping):
+        consider(evidence_payload)
+    with _WRITER_PROCESS_EVIDENCE_LOCK:
+        local = _WRITER_PROCESS_EVIDENCE_MEMORY.pop(int(process_id or 0), None)
+    consider(local)
+    if latest and str(export_txt_path or "").strip():
+        try:
+            _append_public_text_block(
+                Path(export_txt_path),
+                _writer_process_evidence_txt_lines(latest),
+            )
         except Exception:
             pass
+    return latest
 
 
-def _writer_process_entry(connection: Any) -> None:
+def _clear_writer_process_evidence_memory(process_id: int) -> None:
+    """Clear the child-local snapshot without consuming the parent queue."""
+    with _WRITER_PROCESS_EVIDENCE_LOCK:
+        _WRITER_PROCESS_EVIDENCE_MEMORY.pop(int(process_id or 0), None)
+
+
+def _writer_process_entry(connection: Any, evidence_sink: Any | None = None) -> None:
     """Own Writer imports and CPU-heavy MOD work outside the Tk process."""
+    global _WRITER_PROCESS_EVIDENCE_SINK
+    _WRITER_PROCESS_EVIDENCE_SINK = evidence_sink
     process_id = os.getpid()
     _set_current_windows_process_priority(WINDOWS_BELOW_NORMAL_PRIORITY_CLASS)
     writer: Any | None = None
@@ -46479,7 +47434,7 @@ def _writer_process_entry(connection: Any) -> None:
             try:
                 envelope = connection.recv()
             except (EOFError, OSError):
-                _consume_writer_process_evidence(process_id)
+                _clear_writer_process_evidence_memory(process_id)
                 return
             if not isinstance(envelope, dict):
                 continue
@@ -46494,7 +47449,7 @@ def _writer_process_entry(connection: Any) -> None:
                         "result": {"status": "SHUTDOWN", "process_id": os.getpid()},
                     }
                 )
-                _consume_writer_process_evidence(process_id)
+                _clear_writer_process_evidence_memory(process_id)
                 return
             if command == "ping":
                 writer_source_sha = str(
@@ -46531,6 +47486,7 @@ def _writer_process_entry(connection: Any) -> None:
                         },
                         "error_type": "WriterPreloadError" if preload_error else "",
                         "error": preload_error[-12000:] if preload_error else "",
+                        "writer_process_evidence": _writer_process_evidence_snapshot(process_id),
                     }
                 )
                 continue
@@ -46763,9 +47719,10 @@ def _writer_process_entry(connection: Any) -> None:
                         ),
                         "worker_process_id": process_id,
                         "request_sequence": request_sequence,
+                        "writer_process_evidence": _writer_process_evidence_snapshot(process_id),
                     }
                 )
-                _consume_writer_process_evidence(process_id)
+                _clear_writer_process_evidence_memory(process_id)
             else:
                 _write_writer_process_evidence(
                     process_id,
@@ -46783,9 +47740,10 @@ def _writer_process_entry(connection: Any) -> None:
                         "result": result,
                         "worker_process_id": process_id,
                         "request_sequence": request_sequence,
+                        "writer_process_evidence": _writer_process_evidence_snapshot(process_id),
                     }
                 )
-                _consume_writer_process_evidence(process_id)
+                _clear_writer_process_evidence_memory(process_id)
     except BaseException:
         _write_writer_process_evidence(
             process_id,
@@ -46805,9 +47763,10 @@ def _run_writer_process_transport_smoke() -> dict[str, Any]:
 
     context = multiprocessing.get_context("spawn")
     parent_connection, child_connection = context.Pipe(duplex=True)
+    evidence_sink = context.SimpleQueue()
     process = context.Process(
         target=_writer_process_entry,
-        args=(child_connection,),
+        args=(child_connection, evidence_sink),
         name=f"{APP_NAME}-WriterSmoke",
         daemon=True,
     )
@@ -46911,7 +47870,15 @@ def _run_writer_process_transport_smoke() -> dict[str, Any]:
         if process.is_alive():
             process.terminate()
         process.join(timeout=2.0)
-        _consume_writer_process_evidence(int(process.pid or 0))
+        _consume_writer_process_evidence(
+            int(process.pid or 0),
+            evidence_sink=evidence_sink,
+        )
+        try:
+            evidence_sink.close()
+            evidence_sink.join_thread()
+        except Exception:
+            pass
 
 
 class _BinaryReader:
@@ -48398,6 +49365,7 @@ def _validate_deferred_uv_risk_task(
     max_process_id: int,
     output_mod: str | Path,
     log_directory: str | Path,
+    public_fbx_path: str | Path | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     if not isinstance(task, dict):
         return None, "Writer returned an invalid deferred UV receipt."
@@ -48466,6 +49434,9 @@ def _validate_deferred_uv_risk_task(
         "activation_path": activation_path,
         "log_directory": expected_log_root,
         "countdown_seconds": countdown_seconds,
+        "public_fbx_path": Path(public_fbx_path).expanduser().resolve(strict=False)
+        if str(public_fbx_path or "").strip()
+        else None,
     }, ""
 
 
@@ -48545,10 +49516,21 @@ def _consume_deferred_uv_risk_result(context: dict[str, Any]) -> dict[str, Any]:
             elapsed_seconds = max(0.0, float(payload.get("elapsed_seconds", 0.0) or 0.0))
         except (TypeError, ValueError):
             return {"state": "failed", "detail": "Deferred UV result elapsed time is invalid."}
-        try:
-            resolved_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        public_fbx_path = context.get("public_fbx_path")
+        if isinstance(public_fbx_path, Path):
+            try:
+                _append_public_text_block(
+                    public_fbx_path.with_suffix(".txt"),
+                    ["[UV_RISK_RESULT]", *_public_flatten_value(payload), "[END_UV_RISK_RESULT]"],
+                )
+                resolved_path.unlink(missing_ok=True)
+            except OSError:
+                return {"state": "failed", "detail": "Deferred UV result could not be converted to Export TXT."}
+        else:
+            try:
+                _convert_public_json_to_txt(resolved_path, resolved_path.with_suffix(".txt"))
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                return {"state": "failed", "detail": "Deferred UV result could not be converted to TXT."}
         return {
             "state": "complete",
             "uv_risk": uv_risk,
@@ -48557,10 +49539,21 @@ def _consume_deferred_uv_risk_result(context: dict[str, Any]) -> dict[str, Any]:
     if status == "failed":
         error_type = str(payload.get("error_type", "") or "DeferredUvRiskError")
         error = str(payload.get("error", "") or "The background UV report failed.")
-        try:
-            resolved_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        public_fbx_path = context.get("public_fbx_path")
+        if isinstance(public_fbx_path, Path):
+            try:
+                _append_public_text_block(
+                    public_fbx_path.with_suffix(".txt"),
+                    ["[UV_RISK_RESULT]", *_public_flatten_value(payload), "[END_UV_RISK_RESULT]"],
+                )
+                resolved_path.unlink(missing_ok=True)
+            except OSError:
+                return {"state": "failed", "detail": "Deferred UV failure could not be converted to Export TXT."}
+        else:
+            try:
+                _convert_public_json_to_txt(resolved_path, resolved_path.with_suffix(".txt"))
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                return {"state": "failed", "detail": "Deferred UV failure could not be converted to TXT."}
         return {"state": "failed", "detail": f"{error_type}: {error}"}
     return {"state": "failed", "detail": f"Deferred UV result returned unknown status: {status or '?'}"}
 
@@ -50959,12 +51952,17 @@ class LauncherApp:
                 )
             except OSError:
                 pass
-            selected_state_path = _launcher_state_path(
-                self._long_term_cache_directory
-            )
             self.launcher_state = (
                 _load_launcher_state(self._long_term_cache_directory)
-                if selected_state_path.is_file()
+                if _public_read_cache_section(
+                    self._long_term_cache_directory, "launcher_state"
+                ) is not None
+                or (
+                    _normalize_long_term_cache_directory(
+                        self._long_term_cache_directory
+                    )
+                    / LAUNCHER_STATE_FILE_NAME
+                ).is_file()
                 else bootstrap_state
             )
             self.launcher_state["log_directory"] = str(
@@ -51090,6 +52088,21 @@ class LauncherApp:
             self.launcher_state.get("main_ui_scaling_layout_cache", {})
         )
         self._main_ui_scaling_reflow = False
+        # Every delayed scaling callback belongs to one generation. Tk can
+        # dispatch a callback that was already dequeued even after
+        # after_cancel succeeds, so cancellation alone is not a sufficient
+        # stale-work guard.
+        self._main_ui_scaling_reflow_generation = 0
+        # Endpoint measurement must use one stable natural topology. If the
+        # live target width participates in those measurements, the baseline
+        # grows with the window and the solver has no signal to enlarge the
+        # controls on the final commit.
+        self._main_ui_scaling_measurement_active = False
+        self._main_ui_scaling_transaction_active = False
+        self._main_ui_scaling_transaction_publishing = False
+        self._main_ui_scaling_transaction_pending_viewport = False
+        self._main_ui_scaling_transaction_target_size: tuple[int, int] | None = None
+        self._main_ui_scaling_committed_content_size: tuple[int, int] | None = None
         self._main_ui_scaling_containment_active = False
         self._main_ui_grid_metrics: dict[Any, dict[str, Any]] = {}
         self._ui_text_measure_cache: dict[tuple[Any, ...], int] = {}
@@ -51097,6 +52110,7 @@ class LauncherApp:
         self._pre_scaling_window_sizes: dict[str, tuple[str, int, int]] = {}
         self._pre_scaling_content_sizes: dict[str, tuple[int, int]] = {}
         self._main_window_requested_geometry: tuple[str, int, int] | None = None
+        self._main_window_requested_position: tuple[int, int] | None = None
         self._main_window_layout_finalized = False
         self._main_window_last_viewport_size: tuple[int, int] | None = None
         self._main_viewport_content_size = (1, 1)
@@ -51236,6 +52250,10 @@ class LauncherApp:
         self._background_callback_queue: queue.Queue[Callable[[], None]] = queue.Queue()
         self._background_pump_scheduled = False
         self._writer_pool_lock = threading.Lock()
+        # Serialise worker acquisition with the idle warmup.  Without this
+        # gate an export can observe an idle Launcher just as warmup starts,
+        # causing a second Writer process to be spawned.
+        self._writer_warmup_gate = threading.Lock()
         self._writer_processes: dict[int, _WriterProcessWorker] = {}
         self._importer_warmup_lock = threading.Lock()
         self._importer_warmup_started = False
@@ -51407,9 +52425,9 @@ class LauncherApp:
         self._manual_restart_in_progress = False
         self._bootstrap_health_supervisor_lock = threading.RLock()
         self._bootstrap_health_supervisor_process: subprocess.Popen[Any] | None = None
-        self._bootstrap_health_supervisor_log_dir = Path(
+        self._bootstrap_health_supervisor_log_dir = _public_long_term_cache_directory(
             str(self.launcher_state.get("log_directory", DEFAULT_LOG_DIR) or DEFAULT_LOG_DIR)
-        ).resolve(strict=False)
+        )
         self._bootstrap_health_supervisor_restart_count = 0
         self._auto_launch_requested = bool(auto_launch)
         self._message_editor_reopen_requested = bool(
@@ -51460,7 +52478,9 @@ class LauncherApp:
         self._apply_main_ui_style_scope()
         self._set_active_view_enabled(False)
         self._blank_active_view()
-        self._restore_main_window_size(self._main_window_size_mode, center=True)
+        # Restore the persisted size/position when available.  ``run_ui``
+        # centers only a first-run window with no saved position.
+        self._restore_main_window_size(self._main_window_size_mode, center=False)
         self._main_window_resize_ready = True
         self.root.bind("<Configure>", self._on_main_window_configure, add="+")
         self.root.bind("<MouseWheel>", self._on_main_viewport_mousewheel, add="+")
@@ -51492,7 +52512,6 @@ class LauncherApp:
         self.root.after(500, self._start_github_launcher_update_check)
         self._refresh_agent_startup_hooks(time.monotonic(), force=True)
         self._start_importer_warmup()
-        self._schedule_writer_warmup()
         self.root.after(350, self._poll_max_windows)
         if self._message_editor_reopen_requested:
             self._message_editor_reopen_requested = False
@@ -52070,15 +53089,16 @@ class LauncherApp:
         if target.resolve(strict=False) != previous_cache_directory:
             self._persist_message_editor_state()
         with self._bootstrap_health_supervisor_lock:
+            health_target = _public_long_term_cache_directory(target)
             current = Path(self._bootstrap_health_supervisor_log_dir).resolve(strict=False)
             process = self._bootstrap_health_supervisor_process
             process_alive = process is not None and process.poll() is None
-            if current == target.resolve(strict=False):
+            if current == health_target.resolve(strict=False):
                 if self._runtime_services_started and not process_alive:
                     self._start_bootstrap_health_supervisor(schedule_poll=False)
                 return target
             self._bootstrap_health_supervisor_process = None
-            self._bootstrap_health_supervisor_log_dir = target
+            self._bootstrap_health_supervisor_log_dir = health_target
             self._bootstrap_health_supervisor_restart_count = 0
         if process_alive and process is not None:
             try:
@@ -52100,7 +53120,9 @@ class LauncherApp:
             if process is not None and process.poll() is None:
                 return
         try:
-            log_directory = _resolve_log_directory(self.log_dir_var.get())
+            log_directory = _public_long_term_cache_directory(
+                _resolve_log_directory(self.log_dir_var.get())
+            )
             creation_flags = _low_priority_subprocess_creation_flags()
             process = subprocess.Popen(
                 [
@@ -52123,6 +53145,7 @@ class LauncherApp:
             with self._bootstrap_health_supervisor_lock:
                 self._bootstrap_health_supervisor_log_dir = log_directory
                 self._bootstrap_health_supervisor_process = process
+            _consolidate_legacy_bootstrap_health_log(log_directory)
         except Exception as exc:
             with self._bootstrap_health_supervisor_lock:
                 self._bootstrap_health_supervisor_process = None
@@ -52260,6 +53283,7 @@ class LauncherApp:
                     detail=detail,
                     extra=extra,
                 )
+                _consolidate_legacy_bootstrap_health_log(log_directory)
             else:
                 raise RuntimeError("Bootstrap health reporter entry point is missing")
         except Exception as reporter_error:
@@ -52734,9 +53758,7 @@ class LauncherApp:
                 directory / AGENT_STARTUP_MS_LOADER
                 for directory in directories
             ]
-            expected_loader = _max_agent_startup_loader_text(
-                DEFAULT_LOG_DIR / AGENT_STARTUP_PYTHON_BRIDGE
-            )
+            expected_loader = _max_agent_startup_loader_text(LAUNCHER_SOURCE_PATH)
             hooks_present = all(
                 _startup_hook_matches_expected(path, expected_loader)
                 for path in expected_paths
@@ -53013,6 +54035,40 @@ class LauncherApp:
             tk_scaling = round(float(self.root.tk.call("tk", "scaling")), 4)
         except (self.tk.TclError, TypeError, ValueError):
             tk_scaling = 1.0
+        # Keep the measured layout keyed by the live root width in both
+        # Scaling and normal modes.  Otherwise a normal-mode resize reuses the
+        # first narrow layout forever and the left controls stay tiny.
+        responsive_width = 0
+        try:
+            responsive_width = max(0, int(self.root.winfo_width()))
+        except (self.tk.TclError, TypeError, ValueError):
+            responsive_width = 0
+        scaling_mode = bool(getattr(self, "_scaling_mode_enabled", False))
+        if (
+            scaling_mode
+            and responsive_width <= 1
+            and not bool(getattr(self, "_main_ui_scaling_measurement_active", False))
+        ):
+            # Tk reports the hidden staging window as 1x1 during startup.
+            # Reuse the transaction/applied target so the first mapped frame
+            # uses the restored width instead of publishing a narrow layout.
+            for size_attribute in (
+                "_main_ui_scaling_transaction_target_size",
+                "_main_ui_scaling_applied_size",
+            ):
+                target_size = getattr(self, size_attribute, None)
+                if not isinstance(target_size, (tuple, list)) or len(target_size) < 2:
+                    continue
+                try:
+                    responsive_width = max(1, int(target_size[0]))
+                except (TypeError, ValueError):
+                    continue
+                if responsive_width > 1:
+                    break
+        if bool(getattr(self, "_main_ui_scaling_measurement_active", False)):
+            # Keep all four endpoint measurements on the same natural-width
+            # contract. The final commit re-enables responsive allocation.
+            responsive_width = 0
         cache_key = (
             self._active_ui_page_key(),
             str(self.ui_language),
@@ -53020,6 +54076,7 @@ class LauncherApp:
             tk_scaling,
             bool(getattr(self, "_scaling_mode_enabled", False)),
             round(float(getattr(self, "_main_ui_layout_scale", 1.0)), 3),
+            responsive_width,
         )
         cached = self._main_layout_cache.get(cache_key)
         if cached is not None:
@@ -53147,6 +54204,34 @@ class LauncherApp:
         layout = dict(source)
         width = self._measure_ui_text
         scaling_mode = bool(getattr(self, "_scaling_mode_enabled", False))
+        try:
+            responsive_width = max(0, int(self.root.winfo_width()))
+        except (self.tk.TclError, TypeError, ValueError):
+            responsive_width = 0
+        if (
+            scaling_mode
+            and responsive_width <= 1
+            and not bool(getattr(self, "_main_ui_scaling_measurement_active", False))
+        ):
+            # During hidden startup, the saved final width lives in the
+            # scaling transaction rather than in Tk's 1x1 staging geometry.
+            for size_attribute in (
+                "_main_ui_scaling_transaction_target_size",
+                "_main_ui_scaling_applied_size",
+            ):
+                target_size = getattr(self, size_attribute, None)
+                if not isinstance(target_size, (tuple, list)) or len(target_size) < 2:
+                    continue
+                try:
+                    responsive_width = max(1, int(target_size[0]))
+                except (TypeError, ValueError):
+                    continue
+                if responsive_width > 1:
+                    break
+        if bool(getattr(self, "_main_ui_scaling_measurement_active", False)):
+            # Endpoint measurements must not feed the target width back into
+            # their own responsive layout calculation.
+            responsive_width = 0
         model_buttons = max(width(self._tr("导入 Mod", "Import Mod")), width(self._tr("导出到 Mod", "Export To Mod"))) + 28
         model_checks = max(
             width(self._tr("导入法线", "Import Normals")),
@@ -53261,6 +54346,89 @@ class LauncherApp:
             left_w = max(left_minimum_width, int(round(left_w * widget_scale)))
             side_w = max(side_minimum_width, int(round(side_w * widget_scale)))
 
+        # Scaling Mode is also responsive when the user widens the Launcher.
+        # Allocate the spare width before deriving control bounds: one third
+        # goes to the left stack and one third to each of the two right stacks.
+        # The action column stays at the far edge, so the page grows into the
+        # newly available area instead of leaving an empty right-hand band.
+        if bool(self.advanced_visible_var.get()) and scaling_mode:
+            responsive_root_width = responsive_width
+            if (
+                responsive_root_width <= 1
+                and not bool(
+                    getattr(self, "_main_ui_scaling_measurement_active", False)
+                )
+            ):
+                # Keep this local fallback beside the responsive allocation:
+                # during hidden startup Tk still reports a 1px root.
+                for size_attribute in (
+                    "_main_ui_scaling_transaction_target_size",
+                    "_main_ui_scaling_applied_size",
+                ):
+                    target_size = getattr(self, size_attribute, None)
+                    if not isinstance(target_size, (tuple, list)) or len(target_size) < 2:
+                        continue
+                    try:
+                        responsive_root_width = max(1, int(target_size[0]))
+                    except (TypeError, ValueError):
+                        continue
+                    if responsive_root_width > 1:
+                        break
+            action_area = getattr(self, "toolbar_action_area", None)
+            action_width = 0
+            if action_area is not None:
+                try:
+                    action_area.update_idletasks()
+                    action_width = max(
+                        1,
+                        int(action_area.winfo_reqwidth()),
+                    )
+                except (self.tk.TclError, TypeError, ValueError):
+                    action_width = 0
+            right_area = getattr(self, "right_area", None)
+            panel_gap = self._scale_main_ui_spacing_metric(28, minimum=12)
+            panel_requested_width = 0
+            if right_area is not None:
+                try:
+                    # right_area is the container for BOTH middle/right
+                    # stacks.  Its live width may already include a previous
+                    # responsive expansion; feeding that width back here
+                    # makes the expansion self-locking.  Only its requested
+                    # width is a stable minimum for this calculation.
+                    panel_requested_width = max(1, int(right_area.winfo_reqwidth()))
+                except (self.tk.TclError, TypeError, ValueError):
+                    panel_requested_width = 0
+            if panel_requested_width > 0:
+                side_w = max(
+                    int(side_w),
+                    max(1, int(panel_requested_width) - int(panel_gap) + 1) // 2,
+                )
+            gap = 14
+            right_margin = max(8, int(layout["left_x"]))
+            action_gap = max(18, int(layout["left_x"]))
+            columns_right = (
+                int(layout["left_x"])
+                + int(left_w)
+                + gap
+                + int(side_w)
+                + gap
+                + int(side_w)
+            )
+            spare_width = (
+                responsive_root_width
+                - columns_right
+                - action_gap
+                - action_width
+                - right_margin
+            )
+            if spare_width > 1:
+                # Split spare width across all visible columns.  In normal
+                # mode this makes a manually widened window useful too; in
+                # Scaling Mode it preserves the same responsive topology.
+                left_delta = int(spare_width) // 3
+                side_delta = (int(spare_width) - left_delta) // 2
+                left_w += max(0, left_delta)
+                side_w += max(0, side_delta)
         layout["left_w"] = left_w
         if scaling_mode:
             compact_width_gap = self._scale_main_ui_spacing_metric(8, minimum=2)
@@ -53416,6 +54584,14 @@ class LauncherApp:
     def _refresh_main_viewport_layout(
         self, *, window_width: int | None = None, window_height: int | None = None
     ) -> None:
+        if bool(getattr(self, "_main_ui_scaling_transaction_active", False)):
+            self._main_ui_scaling_transaction_pending_viewport = True
+            if window_width is not None and window_height is not None:
+                self._main_ui_scaling_transaction_target_size = (
+                    max(1, int(window_width)),
+                    max(1, int(window_height)),
+                )
+            return
         canvas = getattr(self, "main_viewport_canvas", None)
         content = getattr(self, "main_viewport_content", None)
         window_id = getattr(self, "main_viewport_window_id", None)
@@ -53468,8 +54644,11 @@ class LauncherApp:
                 else:
                     content_width = max(1, int(live_width), int(content_width))
                 content_height = max(1, int(live_height), int(content_height))
+            # The advanced page is sized from its placed controls.  Keep the
+            # legacy height floor for the long page, but never reserve a
+            # historical width that can become an empty right-hand band.
             original_width, original_height = (
-                MAIN_WINDOW_ADVANCED_ORIGINAL_SIZE
+                (1, MAIN_WINDOW_ADVANCED_ORIGINAL_SIZE[1])
                 if advanced_visible and not scaling_mode
                 else (1, 1)
             )
@@ -53612,6 +54791,9 @@ class LauncherApp:
         if size != self._main_viewport_content_size:
             self._main_viewport_content_size = size
             self._main_viewport_layout_signature = None
+        if bool(getattr(self, "_main_ui_scaling_transaction_active", False)):
+            self._main_ui_scaling_transaction_pending_viewport = True
+            return
         self._refresh_main_viewport_layout()
 
     def _settle_scaling_main_viewport_layout(
@@ -53628,6 +54810,11 @@ class LauncherApp:
         this path and keeps its existing scrollbar policy.
         """
         if not bool(getattr(self, "_scaling_mode_enabled", False)):
+            return
+        if bool(getattr(self, "_main_ui_scaling_transaction_active", False)):
+            self._main_ui_scaling_transaction_pending_viewport = True
+            return
+        if bool(getattr(self, "_main_ui_scaling_transaction_publishing", False)):
             return
         try:
             for _pass in range(2):
@@ -53662,6 +54849,9 @@ class LauncherApp:
         dialogs or tool windows.
         """
         if not bool(getattr(self, "_scaling_mode_enabled", False)):
+            return
+        if bool(getattr(self, "_main_ui_scaling_transaction_active", False)):
+            self._main_ui_scaling_transaction_pending_viewport = True
             return
         if bool(getattr(self, "_main_ui_scaling_containment_active", False)):
             return
@@ -53765,6 +54955,11 @@ class LauncherApp:
         if bool(getattr(self, "_main_viewport_scroll_layout_frozen", False)):
             self._main_viewport_scroll_layout_pending = True
             return
+        if bool(getattr(self, "_main_ui_scaling_transaction_active", False)):
+            self._main_ui_scaling_transaction_pending_viewport = True
+            return
+        if bool(getattr(self, "_main_ui_scaling_transaction_publishing", False)):
+            return
         try:
             if event is not None and content is not None and event.widget is content:
                 configured_size = (
@@ -53788,7 +54983,7 @@ class LauncherApp:
                 content_width = max(1, int(live_width), int(content_width))
                 content_height = max(1, int(live_height), int(content_height))
             original_width, original_height = (
-                MAIN_WINDOW_ADVANCED_ORIGINAL_SIZE
+                (1, MAIN_WINDOW_ADVANCED_ORIGINAL_SIZE[1])
                 if advanced_visible and not scaling_mode
                 else (1, 1)
             )
@@ -53846,6 +55041,9 @@ class LauncherApp:
         if bool(getattr(self, "_main_viewport_scroll_layout_frozen", False)):
             self._main_viewport_scroll_layout_pending = True
             return
+        if bool(getattr(self, "_main_ui_scaling_transaction_active", False)):
+            self._main_ui_scaling_transaction_pending_viewport = True
+            return
         try:
             viewport_width = max(1, int(event.width))
             viewport_height = max(1, int(event.height))
@@ -53863,7 +55061,7 @@ class LauncherApp:
             advanced_visible = bool(self.advanced_visible_var.get())
             scaling_mode = bool(getattr(self, "_scaling_mode_enabled", False))
             original_width, original_height = (
-                MAIN_WINDOW_ADVANCED_ORIGINAL_SIZE
+                (1, MAIN_WINDOW_ADVANCED_ORIGINAL_SIZE[1])
                 if advanced_visible and not scaling_mode
                 else (1, 1)
             )
@@ -53900,6 +55098,23 @@ class LauncherApp:
         except (self.tk.TclError, TypeError, ValueError):
             return
 
+    def _finalize_main_ui_startup_layout(self, *, width: int, height: int) -> None:
+        """Commit the saved final window size before the first frame is shown."""
+        if not bool(getattr(self, "_scaling_mode_enabled", False)):
+            return
+        target_width = max(1, int(width))
+        target_height = max(1, int(height))
+        try:
+            self._main_window_last_viewport_size = (target_width, target_height)
+            self._main_viewport_layout_signature = None
+            self._apply_main_ui_scaling_policy(
+                window_width=target_width,
+                window_height=target_height,
+            )
+            self._main_window_layout_finalized = True
+        except (self.tk.TclError, TypeError, ValueError):
+            self._main_window_layout_finalized = False
+
     def _finalize_main_window_layout_after_map(self) -> None:
         """Recalculate placed-widget bounds after Tk has assigned real screen geometry."""
         try:
@@ -53909,6 +55124,28 @@ class LauncherApp:
             ):
                 self._main_window_layout_finalized = False
                 return
+            if bool(getattr(self, "_scaling_mode_enabled", False)):
+                mapped_size = (
+                    max(1, int(self.root.winfo_width())),
+                    max(1, int(self.root.winfo_height())),
+                )
+                if (
+                    self._main_ui_scaling_applied_size != mapped_size
+                    or self._main_ui_scaling_committed_content_size is None
+                ):
+                    self._apply_main_ui_scaling_policy(
+                        window_width=mapped_size[0],
+                        window_height=mapped_size[1],
+                    )
+                else:
+                    self._main_viewport_layout_signature = None
+                    self._refresh_main_viewport_layout(
+                        window_width=mapped_size[0],
+                        window_height=mapped_size[1],
+                    )
+                _redraw_native_window_after_geometry(self.root)
+                self._schedule_blender_hierarchy_message_position()
+                return
             self.root.update_idletasks()
             self._position_content_after_toolbar(flush_layout=False)
             self._reflow_left_sections(flush_layout=False)
@@ -53917,9 +55154,6 @@ class LauncherApp:
             self._main_viewport_layout_signature = None
             self._refresh_main_viewport_layout()
             self.root.update_idletasks()
-            if bool(getattr(self, "_scaling_mode_enabled", False)):
-                self._settle_scaling_main_viewport_layout(reset_origin=True)
-                self._ensure_scaling_main_window_contains_content()
             _redraw_native_window_after_geometry(self.root)
             self._schedule_blender_hierarchy_message_position()
         except self.tk.TclError:
@@ -54349,9 +55583,9 @@ class LauncherApp:
         return right, bottom
 
     def _fit_main_window_to_content(
-        self, *, flush_layout: bool = True
+        self, *, flush_layout: bool = True, publish: bool = True
     ) -> tuple[int, int]:
-        """Measure the fixed layout; advanced mode exposes overflow through one viewport."""
+        """Measure content and optionally publish it to the live viewport."""
         try:
             if flush_layout:
                 self.root.update_idletasks()
@@ -54465,8 +55699,11 @@ class LauncherApp:
                     )
                 minimum_content_height = 270
             content_height = max(minimum_content_height, bottom + bottom_padding)
+            # Measure the actual placed bounds instead of imposing the old
+            # 792px advanced-page width.  The height floor remains because the
+            # advanced page is intentionally a long, scrollable surface.
             original_width, original_height = (
-                MAIN_WINDOW_ADVANCED_ORIGINAL_SIZE
+                (1, MAIN_WINDOW_ADVANCED_ORIGINAL_SIZE[1])
                 if advanced_visible
                 and not bool(getattr(self, "_scaling_mode_enabled", False))
                 else (1, 1)
@@ -54475,6 +55712,8 @@ class LauncherApp:
             content_height = max(content_height, int(original_height))
             width = min(screen_width, content_width)
             height = min(screen_height, content_height)
+            if not publish:
+                return content_width, content_height
             self._main_window_natural_sizes[
                 self._main_window_natural_size_cache_key(mode)
             ] = (width, height)
@@ -54527,9 +55766,73 @@ class LauncherApp:
         )
 
     def _main_ui_scaling_layout_signature(self, mode: str | None = None) -> str:
-        """Version the persisted Scaling Mode layout contract independently."""
-        del mode
-        return MAIN_UI_SCALING_LAYOUT_CACHE_VERSION
+        """Return the Scaling Mode contract for the active layout topology.
+
+        Scaling factors are geometry measurements, not global preferences.  A
+        factor measured for one backend, language, page mode, or collapsed
+        section can be wrong for another surface at the same window size.
+        Keep those inputs in the persisted signature so replay is limited to
+        the exact layout contract that produced the measurement.
+        """
+        if mode == "expanded":
+            normalized_mode = "expanded"
+        elif mode == "collapsed":
+            normalized_mode = "collapsed"
+        else:
+            advanced_var = getattr(self, "advanced_visible_var", None)
+            if advanced_var is not None:
+                try:
+                    advanced_visible = bool(advanced_var.get())
+                except Exception:
+                    advanced_visible = False
+                normalized_mode = "expanded" if advanced_visible else "collapsed"
+            else:
+                # During startup the Tk BooleanVar is not built yet.  Use the
+                # already restored mode so cache priming selects the same
+                # topology that the first layout pass will build.
+                startup_mode = str(
+                    getattr(self, "_main_window_size_mode", "collapsed")
+                    or "collapsed"
+                ).casefold()
+                normalized_mode = (
+                    "expanded" if startup_mode == "expanded" else "collapsed"
+                )
+        backend = (
+            "blender"
+            if bool(getattr(self, "blender_mode_enabled", False))
+            else "max"
+        )
+        language = (
+            "CN"
+            if str(getattr(self, "ui_language", "EN") or "").upper() == "CN"
+            else "EN"
+        )
+        raw_sections = getattr(self, "_section_collapsed_preferences", {})
+        if not isinstance(raw_sections, dict):
+            raw_sections = {}
+        sections = ",".join(
+            f"{key}={int(bool(raw_sections.get(key, False)))}"
+            for key in ("model", "rename", "filter")
+        )
+        compact = int(
+            bool(getattr(self, "_compact_mode_panel_collapsed", False))
+        )
+        try:
+            root = getattr(self, "root", None)
+            tk_scaling = round(float(root.tk.call("tk", "scaling")), 4)
+            if not math.isfinite(tk_scaling) or tk_scaling <= 0:
+                raise ValueError
+        except Exception:
+            tk_scaling = 1.0
+        return (
+            f"{MAIN_UI_SCALING_LAYOUT_CACHE_VERSION}|"
+            f"backend={backend};lang={language};mode={normalized_mode};"
+            f"sections={sections};compact={compact};tk={tk_scaling}"
+        )
+
+    def _main_ui_scaling_layout_cache_key(self, mode: str | None = None) -> str:
+        """Return the persisted factor key for the active layout contract."""
+        return f"main:scaling|{self._main_ui_scaling_layout_signature(mode)}"
 
     def _main_window_layout_signature_matches(
         self, cached_signature: str, expected_signature: str
@@ -54546,7 +55849,10 @@ class LauncherApp:
 
     def _main_window_size_cache_key(self, mode: str) -> str:
         if bool(getattr(self, "_scaling_mode_enabled", False)):
-            return "main:scaling"
+            normalized_mode = "expanded" if mode == "expanded" else "collapsed"
+            # Scaling keeps one geometry slot per page. The compact page must
+            # not inherit the expanded page's wide window after a restart.
+            return f"main:scaling:{normalized_mode}"
         normalized_mode = "expanded" if mode == "expanded" else "collapsed"
         return f"main:normal:{normalized_mode}"
 
@@ -54562,6 +55868,7 @@ class LauncherApp:
         cache_key = self._main_window_size_cache_key(normalized_mode)
         size = [max(1, int(width)), max(1, int(height))]
         sizes = dict(self.launcher_state.get("main_window_sizes", {}))
+        positions = dict(self.launcher_state.get("main_window_positions", {}))
         signatures = dict(
             self.launcher_state.get("main_window_layout_signatures", {})
         )
@@ -54569,7 +55876,7 @@ class LauncherApp:
             self.launcher_state.get("main_window_default_modes", {})
         )
         signature = (
-            self._main_ui_scaling_layout_signature()
+            self._main_ui_scaling_layout_signature(normalized_mode)
             if bool(getattr(self, "_scaling_mode_enabled", False))
             else self._main_window_layout_signature(normalized_mode)
         )
@@ -54581,15 +55888,39 @@ class LauncherApp:
                 != normalized_default_size
             )
             default_modes[cache_key] = normalized_default_size
+        requested_position = getattr(self, "_main_window_requested_position", None)
+        try:
+            is_mapped = bool(self.root.winfo_ismapped())
+        except (self.tk.TclError, AttributeError):
+            is_mapped = True
+        if not is_mapped and isinstance(requested_position, (list, tuple)):
+            # LauncherApp restores size while the root is withdrawn. Preserve
+            # the requested persisted position until run_ui maps the window;
+            # winfo_x()/winfo_y() are only the withdrawn staging origin there.
+            current_position = [
+                int(requested_position[0]),
+                int(requested_position[1]),
+            ]
+        else:
+            try:
+                current_position = [
+                    int(self.root.winfo_x()),
+                    int(self.root.winfo_y()),
+                ]
+            except (self.tk.TclError, TypeError, ValueError, AttributeError):
+                current_position = list(positions.get(cache_key, []) or [])
         if (
             sizes.get(cache_key) == size
             and signatures.get(cache_key) == signature
+            and positions.get(cache_key) == current_position
             and not default_mode_changed
         ):
             return
         sizes[cache_key] = size
+        positions[cache_key] = current_position
         signatures[cache_key] = signature
         self.launcher_state["main_window_sizes"] = sizes
+        self.launcher_state["main_window_positions"] = positions
         self.launcher_state["main_window_layout_signatures"] = signatures
         self.launcher_state["main_window_default_modes"] = default_modes
         self._queue_launcher_state_write()
@@ -54612,6 +55943,7 @@ class LauncherApp:
         persist: bool = False,
         center: bool = False,
         default_size: bool | None = None,
+        apply_saved_position: bool = False,
     ) -> None:
         normalized_mode = "expanded" if mode == "expanded" else "collapsed"
         target_width = max(1, int(width))
@@ -54665,6 +55997,68 @@ class LauncherApp:
                 )
                 target_position = (center_x, center_y)
                 geometry += f"+{center_x}+{center_y}"
+            else:
+                if apply_saved_position:
+                    requested_position = getattr(
+                        self, "_main_window_requested_position", None
+                    )
+                    if isinstance(requested_position, (list, tuple)) and len(
+                        requested_position
+                    ) >= 2:
+                        try:
+                            target_position = (
+                                int(requested_position[0]),
+                                int(requested_position[1]),
+                            )
+                        except (TypeError, ValueError):
+                            target_position = None
+                # During startup the root is still withdrawn.  Scaling's
+                # final measurement may resize it again before the first
+                # map; keep the position already submitted by run_ui so the
+                # hidden-paint pass cannot strand the window at +20000+20000.
+                try:
+                    root_is_mapped = bool(self.root.winfo_ismapped())
+                except Exception:
+                    root_is_mapped = True
+                if not root_is_mapped and target_position is None:
+                    requested_position = getattr(
+                        self, "_main_window_requested_position", None
+                    )
+                    if isinstance(requested_position, (list, tuple)) and len(
+                        requested_position
+                    ) >= 2:
+                        try:
+                            target_position = (
+                                int(requested_position[0]),
+                                int(requested_position[1]),
+                            )
+                        except (TypeError, ValueError):
+                            target_position = None
+                    if target_position is None:
+                        pending_geometry = str(
+                            getattr(
+                                self.root,
+                                "_pc_rehd_requested_geometry",
+                                "",
+                            )
+                            or ""
+                        ).strip()
+                        pending_match = TK_WINDOW_GEOMETRY_RE.fullmatch(
+                            pending_geometry
+                        )
+                        if pending_match is not None:
+                            try:
+                                pending_x = int(pending_match.group("x"))
+                                pending_y = int(pending_match.group("y"))
+                            except (TypeError, ValueError):
+                                pending_x = pending_y = WINDOW_OFFSCREEN_STAGE_COORDINATE
+                            if (
+                                pending_x < WINDOW_OFFSCREEN_STAGE_COORDINATE
+                                and pending_y < WINDOW_OFFSCREEN_STAGE_COORDINATE
+                            ):
+                                target_position = (pending_x, pending_y)
+                if target_position is not None:
+                    geometry += f"+{target_position[0]}+{target_position[1]}"
             current_size = (
                 max(1, int(self.root.winfo_width())),
                 max(1, int(self.root.winfo_height())),
@@ -54730,7 +56124,12 @@ class LauncherApp:
             return
 
     def _restore_main_window_size(
-        self, mode: str, *, reset: bool = False, center: bool = False
+        self,
+        mode: str,
+        *,
+        reset: bool = False,
+        center: bool = False,
+        restore_position: bool = False,
     ) -> None:
         normalized_mode = "expanded" if mode == "expanded" else "collapsed"
         natural_size = self._main_window_natural_sizes.get(
@@ -54740,8 +56139,16 @@ class LauncherApp:
             natural_size = self._fit_main_window_to_content()
         natural_width, natural_height = natural_size
         cache_key = self._main_window_size_cache_key(normalized_mode)
+        # A cold Launcher start should fit the current three-column content,
+        # not resurrect a width saved by an older layout or a previous wide
+        # Scaling Mode session.  Once shown, normal resize handling still
+        # permits the user to drag the window wider.
+        startup_fit = bool(center) and not bool(reset)
         cached = [] if reset else dict(
             self.launcher_state.get("main_window_sizes", {})
+        ).get(cache_key, [])
+        cached_position = [] if reset else dict(
+            self.launcher_state.get("main_window_positions", {})
         ).get(cache_key, [])
         cached_signature = str(
             dict(
@@ -54750,19 +56157,67 @@ class LauncherApp:
             or ""
         )
         expected_signature = (
-            self._main_ui_scaling_layout_signature()
+            self._main_ui_scaling_layout_signature(normalized_mode)
             if bool(getattr(self, "_scaling_mode_enabled", False))
             else self._main_window_layout_signature(normalized_mode)
         )
         layout_signature_changed = not self._main_window_layout_signature_matches(
             cached_signature, expected_signature
         )
+        if (
+            layout_signature_changed
+            and bool(getattr(self, "_scaling_mode_enabled", False))
+            and not cached_signature
+        ):
+            # A short migration window in older builds could save the page
+            # geometry before its main-window signature was populated. If the
+            # context-keyed Scaling cache proves that this exact page contract
+            # is still current, recover the user's size instead of discarding
+            # the otherwise valid legacy slot.
+            try:
+                cached_size_valid = (
+                    int(cached[0]) > 0 and int(cached[1]) > 0
+                )
+            except (IndexError, TypeError, ValueError):
+                cached_size_valid = False
+            scaling_entry = self._main_ui_scaling_layout_cache.get(
+                self._main_ui_scaling_layout_cache_key(normalized_mode), {}
+            )
+            scaling_signature = str(
+                scaling_entry.get("signature", "") or ""
+            ) if isinstance(scaling_entry, dict) else ""
+            if cached_size_valid and scaling_signature == expected_signature:
+                cached_signature = scaling_signature
+                layout_signature_changed = False
+                signatures = dict(
+                    self.launcher_state.get(
+                        "main_window_layout_signatures", {}
+                    )
+                )
+                signatures[cache_key] = scaling_signature
+                self.launcher_state[
+                    "main_window_layout_signatures"
+                ] = signatures
+                self._queue_launcher_state_write()
         if layout_signature_changed:
+            cached = []
+        if startup_fit:
             cached = []
         try:
             cached_width, cached_height = int(cached[0]), int(cached[1])
         except (IndexError, TypeError, ValueError):
             cached_width, cached_height = natural_width, natural_height
+        try:
+            cached_x, cached_y = int(cached_position[0]), int(cached_position[1])
+        except (IndexError, TypeError, ValueError):
+            self._main_window_requested_position = None
+        else:
+            screen_width = max(1, int(self.root.winfo_screenwidth()))
+            screen_height = max(1, int(self.root.winfo_screenheight()))
+            self._main_window_requested_position = (
+                max(0, min(screen_width - 80, cached_x)),
+                max(0, min(screen_height - 80, cached_y)),
+            )
         if normalized_mode == "expanded":
             minimum_width = min(natural_width, MAIN_WINDOW_ADVANCED_MIN_WIDTH)
             minimum_height = min(natural_height, MAIN_WINDOW_ADVANCED_MIN_HEIGHT)
@@ -54778,7 +56233,12 @@ class LauncherApp:
             max(minimum_height, cached_height),
         )
         if bool(getattr(self, "_scaling_mode_enabled", False)):
-            scaling_entry = self._main_ui_scaling_layout_cache.get("main:scaling")
+            scaling_cache_key = self._main_ui_scaling_layout_cache_key(
+                normalized_mode
+            )
+            scaling_entry = self._main_ui_scaling_layout_cache.get(
+                scaling_cache_key
+            )
             expected_scaling_signature = self._main_ui_scaling_layout_signature(
                 normalized_mode
             )
@@ -54795,7 +56255,7 @@ class LauncherApp:
                     # with the final minimum-clamped window size. Otherwise a
                     # cold start always sees mismatched dimensions and reruns
                     # the entire scaling solver after the window is shown.
-                    self._main_ui_scaling_layout_cache["main:scaling"] = rebased_entry
+                    self._main_ui_scaling_layout_cache[scaling_cache_key] = rebased_entry
                     self.launcher_state["main_ui_scaling_layout_cache"] = dict(
                         self._main_ui_scaling_layout_cache
                     )
@@ -54812,8 +56272,11 @@ class LauncherApp:
             persist=True,
             center=center,
             default_size=(
-                True if reset or layout_signature_changed else existing_default_mode
+                True
+                if reset or layout_signature_changed or startup_fit
+                else existing_default_mode
             ),
+            apply_saved_position=bool(restore_position),
         )
 
     def _window_size_reset_button_text(self) -> str:
@@ -54985,6 +56448,7 @@ class LauncherApp:
 
         launcher_keys = (
             "main_window_sizes",
+            "main_window_positions",
             "main_window_layout_signatures",
             "main_window_default_modes",
             "export_sets_scroll_position",
@@ -55035,6 +56499,10 @@ class LauncherApp:
             self._restore_main_window_size(current_mode)
             return
         self._main_window_size_mode = current_mode
+        self._main_window_requested_position = (
+            int(match.group("x")),
+            int(match.group("y")),
+        )
         self._apply_main_window_geometry(
             current_mode,
             int(match.group("width")),
@@ -55150,6 +56618,7 @@ class LauncherApp:
         active_key = self._main_window_size_cache_key(active_mode)
         for state_key in (
             "main_window_sizes",
+            "main_window_positions",
             "main_window_layout_signatures",
             "main_window_default_modes",
         ):
@@ -55245,6 +56714,9 @@ class LauncherApp:
         environment = _isolated_python_child_environment()
         # The new GUI is already windowed; do not let startup spawn a duplicate.
         environment[WINDOWED_RELAUNCH_ENV] = "1"
+        # The replacement starts before this process finishes its health
+        # handoff; let it wait for the singleton mutex instead of racing us.
+        environment[LAUNCHER_SINGLETON_HANDOFF_ENV] = "1"
         try:
             subprocess.Popen(
                 [str(executable), str(Path(__file__).resolve())],
@@ -55561,6 +57033,24 @@ class LauncherApp:
             # remaining usable.  Root widgets have already been measured.
             self._main_ui_preload_complete = False
 
+    def _invalidate_main_ui_scaling_schedule(
+        self, *, clear_pending: bool = True
+    ) -> None:
+        """Cancel delayed scaling work and invalidate callbacks already queued."""
+        generation = int(
+            getattr(self, "_main_ui_scaling_reflow_generation", 0) or 0
+        ) + 1
+        self._main_ui_scaling_reflow_generation = generation
+        callback_id = getattr(self, "_main_ui_scaling_after", None)
+        if callback_id is not None:
+            try:
+                self.root.after_cancel(callback_id)
+            except (self.tk.TclError, AttributeError):
+                pass
+        self._main_ui_scaling_after = None
+        if clear_pending:
+            self._main_ui_scaling_pending_size = None
+
     def _schedule_main_ui_scaling_reflow(
         self, width: int, height: int, *, delay_ms: int = 180
     ) -> None:
@@ -55569,14 +57059,19 @@ class LauncherApp:
             max(1, int(width)),
             max(1, int(height)),
         )
-        callback_id = getattr(self, "_main_ui_scaling_after", None)
-        if callback_id is not None:
-            try:
-                self.root.after_cancel(callback_id)
-            except self.tk.TclError:
-                pass
+        self._invalidate_main_ui_scaling_schedule(clear_pending=False)
+        callback_generation = int(
+            getattr(self, "_main_ui_scaling_reflow_generation", 0) or 0
+        )
 
         def reflow_after_resize() -> None:
+            # after_cancel cannot retract a callback that Tk has already
+            # dequeued. Ignore that callback without touching the live token or
+            # pending size belonging to the newer resize request.
+            if callback_generation != int(
+                getattr(self, "_main_ui_scaling_reflow_generation", 0) or 0
+            ):
+                return
             self._main_ui_scaling_after = None
             pending = self._main_ui_scaling_pending_size
             if pending is None or not bool(getattr(self, "_scaling_mode_enabled", False)):
@@ -55594,18 +57089,12 @@ class LauncherApp:
             except (self.tk.TclError, TypeError, ValueError):
                 actual_size = pending
             if actual_size == self._main_ui_scaling_applied_size:
+                self._main_ui_scaling_pending_size = None
                 return
             self._apply_main_ui_scaling_policy(
                 window_width=actual_size[0],
                 window_height=actual_size[1],
             )
-            self._main_ui_scaling_applied_size = actual_size
-            self._refresh_main_viewport_layout(
-                window_width=actual_size[0],
-                window_height=actual_size[1],
-            )
-            self._settle_scaling_main_viewport_layout()
-            self._ensure_scaling_main_window_contains_content()
             self._schedule_blender_hierarchy_message_position()
             self._schedule_launcher_tile_follow()
 
@@ -55625,6 +57114,13 @@ class LauncherApp:
             return
         if width <= 1 or height <= 1:
             return
+        if bool(getattr(self, "_main_ui_scaling_transaction_active", False)):
+            self._main_ui_scaling_transaction_pending_viewport = True
+            self._main_ui_scaling_transaction_target_size = (width, height)
+            return
+        if bool(getattr(self, "_main_ui_scaling_transaction_publishing", False)):
+            self._main_window_last_viewport_size = (width, height)
+            return
         # The grip is created while the root is still staged at 1x1.  Move it
         # after every real root Configure so that startup never leaves its
         # hit box at (0, 0) over the MAX/Blender process label.
@@ -55639,16 +57135,10 @@ class LauncherApp:
                 self._schedule_main_live_resize_commit()
             elif bool(getattr(self, "_scaling_mode_enabled", False)):
                 if self._main_ui_scaling_applied_size is None:
-                    self._main_ui_scaling_applied_size = viewport_size
                     self._apply_main_ui_scaling_policy(
                         window_width=width,
                         window_height=height,
                     )
-                    self._refresh_main_viewport_layout(
-                        window_width=width, window_height=height
-                    )
-                    self._settle_scaling_main_viewport_layout()
-                    self._ensure_scaling_main_window_contains_content()
                     self._schedule_blender_hierarchy_message_position()
                 else:
                     self._schedule_main_ui_scaling_reflow(width, height)
@@ -58124,6 +59614,56 @@ class LauncherApp:
         except self.tk.TclError:
             return False
 
+    def _set_right_area_place_visible(self, visible: bool) -> bool:
+        """Hide the advanced right panel without retaining stale bounds.
+
+        place_forget removes Tk's place manager but intentionally leaves the
+        widget's last allocated rectangle in winfo_*.  The right panel also
+        derives its requested size from two live grid stacks, so a hidden panel
+        can still look like a large content rectangle during compact-page
+        measurements.  Collapse that rectangle while hidden and restore grid
+        propagation before the normal reflow computes the next visible size.
+        """
+        widget = getattr(self, "right_area", None)
+        if widget is None:
+            return False
+        try:
+            currently_visible = str(widget.winfo_manager()) == "place"
+            propagation_marker = "_pc_rehd_right_area_grid_propagation"
+            if visible:
+                if hasattr(widget, propagation_marker):
+                    widget.grid_propagate(
+                        bool(getattr(widget, propagation_marker))
+                    )
+                    delattr(widget, propagation_marker)
+                    # Leave placement to the caller's reflow/commit pass so a
+                    # restored panel is published with one final geometry.
+                    return True
+                return False if currently_visible else True
+
+            if not hasattr(widget, propagation_marker):
+                try:
+                    propagation = bool(widget.grid_propagate())
+                except (AttributeError, self.tk.TclError, TypeError, ValueError):
+                    propagation = True
+                setattr(widget, propagation_marker, propagation)
+            # Shrink the allocated rectangle before forgetting the place
+            # manager; otherwise Tk retains the old width/height for hidden
+            # geometry probes.  Disable propagation so child stacks cannot
+            # immediately restore their larger requested bounds.
+            widget.grid_propagate(False)
+            if currently_visible:
+                widget.place_configure(width=1, height=1)
+                # Flush the one hidden staging rectangle before forgetting the
+                # manager; without this idle pass Tk keeps the old allocated
+                # winfo_width/winfo_height values.
+                widget.update_idletasks()
+                widget.place_forget()
+            widget.configure(width=1, height=1)
+            return True
+        except self.tk.TclError:
+            return False
+
     def _set_widget_place_geometry(self, widget: Any, **geometry: int) -> bool:
         try:
             target = {name: int(value) for name, value in geometry.items()}
@@ -58275,24 +59815,17 @@ class LauncherApp:
         if self._persist_active_ui_page_preferences():
             self._queue_launcher_state_write()
         self._set_collapsible_section_state(key, collapsed)
-        self._reflow_left_sections(flush_layout=False)
-        if bool(getattr(self, "_scaling_mode_enabled", False)):
+        scaling_mode = bool(getattr(self, "_scaling_mode_enabled", False))
+        if scaling_mode:
             try:
-                # A saved layout is only a warm start.  Collapsing and then
-                # reopening a section must converge to the same compact
-                # factors as a first render at this exact window size.
                 self._apply_main_ui_scaling_policy(
                     window_width=max(1, int(self.root.winfo_width())),
                     window_height=max(1, int(self.root.winfo_height())),
                 )
             except (self.tk.TclError, TypeError, ValueError):
                 pass
-            # Collapse changes grid-managed children asynchronously.  Settle
-            # the scaled viewport now so an old page size cannot keep a bar
-            # visible until the deferred window-geometry commit runs.
-            self._settle_scaling_main_viewport_layout()
-            self._ensure_scaling_main_window_contains_content()
-            self._reclaim_scaling_window_whitespace()
+        else:
+            self._reflow_left_sections(flush_layout=False)
         self._schedule_main_window_geometry_commit(
             "collapsed",
             reset_origin=False,
@@ -58317,8 +59850,8 @@ class LauncherApp:
         )
         if self._persist_active_ui_page_preferences():
             self._queue_launcher_state_write()
-        self._reflow_left_sections(flush_layout=False)
-        if bool(getattr(self, "_scaling_mode_enabled", False)):
+        scaling_mode = bool(getattr(self, "_scaling_mode_enabled", False))
+        if scaling_mode:
             try:
                 self._apply_main_ui_scaling_policy(
                     window_width=max(1, int(self.root.winfo_width())),
@@ -58326,13 +59859,12 @@ class LauncherApp:
                 )
             except (self.tk.TclError, TypeError, ValueError):
                 pass
-            self._settle_scaling_main_viewport_layout()
-            self._ensure_scaling_main_window_contains_content()
-            self._reclaim_scaling_window_whitespace()
+        else:
+            self._reflow_left_sections(flush_layout=False)
         self._schedule_main_window_geometry_commit(
             "collapsed",
             reset_origin=False,
-            fit_to_content=True,
+            fit_to_content=not scaling_mode,
         )
         self.root.focus_set()
 
@@ -58954,6 +60486,273 @@ class LauncherApp:
         _width, live_height = self._scaling_visible_widget_size(widget)
         return max(1, int(live_height))
 
+    def _main_ui_panel_button_geometry(
+        self,
+        *,
+        panel_x: int,
+        panel_width: int,
+        widget: Any,
+        baseline_width: int = 0,
+    ) -> tuple[int, int]:
+        """Return the shared full-row action-button rectangle.
+
+        Scaling Mode changes the metrics of the page, but it does not change
+        the visual chrome of the three left-panel actions.  Keeping the
+        requested panel width here makes Import, Export, and Rename match the
+        established Normal Mode style in every mode.  The extra arguments are
+        retained for callers that still pass the old geometry inputs.
+        """
+        x = int(panel_x)
+        available = max(1, int(panel_width))
+        return x, available
+
+    def _apply_main_ui_action_button_fill_policy(self) -> None:
+        """Keep the left-panel Import/Export actions full-row in every mode."""
+        buttons = (
+            getattr(self, "import_button", None),
+            getattr(self, "export_button", None),
+        )
+        for button in buttons:
+            if button is None:
+                continue
+            try:
+                if not button.grid_info():
+                    continue
+                button.grid_configure(sticky="ew")
+            except (AttributeError, self.tk.TclError):
+                continue
+
+    def _apply_main_ui_vertical_fill(self, layout: Mapping[str, int]) -> None:
+        """Use spare viewport height for the existing main-page sections.
+
+        Main content is intentionally placed rather than grid-managed, so a
+        taller native window otherwise leaves the measured page anchored at
+        the top.  Recompute natural section bounds, distribute only the spare
+        height among visible panels, and keep the footer/right area at the same
+        bottom edge.  The natural bounds are recalculated on every pass, which
+        lets a later shrink retract the fill without accumulating height.
+        """
+        try:
+            if bool(getattr(self, "_main_ui_scaling_measurement_active", False)):
+                return
+            canvas = getattr(self, "main_viewport_canvas", None)
+            root_height = max(1, int(self.root.winfo_height()))
+            viewport_height = root_height
+            if root_height <= 1 and canvas is not None:
+                canvas_height = max(1, int(canvas.winfo_height()))
+                if canvas_height > 1:
+                    viewport_height = canvas_height
+            bottom_margin = self._scale_main_ui_spacing_metric(8, minimum=2)
+            available_bottom = max(1, viewport_height - bottom_margin)
+            flow = getattr(self, "_section_flow", {})
+            if not isinstance(flow, dict):
+                return
+            content_top = int(flow.get("content_top", layout.get("top_y", 0)) or 0)
+            model_y = int(flow.get("model_y", content_top) or content_top)
+            model_collapsed = bool(
+                self._collapsible_sections.get("model", {}).get("collapsed", False)
+            )
+            rename_collapsed = bool(
+                self._collapsible_sections.get("rename", {}).get("collapsed", False)
+            )
+            filter_collapsed = bool(
+                self._collapsible_sections.get("filter", {}).get("collapsed", False)
+            )
+            scaling_mode = bool(getattr(self, "_scaling_mode_enabled", False))
+            # _reflow_left_sections has already computed the responsive width
+            # in _section_flow. Never read the frame's current width here: a
+            # prior clipped placement can be stale and would undo that result.
+            left_width = max(
+                1,
+                int(flow.get("left_width", layout.get("left_w", 1)) or 1),
+            )
+
+            def natural_height(widget: Any, baseline: int, collapsed: bool) -> int:
+                if collapsed:
+                    return max(1, int(self._collapsed_section_height()))
+                return max(
+                    1,
+                    int(
+                        self._scaling_section_required_height(widget, baseline)
+                        if scaling_mode
+                        else self._managed_widget_required_height(widget, baseline)
+                    ),
+                )
+
+            model_h = natural_height(
+                self.model_group, int(layout.get("model_h", 1)), model_collapsed
+            )
+            rename_h = natural_height(
+                self.rename_group, int(layout.get("rename_h", 1)), rename_collapsed
+            )
+            filter_h = natural_height(
+                self.filter_group, int(layout.get("filter_h", 1)), filter_collapsed
+            )
+            gap = max(1, int(layout.get("section_gap", 1)))
+            rename_y = model_y + model_h + gap
+            rename_button_h = max(1, int(self.rename_button.winfo_reqheight()))
+            filter_y = (
+                rename_y + rename_h + gap
+                if rename_collapsed
+                else rename_y + rename_h + gap + rename_button_h + gap
+            )
+            footer_gap = self._scale_main_ui_spacing_metric(8, minimum=2)
+            footer_height = max(1, int(self._managed_widget_required_height(self.footer_frame)))
+            footer_y = filter_y + filter_h + footer_gap
+
+            right_area = getattr(self, "right_area", None)
+            right_y = int(flow.get("right_content_top", model_y) or model_y)
+            right_height = 0
+            if right_area is not None and bool(self.advanced_visible_var.get()):
+                right_area.update_idletasks()
+                right_height = max(
+                    1,
+                    int(right_area.winfo_reqheight()),
+                    int(self.right_left_stack.winfo_reqheight()),
+                    int(self.right_right_stack.winfo_reqheight()),
+                )
+
+            natural_bottom = max(
+                filter_y + filter_h,
+                footer_y + footer_height,
+                right_y + right_height,
+            )
+            extra = max(0, available_bottom - natural_bottom)
+            # Do not pour spare height into LabelFrames whose grid rows are
+            # content-sized; that creates the large empty cavities visible in
+            # the screenshot while buttons remain pinned to the top. Stretch
+            # the existing vertical rhythm instead, keeping each panel's live
+            # child bounds intact and retracting cleanly on a later shrink.
+            # A collapsed page has no content to stretch between its section
+            # headers.  Keep those headers packed together and place any
+            # unavoidable spare height after the content (before the footer),
+            # otherwise a narrow Scaling window turns one collapse click into
+            # several giant blank bands.  The fully expanded page keeps the
+            # existing rhythm-fill behavior.
+            if model_collapsed or rename_collapsed or filter_collapsed:
+                gap_extra = 0
+                trailing_extra = int(extra)
+            else:
+                gap_extra = int(extra) // 4 if extra > 0 else 0
+                trailing_extra = int(extra) - gap_extra * 3
+            gap = max(1, int(gap) + gap_extra)
+            footer_gap = max(1, int(footer_gap) + trailing_extra)
+
+            rename_y = model_y + model_h + gap
+            filter_y = (
+                rename_y + rename_h + gap
+                if rename_collapsed
+                else rename_y + rename_h + gap + rename_button_h + gap
+            )
+            footer_y = filter_y + filter_h + footer_gap
+            target_bottom = max(
+                available_bottom,
+                filter_y + filter_h,
+                footer_y + footer_height,
+            )
+            self._set_widget_place_geometry(
+                self.model_group,
+                x=int(self.model_group.winfo_x()),
+                y=model_y,
+                width=left_width,
+                height=model_h,
+            )
+            self._place_collapsible_section_button(
+                "model",
+                x=int(self.model_group.winfo_x()),
+                y=model_y,
+                width=left_width,
+            )
+            self._set_widget_place_geometry(
+                self.rename_group,
+                x=int(self.rename_group.winfo_x()),
+                y=rename_y,
+                width=left_width,
+                height=rename_h,
+            )
+            self._place_collapsible_section_button(
+                "rename",
+                x=int(self.rename_group.winfo_x()),
+                y=rename_y,
+                width=left_width,
+            )
+            self._place_mesh_rename_failure_notice(
+                x=int(self.rename_group.winfo_x()),
+                y=rename_y,
+                width=left_width,
+            )
+            if rename_collapsed:
+                self._set_widget_place_visible(self.rename_button, False)
+            else:
+                rename_button_x, rename_button_width = (
+                    self._main_ui_panel_button_geometry(
+                        panel_x=int(self.rename_group.winfo_x()),
+                        panel_width=left_width,
+                        widget=self.rename_button,
+                        baseline_width=int(layout.get("rename_button_w", 1)),
+                    )
+                )
+                self._set_widget_place_geometry(
+                    self.rename_button,
+                    x=rename_button_x,
+                    y=rename_y + rename_h + gap,
+                    width=rename_button_width,
+                    height=rename_button_h,
+                )
+            self._set_widget_place_geometry(
+                self.filter_group,
+                x=int(self.filter_group.winfo_x()),
+                y=filter_y,
+                width=left_width,
+                height=filter_h,
+            )
+            self._place_collapsible_section_button(
+                "filter",
+                x=int(self.filter_group.winfo_x()),
+                y=filter_y,
+                width=left_width,
+            )
+            self._set_widget_place_geometry(
+                self.footer_frame,
+                x=int(self.footer_frame.winfo_x()),
+                y=footer_y,
+                width=left_width,
+                height=footer_height,
+            )
+            if right_area is not None and bool(self.advanced_visible_var.get()):
+                right_area_height = max(right_height, target_bottom - right_y)
+                self._set_widget_place_geometry(
+                    right_area,
+                    x=int(right_area.winfo_x()),
+                    y=right_y,
+                    width=max(
+                        1,
+                        int(
+                            float(
+                                right_area.place_info().get(
+                                    "width", right_area.winfo_width()
+                                )
+                                or right_area.winfo_width()
+                            )
+                        ),
+                    ),
+                    height=right_area_height,
+                )
+            flow.update(
+                {
+                    "model_h": model_h,
+                    "rename_y": rename_y,
+                    "rename_h": rename_h,
+                    "filter_y": filter_y,
+                    "filter_h": filter_h,
+                    "vertical_fill_extra": int(extra),
+                    "vertical_fill_gap": int(gap),
+                    "content_bottom": int(target_bottom),
+                }
+            )
+        except (self.tk.TclError, TypeError, ValueError, AttributeError):
+            return
+
     def _raise_scaling_main_content_layers(self) -> None:
         """Keep the scaled main surface above the toolbar backing frame."""
         if not bool(getattr(self, "_scaling_mode_enabled", False)):
@@ -59074,11 +60873,17 @@ class LauncherApp:
         else:
             button_y = rename_y + rename_h + gap
             button_h = self.rename_button.winfo_reqheight()
+            rename_button_x, rename_button_width = self._main_ui_panel_button_geometry(
+                panel_x=x,
+                panel_width=width,
+                widget=self.rename_button,
+                baseline_width=int(layout.get("rename_button_w", 1)),
+            )
             self._set_widget_place_geometry(
                 self.rename_button,
-                x=x,
+                x=rename_button_x,
                 y=button_y,
-                width=width,
+                width=rename_button_width,
                 height=button_h,
             )
             filter_y = button_y + button_h + gap
@@ -59104,7 +60909,73 @@ class LauncherApp:
         right_content_top = self._advanced_area_aligned_top(model_y)
         if hasattr(self, "right_area") and advanced_visible:
             self.right_area.update_idletasks()
-            right_width = max(1, int(self.right_area.winfo_reqwidth()))
+            right_width = max(
+                1,
+                int(self.right_area.winfo_reqwidth()),
+            )
+            if scaling_mode:
+                # The two internal stacks are the responsive right columns.
+                # Give them the expanded layout width so their sticky
+                # children follow a manually widened Launcher surface.
+                right_width = max(
+                    right_width,
+                    (2 * int(layout["side_w"]))
+                    + self._scale_main_ui_spacing_metric(28, minimum=12),
+                )
+                action_area = getattr(self, "toolbar_action_area", None)
+                action_width = 0
+                if action_area is not None:
+                    try:
+                        action_area.update_idletasks()
+                        action_width = max(
+                            1,
+                            int(action_area.winfo_width()),
+                            int(action_area.winfo_reqwidth()),
+                        )
+                    except (self.tk.TclError, TypeError, ValueError):
+                        action_width = 0
+                try:
+                    root_width = max(0, int(self.root.winfo_width()))
+                except (self.tk.TclError, TypeError, ValueError):
+                    root_width = 0
+                if (
+                    root_width <= 1
+                    and not bool(
+                        getattr(self, "_main_ui_scaling_measurement_active", False)
+                    )
+                ):
+                    # The root is still withdrawn during startup. Use the
+                    # final transaction/applied size for right-column fill.
+                    for size_attribute in (
+                        "_main_ui_scaling_transaction_target_size",
+                        "_main_ui_scaling_applied_size",
+                    ):
+                        target_size = getattr(self, size_attribute, None)
+                        if not isinstance(target_size, (tuple, list)) or len(target_size) < 2:
+                            continue
+                        try:
+                            root_width = max(1, int(target_size[0]))
+                        except (TypeError, ValueError):
+                            continue
+                        if root_width > 1:
+                            break
+                if (
+                    root_width > 1
+                    and action_width > 0
+                    and not bool(
+                        getattr(self, "_main_ui_scaling_measurement_active", False)
+                    )
+                ):
+                    right_margin = max(8, int(layout["left_x"]))
+                    action_gap = max(18, int(layout["left_x"]))
+                    right_width = max(
+                        right_width,
+                        root_width
+                        - right_margin
+                        - action_width
+                        - action_gap
+                        - int(right_x),
+                    )
             area_height = max(
                 1,
                 int(self.right_area.winfo_reqheight()),
@@ -59123,7 +60994,7 @@ class LauncherApp:
             )
             self._raise_placed_widget(self.right_area)
         elif hasattr(self, "right_area"):
-            self._set_widget_place_visible(self.right_area, False)
+            self._set_right_area_place_visible(False)
         self._section_flow = {
             "content_top": content_top,
             "right_content_top": right_content_top,
@@ -59146,6 +61017,8 @@ class LauncherApp:
                 + self._scale_main_ui_spacing_metric(8, minimum=2),
                 width=width,
             )
+        if scaling_mode:
+            self._apply_main_ui_vertical_fill(layout)
         self._raise_scaling_main_content_layers()
 
     def _build_toolbar(self, root: Any) -> None:
@@ -59701,6 +61574,22 @@ class LauncherApp:
                 )
         except (self.tk.TclError, TypeError, ValueError):
             pass
+        if bool(getattr(self, "_scaling_mode_enabled", False)) and not bool(
+            getattr(self, "_main_ui_scaling_measurement_active", False)
+        ):
+            # Keep the action stack on the same right edge as the viewport.
+            # The right panel is widened by _reflow_left_sections to meet this
+            # edge, so a manual resize cannot leave a detached empty band.
+            try:
+                root_width = max(0, int(self.root.winfo_width()))
+                if root_width > 1:
+                    right_margin = max(8, int(layout["left_x"]))
+                    action_x = max(
+                        action_x,
+                        root_width - right_margin - action_width,
+                    )
+            except (self.tk.TclError, TypeError, ValueError):
+                pass
         action_y = int(layout["toolbar_y"]) + process_height + 10
         toolbar_x = int(layout["left_x"])
         toolbar_y = int(layout["toolbar_y"])
@@ -60041,9 +61930,15 @@ class LauncherApp:
         self.rename_undo_last_button = undo_last_button
         self.rename_redo_last_button = redo_last_button
         rename_button = ttk.Button(root, text=self._tr("重命名所选", "Rename Selected"), command=self._rename_selected_meshes)
+        rename_button_x, rename_button_width = self._main_ui_panel_button_geometry(
+            panel_x=int(layout["left_x"]),
+            panel_width=int(layout["left_w"]),
+            widget=rename_button,
+            baseline_width=int(layout.get("rename_button_w", 1)),
+        )
         rename_button.place(
-            x=layout["left_x"], y=layout["rename_button_y"],
-            width=layout["rename_button_w"], height=layout["rename_button_h"],
+            x=rename_button_x, y=layout["rename_button_y"],
+            width=rename_button_width, height=layout["rename_button_h"],
         )
         self.max_scene_controls.append((rename_button, "normal"))
         self.rename_button = rename_button
@@ -63740,9 +65635,6 @@ class LauncherApp:
                     )
                 except (self.tk.TclError, TypeError, ValueError):
                     pass
-                self._settle_scaling_main_viewport_layout(reset_origin=True)
-                self._ensure_scaling_main_window_contains_content()
-                self._reclaim_scaling_window_whitespace()
             self._apply_topmost()
             self._set_status(self._tr("已切换到中文。", "Switched to English."))
             if reopen_toolbox:
@@ -66097,10 +67989,12 @@ class LauncherApp:
     def _persist_main_ui_scaling_layout_cache(
         self, width: int, height: int
     ) -> None:
-        """Persist the settled Scaling Mode factors for one isolated surface."""
+        """Persist settled factors under the active layout context."""
         if not bool(getattr(self, "_scaling_mode_enabled", False)):
             return
-        cache_key = self._main_window_size_cache_key(self._main_window_size_mode)
+        cache_key = self._main_ui_scaling_layout_cache_key(
+            self._main_window_size_mode
+        )
         entry = {
             "width": max(1, int(width)),
             "height": max(1, int(height)),
@@ -66125,7 +68019,9 @@ class LauncherApp:
         """Apply a valid saved factor before the first themed widget is built."""
         if not bool(getattr(self, "_scaling_mode_enabled", False)):
             return
-        cache_key = self._main_window_size_cache_key(self._main_window_size_mode)
+        cache_key = self._main_ui_scaling_layout_cache_key(
+            self._main_window_size_mode
+        )
         entry = self._main_ui_scaling_layout_cache.get(cache_key, {})
         if not isinstance(entry, dict):
             return
@@ -66203,20 +68099,11 @@ class LauncherApp:
             self._queue_launcher_state_write()
         self._main_layout_cache.clear()
         self._main_viewport_layout_signature = None
-        scaling_policy_size: tuple[int, int] | None = None
         if enabled and has_saved_scaling_size:
-            cached_layout = self._main_ui_scaling_layout_cache.get(
-                self._main_window_size_cache_key(self._main_window_size_mode), {}
-            )
-            if isinstance(cached_layout, dict):
-                try:
-                    cached_width = int(cached_layout.get("width", 0) or 0)
-                    cached_height = int(cached_layout.get("height", 0) or 0)
-                    if cached_width > 1 and cached_height > 1:
-                        scaling_policy_size = (cached_width, cached_height)
-                except (TypeError, ValueError):
-                    scaling_policy_size = None
-        if scaling_policy_size is None:
+            self._restore_main_window_size(self._main_window_size_mode, center=False)
+        elif enabled:
+            self._capture_main_window_size(self._main_window_size_mode)
+        if enabled:
             try:
                 scaling_policy_size = (
                     max(1, int(self.root.winfo_width())),
@@ -66224,23 +68111,15 @@ class LauncherApp:
                 )
             except (self.tk.TclError, TypeError, ValueError):
                 scaling_policy_size = None
-        if scaling_policy_size is None:
-            self._apply_main_ui_scaling_policy(force_reset=not enabled)
+            if scaling_policy_size is None:
+                self._apply_main_ui_scaling_policy()
+            else:
+                self._apply_main_ui_scaling_policy(
+                    window_width=scaling_policy_size[0],
+                    window_height=scaling_policy_size[1],
+                )
         else:
-            self._apply_main_ui_scaling_policy(
-                window_width=scaling_policy_size[0],
-                window_height=scaling_policy_size[1],
-                force_reset=not enabled,
-            )
-        if enabled and has_saved_scaling_size:
-            self._restore_main_window_size(self._main_window_size_mode, center=False)
-        elif enabled:
-            self._capture_main_window_size(self._main_window_size_mode)
-        if enabled:
-            # A saved factor is only a warm start.  After the real root geometry
-            # is restored, enforce the no-scroll containment contract once.
-            self._settle_scaling_main_viewport_layout(reset_origin=True)
-            self._ensure_scaling_main_window_contains_content()
+            self._apply_main_ui_scaling_policy(force_reset=True)
         if not enabled:
             pending_callback = getattr(self, "_main_ui_scaling_after", None)
             if pending_callback is not None:
@@ -66268,49 +68147,242 @@ class LauncherApp:
                     int(baseline_size[0]), int(baseline_size[1])
                 )
 
+    @contextmanager
+    def _main_ui_scaling_transaction(
+        self, width: int, height: int
+    ) -> Any:
+        """Hide intermediate Tk measurements and publish one final viewport."""
+        if bool(getattr(self, "_main_ui_scaling_transaction_active", False)):
+            yield
+            return
+        target_size = (max(1, int(width)), max(1, int(height)))
+        # Consume any resize callback that was queued before this transaction
+        # began. The generation guard also covers a callback already dequeued
+        # by Tk, which after_cancel cannot retract.
+        self._invalidate_main_ui_scaling_schedule()
+        self._main_ui_scaling_transaction_active = True
+        self._main_ui_scaling_transaction_publishing = False
+        self._main_ui_scaling_transaction_pending_viewport = False
+        self._main_ui_scaling_transaction_target_size = target_size
+        canvas = getattr(self, "main_viewport_canvas", None)
+        paint_scope = (
+            _atomic_native_viewport_paint(canvas)
+            if canvas is not None
+            else nullcontext()
+        )
+        try:
+            with paint_scope:
+                try:
+                    yield
+                finally:
+                    final_size = (
+                        self._main_ui_scaling_transaction_target_size
+                        or target_size
+                    )
+                    should_publish = bool(
+                        getattr(
+                            self,
+                            "_main_ui_scaling_transaction_pending_viewport",
+                            False,
+                        )
+                    )
+                    # Mark the final root size before publishing. Configure
+                    # events generated by the publish then coalesce against
+                    # this value instead of re-entering the solver.
+                    self._main_ui_scaling_transaction_active = False
+                    if should_publish:
+                        self._main_window_last_viewport_size = final_size
+                        self._main_viewport_layout_signature = None
+                        self._main_ui_scaling_transaction_publishing = True
+                        try:
+                            self._refresh_main_viewport_layout(
+                                window_width=final_size[0],
+                                window_height=final_size[1],
+                            )
+                        finally:
+                            self._main_ui_scaling_transaction_publishing = False
+        finally:
+            self._main_ui_scaling_transaction_active = False
+            self._main_ui_scaling_transaction_publishing = False
+            self._main_ui_scaling_transaction_pending_viewport = False
+            self._main_ui_scaling_transaction_target_size = None
+
+    def _layout_main_ui_scaling_stage(
+        self,
+        *,
+        spacing_scale: float,
+        widget_scale: float,
+        font_scale: float,
+    ) -> MainUiScalingMeasurement:
+        """Apply one hidden endpoint and return its settled Tk bounds."""
+        self._main_ui_layout_scale = max(
+            MAIN_WINDOW_SCALING_MIN_SCALE,
+            min(MAIN_WINDOW_SCALING_MAX_SCALE, float(spacing_scale)),
+        )
+        self._main_layout_cache.clear()
+        self._apply_main_ui_widget_scale(widget_scale)
+        self._apply_main_ui_font_scale(font_scale)
+        self._apply_main_ui_action_button_fill_policy()
+        self._main_layout_cache.clear()
+        self._main_viewport_layout_signature = None
+        self.root.update_idletasks()
+        self._sync_toolbar_region_geometry()
+        self._position_content_after_toolbar(flush_layout=False)
+        self._reflow_left_sections(flush_layout=False)
+        self.root.update_idletasks()
+        content_width, content_height = self._fit_main_window_to_content(
+            flush_layout=False,
+            publish=False,
+        )
+        return MainUiScalingMeasurement(content_width, content_height)
+
+    def _measure_main_ui_scaling_snapshot(
+        self, width: int, height: int
+    ) -> MainUiScalingSnapshot:
+        """Measure the four fixed stage endpoints on Tk's owning thread."""
+        original_factors = (
+            self._main_ui_spacing_scale_factor(),
+            self._main_ui_scale_factor(),
+            self._main_ui_font_scale_factor(),
+        )
+        stages = (
+            (1.0, 1.0, 1.0),
+            (MAIN_WINDOW_SCALING_MIN_SCALE, 1.0, 1.0),
+            (
+                MAIN_WINDOW_SCALING_MIN_SCALE,
+                MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE,
+                1.0,
+            ),
+            (
+                MAIN_WINDOW_SCALING_MIN_SCALE,
+                MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE,
+                MAIN_WINDOW_SCALING_MIN_FONT_SCALE,
+            ),
+        )
+        measurements: list[MainUiScalingMeasurement] = []
+        previous_measurement_state = bool(
+            getattr(self, "_main_ui_scaling_measurement_active", False)
+        )
+        self._main_ui_scaling_measurement_active = True
+        try:
+            for spacing_scale, widget_scale, font_scale in stages:
+                measurements.append(
+                    self._layout_main_ui_scaling_stage(
+                        spacing_scale=spacing_scale,
+                        widget_scale=widget_scale,
+                        font_scale=font_scale,
+                    )
+                )
+        except Exception:
+            self._layout_main_ui_scaling_stage(
+                spacing_scale=original_factors[0],
+                widget_scale=original_factors[1],
+                font_scale=original_factors[2],
+            )
+            raise
+        finally:
+            self._main_ui_scaling_measurement_active = previous_measurement_state
+        return MainUiScalingSnapshot(
+            target_width=width,
+            target_height=height,
+            baseline=measurements[0],
+            spacing_floor=measurements[1],
+            widget_floor=measurements[2],
+            font_floor=measurements[3],
+        )
+
+    def _commit_main_ui_scaling_snapshot(
+        self,
+        result: Mapping[str, float],
+        *,
+        width: int,
+        height: int,
+        fit_window: bool = False,
+    ) -> None:
+        """Apply final factors once, optionally fit, then publish one layout."""
+        measurement = self._layout_main_ui_scaling_stage(
+            spacing_scale=float(result["spacing_scale"]),
+            widget_scale=float(result["widget_scale"]),
+            font_scale=float(result["font_scale"]),
+        )
+        content_width = int(measurement.width)
+        content_height = int(measurement.height)
+        self._fit_main_window_to_content(flush_layout=False, publish=True)
+
+        final_width = max(1, int(width))
+        final_height = max(1, int(height))
+        tolerance = max(2, self._scale_main_ui_spacing_metric(4, minimum=2))
+        screen_width = max(320, int(self.root.winfo_screenwidth()))
+        screen_height = max(320, int(self.root.winfo_screenheight()))
+        requested_width = final_width
+        requested_height = final_height
+        if fit_window:
+            # Mode/page changes are automatic-fit transactions. The endpoint
+            # measurements already contain settled widget bounds, so resize
+            # the native window to that result without another solver pass.
+            final_width = min(screen_width, max(1, content_width))
+            final_height = min(screen_height, max(1, content_height))
+        elif (
+            content_width > final_width + tolerance
+            or content_height > final_height + tolerance
+        ):
+            final_width = min(screen_width, max(final_width, content_width))
+            final_height = min(screen_height, max(final_height, content_height))
+        if (final_width, final_height) != (requested_width, requested_height):
+            self._apply_main_window_geometry(
+                self._main_window_size_mode,
+                final_width,
+                final_height,
+                persist=True,
+                center=False,
+                default_size=False,
+            )
+            final_width = max(1, int(self.root.winfo_width()))
+            final_height = max(1, int(self.root.winfo_height()))
+
+        self._main_ui_scaling_transaction_target_size = (
+            final_width,
+            final_height,
+        )
+        self._main_ui_scaling_transaction_pending_viewport = True
+        self._main_ui_scaling_applied_size = (final_width, final_height)
+        self._main_ui_scaling_committed_content_size = (
+            content_width,
+            content_height,
+        )
+        self._enforce_scaling_main_page_minimum(content_width, content_height)
+        self._persist_main_ui_scaling_layout_cache(final_width, final_height)
+
     def _apply_main_ui_scaling_policy(
         self,
         *,
         window_width: int | None = None,
         window_height: int | None = None,
         force_reset: bool = False,
+        auto_fit: bool = False,
     ) -> None:
-        """Fit the complete main surface before allowing viewport overflow.
-
-        Scaling Mode treats the current main-window size as a hard layout
-        target.  It first removes grid/place whitespace, then reduces control
-        chrome while preserving all text metrics.  The viewport scrollbar is
-        only a last-resort fallback after both stages reach their configured
-        lower bounds.  The controller is keyed by backend, language, and
-        compact/advanced page through the existing Scaling Mode cache.
-        """
+        """Measure fixed endpoints, solve once, and publish one scaled frame."""
         if bool(getattr(self, "_main_ui_scaling_reflow", False)):
             return
         scaling_mode = bool(getattr(self, "_scaling_mode_enabled", False))
-        # Ordinary Launcher layout is owned by the normal geometry path.  The
-        # non-scaling branch is only a deliberate reset issued by the Scaling
-        # Mode toggle; stray page/resize callbacks must be no-ops.
         if not scaling_mode and not bool(force_reset):
             return
         if not scaling_mode:
             self._main_ui_layout_scale = 1.0
             self._apply_main_ui_widget_scale(1.0)
             self._apply_main_ui_font_scale(1.0)
+            self._apply_main_ui_action_button_fill_policy()
             self._main_layout_cache.clear()
             self._main_viewport_layout_signature = None
-            # Re-anchor the content against the restored, non-scaled toolbar
-            # before flowing sections.  Otherwise _content_top can remain at
-            # the last scaled action-stack position after Scaling Mode closes.
             self._sync_toolbar_region_geometry()
             self._position_content_after_toolbar(flush_layout=True)
             self.root.update_idletasks()
             self._reflow_left_sections(flush_layout=True)
             self.root.update_idletasks()
-            # The right stack's natural width is restored by the reflow above;
-            # recalculate the toolbar/action column once from that baseline.
             self._sync_toolbar_region_geometry()
             self._fit_main_window_to_content(flush_layout=False)
             return
+
         try:
             width = max(
                 1,
@@ -66326,18 +68398,13 @@ class LauncherApp:
             )
         except (self.tk.TclError, TypeError, ValueError):
             return
-        cache_key = self._main_window_size_cache_key(self._main_window_size_mode)
-        cached_layout = self._main_ui_scaling_layout_cache.get(cache_key, {})
-        cached_signature = str(
-            cached_layout.get("signature", "")
-            if isinstance(cached_layout, dict)
-            else ""
-        )
-        expected_signature = self._main_ui_scaling_layout_signature(
+
+        cache_key = self._main_ui_scaling_layout_cache_key(
             self._main_window_size_mode
         )
-        cached_dimensions_match = False
-        cached_layout_valid = False
+        cached_layout = self._main_ui_scaling_layout_cache.get(cache_key, {})
+        cached_result: dict[str, float] | None = None
+        cached_size: tuple[int, int] | None = None
         if isinstance(cached_layout, dict):
             try:
                 cached_width = max(1, int(cached_layout.get("width", 0) or 0))
@@ -66349,9 +68416,13 @@ class LauncherApp:
                     cached_layout.get("widget_scale", 1.0) or 1.0
                 )
                 cached_font = float(
-                    cached_layout.get("font_scale", cached_widget) or cached_widget
+                    cached_layout.get("font_scale", 1.0) or 1.0
                 )
-                cached_layout_valid = bool(
+                cached_signature = str(cached_layout.get("signature", "") or "")
+                expected_signature = self._main_ui_scaling_layout_signature(
+                    self._main_window_size_mode
+                )
+                if (
                     cached_width > 1
                     and cached_height > 1
                     and math.isfinite(cached_spacing)
@@ -66366,317 +68437,43 @@ class LauncherApp:
                     and MAIN_WINDOW_SCALING_MIN_FONT_SCALE
                     <= cached_font
                     <= MAIN_WINDOW_SCALING_MAX_SCALE
-                    and (
-                        not cached_signature
-                        or cached_signature == expected_signature
-                    )
-                )
-                cached_dimensions_match = bool(
-                    cached_layout_valid
-                    and cached_width == width
-                    and cached_height == height
-                )
+                    and (not cached_signature or cached_signature == expected_signature)
+                ):
+                    cached_size = (cached_width, cached_height)
+                    cached_result = {
+                        "spacing_scale": cached_spacing,
+                        "widget_scale": cached_widget,
+                        "font_scale": cached_font,
+                    }
             except (TypeError, ValueError):
-                cached_layout_valid = False
-        replay_cached_layout = bool(
-            cached_layout_valid and (cached_dimensions_match or width <= 1 or height <= 1)
-        )
-        if width <= 1 or height <= 1:
-            if not replay_cached_layout:
-                # The root is still in its 1x1 staging geometry during cold
-                # startup.  Defer a first calculation until the saved window
-                # size is restored instead of calculating against 1x1.
+                cached_result = None
+                cached_size = None
+
+        staged_geometry = width <= 1 or height <= 1
+        if staged_geometry:
+            if cached_result is None or cached_size is None:
                 return
-            width, height = cached_width, cached_height
+            width, height = cached_size
+        replay_cached_result = bool(
+            cached_result is not None and cached_size == (width, height)
+        )
+
         self._main_ui_scaling_reflow = True
         try:
-            # Stage 1 is exclusively whitespace compression. It starts from the
-            # complete normal layout every time so a larger window restores all
-            # spacing before the control-sizing phase runs.
-            self._main_ui_layout_scale = (
-                cached_spacing if replay_cached_layout else 1.0
-            )
-            self._main_layout_cache.clear()
-            self._apply_main_ui_widget_scale(
-                cached_widget if replay_cached_layout else 1.0
-            )
-            self._apply_main_ui_font_scale(
-                cached_font if replay_cached_layout else 1.0
-            )
-            self._main_layout_cache.clear()
-            self._main_viewport_layout_signature = None
-            self._reflow_left_sections(flush_layout=True)
-            self.root.update_idletasks()
-
-            # Converge against both axes.  A compact page can eliminate the
-            # vertical bar by using spare horizontal space (or vice versa), so
-            # never terminate based solely on the first measured dimension.
-            for _spacing_pass in range(0 if replay_cached_layout else 10):
-                content_width, content_height = self._fit_main_window_to_content(
-                    flush_layout=False
-                )
-                required_spacing_scale = min(
-                    1.0,
-                    width / max(1, int(content_width)),
-                    height / max(1, int(content_height)),
-                )
-                if required_spacing_scale >= 0.999:
-                    break
-                current_spacing_scale = self._main_ui_spacing_scale_factor()
-                next_spacing_scale = max(
-                    MAIN_WINDOW_SCALING_MIN_SCALE,
-                    min(
-                        current_spacing_scale,
-                        current_spacing_scale * required_spacing_scale,
-                    ),
-                )
-                if abs(next_spacing_scale - current_spacing_scale) < 0.001:
-                    break
-                self._main_ui_layout_scale = next_spacing_scale
-                # Reapply only grid spacing while widget dimensions and fonts
-                # remain at their original size.
-                self._apply_main_ui_widget_scale(1.0)
-                self._main_layout_cache.clear()
-                self._main_viewport_layout_signature = None
-                self._reflow_left_sections(flush_layout=True)
-                self.root.update_idletasks()
-
-            # Stage 2 begins only after Stage 1 cannot reduce whitespace any
-            # further. It reduces widget padding, frame bounds and control
-            # chrome while `_main_ui_font_scale_factor` keeps text unchanged.
-            for _pass in range(0 if replay_cached_layout else 10):
-                content_width, content_height = self._fit_main_window_to_content(
-                    flush_layout=False
-                )
-                required_widget_scale = min(
-                    1.0,
-                    width / max(1, int(content_width)),
-                    height / max(1, int(content_height)),
-                )
-                if required_widget_scale >= 0.999:
-                    break
-                current_widget_scale = self._main_ui_scale_factor()
-                next_widget_scale = max(
-                    MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE,
-                    min(current_widget_scale, current_widget_scale * required_widget_scale),
-                )
-                if abs(next_widget_scale - current_widget_scale) < 0.001:
-                    break
-                self._apply_main_ui_widget_scale(next_widget_scale)
-                self._main_layout_cache.clear()
-                self._main_viewport_layout_signature = None
-                self._reflow_left_sections(flush_layout=True)
-                self.root.update_idletasks()
-
-            # Text is the final compacting stage. Keep it at 1.0 until
-            # whitespace and control chrome can no longer fit the page.
-            for _font_pass in range(0 if replay_cached_layout else 8):
-                content_width, content_height = self._fit_main_window_to_content(
-                    flush_layout=False
-                )
-                required_font_scale = min(
-                    1.0,
-                    width / max(1, int(content_width)),
-                    height / max(1, int(content_height)),
-                )
-                if required_font_scale >= 0.999:
-                    break
-                current_font_scale = self._main_ui_font_scale_factor()
-                next_font_scale = max(
-                    MAIN_WINDOW_SCALING_MIN_FONT_SCALE,
-                    min(current_font_scale, current_font_scale * required_font_scale),
-                )
-                if abs(next_font_scale - current_font_scale) < 0.001:
-                    break
-                self._apply_main_ui_font_scale(next_font_scale)
-                self._main_layout_cache.clear()
-                self._main_viewport_layout_signature = None
-                self._reflow_left_sections(flush_layout=True)
-                self.root.update_idletasks()
-
-            # Growth deliberately runs in the inverse order of compaction:
-            # text first, controls second, then whitespace.  Every stage owns
-            # exactly one metric family so an enlarged page never grows a
-            # button and its label in the same layout pass.
-            for _font_growth_pass in range(0 if replay_cached_layout else 8):
-                content_width, content_height = self._fit_main_window_to_content(
-                    flush_layout=False
-                )
-                width_ratio = width / max(1, int(content_width))
-                height_ratio = height / max(1, int(content_height))
-                if width_ratio <= 1.01 and height_ratio > 1.0:
-                    # When the page already spans the current window width,
-                    # treat spare height as real growth headroom instead of
-                    # freezing controls at their previous size and only
-                    # leaving a blank band below the footer.
-                    expansion = min(
-                        MAIN_WINDOW_SCALING_MAX_SCALE,
-                        max(1.0, height_ratio),
-                    )
+            with self._main_ui_scaling_transaction(width, height):
+                if replay_cached_result:
+                    result = cached_result
                 else:
-                    expansion = min(
-                        MAIN_WINDOW_SCALING_MAX_SCALE,
-                        max(1.0, min(width_ratio, height_ratio)),
-                    )
-                current_font_scale = self._main_ui_font_scale_factor()
-                next_font_scale = min(
-                    MAIN_WINDOW_SCALING_MAX_SCALE,
-                    max(current_font_scale, current_font_scale * expansion),
+                    snapshot = self._measure_main_ui_scaling_snapshot(width, height)
+                    result = _solve_main_ui_scaling_snapshot(snapshot)
+                self._commit_main_ui_scaling_snapshot(
+                    result,
+                    width=width,
+                    height=height,
+                    fit_window=bool(auto_fit),
                 )
-                if next_font_scale <= current_font_scale + 0.001:
-                    break
-                self._apply_main_ui_font_scale(next_font_scale)
-                self._main_layout_cache.clear()
-                self._main_viewport_layout_signature = None
-                self._reflow_left_sections(flush_layout=True)
-                self.root.update_idletasks()
-
-            for _widget_growth_pass in range(0 if replay_cached_layout else 10):
-                content_width, content_height = self._fit_main_window_to_content(
-                    flush_layout=False
-                )
-                width_ratio = width / max(1, int(content_width))
-                height_ratio = height / max(1, int(content_height))
-                if width_ratio <= 1.01 and height_ratio > 1.0:
-                    expansion = min(
-                        MAIN_WINDOW_SCALING_MAX_SCALE,
-                        max(1.0, height_ratio),
-                    )
-                else:
-                    expansion = min(
-                        MAIN_WINDOW_SCALING_MAX_SCALE,
-                        max(1.0, min(width_ratio, height_ratio)),
-                    )
-                current_widget_scale = self._main_ui_scale_factor()
-                next_widget_scale = min(
-                    MAIN_WINDOW_SCALING_MAX_SCALE,
-                    max(current_widget_scale, current_widget_scale * expansion),
-                )
-                if next_widget_scale <= current_widget_scale + 0.001:
-                    break
-                self._apply_main_ui_widget_scale(next_widget_scale)
-                self._main_layout_cache.clear()
-                self._main_viewport_layout_signature = None
-                self._reflow_left_sections(flush_layout=True)
-                self.root.update_idletasks()
-
-            for _spacing_growth_pass in range(0 if replay_cached_layout else 10):
-                content_width, content_height = self._fit_main_window_to_content(
-                    flush_layout=False
-                )
-                width_ratio = width / max(1, int(content_width))
-                height_ratio = height / max(1, int(content_height))
-                if width_ratio <= 1.01 and height_ratio > 1.0:
-                    expansion = min(
-                        MAIN_WINDOW_SCALING_MAX_SCALE,
-                        max(1.0, height_ratio),
-                    )
-                else:
-                    expansion = min(
-                        MAIN_WINDOW_SCALING_MAX_SCALE,
-                        max(1.0, min(width_ratio, height_ratio)),
-                    )
-                current_spacing_scale = self._main_ui_spacing_scale_factor()
-                next_spacing_scale = min(
-                    MAIN_WINDOW_SCALING_MAX_SCALE,
-                    max(current_spacing_scale, current_spacing_scale * expansion),
-                )
-                if next_spacing_scale <= current_spacing_scale + 0.001:
-                    break
-                self._main_ui_layout_scale = next_spacing_scale
-                self._main_layout_cache.clear()
-                self._main_viewport_layout_signature = None
-                self._reflow_left_sections(flush_layout=True)
-                self.root.update_idletasks()
-
-            # A later axis can still overflow after growth.  Correct it in the
-            # required compact order: whitespace, controls, then text.
-            for _spacing_correction_pass in range(0 if replay_cached_layout else 6):
-                content_width, content_height = self._fit_main_window_to_content(
-                    flush_layout=False
-                )
-                correction = min(
-                    1.0,
-                    width / max(1, int(content_width)),
-                    height / max(1, int(content_height)),
-                )
-                if correction >= 0.999:
-                    break
-                current_spacing_scale = self._main_ui_spacing_scale_factor()
-                next_spacing_scale = max(
-                    MAIN_WINDOW_SCALING_MIN_SCALE,
-                    min(current_spacing_scale, current_spacing_scale * correction),
-                )
-                if next_spacing_scale >= current_spacing_scale - 0.001:
-                    break
-                self._main_ui_layout_scale = next_spacing_scale
-                self._main_layout_cache.clear()
-                self._main_viewport_layout_signature = None
-                self._reflow_left_sections(flush_layout=True)
-                self.root.update_idletasks()
-
-            for _widget_correction_pass in range(0 if replay_cached_layout else 6):
-                content_width, content_height = self._fit_main_window_to_content(
-                    flush_layout=False
-                )
-                correction = min(
-                    1.0,
-                    width / max(1, int(content_width)),
-                    height / max(1, int(content_height)),
-                )
-                if correction >= 0.999:
-                    break
-                current_widget_scale = self._main_ui_scale_factor()
-                next_widget_scale = max(
-                    MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE,
-                    min(current_widget_scale, current_widget_scale * correction),
-                )
-                if next_widget_scale >= current_widget_scale - 0.001:
-                    break
-                self._apply_main_ui_widget_scale(next_widget_scale)
-                self._main_layout_cache.clear()
-                self._main_viewport_layout_signature = None
-                self._reflow_left_sections(flush_layout=True)
-                self.root.update_idletasks()
-
-            for _font_correction_pass in range(0 if replay_cached_layout else 6):
-                content_width, content_height = self._fit_main_window_to_content(
-                    flush_layout=False
-                )
-                correction = min(
-                    1.0,
-                    width / max(1, int(content_width)),
-                    height / max(1, int(content_height)),
-                )
-                if correction >= 0.999:
-                    break
-                current_font_scale = self._main_ui_font_scale_factor()
-                next_font_scale = max(
-                    MAIN_WINDOW_SCALING_MIN_FONT_SCALE,
-                    min(current_font_scale, current_font_scale * correction),
-                )
-                if next_font_scale >= current_font_scale - 0.001:
-                    break
-                self._apply_main_ui_font_scale(next_font_scale)
-                self._main_layout_cache.clear()
-                self._main_viewport_layout_signature = None
-                self._reflow_left_sections(flush_layout=True)
-                self.root.update_idletasks()
-            self._fit_main_window_to_content(flush_layout=False)
-            self._sync_toolbar_region_geometry()
-            # Re-anchor once against the final toolbar geometry so the MAX /
-            # Blender process title cannot remain under a panel after scaling.
-            self._position_content_after_toolbar(flush_layout=False)
-            self._reflow_left_sections(flush_layout=False)
-            self._sync_toolbar_region_geometry()
-            # The final scrollbar choice must use live post-reflow rectangles,
-            # never the first unscaled request size captured by Tk.
-            self._settle_scaling_main_viewport_layout()
-            self._ensure_scaling_main_window_contains_content()
-            self._persist_main_ui_scaling_layout_cache(width, height)
         finally:
             self._main_ui_scaling_reflow = False
-
     def _toggle_dark_mode(self) -> None:
         _mask_window_until_themed(self.root)
         try:
@@ -77314,7 +79111,7 @@ class LauncherApp:
                 action,
                 "completed",
                 max_process_id=session.pid,
-                request_id=request_id,
+                request_id=request_token,
             )
             route_cn = "Python + FBX（未验证）" if pythonized else "传统 pymxs"
             route_en = "Python + FBX (unverified)" if pythonized else "legacy pymxs"
@@ -77579,7 +79376,9 @@ class LauncherApp:
                 action,
                 "completed",
                 max_process_id=session.pid,
-                request_id=request_id,
+                # Bootstrap receipts are keyed by the Launcher-level token;
+                # the Max IPC request ID is only an inner ownership value.
+                request_id=request_token,
             )
             if not self._session_is_visible(session):
                 return
@@ -80803,7 +82602,7 @@ class LauncherApp:
                 continue
         self._position_blender_hierarchy_message_frame()
 
-    def _apply_advanced_visibility(self) -> None:
+    def _apply_advanced_visibility(self, *, apply_scaling: bool = True) -> None:
         if not hasattr(self, "right_area") or not hasattr(self, "advanced_toggle"):
             return
         visible = bool(self.advanced_visible_var.get())
@@ -80817,7 +82616,7 @@ class LauncherApp:
         self._apply_collapsible_section_policy(visible)
         toolbar_widgets = getattr(self, "toolbar_advanced_widgets", ())
         if visible:
-            self._set_widget_place_visible(self.right_area, True)
+            self._set_right_area_place_visible(True)
             self._configure_widget_if_changed(self.max_exe_combo, width=18)
             for widget in toolbar_widgets:
                 is_max_toolbox = widget is getattr(self, "toolbox_button", None)
@@ -80833,7 +82632,7 @@ class LauncherApp:
                 )
             self._set_widget_grid_visible(self.collapse_button, True)
         else:
-            self._set_widget_place_visible(self.right_area, False)
+            self._set_right_area_place_visible(False)
             for widget in toolbar_widgets:
                 self._set_widget_grid_visible(widget, False)
             self._configure_widget_if_changed(self.max_exe_combo, width=13)
@@ -80841,38 +82640,46 @@ class LauncherApp:
         self._apply_backend_advanced_widget_policy(advanced_visible=visible)
         self._apply_model_process_toolbar_mode(advanced_visible=visible)
         self._apply_toolbar_action_layout()
-        # Establish the current page's real panel bounds before anchoring the
-        # independent action stack.  On a cold start the right area has no old
-        # placement yet, whereas later MAX/Blender switches do.
-        self.toolbar.update_idletasks()
-        self._position_content_after_toolbar(flush_layout=False)
-        self._reflow_left_sections(flush_layout=False)
-        self._sync_toolbar_region_geometry()
-        # One idle-layout flush is required before measuring the newly shown or
-        # hidden toolbar and the right column. All widget writes above remain
-        # idempotent, so this is the only synchronous layout pass in the toggle.
-        self.toolbar.update_idletasks()
-        toolbar_info = self.toolbar.place_info()
-        toolbar_x = int(float(toolbar_info.get("x", self.toolbar.winfo_x()) or 0))
-        toolbar_y = int(float(toolbar_info.get("y", self.toolbar.winfo_y()) or 0))
-        toolbar_width, toolbar_height = getattr(
-            self,
-            "_toolbar_region_size",
-            (self.toolbar.winfo_reqwidth(), self.toolbar.winfo_reqheight()),
-        )
-        self._set_widget_place_geometry(
-            self.toolbar,
-            x=toolbar_x,
-            y=toolbar_y,
-            width=max(int(self.toolbar.winfo_reqwidth()), int(toolbar_width)),
-            height=max(int(self.toolbar.winfo_reqheight()), int(toolbar_height)),
-        )
-        self._position_content_after_toolbar(flush_layout=False)
-        self._reflow_left_sections(flush_layout=False)
-        self._fit_main_window_to_content(flush_layout=False)
-        # A compact/advanced page switch must never leave the user at an old
-        # canvas offset where the newly selected page appears blank.
-        self._reset_main_viewport_origin()
+        scaling_mode = bool(getattr(self, "_scaling_mode_enabled", False))
+        if scaling_mode:
+            # Compact Scaling pages still use the compact toolbar topology.
+            # Settle that topology before restoring the page-specific window
+            # geometry, otherwise the hidden Advanced row can contribute its
+            # stale request width to the compact default.
+            self._apply_main_ui_action_button_fill_policy()
+            self.toolbar.update_idletasks()
+            self._sync_toolbar_region_geometry()
+            self._position_content_after_toolbar(flush_layout=False)
+            self._reflow_left_sections(flush_layout=False)
+        if not scaling_mode:
+            self.toolbar.update_idletasks()
+            self._position_content_after_toolbar(flush_layout=False)
+            self._reflow_left_sections(flush_layout=False)
+            self._sync_toolbar_region_geometry()
+            self.toolbar.update_idletasks()
+            toolbar_info = self.toolbar.place_info()
+            toolbar_x = int(
+                float(toolbar_info.get("x", self.toolbar.winfo_x()) or 0)
+            )
+            toolbar_y = int(
+                float(toolbar_info.get("y", self.toolbar.winfo_y()) or 0)
+            )
+            toolbar_width, toolbar_height = getattr(
+                self,
+                "_toolbar_region_size",
+                (self.toolbar.winfo_reqwidth(), self.toolbar.winfo_reqheight()),
+            )
+            self._set_widget_place_geometry(
+                self.toolbar,
+                x=toolbar_x,
+                y=toolbar_y,
+                width=max(int(self.toolbar.winfo_reqwidth()), int(toolbar_width)),
+                height=max(int(self.toolbar.winfo_reqheight()), int(toolbar_height)),
+            )
+            self._position_content_after_toolbar(flush_layout=False)
+            self._reflow_left_sections(flush_layout=False)
+            self._fit_main_window_to_content(flush_layout=False)
+            self._reset_main_viewport_origin()
         mode = "expanded" if visible else "collapsed"
         mode_changed = mode != self._main_window_size_mode
         self._main_window_size_mode = mode
@@ -80880,26 +82687,23 @@ class LauncherApp:
             # Each advanced/compact surface owns a distinct persisted size.
             # Do not center or fit after restoring it: either operation turns
             # the user's compact-page geometry back into the content default.
-            self._restore_main_window_size(mode, center=False)
+            self._restore_main_window_size(
+                mode,
+                center=False,
+                restore_position=bool(scaling_mode),
+            )
             self._schedule_main_window_geometry_commit(
                 mode,
                 reset_origin=True,
                 fit_to_content=False,
             )
-        if bool(getattr(self, "_scaling_mode_enabled", False)):
-            # Scaling Mode owns this extra reflow.  Ordinary Advanced/Compact
-            # switches keep their established layout and never enter the
-            # scaling controller.
+        if scaling_mode and apply_scaling:
             self._main_ui_scaling_applied_size = None
             try:
-                self.root.update_idletasks()
                 self._apply_main_ui_scaling_policy(
                     window_width=max(1, int(self.root.winfo_width())),
                     window_height=max(1, int(self.root.winfo_height())),
                 )
-                self._settle_scaling_main_viewport_layout(reset_origin=True)
-                self._ensure_scaling_main_window_contains_content()
-                self._reclaim_scaling_window_whitespace()
             except (self.tk.TclError, TypeError, ValueError):
                 pass
 
@@ -81823,7 +83627,7 @@ class LauncherApp:
             self._blender_mode_restore_advanced_visible = source_advanced_visible
         self.advanced_visible_var.set(source_advanced_visible)
         self._persist_blender_mode_state()
-        self._apply_advanced_visibility()
+        self._apply_advanced_visibility(apply_scaling=False)
 
         target_mode = (
             "expanded" if source_advanced_visible else "collapsed"
@@ -81841,9 +83645,6 @@ class LauncherApp:
                 )
             except (self.tk.TclError, TypeError, ValueError):
                 pass
-            self._settle_scaling_main_viewport_layout(reset_origin=True)
-            self._ensure_scaling_main_window_contains_content()
-            self._reclaim_scaling_window_whitespace()
         return source_advanced_visible
 
     def _activate_blender_mode(self) -> None:
@@ -82530,16 +84331,28 @@ class LauncherApp:
             process.join(timeout=1.0)
         except Exception:
             pass
-        _consume_writer_process_evidence(int(process.pid or 0))
+        process_id = int(process.pid or 0)
+        _consume_writer_process_evidence(
+            process_id,
+            evidence_sink=worker.evidence_sink,
+        )
+        _unregister_writer_process_evidence_sink(process_id)
+        try:
+            if worker.evidence_sink is not None:
+                worker.evidence_sink.close()
+                worker.evidence_sink.join_thread()
+        except Exception:
+            pass
 
     def _spawn_writer_worker_locked(self) -> _WriterProcessWorker:
         import multiprocessing
 
         context = multiprocessing.get_context("spawn")
         parent_connection, child_connection = context.Pipe(duplex=True)
+        evidence_sink = context.SimpleQueue()
         process = context.Process(
             target=_writer_process_entry,
-            args=(child_connection,),
+            args=(child_connection, evidence_sink),
             name=f"{APP_NAME}-Writer",
             daemon=True,
         )
@@ -82548,6 +84361,11 @@ class LauncherApp:
         except Exception:
             parent_connection.close()
             child_connection.close()
+            try:
+                evidence_sink.close()
+                evidence_sink.join_thread()
+            except Exception:
+                pass
             raise
         child_connection.close()
         process_id = int(process.pid or 0)
@@ -82557,8 +84375,18 @@ class LauncherApp:
                 process.terminate()
             except Exception:
                 pass
+            try:
+                evidence_sink.close()
+                evidence_sink.join_thread()
+            except Exception:
+                pass
             raise RuntimeError("Writer process started without a process ID")
-        worker = _WriterProcessWorker(process=process, connection=parent_connection)
+        _register_writer_process_evidence_sink(process_id, evidence_sink)
+        worker = _WriterProcessWorker(
+            process=process,
+            connection=parent_connection,
+            evidence_sink=evidence_sink,
+        )
         self._writer_processes[process_id] = worker
         return worker
 
@@ -82623,6 +84451,8 @@ class LauncherApp:
     def _ensure_writer_worker_ready(
         self,
         worker: _WriterProcessWorker,
+        *,
+        export_txt_path: str | Path | None = None,
     ) -> tuple[Any, Any]:
         process = worker.process
         connection = worker.connection
@@ -82644,7 +84474,11 @@ class LauncherApp:
         except (EOFError, OSError, TimeoutError) as exc:
             process.join(timeout=0.75)
             exit_code = process.exitcode
-            evidence = _consume_writer_process_evidence(int(process.pid or 0))
+            evidence = _consume_writer_process_evidence(
+                int(process.pid or 0),
+                evidence_sink=worker.evidence_sink,
+                export_txt_path=export_txt_path,
+            )
             evidence_detail = (
                 f", evidence={json.dumps(evidence, ensure_ascii=False, sort_keys=True)}"
                 if evidence
@@ -82672,13 +84506,31 @@ class LauncherApp:
                 pass
             raise error from exc
 
-        if (
-            not isinstance(response, dict)
-            or response.get("protocol") != WRITER_PROCESS_PROTOCOL
-            or response.get("message_id") != message_id
-        ):
+        response_is_valid_envelope = (
+            isinstance(response, dict)
+            and response.get("protocol") == WRITER_PROCESS_PROTOCOL
+            and response.get("message_id") == message_id
+        )
+        preload_evidence = (
+            response.get("writer_process_evidence")
+            if isinstance(response, Mapping)
+            else None
+        )
+        if not response_is_valid_envelope:
+            _consume_writer_process_evidence(
+                int(process.pid or 0),
+                evidence_sink=worker.evidence_sink,
+                evidence_payload=preload_evidence if isinstance(preload_evidence, Mapping) else None,
+                export_txt_path=export_txt_path,
+            )
             raise ProtocolError("Writer preload returned an invalid response envelope")
         if response.get("ok") is not True:
+            _consume_writer_process_evidence(
+                int(process.pid or 0),
+                evidence_sink=worker.evidence_sink,
+                evidence_payload=preload_evidence if isinstance(preload_evidence, Mapping) else None,
+                export_txt_path=export_txt_path,
+            )
             error_type = str(response.get("error_type", "WriterPreloadError") or "WriterPreloadError")
             error_text = str(response.get("error", "Writer preload failed") or "Writer preload failed")
             raise RuntimeError(f"{error_type}: {error_text[-12000:]}")
@@ -82696,7 +84548,18 @@ class LauncherApp:
             or result.get("trusted_fast_load") is not True
             or result.get("headless_ui_callbacks") is not True
         ):
+            _consume_writer_process_evidence(
+                int(process.pid or 0),
+                evidence_sink=worker.evidence_sink,
+                evidence_payload=preload_evidence if isinstance(preload_evidence, Mapping) else None,
+                export_txt_path=export_txt_path,
+            )
             raise ProtocolError(f"Writer preload returned an invalid READY receipt: {result!r}")
+        _consume_writer_process_evidence(
+            int(process.pid or 0),
+            evidence_sink=worker.evidence_sink,
+            evidence_payload=preload_evidence if isinstance(preload_evidence, Mapping) else None,
+        )
         worker.ready = True
         return process, connection
 
@@ -82768,10 +84631,24 @@ class LauncherApp:
 
     def _run_writer_request_once(self, request: dict[str, Any]) -> dict[str, Any]:
         message_id = uuid.uuid4().hex
-        worker = self._acquire_writer_worker()
+        # An idle warmup may already be starting a Worker.  Wait off the UI
+        # thread until it has either become reusable or been discarded.
+        worker: _WriterProcessWorker | None = None
+        self._writer_warmup_gate.acquire()
+        try:
+            worker = self._acquire_writer_worker()
+            process, connection = self._ensure_writer_worker_ready(
+                worker,
+                export_txt_path=_export_primary_txt_path(request),
+            )
+        except Exception:
+            if worker is not None:
+                self._release_writer_worker(worker, discard=True)
+            raise
+        finally:
+            self._writer_warmup_gate.release()
         discard_worker = False
         try:
-            process, connection = self._ensure_writer_worker_ready(worker)
             try:
                 connection.send(
                     {
@@ -82790,7 +84667,11 @@ class LauncherApp:
                 discard_worker = True
                 process.join(timeout=0.75)
                 exit_code = process.exitcode
-                evidence = _consume_writer_process_evidence(int(process.pid or 0))
+                evidence = _consume_writer_process_evidence(
+                    int(process.pid or 0),
+                    evidence_sink=worker.evidence_sink,
+                    export_txt_path=_export_primary_txt_path(request),
+                )
                 if isinstance(exc, TimeoutError):
                     raise
                 evidence_detail = (
@@ -82803,6 +84684,28 @@ class LauncherApp:
                     f"(worker_pid={int(process.pid or 0)}, exit_code={exit_code!r}, "
                     f"error={type(exc).__name__}: {exc}{evidence_detail})"
                 ) from exc
+            response_is_valid_success = (
+                isinstance(response, dict)
+                and response.get("protocol") == WRITER_PROCESS_PROTOCOL
+                and response.get("message_id") == message_id
+                and response.get("ok") is True
+                and isinstance(response.get("result"), dict)
+            )
+            _consume_writer_process_evidence(
+                int(process.pid or 0),
+                evidence_sink=worker.evidence_sink,
+                evidence_payload=(
+                    response.get("writer_process_evidence")
+                    if isinstance(response, Mapping)
+                    and isinstance(response.get("writer_process_evidence"), Mapping)
+                    else None
+                ),
+                export_txt_path=(
+                    _export_primary_txt_path(request)
+                    if not response_is_valid_success
+                    else None
+                ),
+            )
             if (
                 not isinstance(response, dict)
                 or response.get("protocol") != WRITER_PROCESS_PROTOCOL
@@ -82871,13 +84774,25 @@ class LauncherApp:
             self._release_writer_worker(worker, discard=discard_worker)
 
     def _start_writer_process(self) -> None:
-        worker = self._acquire_writer_worker()
-        self._release_writer_worker(worker)
+        worker: _WriterProcessWorker | None = None
+        self._writer_warmup_gate.acquire()
+        try:
+            worker = self._acquire_writer_worker()
+        finally:
+            if worker is not None:
+                self._release_writer_worker(worker)
+            self._writer_warmup_gate.release()
 
     def _preload_writer_process(self) -> None:
         worker: _WriterProcessWorker | None = None
         discard_worker = False
+        self._writer_warmup_gate.acquire()
         try:
+            # The idle callback and the export admission can cross between
+            # their checks. Re-check while holding the same gate so warmup
+            # never spawns a second Worker for an already-admitted export.
+            if self._import_export_priority_active() or self.busy_count > 0:
+                return
             worker = self._acquire_writer_worker()
             self._ensure_writer_worker_ready(worker)
         except Exception:
@@ -82887,6 +84802,7 @@ class LauncherApp:
         finally:
             if worker is not None:
                 self._release_writer_worker(worker, discard=discard_worker)
+            self._writer_warmup_gate.release()
 
     def _shutdown_writer_process(self) -> None:
         with self._writer_pool_lock:
@@ -86987,7 +88903,7 @@ class LauncherApp:
         import_txt_path = (
             fbx_path.with_suffix(".txt")
             if fbx_path is not None
-            else log_directory / f"import_pid{session.pid}_{request_token}.txt"
+            else _public_operation_log_path(log_directory, "import")
         )
         import_bug_control = create_import_bug_controller(
             request_id=request_token,
@@ -87323,9 +89239,38 @@ class LauncherApp:
                     detail="A newer operation replaced this import callback.",
                 )
                 self._release_import_export_priority(session, action, generation)
+                _release_public_fbx_reservation(fbx_path)
                 return
             request_id, result, import_receipt, planned_name_snapshot = value
             import_bug_control.complete()
+            try:
+                _write_public_operation_receipt_txt(
+                    import_txt_path,
+                    operation="import",
+                    process_id=session.pid,
+                    request_id=request_token,
+                    status="OK",
+                    fbx_path=fbx_path,
+                    details={
+                        "source_mod": str(source_mod),
+                        "receipt": import_receipt,
+                        "result": result,
+                    },
+                )
+                _append_public_operation_log(
+                    log_directory,
+                    "import",
+                    session.pid,
+                    request_token,
+                    "OK",
+                    {"fbx_path": str(fbx_path or ""), "source_mod": str(source_mod)},
+                )
+            except Exception as txt_exc:
+                import_failure_state["public_txt_error"] = (
+                    f"{type(txt_exc).__name__}: {txt_exc}"
+                )
+            finally:
+                _release_public_fbx_reservation(fbx_path)
 
             def record_blender_hierarchy_coverage(
                 hierarchy: dict[str, Any], imported_mesh_count: int
@@ -87437,7 +89382,7 @@ class LauncherApp:
                     action,
                     "completed",
                     max_process_id=session.pid,
-                    request_id=request_id,
+                    request_id=request_token,
                     extra={
                         "backend": "blender_bpy",
                         "lod_hierarchy": hierarchy,
@@ -87617,7 +89562,7 @@ class LauncherApp:
                     action,
                     "completed",
                     max_process_id=session.pid,
-                    request_id=request_id,
+                    request_id=request_token,
                     extra={
                         "backend": "blender_fbx",
                         "lod_hierarchy": hierarchy,
@@ -87814,7 +89759,7 @@ class LauncherApp:
                 action,
                 "completed",
                 max_process_id=session.pid,
-                request_id=request_id,
+                request_id=request_token,
                 extra={
                     "texture_import": dict(
                         import_receipt.get("texture_import", {}) or {}
@@ -87945,7 +89890,7 @@ class LauncherApp:
                     "traceback": traceback_text,
                     "failure_domain": _operation_failure_domain(action),
                     "bootstrap_health_log": str(
-                        log_directory / BOOTSTRAP_HEALTH_LOG_FILE_NAME
+                        _public_bootstrap_health_log_path(log_directory)
                     ),
                 }
             )
@@ -87967,6 +89912,30 @@ class LauncherApp:
             )
             if txt_write_error:
                 import_failure_state["bug_control_txt_error"] = txt_write_error
+            try:
+                _write_public_operation_receipt_txt(
+                    import_txt_path,
+                    operation="import",
+                    process_id=session.pid,
+                    request_id=request_token,
+                    status="ERROR",
+                    fbx_path=fbx_path,
+                    details=import_failure_state,
+                )
+                _append_public_operation_log(
+                    log_directory,
+                    "import",
+                    session.pid,
+                    request_token,
+                    "ERROR",
+                    import_failure_state,
+                )
+            except Exception as txt_exc:
+                import_failure_state["public_txt_error"] = (
+                    f"{type(txt_exc).__name__}: {txt_exc}"
+                )
+            finally:
+                _release_public_fbx_reservation(fbx_path)
             failure_detail = f"{type(exc).__name__}: {exc}"
             if traceback_text:
                 failure_detail += "\n" + traceback_text
@@ -89119,6 +91088,7 @@ class LauncherApp:
                 choices=[(self._tr("确定", "OK"), "ok")],
                 center_on_screen=True,
             ).show()
+            _release_public_fbx_reservation(fbx_path)
             release_legacy_bucket_plan()
             return
 
@@ -89235,6 +91205,7 @@ class LauncherApp:
                 3,
             )
         except Exception:
+            _release_public_fbx_reservation(fbx_path)
             release_export_transaction()
             raise
 
@@ -89256,6 +91227,28 @@ class LauncherApp:
             )
 
         def export_failure(exc: Exception) -> None:
+            try:
+                _write_public_operation_receipt_txt(
+                    fbx_path.with_suffix(".txt"),
+                    operation="export",
+                    process_id=session.pid,
+                    request_id=request_token,
+                    status="ERROR",
+                    fbx_path=fbx_path,
+                    details={"error_type": type(exc).__name__, "error": str(exc)},
+                )
+                _append_public_operation_log(
+                    log_directory,
+                    "export",
+                    session.pid,
+                    request_token,
+                    "ERROR",
+                    {"fbx_path": str(fbx_path), "error": str(exc)},
+                )
+            except Exception:
+                pass
+            finally:
+                _release_public_fbx_reservation(fbx_path)
             self._report_bootstrap_health_operation(
                 action,
                 "failed",
@@ -89735,6 +91728,7 @@ class LauncherApp:
                     request_id=request_token,
                     detail="A newer operation replaced this export callback.",
                 )
+                _release_public_fbx_reservation(fbx_path)
                 return
             live_contract = max_result.get("scene_contract")
             if isinstance(live_contract, dict):
@@ -89785,11 +91779,12 @@ class LauncherApp:
                 if overwrite_choice != "overwrite":
                     restore_detail = restore_renamed_source_after_failure()
                     release_export_transaction()
+                    _release_public_fbx_reservation(fbx_path)
                     self._report_bootstrap_health_operation(
                         action,
                         "cancelled",
                         max_process_id=session.pid,
-                        request_id=request_id,
+                        request_id=request_token,
                         detail="User cancelled the output overwrite confirmation.",
                     )
                     session.workspace.last_status = self._tr(
@@ -89848,11 +91843,12 @@ class LauncherApp:
                 if keep is None:
                     restore_renamed_source_after_failure()
                     release_export_transaction()
+                    _release_public_fbx_reservation(fbx_path)
                     self._report_bootstrap_health_operation(
                         action,
                         "cancelled",
                         max_process_id=session.pid,
-                        request_id=request_id,
+                        request_id=request_token,
                         detail="User cancelled the Mesh slot conflict decision.",
                     )
                     session.workspace.last_status = self._tr(
@@ -89969,7 +91965,7 @@ class LauncherApp:
                 return
             writer_log_warning = str(writer_result.get("log_warning", "") or "").strip()
             writer_log_path_text = str(writer_result.get("log_path", "") or "").strip()
-            expected_log_path = log_directory / f"{fbx_path.stem}.txt"
+            expected_log_path = fbx_path.with_suffix(".txt")
             validated_log_path = ""
             log_health_warning = ""
             log_check_required = bool(workspace.log_mode or writer_log_warning)
@@ -89983,21 +91979,14 @@ class LauncherApp:
                         returned_log_path = Path(writer_log_path_text).expanduser().resolve(
                             strict=False
                         )
-                        expected_log_root = log_directory.resolve(strict=False)
-                        if returned_log_path.parent != expected_log_root:
+                        expected_log_roots = {
+                            log_directory.resolve(strict=False),
+                            _public_operation_directory(log_directory, "export").resolve(strict=False),
+                        }
+                        if returned_log_path.parent not in expected_log_roots:
                             log_health_warning = (
                                 "Writer returned a Log Mode TXT outside the active log directory: "
                                 f"{returned_log_path}"
-                            )
-                        elif SAMPLE_FILE_RE.fullmatch(returned_log_path.name) is None:
-                            log_health_warning = (
-                                "Writer returned an invalid Log Mode TXT filename: "
-                                f"{returned_log_path.name}"
-                            )
-                        elif returned_log_path.name.casefold() != expected_log_path.name.casefold():
-                            log_health_warning = (
-                                "Writer returned the wrong Log Mode TXT for this export request: "
-                                f"expected={expected_log_path.name}, returned={returned_log_path.name}"
                             )
                         elif not returned_log_path.is_file():
                             log_health_warning = (
@@ -90014,6 +92003,33 @@ class LauncherApp:
                             "Launcher could not validate the Writer Log Mode TXT: "
                             f"{type(log_exc).__name__}: {log_exc}"
                         )
+            try:
+                _publish_public_export_receipt_txt(
+                    validated_log_path or writer_log_path_text,
+                    expected_log_path,
+                    process_id=session.pid,
+                    request_id=request_id,
+                    fbx_path=fbx_path,
+                    details={
+                        "writer_log_warning": writer_log_warning,
+                        "log_health_warning": log_health_warning,
+                        "writer_result": writer_result,
+                    },
+                )
+                _append_public_operation_log(
+                    log_directory,
+                    "export",
+                    session.pid,
+                    request_id,
+                    "OK",
+                    {"fbx_path": str(fbx_path), "output_mod": str(output_path)},
+                )
+            except Exception as txt_exc:
+                log_health_warning = (
+                    f"Public Export TXT write failed: {type(txt_exc).__name__}: {txt_exc}"
+                )
+            finally:
+                _release_public_fbx_reservation(fbx_path)
             receipt_source_sha = str(writer_result.get("source_sha256", "") or "") or expected_source_sha
             workspace.scene_contract = dict(max_result.get("scene_contract", workspace.scene_contract))
             commit_source_state_after_success(output_path)
@@ -90028,7 +92044,7 @@ class LauncherApp:
                 action,
                 "completed",
                 max_process_id=session.pid,
-                request_id=request_id,
+                request_id=request_token,
             )
             if log_check_required:
                 log_health_extra = {
@@ -90046,7 +92062,7 @@ class LauncherApp:
                         "export_log",
                         "failed",
                         max_process_id=session.pid,
-                        request_id=request_id,
+                        request_id=request_token,
                         detail=log_health_warning,
                         extra=log_health_extra,
                     )
@@ -90055,7 +92071,7 @@ class LauncherApp:
                         "export_log",
                         "completed",
                         max_process_id=session.pid,
-                        request_id=request_id,
+                        request_id=request_token,
                         extra=log_health_extra,
                     )
             if self._owns_session_operation(session, action, generation):
@@ -90103,6 +92119,7 @@ class LauncherApp:
                         max_process_id=session.pid,
                         output_mod=output_path,
                         log_directory=log_directory,
+                        public_fbx_path=fbx_path,
                     )
                 mod_operations = writer_result.get("mod_operations")
                 if not isinstance(mod_operations, dict):
@@ -90249,7 +92266,7 @@ class LauncherApp:
                             "",
                             "日志模式警告（不影响本次 .MOD 导出结果）：",
                             log_health_warning,
-                            f"Bootstrap 健康日志：{log_directory / BOOTSTRAP_HEALTH_LOG_FILE_NAME}",
+                            f"Bootstrap 健康日志：{_public_bootstrap_health_log_path(log_directory)}",
                         ))
                     if verify_summary:
                         receipt_lines.extend(("", f"验证详情：{localized_verify_summary(verify_summary)}"))
@@ -90381,7 +92398,7 @@ class LauncherApp:
                             "",
                             "Log Mode warning (the .MOD export itself still succeeded):",
                             log_health_warning,
-                            f"Bootstrap health log: {log_directory / BOOTSTRAP_HEALTH_LOG_FILE_NAME}",
+                            f"Bootstrap health log: {_public_bootstrap_health_log_path(log_directory)}",
                         ))
                     if verify_summary:
                         receipt_lines.extend(("", f"Verification detail: {verify_summary}"))
@@ -90632,6 +92649,13 @@ class LauncherApp:
             if not self._owns_session_operation(session, action, generation):
                 restore_renamed_source_after_failure()
                 release_export_transaction()
+                self._report_bootstrap_health_operation(
+                    action,
+                    "cancelled",
+                    max_process_id=session.pid,
+                    request_id=request_token,
+                    detail="A newer operation replaced this export callback.",
+                )
                 return
             finish_writer(*value)
 
@@ -90694,6 +92718,8 @@ class LauncherApp:
         except Exception:
             pass
         self._persist_window_preferences()
+        if self._persist_active_ui_page_preferences():
+            self._queue_launcher_state_write()
         self._capture_main_window_size(self._main_window_size_mode)
         self._capture_export_sets_window_size()
         self._capture_export_sets_scroll_position()
@@ -90730,8 +92756,9 @@ class LauncherApp:
                     "active_operations": active_operations,
                     "active_operation_count": len(active_operations),
                     "bootstrap_health_log": str(
-                        self._bootstrap_health_supervisor_log_dir
-                        / BOOTSTRAP_HEALTH_LOG_FILE_NAME
+                        _public_bootstrap_health_log_path(
+                            self._bootstrap_health_supervisor_log_dir.parent
+                        )
                     ),
                 },
             )
@@ -90794,6 +92821,7 @@ class LauncherApp:
             self._close_message_editor(reopen_next_launch=True)
         for pid in list(self.agent_active_starting_pids):
             self._clear_active_agent_start(pid)
+        _release_launcher_singleton()
         self.root.destroy()
 
 
@@ -90810,65 +92838,110 @@ def _centered_window_position(
 
 
 def run_ui(*, initial_target_pid: int = 0) -> int:
-    import tkinter as tk
+    # Acquire the process-wide GUI lease before importing/creating Tk.  This
+    # prevents duplicate windows and their hidden supervisors/workers when a
+    # .py association or a restart launches the script twice.
+    if not _acquire_launcher_singleton():
+        return 0
+    try:
+        import tkinter as tk
+        initial_foreground_pid = int(initial_target_pid) if int(initial_target_pid) > 0 else _foreground_window_pid()
+        _set_windows_launcher_app_id()
+        root = tk.Tk()
+        setattr(root, "_pc_rehd_startup_publish_complete", False)
+        root.withdraw()
+        _mask_window_until_themed(root)
+        _capture_launcher_original_window_icon(root)
+        app = LauncherApp(
+            root,
+            initial_foreground_pid=initial_foreground_pid,
+        )
+        _apply_native_window_theme(root, dark=bool(getattr(app, "_theme_dark", False)))
+        root.update_idletasks()
 
-    initial_foreground_pid = int(initial_target_pid) if int(initial_target_pid) > 0 else _foreground_window_pid()
-    _set_windows_launcher_app_id()
-    root = tk.Tk()
-    setattr(root, "_pc_rehd_startup_publish_complete", False)
-    root.withdraw()
-    _mask_window_until_themed(root)
-    _capture_launcher_original_window_icon(root)
-    app = LauncherApp(
-        root,
-        initial_foreground_pid=initial_foreground_pid,
-    )
-    _apply_native_window_theme(root, dark=bool(getattr(app, "_theme_dark", False)))
-    root.update_idletasks()
+        minimum_width, minimum_height = root.minsize()
+        requested_geometry = app._main_window_requested_geometry
+        if (
+            requested_geometry is not None
+            and requested_geometry[0] == app._main_window_size_mode
+        ):
+            final_width = max(int(minimum_width), int(requested_geometry[1]))
+            final_height = max(int(minimum_height), int(requested_geometry[2]))
+        else:
+            final_width = max(int(minimum_width), int(root.winfo_width()))
+            final_height = max(int(minimum_height), int(root.winfo_height()))
+        requested_position = getattr(app, "_main_window_requested_position", None)
+        screen_width = max(1, int(root.winfo_screenwidth()))
+        screen_height = max(1, int(root.winfo_screenheight()))
+        if requested_position is None:
+            desired_x, desired_y = _centered_window_position(
+                final_width,
+                final_height,
+                screen_width,
+                screen_height,
+            )
+        else:
+            requested_x, requested_y = (
+                int(requested_position[0]),
+                int(requested_position[1]),
+            )
+            invalid_stage_position = (
+                requested_x >= WINDOW_OFFSCREEN_STAGE_COORDINATE
+                or requested_y >= WINDOW_OFFSCREEN_STAGE_COORDINATE
+                or requested_x >= screen_width
+                or requested_y >= screen_height
+            )
+            if invalid_stage_position:
+                desired_x, desired_y = _centered_window_position(
+                    final_width,
+                    final_height,
+                    screen_width,
+                    screen_height,
+                )
+            else:
+                max_x = max(0, screen_width - min(final_width, screen_width))
+                max_y = max(0, screen_height - min(final_height, screen_height))
+                desired_x, desired_y = (
+                    max(0, min(max_x, requested_x)),
+                    max(0, min(max_y, requested_y)),
+                )
 
-    minimum_width, minimum_height = root.minsize()
-    requested_geometry = app._main_window_requested_geometry
-    if (
-        requested_geometry is not None
-        and requested_geometry[0] == app._main_window_size_mode
-    ):
-        final_width = max(int(minimum_width), int(requested_geometry[1]))
-        final_height = max(int(minimum_height), int(requested_geometry[2]))
-    else:
-        final_width = max(int(minimum_width), int(root.winfo_width()))
-        final_height = max(int(minimum_height), int(root.winfo_height()))
-    desired_x, desired_y = _centered_window_position(
-        final_width,
-        final_height,
-        root.winfo_screenwidth(),
-        root.winfo_screenheight(),
-    )
+        dark = bool(getattr(app, "_theme_dark", False))
+        _set_themed_window_geometry(
+            root,
+            f"{final_width}x{final_height}+{desired_x}+{desired_y}",
+            dark=dark,
+        )
+        # The Launcher is still withdrawn here, so the Configure callback
+        # cannot reliably observe the restored size.  Submit that final
+        # geometry explicitly before publishing the first frame.
+        app._finalize_main_ui_startup_layout(
+            width=final_width,
+            height=final_height,
+        )
+        _prepare_native_window_theme_restore(root, dark=dark)
+        window_scheduler = _managed_window_scheduler(root)
+        if window_scheduler.publish_root(dark=dark):
+            app._launcher_window_state = LAUNCHER_WINDOW_VISIBLE
+        else:
+            def publish_after_mainloop_starts() -> None:
+                if window_scheduler.publish_root(dark=dark):
+                    app._launcher_window_state = LAUNCHER_WINDOW_VISIBLE
 
-    dark = bool(getattr(app, "_theme_dark", False))
-    _set_themed_window_geometry(
-        root,
-        f"{final_width}x{final_height}+{desired_x}+{desired_y}",
-        dark=dark,
-    )
-    _prepare_native_window_theme_restore(root, dark=dark)
-    window_scheduler = _managed_window_scheduler(root)
-    if window_scheduler.publish_root(dark=dark):
-        app._launcher_window_state = LAUNCHER_WINDOW_VISIBLE
-    else:
-        def publish_after_mainloop_starts() -> None:
-            if window_scheduler.publish_root(dark=dark):
-                app._launcher_window_state = LAUNCHER_WINDOW_VISIBLE
-
-        root.after(0, publish_after_mainloop_starts)
-    app._apply_topmost()
-    app._start_runtime_services()
-    # The first frame is already published; warm reusable UI surfaces in
-    # short Tk slices so startup and pointer input never wait for the cache.
-    app._schedule_main_ui_preload()
-    # AI maintenance policy is explicit CLI work. Never run its fixed SHA table
-    # in a user's GUI session or let a stale review affect normal operations.
-    root.mainloop()
-    return 0
+            root.after(0, publish_after_mainloop_starts)
+        app._apply_topmost()
+        app._start_runtime_services()
+        # The first frame is already published; warm reusable UI surfaces in
+        # short Tk slices so startup and pointer input never wait for the cache.
+        app._schedule_main_ui_preload()
+        # AI maintenance policy is explicit CLI work. Never run its fixed SHA table
+        # in a user's GUI session or let a stale review affect normal operations.
+        root.mainloop()
+        return 0
+    finally:
+        # _on_close releases this earlier after the health handoff; the
+        # idempotent fallback also covers startup errors and external destroy.
+        _release_launcher_singleton()
 
 
 def run_ui_smoke_test() -> dict[str, Any]:
@@ -91871,6 +93944,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
         return 0
     if args.policy_smoke:
         print(json.dumps(run_policy_guard_smoke_test(), ensure_ascii=False))
+        return 0
+    # Reject duplicate GUI launches before starting a Guardian or any other
+    # hidden runtime service.  run_ui() repeats the idempotent check before Tk
+    # creation for direct callers and startup-error cleanup.
+    if not _acquire_launcher_singleton():
         return 0
     _start_runtime_guardian()
     return run_ui(initial_target_pid=args.target_pid)

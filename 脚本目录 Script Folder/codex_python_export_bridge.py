@@ -30,6 +30,7 @@ from codex_python_runtime_bootstrap import (
     runtime_ui_is_chinese,
     runtime_ui_text,
     runtime_write_json_file,
+    try_import_optional_runtime_module,
 )
 from codex_re6_scene_compatibility import (
     CROSS_MOD_COMPATIBILITY_EXPORT_RULE,
@@ -45,7 +46,10 @@ from codex_re6_scene_compatibility import (
     run_compatibility_regression_guard,
 )
 
-UV_LAYOUT_ACCEL = None
+UV_LAYOUT_ACCEL = try_import_optional_runtime_module(
+    "codex_uv_layout_accel",
+    repair=False,
+)
 # AI MAINTENANCE GATE: changing this consumer contract requires synchronized
 # edits to the accelerator package, bootstrap health contract, and release copy.
 REQUIRED_UV_ACCELERATOR_CONTRACT_REVISION = 2
@@ -2620,7 +2624,7 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
                     _clamp_short(short_pos[1]),
                     _clamp_short(short_pos[2]),
                     bone_1,
-                    255,
+                    0,
                     write_uv[0],
                     write_uv[1],
                 )
@@ -2675,7 +2679,7 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
                     _clamp_short(short_pos[1]),
                     _clamp_short(short_pos[2]),
                     bone_1,
-                    254,
+                    0,
                     *normal_bytes,
                     *tangent_bytes,
                     write_uv[0],
@@ -2975,7 +2979,7 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
                     _clamp_short(short_pos[1]),
                     _clamp_short(short_pos[2]),
                     bone_1,
-                    254,
+                    0,
                     *normal_bytes,
                     *tangent_bytes,
                     write_uv[0],
@@ -3697,7 +3701,10 @@ def _resolve_semantic_payload_max_workers(max_workers: int | None = None) -> int
         return env_workers
 
     cpu_count = os.cpu_count() or 2
-    return max(1, min(8, cpu_count - 1))
+    # A Writer already runs in its own process. Keep the per-export fan-out
+    # bounded so one large export cannot create eight additional Python
+    # interpreters and compete with Max/Launcher memory.
+    return max(1, min(4, cpu_count - 1))
 
 
 def _resolve_semantic_payload_parallel_override(parallel_override: bool | None = None) -> bool | None:
@@ -3762,6 +3769,7 @@ def _prebuild_semantic_payloads(
     required_tasks = [task for task in tasks if task not in fallback_tasks]
     parallel_mode = _resolve_semantic_payload_parallel_override(parallel_override)
     worker_count = _resolve_semantic_payload_max_workers(max_workers=max_workers)
+    worker_count = min(worker_count, len(required_tasks))
     use_parallel = (
         worker_count > 1
         and len(required_tasks) > 1
@@ -10671,9 +10679,15 @@ SOURCE_MOD_SKIN_TRUTH_LAYOUTS = {
     0x0CB68016: {"kind": "single_slot_full_weight", "slot_offset": 6, "slot_count": 1},
     0xA8FAB018: {"kind": "single_slot_full_weight", "slot_offset": 6, "slot_count": 1},
     0xA8FAB019: {"kind": "single_slot_full_weight", "slot_offset": 6, "slot_count": 1},
-    # V4 exposes byte 7 as the scene Bone while byte 6 remains part of the
-    # source binding pair. Preserve both bytes when that scene view is unchanged.
-    0xCBF6C01A: {"kind": "single_slot_full_weight", "slot_offset": 7, "slot_count": 1},
+    # Albam's MOD-21 CBF6 layout defines one little-endian u16 bone index at
+    # offset 6. Preserve the complete two-byte field when the scene Skin is
+    # unchanged.
+    0xCBF6C01A: {
+        "kind": "single_slot_full_weight",
+        "slot_count": 1,
+        "slot_encoding": "ushort_values",
+        "slot_offsets": (6,),
+    },
     0x667B1019: {
         "kind": "single_slot_full_weight",
         "slot_count": 1,
@@ -10709,7 +10723,7 @@ SOURCE_MOD_SKIN_TRUTH_LAYOUTS = {
     0xDA55A021: {"kind": "legacy4_short_half", "slot_offset": 16, "slot_count": 4, "half_weight_offsets": (24, 26)},
     0x77D87022: {"kind": "legacy4_short_half", "slot_offset": 16, "slot_count": 4, "half_weight_offsets": (24, 26)},
     0x64593023: {"kind": "legacy4_short_half", "slot_offset": 16, "slot_count": 4, "half_weight_offsets": (24, 26)},
-    0xD877801B: {"kind": "single_slot_full_weight", "slot_offset": 7, "slot_count": 1},
+    0xD877801B: {"kind": "single_slot_full_weight", "slot_offset": 6, "slot_count": 1},
     0x75C3E025: {
         "kind": "legacy8_short_byte_half",
         "slot_offset": 16,
@@ -11042,6 +11056,18 @@ def _run_source_skin_truth_regression_guard() -> dict[str, Any]:
         if not _skin_rows_are_semantically_equal([35], [1.0], c31_bones, c31_weights, tolerance=0.001):
             raise RuntimeError(f"FVF 0x{source_fvf:08X} source-truth regression: same-bone w1=0 row was treated as edited")
 
+    d877_vertex = bytearray(32)
+    d877_vertex[6] = 7
+    d877_vertex[7] = 0
+    d877_row = _decode_source_mod_skin_truth_row(
+        bytes(d877_vertex),
+        vertex_offset=0,
+        source_fvf=0xD877801B,
+        source_palette_rows=palette_rows,
+    )
+    if d877_row.get("resolved_source_bones") != [39] or d877_row.get("raw_weight_values") != [1.0]:
+        raise RuntimeError("FVF 0xD877801B source-truth regression: direct global bone lane must be byte 6")
+
     single_667_vertex = bytearray(24)
     struct.pack_into("<H", single_667_vertex, 6, 3)
     single_667_row = _decode_source_mod_skin_truth_row(
@@ -11052,6 +11078,20 @@ def _run_source_skin_truth_regression_guard() -> dict[str, Any]:
     )
     if single_667_row.get("resolved_source_bones") != [35] or single_667_row.get("raw_weight_values") != [1.0]:
         raise RuntimeError("FVF 0x667B1019 source-truth regression: ushort bone field lost one-bone semantics")
+
+    single_cbf6_vertex = bytearray(24)
+    struct.pack_into("<H", single_cbf6_vertex, 6, 3)
+    single_cbf6_row = _decode_source_mod_skin_truth_row(
+        bytes(single_cbf6_vertex),
+        vertex_offset=0,
+        source_fvf=0xCBF6C01A,
+        source_palette_rows=palette_rows,
+    )
+    if (
+        single_cbf6_row.get("resolved_source_bones") != [35]
+        or single_cbf6_row.get("raw_weight_values") != [1.0]
+    ):
+        raise RuntimeError("FVF 0xCBF6C01A source-truth regression: ushort bone field lost one-bone semantics")
 
     dual_0d9e_vertex = bytearray(28)
     struct.pack_into("<h", dual_0d9e_vertex, 6, 0)
@@ -11122,6 +11162,30 @@ def _run_source_skin_truth_regression_guard() -> dict[str, Any]:
         or d877_vertex_bytes[28:32] != b"\x00" * 4
     ):
         raise RuntimeError("FVF 0xD877801B writer regression: UV1/UV2 lanes moved from offsets 16/24")
+
+    # One-bone short-position layouts carry the bone in byte 6 and keep byte
+    # 7 as the source MOD's reserved/padding byte. Hard-coding FE/FF here
+    # changes otherwise valid source rows such as A8FAB018's 53 00 pair.
+    one_bone_lane_expectations = (
+        (0xB0983013, 12),
+        (0xB0983014, 12),
+        (0x0CB68015, 20),
+        (0x0CB68016, 20),
+        (0xA8FAB018, 20),
+        (0xA8FAB019, 20),
+        (0xCBF6C01A, 24),
+        (0xD877801B, 32),
+    )
+    for one_bone_fvf, one_bone_stride in one_bone_lane_expectations:
+        one_bone_payload = build_semantic_mesh_payload(
+            _base_writer_regression_scene_mesh(one_bone_fvf, one_bone_stride, [0x53], [1.0])
+        )
+        one_bone_vertex = one_bone_payload.get("vertex_bytes", b"")
+        if len(one_bone_vertex) != one_bone_stride or one_bone_vertex[6:8] != b"\x53\x00":
+            raise RuntimeError(
+                f"FVF 0x{one_bone_fvf:08X} writer regression: expected one-bone lane 53 00, "
+                f"got {bytes(one_bone_vertex[6:8]).hex(' ')}"
+            )
 
     required_skin_fvfs = {
         0xB0983013, 0xB0983014, 0xA8FAB018, 0xA8FAB019,
@@ -22366,19 +22430,19 @@ def _run_ordinary_skin_round_trip_regression_guard() -> dict[str, Any]:
             )
 
         exact_scene_skin_cases = {
-            0xCBF6C01A: (24, 0x35, 4),
-            0xD877801B: (32, 0x27, 3),
+            0xCBF6C01A: (24, 0x04, 0x00),
+            0xD877801B: (32, 0x27, 0x03),
         }
-        for fvf, (stride, source_byte_6, source_bone_slot) in exact_scene_skin_cases.items():
+        for fvf, (stride, source_byte_6, source_byte_7) in exact_scene_skin_cases.items():
             source_vertex = bytearray(
                 build_semantic_mesh_payload(
                     _base_writer_regression_scene_mesh(fvf, stride, [0], [1.0])
                 )["vertex_bytes"]
             )
             source_vertex[6] = source_byte_6
-            source_vertex[7] = source_bone_slot
+            source_vertex[7] = source_byte_7
             execute_case(
-                f"single_byte_pair_{fvf:08X}",
+                f"single_skin_pair_{fvf:08X}",
                 fvf,
                 stride,
                 bytes(source_vertex),
@@ -24350,6 +24414,7 @@ def _build_expected_output_mesh_state(
     output_vert_start = _int_or_default(output_mesh_header.get("vert_start"), 0)
     mode = "copied"
     expected_vertex_bytes = source_vertex_bytes
+    final_normal_face_indices: list[int] | None = None
     expected_face_bytes = _remap_copied_face_bytes(
         source_face_bytes,
         _int_or_default(source_mesh_header.get("vert_start"), 0),
@@ -24369,7 +24434,12 @@ def _build_expected_output_mesh_state(
                     default_fvf=contract_mesh.get("header_fvf") or source_mesh_header.get("fvf_info"),
                 )
             expected_vertex_bytes = semantic_payload["vertex_bytes"]
-            expected_face_indices = [int(index) + output_vert_start for index in semantic_payload["face_indices"]]
+            final_normal_face_indices = [
+                int(index) for index in semantic_payload["face_indices"]
+            ]
+            expected_face_indices = [
+                int(index) + output_vert_start for index in final_normal_face_indices
+            ]
             expected_face_bytes = (
                 _pack_face_indices(expected_face_indices)
                 if not expected_face_indices or max(expected_face_indices) <= UINT16_FACE_INDEX_MAX
@@ -24394,6 +24464,7 @@ def _build_expected_output_mesh_state(
                     if contract_face_indices is not None
                     else _unpack_face_indices(source_face_bytes)
                 )
+                final_normal_face_indices = list(raw_face_indices)
                 expected_face_indices = [index + output_vert_start for index in raw_face_indices]
                 expected_face_bytes = (
                     _pack_face_indices(expected_face_indices)
@@ -24402,6 +24473,24 @@ def _build_expected_output_mesh_state(
                 )
                 expected_fvf = _parse_fvf_int(contract_mesh.get("header_fvf")) or expected_fvf
                 mode = "binary"
+
+    if (
+        final_normal_face_indices is not None
+        and expected_fvf in BB4240X_FINAL_GEOMETRY_NORMAL_FVFS
+    ):
+        expected_vertex_bytes, _final_normal_receipt = (
+            _apply_bb4240x_final_geometry_normals(
+                bytes(expected_vertex_bytes),
+                final_normal_face_indices,
+                fvf=expected_fvf,
+                vertex_stride=expected_stride,
+                source_vertex_indices=(
+                    contract_mesh.get("source_vertex_indices")
+                    if isinstance(contract_mesh, dict)
+                    else None
+                ),
+            )
+        )
 
     expected_vert_count = (
         len(expected_vertex_bytes) // expected_stride if expected_stride > 0 else _int_or_default(source_mesh_header.get("vert_count"), 0)

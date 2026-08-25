@@ -652,7 +652,15 @@ function Start-GuardianReplacementLauncher {
         return [pscustomobject]@{ Success = $false; Detail = 'Launcher source is missing.' }
     }
     try {
-        Start-Process -FilePath $managedBaselinePython -ArgumentList @('-I', '-B', $launcherPath) -WorkingDirectory $scriptRoot -WindowStyle Hidden
+        $handoffVariable = 'PC_REHD_CODE_X_SINGLETON_HANDOFF'
+        $previousHandoff = [Environment]::GetEnvironmentVariable($handoffVariable, 'Process')
+        [Environment]::SetEnvironmentVariable($handoffVariable, '1', 'Process')
+        try {
+            Start-Process -FilePath $managedBaselinePython -ArgumentList @('-I', '-B', $launcherPath) -WorkingDirectory $scriptRoot -WindowStyle Hidden
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable($handoffVariable, $previousHandoff, 'Process')
+        }
         return [pscustomobject]@{ Success = $true; Detail = 'Launcher restart requested.' }
     }
     catch {
@@ -660,37 +668,97 @@ function Start-GuardianReplacementLauncher {
     }
 }
 
+
+$script:GuardianMutex = $null
+function Enter-GuardianMutex {
+    try {
+        $mutex = New-Object System.Threading.Mutex -ArgumentList @($false, 'Local\PC_REHD_Code_X_Guardian')
+        $acquired = $false
+        try {
+            $acquired = [bool]$mutex.WaitOne(0)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            # The previous Guardian died; the OS has already transferred
+            # ownership to this process.
+            $acquired = $true
+        }
+        if (-not $acquired) {
+            $mutex.Dispose()
+            return $false
+        }
+        $script:GuardianMutex = $mutex
+        return $true
+    }
+    catch {
+        Write-GuardianLog ('guardian mutex failed: ' + $_.Exception.Message)
+        return $false
+    }
+}
+
+function Exit-GuardianMutex {
+    $mutex = $script:GuardianMutex
+    $script:GuardianMutex = $null
+    if ($null -eq $mutex) { return }
+    try { [void]$mutex.ReleaseMutex() } catch {}
+    try { $mutex.Dispose() } catch {}
+}
+
 function Invoke-PythonGuardian {
     if (-not $PythonPath) {
         Write-GuardianLog 'guardian stopped: Launcher did not provide PythonPath.'
         return 2
     }
-    $intervalSeconds = 10
-    while (Test-GuardianParentAlive $ParentPid) {
-        $probe = Test-GuardianPythonRuntime $PythonPath
-        if ($probe.Healthy) {
-            if ($GuardianOnce.IsPresent) { return 0 }
-            Start-Sleep -Seconds $intervalSeconds
-            continue
-        }
-        Write-GuardianLog ('runtime failure: ' + $probe.Detail)
-        if ($GuardianOnce.IsPresent) { return 1 }
-        $decision = Request-GuardianRepairDecision $probe.Detail
-        if ($decision -ne 'automatic') {
-            Write-GuardianLog 'user chose manual Python repair.'
-            return 1
-        }
-        if (Test-GuardianParentAlive $ParentPid) {
-            try { Stop-Process -Id $ParentPid -Force -ErrorAction Stop } catch {}
-        }
-        $repair = Invoke-ManagedPythonReinstall
-        Write-GuardianLog ('automatic repair: ' + $repair.Detail)
-        if (-not $repair.Success) { return 1 }
-        $restart = Start-GuardianReplacementLauncher
-        Write-GuardianLog ('launcher restart: ' + $restart.Detail)
-        return $(if ($restart.Success) { 0 } else { 1 })
+    if (-not (Enter-GuardianMutex)) {
+        Write-GuardianLog 'guardian skipped: another Guardian already owns the repair mutex.'
+        return 0
     }
-    return 0
+    $intervalSeconds = 10
+    try {
+        while (Test-GuardianParentAlive $ParentPid) {
+            $probe = Test-GuardianPythonRuntime $PythonPath
+            if ($probe.Healthy) {
+                if ($GuardianOnce.IsPresent) { return 0 }
+                Start-Sleep -Seconds $intervalSeconds
+                continue
+            }
+            Write-GuardianLog ('runtime failure: ' + $probe.Detail)
+            if ($GuardianOnce.IsPresent) { return 1 }
+            $decision = Request-GuardianRepairDecision $probe.Detail
+            if ($decision -ne 'automatic') {
+                Write-GuardianLog 'user chose manual Python repair.'
+                return 1
+            }
+            if (-not (Test-GuardianParentAlive $ParentPid)) {
+                Write-GuardianLog 'guardian repair skipped: Launcher exited before repair.'
+                return 0
+            }
+            try {
+                Stop-Process -Id $ParentPid -Force -ErrorAction Stop
+            }
+            catch {
+                Write-GuardianLog ('could not stop Launcher before repair: ' + $_.Exception.Message)
+                return 1
+            }
+            $stopDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            while ((Test-GuardianParentAlive $ParentPid) -and ([DateTime]::UtcNow -lt $stopDeadline)) {
+                Start-Sleep -Milliseconds 100
+            }
+            if (Test-GuardianParentAlive $ParentPid) {
+                Write-GuardianLog 'guardian repair aborted: Launcher did not exit after Stop-Process.'
+                return 1
+            }
+            $repair = Invoke-ManagedPythonReinstall
+            Write-GuardianLog ('automatic repair: ' + $repair.Detail)
+            if (-not $repair.Success) { return 1 }
+            $restart = Start-GuardianReplacementLauncher
+            Write-GuardianLog ('launcher restart: ' + $restart.Detail)
+            return $(if ($restart.Success) { 0 } else { 1 })
+        }
+        return 0
+    }
+    finally {
+        Exit-GuardianMutex
+    }
 }
 
 if ($Guardian.IsPresent) {

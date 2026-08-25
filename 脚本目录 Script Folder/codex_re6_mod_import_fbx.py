@@ -233,7 +233,7 @@ FVF_LAYOUTS.update(_layouts(0x0CB68015, 0x0CB68016, read_stride=20, position_kin
 FVF_LAYOUTS.update(_layouts(0xA8FAB018, 0xA8FAB019, read_stride=20, position_kind="short", uv_kind="half", uv_offset=16, normal_offset=8, tangent_offset=12, tangent_header_stride=20, skin_kind="single_6"))
 FVF_LAYOUTS.update(_layouts(0xA7D7D036, read_stride=20, position_kind="float", uv_kind="u16", uv_offset=16, normal_offset=12))
 FVF_LAYOUTS.update(_layouts(0xC31F201C, 0xC31F201D, read_stride=24, position_kind="short", uv_kind="half", uv_offset=16, normal_offset=8, tangent_offset=12, tangent_header_stride=24, skin_kind="two_c31"))
-FVF_LAYOUTS.update(_layouts(0xCBF6C01A, read_stride=24, position_kind="short", uv_kind="half", uv_offset=16, normal_offset=8, tangent_offset=12, tangent_header_stride=24, skin_kind="single_7"))
+FVF_LAYOUTS.update(_layouts(0xCBF6C01A, read_stride=24, position_kind="short", uv_kind="half", uv_offset=16, normal_offset=8, tangent_offset=12, tangent_header_stride=24, skin_kind="single_u16_6"))
 FVF_LAYOUTS.update(_layouts(0x207D6037, read_stride=24, position_kind="float", uv_kind="half", uv_offset=16, normal_offset=12))
 FVF_LAYOUTS.update(_layouts(0xD1A47038, read_stride=24, position_kind="float", uv_kind="half", uv_offset=16, uv2_kind="half", uv2_offset=20, normal_offset=12))
 FVF_LAYOUTS.update(_layouts(0xD8297028, read_stride=24, position_kind="float", uv_kind="half", uv_offset=20, normal_offset=12))
@@ -246,7 +246,7 @@ FVF_LAYOUTS.update(_layouts(0xA320C016, 0xA320C017, read_stride=28, position_kin
 FVF_LAYOUTS.update(_layouts(0x49B4F029, read_stride=28, position_kind="float", uv_kind="half", uv_offset=20, uv2_kind="half", uv2_offset=24, normal_offset=12, tangent_offset=16, tangent_header_stride=28))
 FVF_LAYOUTS.update(_layouts(0x0D9E801D, read_stride=28, position_kind="short", uv_kind="zero", normal_offset=8, skin_kind="two_u16_20", create_scene_skin=False))
 FVF_LAYOUTS.update(_layouts(0xA013501E, read_stride=28, position_kind="short", uv_kind="half", uv_offset=16, normal_offset=8, tangent_offset=12, tangent_header_stride=28, skin_kind="two_20"))
-FVF_LAYOUTS.update(_layouts(0xD877801B, read_stride=32, position_kind="short", uv_kind="half", uv_offset=16, uv2_kind="half", uv2_offset=24, normal_offset=8, tangent_offset=12, tangent_header_stride=32, skin_kind="single_7"))
+FVF_LAYOUTS.update(_layouts(0xD877801B, read_stride=32, position_kind="short", uv_kind="half", uv_offset=16, uv2_kind="half", uv2_offset=24, normal_offset=8, tangent_offset=12, tangent_header_stride=32, skin_kind="single_6"))
 FVF_LAYOUTS.update(_layouts(0x747D1031, 0x9399C033, 0x12553032, read_stride=32, position_kind="float", uv_kind="half", uv_offset=20, uv2_kind="half", uv2_offset=24, normal_offset=12))
 FVF_LAYOUTS.update(_layouts(0xB86DE02A, 0x926FD02E, read_stride=32, position_kind="float", uv_kind="half", uv_offset=20, uv2_kind="half", uv2_offset=24, normal_offset=12, tangent_offset=16, tangent_header_stride=32))
 FVF_LAYOUTS.update(_layouts(0xA14E003C, read_stride=32, position_kind="short", uv_kind="zero"))
@@ -733,6 +733,190 @@ def _parse_mesh_headers(data: bytes, header: ModHeader) -> list[MeshHeader]:
     return result
 
 
+def _mod_topology_error(
+    error_code: str,
+    message: str,
+    *,
+    diagnostic: dict[str, Any],
+) -> ValueError:
+    """Build a machine-readable, source-offset-specific MOD topology error."""
+    payload = {
+        "schema": "re6-mod-topology-diagnostic-v1",
+        "status": "ERROR",
+        "error_code": str(error_code),
+        **diagnostic,
+    }
+    error = ValueError(f"{error_code}: {message}")
+    error.diagnostic = payload  # type: ignore[attr-defined]
+    return error
+
+
+def _validate_mod_triangle_topology(
+    data: bytes,
+    header: ModHeader,
+    mesh_headers: Sequence[MeshHeader],
+) -> dict[str, Any]:
+    """Validate the deployed MOD indexed-triangle byte contract.
+
+    MeshHeader.face_count stores index/corner count, not triangle count.  The
+    importer only supports the established 3-index triangle stream for now;
+    this gate prevents malformed input from being silently truncated by an
+    integer division before any vertex or face bytes are consumed.
+    """
+    file_size = len(data)
+    triangle_start = int(header.ptr_triangle)
+    mesh_header_start = int(header.ptr_mesh)
+    declared_index_count = int(header.triangle_count)
+    if triangle_start < 0 or triangle_start > file_size:
+        raise _mod_topology_error(
+            "triangle_pointer_out_of_range",
+            (
+                f"triangle buffer starts at 0x{triangle_start:X}, outside"
+                f" the {file_size}-byte MOD"
+            ),
+            diagnostic={
+                "mesh_slot": 1 if mesh_headers else None,
+                "mesh_header_offset": mesh_header_start if mesh_headers else None,
+                "triangle_start": triangle_start,
+                "triangle_offset": triangle_start,
+                "triangle_end": triangle_start,
+                "triangle_bytes": 0,
+                "remaining_bytes": max(0, file_size - triangle_start),
+                "file_size": file_size,
+                "declared_triangle_count": declared_index_count,
+                "mesh_face_count_total": 0,
+            },
+        )
+
+    cumulative_indices = 0
+    face_counts: list[int] = []
+    for mesh_slot, mesh_header in enumerate(mesh_headers, start=1):
+        face_count = int(mesh_header.face_count)
+        mesh_header_offset = mesh_header_start + (mesh_slot - 1) * MESH_HEADER_STRUCT.size
+        mesh_triangle_start = triangle_start + cumulative_indices * 2
+        if face_count % 3 != 0:
+            raise _mod_topology_error(
+                "face_count_not_multiple_of_3",
+                (
+                    f"Mesh {mesh_slot} at MeshHeader 0x{mesh_header_offset:X}"
+                    f" declares face_count={face_count}; indexed triangle "
+                    f"streams require a multiple of 3"
+                ),
+                diagnostic={
+                    "mesh_slot": mesh_slot,
+                    "face_count": face_count,
+                    "mesh_header_offset": mesh_header_offset,
+                    "triangle_start": mesh_triangle_start,
+                    "triangle_offset": mesh_triangle_start,
+                    "triangle_end": mesh_triangle_start + max(0, face_count) * 2,
+                    "triangle_bytes": max(0, face_count) * 2,
+                    "remaining_bytes": max(0, file_size - mesh_triangle_start),
+                    "file_size": file_size,
+                    "declared_triangle_count": declared_index_count,
+                    "mesh_face_count_total": sum(face_counts) + face_count,
+                },
+            )
+        face_counts.append(face_count)
+        cumulative_indices += face_count
+
+    total_indices = sum(face_counts)
+    if total_indices != declared_index_count:
+        first_header_offset = mesh_header_start if mesh_headers else None
+        raise _mod_topology_error(
+            "triangle_count_mismatch",
+            (
+                f"MOD header triangle_count={declared_index_count} does not"
+                f" match Mesh face_count total={total_indices}"
+            ),
+            diagnostic={
+                "mesh_slot": 1 if mesh_headers else None,
+                "mesh_header_offset": first_header_offset,
+                "triangle_start": triangle_start,
+                "triangle_offset": triangle_start,
+                "triangle_end": triangle_start + total_indices * 2,
+                "triangle_bytes": total_indices * 2,
+                "remaining_bytes": max(0, file_size - triangle_start),
+                "file_size": file_size,
+                "declared_triangle_count": declared_index_count,
+                "mesh_face_count_total": total_indices,
+            },
+        )
+
+    expected_triangle_bytes = total_indices * 2
+    expected_triangle_end = triangle_start + expected_triangle_bytes
+    if expected_triangle_end > file_size:
+        cumulative_indices = 0
+        for mesh_slot, mesh_header in enumerate(mesh_headers, start=1):
+            mesh_header_offset = mesh_header_start + (mesh_slot - 1) * MESH_HEADER_STRUCT.size
+            mesh_triangle_start = triangle_start + cumulative_indices * 2
+            mesh_triangle_end = mesh_triangle_start + int(mesh_header.face_count) * 2
+            if mesh_triangle_end > file_size:
+                raise _mod_topology_error(
+                    "triangle_data_truncated",
+                    (
+                        f"Mesh {mesh_slot} triangle data 0x{mesh_triangle_start:X}"
+                        f"..0x{mesh_triangle_end:X} exceeds the {file_size}-byte MOD"
+                    ),
+                    diagnostic={
+                        "mesh_slot": mesh_slot,
+                        "face_count": int(mesh_header.face_count),
+                        "mesh_header_offset": mesh_header_offset,
+                        "triangle_start": mesh_triangle_start,
+                        "triangle_offset": mesh_triangle_start,
+                        "triangle_end": mesh_triangle_end,
+                        "triangle_bytes": int(mesh_header.face_count) * 2,
+                        "remaining_bytes": max(0, file_size - mesh_triangle_start),
+                        "file_size": file_size,
+                        "declared_triangle_count": declared_index_count,
+                        "mesh_face_count_total": total_indices,
+                    },
+                )
+            cumulative_indices += int(mesh_header.face_count)
+        # The per-Mesh loop above should identify every truncation. Keep this
+        # final branch defensive for an empty or concurrently changed header.
+        raise _mod_topology_error(
+            "triangle_data_truncated",
+            f"triangle buffer ends at 0x{expected_triangle_end:X}, beyond file size {file_size}",
+            diagnostic={
+                "mesh_slot": None,
+                "mesh_header_offset": None,
+                "triangle_start": triangle_start,
+                "triangle_offset": triangle_start,
+                "triangle_end": expected_triangle_end,
+                "triangle_bytes": expected_triangle_bytes,
+                "remaining_bytes": max(0, file_size - triangle_start),
+                "file_size": file_size,
+                "declared_triangle_count": declared_index_count,
+                "mesh_face_count_total": total_indices,
+            },
+        )
+
+    return {
+        "schema": "re6-mod-topology-diagnostic-v1",
+        "status": "OK",
+        "error_code": "",
+        "mesh_count": len(mesh_headers),
+        "declared_triangle_count": declared_index_count,
+        "mesh_face_count_total": total_indices,
+        "triangle_start": triangle_start,
+        "triangle_end": expected_triangle_end,
+        "triangle_bytes": expected_triangle_bytes,
+        "remaining_bytes": max(0, file_size - expected_triangle_end),
+        "file_size": file_size,
+    }
+
+
+def _triangle_count_from_face_count(face_count: int, *, strict: bool) -> int:
+    """Convert an index/corner count to triangles after an explicit gate."""
+    index_count = int(face_count)
+    triangle_count, remainder = divmod(index_count, 3)
+    if strict and remainder:
+        raise ValueError(
+            f"MOD face_count={index_count} is not divisible by 3; topology must be validated first"
+        )
+    return max(0, triangle_count)
+
+
 def _parse_bone_map_rows(data: bytes, header: ModHeader) -> list[list[int]]:
     if header.bone_map_count <= 0:
         return []
@@ -1057,6 +1241,7 @@ def _parse_meshes(
     mesh_start_index: int = 0,
     mesh_end_index: int | None = None,
     display_map: Sequence[int] | None = None,
+    validate_topology: bool = False,
 ) -> tuple[list[ParsedMesh], list[int]]:
     normalized_fix_mode = _normalize_fix_processing_mode(fix_processing_mode)
     start_index = int(mesh_start_index)
@@ -1070,9 +1255,11 @@ def _parse_meshes(
         display_map = _find_cdxm_display_map(data, header)
     else:
         display_map = [int(value) for value in display_map]
+    if validate_topology:
+        _validate_mod_triangle_topology(data, header, mesh_headers)
     bone_map_rows = _parse_bone_map_rows(data, header)
     face_cursor = int(header.ptr_triangle) + sum(
-        max(0, int(item.face_count) // 3) * 6
+        _triangle_count_from_face_count(int(item.face_count), strict=validate_topology) * 6
         for item in mesh_headers[:start_index]
     )
     parsed: list[ParsedMesh] = []
@@ -1183,7 +1370,10 @@ def _parse_meshes(
                 fbx_weights.append(semantic_weights)
         faces: list[list[int]] = []
         invalid_faces = 0
-        triangle_count = mesh_header.face_count // 3
+        triangle_count = _triangle_count_from_face_count(
+            int(mesh_header.face_count),
+            strict=validate_topology,
+        )
         for triangle_index in range(triangle_count):
             raw = _read_int(data, face_cursor, "<3H", f"Mesh {mesh_index} face {triangle_index}")
             face_cursor += 6
@@ -1380,6 +1570,9 @@ def _mod_full_scan_summary(scan: dict[str, Any]) -> dict[str, int]:
             for row in meshes
             if isinstance(row.get("faces"), list)
         ),
+        "topology_diagnostic_count": len(
+            scan.get("topology_diagnostics", [])
+        ),
         "unrecorded_or_partial_region_count": len(
             scan.get("unrecorded_or_partial_regions", [])
         ),
@@ -1428,6 +1621,7 @@ def scan_mod_file_observables(mod_path: str | Path) -> dict[str, Any]:
         "mtp": [],
         "root_mesh_scale": [],
         "meshes": [],
+        "topology_diagnostics": [],
         "unrecorded_or_partial_regions": [],
         "raw_binary": data,
     }
@@ -1502,7 +1696,7 @@ def scan_mod_file_observables(mod_path: str | Path) -> dict[str, Any]:
             _mod_full_scan_section(
                 "triangle_buffer",
                 int(header.ptr_triangle),
-                int(header.triangle_count) * 6,
+                int(header.triangle_count) * 2,
                 len(data),
             ),
             _mod_full_scan_section(
@@ -1544,6 +1738,29 @@ def scan_mod_file_observables(mod_path: str | Path) -> dict[str, Any]:
             requested_bytes=int(header.mesh_count) * MESH_HEADER_STRUCT.size,
             available_bytes=max(0, len(data) - int(header.ptr_mesh)),
         )
+
+    try:
+        scan["topology"] = _validate_mod_triangle_topology(
+            data, header, mesh_headers
+        )
+    except Exception as exc:
+        diagnostic = getattr(exc, "diagnostic", None)
+        if isinstance(diagnostic, dict):
+            scan["topology_diagnostics"].append(dict(diagnostic))
+            _mod_full_scan_record_gap(
+                scan,
+                "triangle_topology",
+                exc,
+                offset=int(
+                    diagnostic.get("triangle_offset", header.ptr_triangle)
+                ),
+                requested_bytes=int(diagnostic.get("triangle_bytes", 0) or 0),
+                available_bytes=int(
+                    diagnostic.get("remaining_bytes", 0) or 0
+                ),
+            )
+        else:
+            _mod_full_scan_record_gap(scan, "triangle_topology", exc)
 
     material_rows = _mod_full_scan_rows(
         data,
@@ -1765,6 +1982,12 @@ def write_mod_full_scan_report(
         handle.write("\n[MESH_HEADERS]\n")
         for index, row in enumerate(scan.get("mesh_headers", []), start=1):
             handle.write(f"MESH_HEADER[{index:04d}]\n")
+            _write_mod_full_scan_mapping(handle, dict(row))
+        handle.write("\n[TOPOLOGY_DIAGNOSTICS]\n")
+        for index, row in enumerate(
+            scan.get("topology_diagnostics", []), start=1
+        ):
+            handle.write(f"TOPOLOGY[{index:04d}]\n")
             _write_mod_full_scan_mapping(handle, dict(row))
         handle.write("\n[MESHES]\n")
         for index, row in enumerate(scan.get("meshes", []), start=1):
@@ -2405,6 +2628,9 @@ def build_import_scene(
     header = _parse_header(data)
     bounds, preamble = _read_bounds_and_preamble(data)
     mesh_headers = _parse_mesh_headers(data, header)
+    # Gate the complete indexed-triangle region before parsing bones or Mesh
+    # payloads.  A malformed face_count must never be silently truncated.
+    _validate_mod_triangle_topology(data, header, mesh_headers)
     bones, mtp, mesh_scale = _parse_bones(data, header)
     meshes, display_map = _parse_meshes(
         data,
@@ -2416,6 +2642,7 @@ def build_import_scene(
         fix_processing_mode=normalized_fix_mode,
         include_normals=include_normals,
         blender_compact_mesh_names=bool(blender_compact_mesh_names),
+        validate_topology=False,
     )
     source_hash = hashlib.sha256(data).hexdigest()
     scene = {
@@ -4279,6 +4506,38 @@ def _normal_route_identity_payload(route: dict[str, Any]) -> dict[str, Any]:
     return identity
 
 
+def _artifact_path_identity(path: Path) -> str:
+    """Return the case-insensitive lexical identity used by the artifact guard."""
+    return os.path.normcase(os.path.normpath(str(path))).casefold()
+
+
+def _raise_artifact_path_collision(artifacts: dict[str, Path]) -> None:
+    identities: dict[str, list[str]] = {}
+    for name, path in artifacts.items():
+        identities.setdefault(_artifact_path_identity(path), []).append(name)
+    collisions = [names for names in identities.values() if len(names) > 1]
+    if not collisions:
+        return
+    collision_names = [name for names in collisions for name in names]
+    collision_text = "; ".join(
+        "/".join(names) + "=" + str(artifacts[names[0]])
+        for names in collisions
+    )
+    diagnostic = {
+        "schema": "re6-import-artifact-path-diagnostic-v1",
+        "status": "ERROR",
+        "error_code": "artifact_path_collision",
+        "artifact_path_collision": True,
+        "colliding_artifacts": collision_names,
+        "paths": {name: str(path) for name, path in artifacts.items()},
+    }
+    error = ValueError(
+        f"artifact_path_collision: normalized artifact paths must be distinct ({collision_text})"
+    )
+    error.diagnostic = diagnostic  # type: ignore[attr-defined]
+    raise error
+
+
 def _build_import_artifacts_impl(
     mod_path: str | Path,
     output_fbx: str | Path,
@@ -4299,9 +4558,16 @@ def _build_import_artifacts_impl(
 ) -> dict[str, Any]:
     """Atomically build the FBX, mandatory normal route and full manifest."""
     output = _windows_lexical_full_path(output_fbx)
-    output.parent.mkdir(parents=True, exist_ok=True)
     route_path = _windows_lexical_full_path(normal_route_path) if normal_route_path else default_normal_route_path(output)
     manifest = _windows_lexical_full_path(manifest_path) if manifest_path else default_manifest_path(output)
+    _raise_artifact_path_collision(
+        {
+            "output_fbx": output,
+            "normal_route": route_path,
+            "manifest": manifest,
+        }
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
     scene = build_import_scene(
         mod_path,
         include_normals=include_normals,
@@ -4659,7 +4925,7 @@ def _guard_build_mesh_route_mod(*, display_slot: int = 37) -> bytes:
     MOD_HEADER_STRUCT.pack_into(
         data, 6,
         1, 1, 0,
-        3, 1, 0, 60, 0, 0,
+        3, 3, 0, 60, 0, 0,
         bone_ptr, 0, 0, mesh_ptr, vertex_ptr, triangle_ptr, end_size,
     )
     struct.pack_into(
@@ -4991,6 +5257,8 @@ def run_import_maintenance_regression_suite() -> dict[str, Any]:
 
         expected_skin_kinds = {
             0x0CB68015: "single_6",
+            0xD877801B: "single_6",
+            0xCBF6C01A: "single_u16_6",
             0x667B1019: "single_u16_6",
             0x0D9E801D: "two_u16_20",
             0xDA55A021: "legacy4",
@@ -5151,6 +5419,10 @@ def run_import_maintenance_regression_suite() -> dict[str, Any]:
         struct.pack_into("<H", single_667, 6, 5)
         if _decode_skin_row(bytes(single_667), FVF_LAYOUTS[0x667B1019].skin_kind) != ([6], [1.0]):
             raise AssertionError("667 ushort lane is an authoritative one-bone Skin field")
+        single_cbf6 = bytearray(24)
+        struct.pack_into("<H", single_cbf6, 6, 5)
+        if _decode_skin_row(bytes(single_cbf6), FVF_LAYOUTS[0xCBF6C01A].skin_kind) != ([6], [1.0]):
+            raise AssertionError("CBF6 u16 lane is an authoritative one-bone Skin field")
         dual_0d9e = bytearray(28)
         struct.pack_into("<h2x", dual_0d9e, 6, 0)
         struct.pack_into("<2H", dual_0d9e, 20, 2, 3)
@@ -6528,6 +6800,9 @@ def main(argv: list[str] | None = None) -> int:
             "detail": str(exc),
             "contract_revision": IMPORT_MODULE_CONTRACT_REVISION,
         }
+        diagnostic = getattr(exc, "diagnostic", None)
+        if isinstance(diagnostic, dict):
+            result["diagnostic"] = dict(diagnostic)
         exit_code = 1
     result["python_elapsed_ms"] = int(round((time.perf_counter() - started) * 1000.0))
     if args.status:

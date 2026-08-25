@@ -1188,6 +1188,19 @@ def _binary_fbx_normal_fidelity_audit(
     return payload
 
 
+def _disable_ufbx_normal_sources(audit: dict[str, Any]) -> dict[str, Any]:
+    """Mark the legacy UFBX normal streams as intentionally unused."""
+    payload = dict(audit)
+    if str(payload.get("status", "") or "") != "exact":
+        payload.update(
+            {
+                "normal_source": "disabled_ufbx_vertex_normals",
+                "skinned_normal_source": "disabled_ufbx_skinned_normals",
+            }
+        )
+    return payload
+
+
 def _select_binary_fbx_corner_geometry(
     mesh: Any,
     context: dict[str, Any] | None,
@@ -2292,7 +2305,9 @@ def _extract_mesh_geometry_from_binary_corner_layers(
             )
 
         skinned_positions_src = _get_mesh_skinned_vec3_rows(mesh, "skinned_position", "skinned_positions")
-        skinned_normals_src = _get_mesh_skinned_vec3_rows(mesh, "skinned_normal", "skinned_normals")
+        # Exact corner normals come from the raw FBX bytes.  Do not replace
+        # them with UFBX's optional skinned normal stream.
+        skinned_normals_src: list[Any] = []
         skinned_is_local = _coerce_bool(getattr(mesh, "skinned_is_local", None), False)
         vertex_count = int(getattr(mesh, "num_vertices", len(positions_src)) or len(positions_src))
         index_count = len(geom_indices)
@@ -2486,28 +2501,16 @@ def _extract_mesh_geometry(
         if isinstance(strict_geometry, dict):
             return strict_geometry
         fallback_audit = strict_audit
-    if (
-        FBX_PROBE_ACCEL is not None
-        and getattr(FBX_PROBE_ACCEL, "BOOTSTRAP_ACCELERATOR_CONTRACT_REVISION", 0)
-        == REQUIRED_FBX_ACCELERATOR_CONTRACT_REVISION
-        and getattr(FBX_PROBE_ACCEL, "PRESERVES_CORNER_NORMALS", False)
-        and getattr(FBX_PROBE_ACCEL, "PRESERVES_RE6_NORMAL_BYTES", False)
-        and getattr(FBX_PROBE_ACCEL, "USES_INVERSE_TRANSPOSE_NORMALS", False)
-        and hasattr(FBX_PROBE_ACCEL, "extract_mesh_geometry")
-    ):
-        try:
-            accel_geometry = FBX_PROBE_ACCEL.extract_mesh_geometry(mesh, instance_node=instance_node)
-        except Exception:
-            accel_geometry = None
-        if isinstance(accel_geometry, dict):
-            geometry = _restore_max_space_geometry(accel_geometry, mesh, instance_node)
-            geometry["normal_fidelity"] = fallback_audit
-            return geometry
+    # The binary corner reader is the only accepted normal source.  Keep the
+    # legacy UFBX/accelerator geometry route out of this fallback until a real
+    # ambiguous FBX proves a safe mapping; positions and UVs still use the
+    # ordinary compatibility extraction below.
+    fallback_audit = _disable_ufbx_normal_sources(fallback_audit)
 
     positions_src = getattr(mesh, "vertex_positions", None)
-    normals_src = getattr(mesh, "vertex_normals", None)
+    normals_src = None
     skinned_positions_src = _get_mesh_skinned_vec3_rows(mesh, "skinned_position", "skinned_positions")
-    skinned_normals_src = _get_mesh_skinned_vec3_rows(mesh, "skinned_normal", "skinned_normals")
+    skinned_normals_src: list[Any] = []
     skinned_is_local = _coerce_bool(getattr(mesh, "skinned_is_local", None), False)
     uvs_src = getattr(mesh, "vertex_uvs", None)
     indices_src = getattr(mesh, "indices", None)

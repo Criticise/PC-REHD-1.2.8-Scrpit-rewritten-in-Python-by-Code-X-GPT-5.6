@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 from contextlib import contextmanager
 import hashlib
 import importlib
@@ -9628,6 +9629,13 @@ HEALTH_SUPERVISOR_LIGHTWEIGHT_IMPORTS = (
     "codex_re6_auxiliary_max_bridge",
 )
 
+# Source syntax checks run on every supervisor heartbeat. Keep the compiled
+# result keyed by file identity so an unchanged multi-megabyte Launcher does
+# not get read, parsed, and hashed again every 20 seconds.
+_HEALTH_SUPERVISOR_SOURCE_REPORT_CACHE: dict[
+    tuple[str, bool, int, int], dict[str, object]
+] = {}
+
 
 def _health_supervisor_timestamp() -> dict[str, object]:
     now = time.time()
@@ -9652,33 +9660,64 @@ def _health_supervisor_source_report() -> dict[str, object]:
     errors: list[str] = []
     for label, name in HEALTH_SUPERVISOR_WATCHED_SOURCES.items():
         path = BASE_DIR / name
-        item: dict[str, object] = {"path": str(path), "exists": path.is_file()}
-        if path.is_file() is not True:
-            item["status"] = "FAIL"
-            item["error"] = "source file is missing"
-            files[label] = item
-            errors.append(f"{label}: source file is missing")
-            continue
+        path_text = str(path)
         try:
-            source = path.read_bytes()
-            compile(source, str(path), "exec")
-            item.update(
-                {
-                    "status": "PASS",
-                    "bytes": len(source),
-                    "sha256": hashlib.sha256(source).hexdigest().upper(),
-                }
-            )
-        except Exception as exc:
-            item.update(
-                {
-                    "status": "FAIL",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "traceback": traceback.format_exc(),
-                }
-            )
-            errors.append(f"{label}: {item['error']}")
+            stat_result = path.stat()
+            exists = path.is_file()
+            file_size = int(stat_result.st_size) if exists else 0
+            file_mtime_ns = int(
+                getattr(
+                    stat_result,
+                    "st_mtime_ns",
+                    round(float(stat_result.st_mtime) * 1_000_000_000),
+                )
+            ) if exists else 0
+        except OSError:
+            exists = False
+            file_size = 0
+            file_mtime_ns = 0
+
+        cache_key = (path_text, exists, file_size, file_mtime_ns)
+        cached_item = _HEALTH_SUPERVISOR_SOURCE_REPORT_CACHE.get(cache_key)
+        if cached_item is not None:
+            item = copy.deepcopy(cached_item)
+        else:
+            item = {"path": path_text, "exists": exists}
+            if not exists:
+                item["status"] = "FAIL"
+                item["error"] = "source file is missing"
+            else:
+                try:
+                    source = path.read_bytes()
+                    compile(source, path_text, "exec")
+                    item.update(
+                        {
+                            "status": "PASS",
+                            "bytes": len(source),
+                            "sha256": hashlib.sha256(source).hexdigest().upper(),
+                        }
+                    )
+                except Exception as exc:
+                    item.update(
+                        {
+                            "status": "FAIL",
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "traceback": traceback.format_exc(),
+                        }
+                    )
+            # Keep only the current identity for each path while retaining the
+            # full identity in the key for precise invalidation semantics.
+            stale_keys = [
+                key
+                for key in _HEALTH_SUPERVISOR_SOURCE_REPORT_CACHE
+                if key[0] == path_text and key != cache_key
+            ]
+            for stale_key in stale_keys:
+                _HEALTH_SUPERVISOR_SOURCE_REPORT_CACHE.pop(stale_key, None)
+            _HEALTH_SUPERVISOR_SOURCE_REPORT_CACHE[cache_key] = copy.deepcopy(item)
         files[label] = item
+        if item.get("status") == "FAIL":
+            errors.append(f"{label}: {item.get('error', 'source check failed')}")
     return {"status": "PASS" if not errors else "FAIL", "files": files, "errors": errors}
 
 
@@ -9883,7 +9922,10 @@ def _run_operation_domain_isolation_regression_guard() -> dict[str, object]:
 
 # One resident supervisor per Launcher owns diagnosis and writes one classified
 # error-only TXT. Normal operation receipts stay in named Windows memory.
-HEALTH_SUPERVISOR_LOG_FILE_NAME = "PC_REHD_Code_X_Bootstrap_Health.txt"
+# The Bootstrap supervisor has one public human-readable health artifact.
+# Keep this in sync with the Launcher TXT contract; the Launcher still
+# migrates the pre-existing legacy name on startup.
+HEALTH_SUPERVISOR_LOG_FILE_NAME = "Bootstrap RE6 Script Health check 脚本健康度日志.txt"
 HEALTH_SUPERVISOR_LOG_RETENTION_SECONDS = 10.0 * 24.0 * 60.0 * 60.0
 _HEALTH_SUPERVISOR_EVENT_HANDLES: dict[tuple[int, str], int] = {}
 HEALTH_SUPERVISOR_FAILURE_RECEIPT_BYTES = 64 * 1024
@@ -10317,6 +10359,22 @@ def _health_supervisor_find_active_receipt(
         for index, receipt in enumerate(active):
             if str(receipt.get("request_id", "") or "") == request_id:
                 return index
+        # During the request-token migration an already-running Launcher may
+        # finish with its inner Max request ID while the active receipt still
+        # contains the old token. Only recover when the action/PID identifies
+        # exactly one active receipt; never guess across concurrent operations.
+        action = str(payload.get("action", "unknown") or "unknown").casefold()
+        max_process_id = max(0, int(payload.get("max_process_id", 0) or 0))
+        candidates = [
+            index
+            for index, receipt in enumerate(active)
+            if (
+                str(receipt.get("action", "unknown") or "unknown").casefold() == action
+                and max(0, int(receipt.get("max_process_id", 0) or 0)) == max_process_id
+            )
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
         return -1
     action = str(payload.get("action", "unknown") or "unknown").casefold()
     max_process_id = max(0, int(payload.get("max_process_id", 0) or 0))
