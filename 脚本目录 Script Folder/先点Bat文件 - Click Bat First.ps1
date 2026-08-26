@@ -775,7 +775,6 @@ try {
         'codex_re6_mod_import_fbx.py',
         'codex_fbx_probe.py',
         'codex_re6_tex_decode.py',
-        'codex_re6_auxiliary_max_bridge.py',
         'PC-REHD Code X Launcher.py'
     )
     $missingSources = @($requiredSources | Where-Object { -not (Test-Path -LiteralPath (Join-Path $scriptRoot $_) -PathType Leaf) })

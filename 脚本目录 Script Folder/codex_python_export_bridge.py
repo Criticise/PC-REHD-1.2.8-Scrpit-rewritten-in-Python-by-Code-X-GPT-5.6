@@ -1848,10 +1848,15 @@ def _get_semantic_row(mesh: dict[str, Any], key: str, index: int) -> Any:
 # verified Skin evaluation.  Raw object rows are not a fallback authority here.
 BONES_PLUS_MESH_FBX_WORLD_GEOMETRY_AUTHORITY = "fbx_probe_binary_cluster_skinned_max_positions_v4"
 BONES_PLUS_MESH_FBX_SKIN_EVALUATION_STATUS = "binary_cluster_evaluated"
+MAX_FBX_POSITION_AUTHORITY = "skinned_max_positions"
 
 
 def _mesh_requires_bones_plus_mesh_fbx_world_authority(mesh: dict[str, Any]) -> bool:
     return _as_bool(mesh.get("requires_fbx_world_geometry_authority"), False)
+
+
+def _mesh_uses_max_fbx_skinned_position_authority(mesh: dict[str, Any]) -> bool:
+    return str(mesh.get("fbx_position_authority", "") or "") == MAX_FBX_POSITION_AUTHORITY
 
 
 def _copy_final_geometry_rows(rows: Any, *, field: str) -> list[list[float]]:
@@ -1982,6 +1987,12 @@ def _get_semantic_position_rows(mesh: dict[str, Any]) -> list[Any]:
         # The authority projects raw FBX Mesh rows into Max coordinates once.
         # Return a copy so later compatibility passes cannot mutate the authority.
         return _copy_final_geometry_rows(authority.get("mod_write_positions"), field="mod_write_positions")
+    if _mesh_uses_max_fbx_skinned_position_authority(mesh):
+        skinned_max_positions = mesh.get(MAX_FBX_POSITION_AUTHORITY)
+        if not isinstance(skinned_max_positions, list) or not skinned_max_positions:
+            raise ValueError("Max FBX Mesh is missing its sole skinned_max_positions authority")
+        return skinned_max_positions
+    # Non-Max routes only. Explicit Max routes must use skinned_max_positions.
     max_positions = mesh.get("max_positions")
     if isinstance(max_positions, list):
         return max_positions
@@ -2003,6 +2014,8 @@ def _get_semantic_world_position_rows(mesh: dict[str, Any]) -> list[Any]:
             world_positions,
             field="mod_write_world_positions",
         )
+    if _mesh_uses_max_fbx_skinned_position_authority(mesh):
+        return _get_semantic_position_rows(mesh)
     world_positions = mesh.get("world_positions")
     if isinstance(world_positions, list):
         return world_positions
@@ -12528,7 +12541,7 @@ def _build_export_aligned_source_max_position_rows(
         return [list(row) for row in source_rows]
 
     aligned_rows: list[list[float]] = []
-    fallback_rows = mesh.get("max_positions") if isinstance(mesh.get("max_positions"), list) else []
+    fallback_rows = _get_semantic_position_rows(mesh)
     for export_index, source_vertex in enumerate(source_vertex_indices):
         try:
             source_row_index = int(source_vertex)
@@ -14693,6 +14706,7 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
         return {"status": "probe_unavailable", "fbx_path": str(fbx_path)}
     max_snapshot = _build_source_mesh_index(job, source_mesh_headers)
     contract_extract_error = ""
+    route_models: Any = None
     try:
         if hasattr(probe, "probe_fbx_handoff"):
             handoff_payload = probe.probe_fbx_handoff(fbx_path, max_snapshot=max_snapshot)
@@ -14701,6 +14715,7 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
             contract_meshes = handoff_payload.get("contract_meshes")
             fbx_axes = handoff_payload.get("fbx_axes")
             normal_fidelity = handoff_payload.get("normal_fidelity")
+            route_models = handoff_payload.get("route_models")
         else:
             summary = probe.summarize_fbx(fbx_path)
             compare = probe.compare_fbx_to_max_snapshot(summary, max_snapshot)
@@ -14712,6 +14727,8 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
                     contract_meshes = probe.extract_fbx_mesh_contracts(fbx_path)
                 except Exception as exc:
                     contract_extract_error = str(exc)
+            if hasattr(probe, "extract_fbx_route_model_observations"):
+                route_models = probe.extract_fbx_route_model_observations(fbx_path)
     except Exception as exc:
         if isinstance(exc, (ImportError, ModuleNotFoundError)) or _as_bool(
             getattr(exc, "runtime_retryable", False),
@@ -14780,6 +14797,10 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
         payload["normal_fidelity"] = [
             dict(row) for row in normal_fidelity if isinstance(row, dict)
         ]
+    if isinstance(route_models, list):
+        payload["route_models"] = [
+            dict(row) for row in route_models if isinstance(row, dict)
+        ]
     if contract_extract_error != "":
         payload["contract_extract_error"] = contract_extract_error
     return payload
@@ -14799,48 +14820,6 @@ def _max_fbx_route_protocol_is_required(
         == "Model/Properties70/UDP3DSMAX"
         and marker.get("restored") is True
     )
-
-
-def _validate_max_fbx_route_contract(
-    job: dict[str, Any],
-    contract_meshes: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Require an unambiguous UDP3DSMAX route marker for each Max Modify Mesh."""
-    expected_handles = sorted(
-        {
-            _int_or_default(mesh.get("scene_node_handle"), 0)
-            for mesh in job.get("meshes", [])
-            if isinstance(mesh, dict)
-            and str(mesh.get("lane", "") or "").lower() == "modify"
-            and not _mesh_uses_source_geometry(mesh)
-            and _int_or_default(mesh.get("scene_node_handle"), 0) > 0
-        }
-    )
-    routes: dict[int, list[dict[str, Any]]] = {}
-    for mesh in contract_meshes:
-        if not isinstance(mesh, dict):
-            continue
-        route_handle = _int_or_default(mesh.get("fbx_route_handle"), 0)
-        if route_handle > 0:
-            routes.setdefault(route_handle, []).append(mesh)
-    missing = [handle for handle in expected_handles if handle not in routes]
-    ambiguous = [handle for handle in expected_handles if len(routes.get(handle, [])) != 1]
-    if missing or ambiguous:
-        detail: list[str] = []
-        if missing:
-            detail.append("missing=" + ", ".join(str(handle) for handle in missing))
-        if ambiguous:
-            detail.append("ambiguous=" + ", ".join(str(handle) for handle in ambiguous))
-        raise ValueError(
-            "Max FBX route protocol mismatch (expected CodexRe6FbxRouteHandle in "
-            "UDP3DSMAX): " + " | ".join(detail)
-        )
-    return {
-        "status": "PASS",
-        "protocol": "CodexRe6FbxRouteHandle/UDP3DSMAX",
-        "expected_handles": expected_handles,
-        "matched_handles": expected_handles,
-    }
 
 
 def _ensure_contract_meshes(job: dict[str, Any], contract: dict[str, Any]) -> list[dict[str, Any]]:
@@ -15719,6 +15698,74 @@ def _run_same_name_fbx_handle_regression_guard() -> dict[str, Any]:
     }
 
 
+def _run_max_fbx_skinned_position_authority_regression_guard() -> dict[str, Any]:
+    """Prove Max FBX routes can write only Probe Skin-evaluated Max positions."""
+    target = {
+        "lane": "modify",
+        "mesh_slot": 15,
+        "scene_node": "Mesh_015",
+        "scene_node_handle": 4242,
+    }
+    wrong_probe_max_positions = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]
+    expected_skinned_max_positions = [
+        [10.0, 20.0, 30.0],
+        [40.0, 50.0, 60.0],
+        [70.0, 80.0, 90.0],
+    ]
+    fbx_mesh = {
+        "node_name": "Mesh_015",
+        "fbx_route_handle": 4242,
+        "positions": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]],
+        "max_positions": wrong_probe_max_positions,
+        "skinned_max_positions": expected_skinned_max_positions,
+        "face_indices": [0, 1, 2],
+    }
+    job = {"meshes": [dict(target)]}
+    contract = {"meshes": [dict(target)]}
+    _merge_fbx_contract_meshes(
+        job,
+        contract,
+        [],
+        [fbx_mesh],
+        require_explicit_route=True,
+    )
+    merged = contract["meshes"][0]
+    if "max_positions" in merged:
+        raise RuntimeError(
+            "Max FBX position authority regression: Probe max_positions survived the bridge"
+        )
+    if _get_semantic_position_rows(merged) != expected_skinned_max_positions:
+        raise RuntimeError(
+            "Max FBX position authority regression: Writer did not select skinned_max_positions"
+        )
+
+    missing_skin_mesh = dict(fbx_mesh)
+    missing_skin_mesh.pop("skinned_max_positions")
+    try:
+        _merge_fbx_contract_meshes(
+            {"meshes": [dict(target)]},
+            {"meshes": [dict(target)]},
+            [],
+            [missing_skin_mesh],
+            require_explicit_route=True,
+        )
+    except ValueError as exc:
+        if "skinned_max_positions" not in str(exc):
+            raise RuntimeError(
+                "Max FBX position authority regression: missing Skin Max failure was unclear"
+            ) from exc
+    else:
+        raise RuntimeError(
+            "Max FBX position authority regression: missing skinned_max_positions was accepted"
+        )
+    return {
+        "status": "PASS",
+        "probe_max_positions_forbidden": True,
+        "sole_position_authority": "skinned_max_positions",
+        "missing_authority_rejected": True,
+    }
+
+
 def _header_tokens_from_scene_name(scene_name: Any) -> dict[str, int | None]:
     return {
         field: _extract_scene_node_int_token(scene_name, token_prefix)
@@ -15924,10 +15971,22 @@ def _apply_fbx_probe_topology_routes(
     contract: dict[str, Any],
     fbx_contract_meshes: list[dict[str, Any]],
     *,
+    fbx_model_observations: list[dict[str, Any]] | None = None,
     require_explicit_route: bool,
 ) -> dict[str, Any]:
     """Apply Modify routes from FBX topology, never from DCC scene metadata."""
     by_route_handle, by_slot, by_name = _build_fbx_contract_lookup(fbx_contract_meshes)
+    models_by_route_handle: dict[int, dict[str, Any] | None] = {}
+    for observation in fbx_model_observations or []:
+        if not isinstance(observation, dict):
+            continue
+        observation_handle = _int_or_default(observation.get("fbx_route_handle"), 0)
+        if observation_handle <= 0:
+            continue
+        if observation_handle in models_by_route_handle:
+            models_by_route_handle[observation_handle] = None
+        else:
+            models_by_route_handle[observation_handle] = observation
     job_by_handle = {
         _int_or_default(row.get("scene_node_handle"), 0): row
         for row in job.get("meshes", [])
@@ -15953,6 +16012,44 @@ def _apply_fbx_probe_topology_routes(
         reference_vertices = _int_or_default(mesh.get("scene_vertex_count_reference"), 0)
         reference_faces = _int_or_default(mesh.get("scene_face_count_reference"), 0)
         if not isinstance(matched, dict):
+            model_observation = models_by_route_handle.get(handle)
+            max_model_null = (
+                require_explicit_route
+                and isinstance(model_observation, dict)
+                and str(model_observation.get("fbx_model_type", "") or "").strip().casefold()
+                == "null"
+                and not _as_bool(model_observation.get("fbx_geometry_connected"), False)
+            )
+            if max_model_null:
+                # 3ds Max-specific FBX semantic: Model Null is a node without
+                # Geometry. The Launcher receipt owns Header/Delete/Modify; a
+                # Null received in Modify therefore becomes Header Only.
+                for target in targets:
+                    target["fbx_model_type"] = "Null"
+                    target["fbx_geometry_connected"] = False
+                    target["fbx_vertex_count"] = 0
+                    target["fbx_face_count"] = 0
+                    target["auto_header_only"] = True
+                    target["source_passthrough"] = True
+                    target["source_fallback_reason"] = ""
+                    target["requires_selected_fbx"] = False
+                    target["topology_authority"] = "fbx_probe_binary_model"
+                    target["fbx_topology_route"] = "max_model_null_header_only"
+                rows.append(
+                    {
+                        "scene_node_handle": handle,
+                        "scene_node": str(mesh.get("scene_node", "") or ""),
+                        "status": "ok",
+                        "route": "max_model_null_header_only",
+                        "scene_has_skin": reference_skin,
+                        "scene_vertex_count": reference_vertices,
+                        "scene_face_count": reference_faces,
+                        "fbx_model_type": "Null",
+                        "fbx_geometry_connected": False,
+                        "mismatch_fields": [],
+                    }
+                )
+                continue
             rows.append(
                 {
                     "scene_node_handle": handle,
@@ -15980,6 +16077,9 @@ def _apply_fbx_probe_topology_routes(
             use_source = True
         elif not fbx_skin and fbx_faces > 0:
             route = "unskinned_with_fbx_faces"
+            use_source = True
+        elif not fbx_skin:
+            route = "unskinned_without_fbx_faces"
             use_source = True
         else:
             route = "fbx_geometry"
@@ -16080,6 +16180,7 @@ def _run_fbx_probe_topology_authority_regression_guard() -> dict[str, Any]:
         if (
             routed.get("fbx_topology_route") != expected_route
             or _as_bool(routed.get("source_passthrough"), False) is not expect_source
+            or _as_bool(routed.get("auto_header_only"), False) is not expect_source
             or _as_bool(routed.get("requires_selected_fbx"), False) is expect_source
             or not receipt.get("rows", [{}])[0].get("mismatch_fields")
         ):
@@ -16118,11 +16219,128 @@ def _run_fbx_probe_topology_authority_regression_guard() -> dict[str, Any]:
         expected_route="unskinned_with_fbx_faces",
         expect_source=True,
     )
+    route_case(
+        scene_skin=True,
+        scene_vertices=3,
+        scene_faces=1,
+        fbx_skin=False,
+        fbx_vertices=0,
+        fbx_faces=0,
+        expected_route="unskinned_without_fbx_faces",
+        expect_source=True,
+    )
+
+    for scene_skin in (False, True):
+        null_mesh = {
+            "lane": "modify",
+            "scene_node": "Mesh_001_14D40020_LODx255_MatID:80_Group:0_DisplayMode:3_Type:65015",
+            "scene_node_handle": 4242,
+            "mesh_slot": 1,
+            "scene_has_skin_reference": scene_skin,
+            "scene_vertex_count_reference": 0,
+            "scene_face_count_reference": 0,
+            "auto_header_only": False,
+            "source_passthrough": False,
+            "requires_selected_fbx": True,
+        }
+        null_job = {"meshes": [copy.deepcopy(null_mesh)]}
+        null_contract = {"meshes": [copy.deepcopy(null_mesh)]}
+        null_receipt = _apply_fbx_probe_topology_routes(
+            null_job,
+            null_contract,
+            [],
+            fbx_model_observations=[
+                {
+                    "fbx_model_id": 9001,
+                    "fbx_model_name": null_mesh["scene_node"],
+                    "fbx_model_type": "Null",
+                    "fbx_route_handle": 4242,
+                    "fbx_geometry_connected": False,
+                }
+            ],
+            require_explicit_route=True,
+        )
+        null_routed = null_contract["meshes"][0]
+        if (
+            null_routed.get("fbx_topology_route") != "max_model_null_header_only"
+            or not _as_bool(null_routed.get("auto_header_only"), False)
+            or not _as_bool(null_routed.get("source_passthrough"), False)
+            or _as_bool(null_routed.get("requires_selected_fbx"), True)
+            or null_receipt.get("rows", [{}])[0].get("status") != "ok"
+        ):
+            raise RuntimeError("Max Model Null did not route to Header Only")
+
+    strict_observation_cases = (
+        ("missing", []),
+        (
+            "mesh_without_contract",
+            [{"fbx_model_type": "Mesh", "fbx_route_handle": 4242, "fbx_geometry_connected": True}],
+        ),
+        (
+            "null_with_geometry",
+            [{"fbx_model_type": "Null", "fbx_route_handle": 4242, "fbx_geometry_connected": True}],
+        ),
+        (
+            "duplicate_null_handle",
+            [
+                {"fbx_model_id": 1, "fbx_model_type": "Null", "fbx_route_handle": 4242, "fbx_geometry_connected": False},
+                {"fbx_model_id": 2, "fbx_model_type": "Null", "fbx_route_handle": 4242, "fbx_geometry_connected": False},
+            ],
+        ),
+    )
+    for label, observations in strict_observation_cases:
+        pending_mesh = {
+            "lane": "modify",
+            "scene_node": "Mesh_001",
+            "scene_node_handle": 4242,
+            "mesh_slot": 1,
+            "auto_header_only": False,
+            "source_passthrough": False,
+            "requires_selected_fbx": True,
+        }
+        pending_job = {"meshes": [copy.deepcopy(pending_mesh)]}
+        pending_contract = {"meshes": [copy.deepcopy(pending_mesh)]}
+        pending_receipt = _apply_fbx_probe_topology_routes(
+            pending_job,
+            pending_contract,
+            [],
+            fbx_model_observations=observations,
+            require_explicit_route=True,
+        )
+        pending_result = pending_contract["meshes"][0]
+        if (
+            pending_receipt.get("rows", [{}])[0].get("status") != "fbx_match_missing"
+            or _mesh_uses_source_geometry(pending_result)
+            or not _as_bool(pending_result.get("requires_selected_fbx"), False)
+        ):
+            raise RuntimeError(f"Max Model observation {label} was silently accepted")
+
+    non_modify_meshes = [
+        {"lane": "header", "scene_node_handle": 4242, "auto_header_only": False},
+        {"lane": "delete", "scene_node_handle": 4264, "auto_header_only": False},
+    ]
+    non_modify_job = {"meshes": copy.deepcopy(non_modify_meshes)}
+    non_modify_contract = {"meshes": copy.deepcopy(non_modify_meshes)}
+    non_modify_receipt = _apply_fbx_probe_topology_routes(
+        non_modify_job,
+        non_modify_contract,
+        [],
+        fbx_model_observations=[
+            {"fbx_model_type": "Null", "fbx_route_handle": 4242, "fbx_geometry_connected": False},
+            {"fbx_model_type": "Null", "fbx_route_handle": 4264, "fbx_geometry_connected": False},
+        ],
+        require_explicit_route=True,
+    )
+    if non_modify_receipt.get("rows") or non_modify_contract["meshes"] != non_modify_meshes:
+        raise RuntimeError("Max Model Null routing changed Header or Delete Selected")
     return {
         "status": "PASS",
         "authority": "fbx_probe",
         "dcc_topology_diagnostic_only": True,
         "max_handle_route_required": True,
+        "max_model_null_header_only": True,
+        "strict_non_null_failures_preserved": True,
+        "launcher_header_delete_routes_preserved": True,
     }
 
 
@@ -16172,6 +16390,17 @@ def _merge_fbx_contract_meshes(
             continue
         if len(matched["positions"]) <= 0 or len(matched["face_indices"]) <= 0:
             continue
+        if require_explicit_route:
+            skinned_max_positions = matched.get(MAX_FBX_POSITION_AUTHORITY)
+            route_handle = _int_or_default(matched.get("fbx_route_handle"), 0)
+            if not isinstance(skinned_max_positions, list) or not skinned_max_positions:
+                raise ValueError(
+                    f"Max FBX route handle {route_handle} missing skinned_max_positions"
+                )
+            if len(skinned_max_positions) != len(matched["positions"]):
+                raise ValueError(
+                    f"Max FBX route handle {route_handle} skinned_max_positions count mismatch"
+                )
 
         if mesh.get("scene_node") in {None, ""}:
             mesh["scene_node"] = matched.get("node_name", "")
@@ -16224,6 +16453,9 @@ def _merge_fbx_contract_meshes(
             "skin_deformer_count",
             "weight_rows_available",
             "positions",
+            # MAX FBX RULE: max_positions from FBX PROBE PY cannot represent
+            # correct data. It scales Meshes down in MOD and causes wrong
+            # results; therefore skinned_max_positions is our sole choice.
             "max_positions",
             "skinned_positions",
             "skinned_max_positions",
@@ -16254,8 +16486,17 @@ def _merge_fbx_contract_meshes(
             "fbx_uv_channels",
             "normal_fidelity",
         ):
+            if require_explicit_route and key == "max_positions":
+                continue
             if key in matched:
                 mesh[key] = matched[key]
+        if require_explicit_route:
+            # 3ds Max FBX Probe max_positions loses the FBX unit scale and can
+            # shrink MOD geometry. Skin-evaluated Max positions are the sole
+            # position authority for an explicit Max route.
+            mesh.pop("max_positions", None)
+            mesh.pop("world_positions", None)
+            mesh["fbx_position_authority"] = MAX_FBX_POSITION_AUTHORITY
         normal_fidelity = matched.get("normal_fidelity")
         if isinstance(normal_fidelity, dict) and str(normal_fidelity.get("status", "") or "") == "exact":
             # A raw FBX corner stream is the current source of truth.  Never
@@ -16539,6 +16780,12 @@ def _apply_fbx_world_space_overrides(job: dict[str, Any], contract: dict[str, An
             continue
         if _mesh_requires_bones_plus_mesh_fbx_world_authority(mesh):
             # The immutable FBX authority already carries its tested world basis.
+            continue
+        if _mesh_uses_max_fbx_skinned_position_authority(mesh):
+            # Explicit Max routes already have one position authority. Never
+            # recreate max_positions/world_positions over the Skin result.
+            mesh.pop("max_positions", None)
+            mesh.pop("world_positions", None)
             continue
         normal_fidelity = mesh.get("normal_fidelity")
         if isinstance(normal_fidelity, dict) and str(normal_fidelity.get("status", "") or "") == "exact":
@@ -30053,16 +30300,13 @@ def _run_memory_export_impl(
         _advance_export_bug_receipt(bug_control, "fbx_merge")
     if fbx_modify_meshes:
         fbx_contract_meshes = fbx_handoff.get("contract_meshes")
-        if not isinstance(fbx_contract_meshes, list) or not fbx_contract_meshes:
+        if not isinstance(fbx_contract_meshes, list):
             raise RuntimeError("Max FBX geometry carrier contains no readable Mesh contract")
-        if require_explicit_max_route:
-            route_receipt = _validate_max_fbx_route_contract(job, fbx_contract_meshes)
-            job["max_fbx_route_receipt"] = dict(route_receipt)
-            contract["max_fbx_route_receipt"] = dict(route_receipt)
         compatibility_receipt = _apply_fbx_probe_topology_routes(
             job,
             contract,
             fbx_contract_meshes,
+            fbx_model_observations=fbx_handoff.get("route_models"),
             require_explicit_route=require_explicit_max_route,
         )
         fbx_handoff["topology_reconciliation"] = copy.deepcopy(compatibility_receipt)
@@ -30074,6 +30318,8 @@ def _run_memory_export_impl(
             and not _mesh_uses_source_geometry(mesh)
         ]
         if fbx_modify_meshes:
+            if not fbx_contract_meshes:
+                raise RuntimeError("Max FBX geometry carrier contains no readable Mesh contract")
             _merge_fbx_contract_meshes(
                 job,
                 contract,
@@ -30081,33 +30327,6 @@ def _run_memory_export_impl(
                 fbx_contract_meshes,
                 require_explicit_route=require_explicit_max_route,
             )
-            missing_required: list[str] = []
-            for mesh in fbx_modify_meshes:
-                if isinstance(mesh.get("positions"), list) and mesh.get("positions"):
-                    continue
-                mesh_name = str(mesh.get("scene_node", "") or "<unnamed>")
-                if _skip_memory_source_missing_mesh(
-                    job,
-                    contract,
-                    mesh,
-                    "fbx_mesh_match_missing",
-                ):
-                    continue
-                if _mesh_allows_source_geometry_fallback(mesh):
-                    _mark_mesh_source_passthrough(mesh, "fbx_mesh_match_missing")
-                    for job_mesh in job.get("meshes", []):
-                        if (
-                            isinstance(job_mesh, dict)
-                            and _int_or_default(job_mesh.get("scene_node_handle"), 0)
-                            == _int_or_default(mesh.get("scene_node_handle"), 0)
-                        ):
-                            _mark_mesh_source_passthrough(job_mesh, "fbx_mesh_match_missing")
-                else:
-                    missing_required.append(mesh_name)
-            if missing_required:
-                raise RuntimeError(
-                    "FBX geometry did not match required Modify Meshes: " + ", ".join(missing_required)
-                )
         fbx_axis_log = _build_fbx_axis_log(receipt.get("fbx_axes"), fbx_handoff.get("fbx_axes"))
         job["fbx_axis_log"] = fbx_axis_log
         contract["fbx_axis_log"] = fbx_axis_log
@@ -31271,6 +31490,7 @@ _WRITER_MAINTENANCE_RUNNERS: tuple[tuple[str, Callable[[], dict[str, Any]]], ...
     ("MEMORY_SCENE_CONTRACT_REGRESSION_STATUS", _run_memory_scene_contract_regression_guard),
     ("CHECK_SOURCE_ADVISORY_REGRESSION_STATUS", _run_check_source_advisory_regression_guard),
     ("SAME_NAME_FBX_HANDLE_REGRESSION_STATUS", _run_same_name_fbx_handle_regression_guard),
+    ("MAX_FBX_SKINNED_POSITION_AUTHORITY_REGRESSION_STATUS", _run_max_fbx_skinned_position_authority_regression_guard),
     ("FBX_PROBE_TOPOLOGY_AUTHORITY_REGRESSION_STATUS", _run_fbx_probe_topology_authority_regression_guard),
 )
 

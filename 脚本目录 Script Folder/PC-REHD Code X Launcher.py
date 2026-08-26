@@ -68,6 +68,7 @@ import base64
 import colorsys
 import copy
 from collections import Counter
+import datetime
 import hashlib
 import itertools
 import json
@@ -78,6 +79,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import tempfile
@@ -130,6 +132,35 @@ class MaxSessionPausedError(MaxPythonLinkError):
 
 class MaxIpcTransportError(MaxPythonLinkError):
     """The exact-PID IPC channel failed before a valid command receipt arrived."""
+
+
+class BlenderIpcTransportError(ConnectionError):
+    """A Blender IPC transport failure with an explicit dispatch boundary."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str,
+        command: str,
+        dispatch_state: str = "unknown",
+        phase: str = "",
+    ) -> None:
+        super().__init__(str(message))
+        self.request_id = str(request_id or "")
+        self.operation_id = self.request_id
+        self.command = str(command or "")
+        self.dispatch_state = (
+            str(dispatch_state or "unknown").strip().casefold()
+            if str(dispatch_state or "unknown").strip().casefold()
+            in {"not_sent", "sent", "unknown"}
+            else "unknown"
+        )
+        self.phase = str(phase or "")
+
+
+class BlenderOperationResultUnknownError(BlenderIpcTransportError):
+    """The Blender command crossed the send boundary but no receipt arrived."""
 
 
 class BlenderAgentRestartRequiredError(ConnectionError):
@@ -550,15 +581,15 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
     ),
     "import_mod": _spec(
         "import_mod", "import_mod", CommandAccess.SCENE_WRITE,
-        QueuePolicy.SINGLE_FLIGHT, 1800.0, 10,
+        QueuePolicy.SINGLE_FLIGHT, 1800.0, 10, foreground_required=False,
     ),
     "export_mod": _spec(
         "export_mod", "export_mod", CommandAccess.SCENE_WRITE,
-        QueuePolicy.SINGLE_FLIGHT, 1800.0, 10,
+        QueuePolicy.SINGLE_FLIGHT, 1800.0, 10, foreground_required=False,
     ),
     "export_embedded_fbx": _spec(
         "export_embedded_fbx", "auxiliary", CommandAccess.SCENE_WRITE,
-        QueuePolicy.SINGLE_FLIGHT, 1800.0, 10,
+        QueuePolicy.SINGLE_FLIGHT, 1800.0, 10, foreground_required=False,
     ),
     "seam_weight_tool": _spec(
         "seam_weight_tool", "auxiliary", CommandAccess.SCENE_WRITE,
@@ -2782,16 +2813,45 @@ class _WriterProcessWorker:
 
 
 SAMPLE_KEEP_GROUPS = 3
+PUBLIC_FBX_COLLISION_SUFFIX_RE_TEXT = r"(?: \+ (?:0[1-9]|[1-9][0-9]{1,3}))?"
+PUBLIC_IMPORT_FBX_STEM_RE_TEXT = (
+    rf"导入 \+ [1-9][0-9]* Import FBX{PUBLIC_FBX_COLLISION_SUFFIX_RE_TEXT}"
+)
+PUBLIC_EXPORT_FBX_STEM_RE_TEXT = (
+    rf"导出 \+ [1-9][0-9]* Export FBX{PUBLIC_FBX_COLLISION_SUFFIX_RE_TEXT}"
+)
+SAMPLE_STEM_RE_TEXT = (
+    r"(?:import|export)_pid[1-9][0-9]*_[0-9a-f]{32}"
+    rf"|{PUBLIC_IMPORT_FBX_STEM_RE_TEXT}"
+    rf"|{PUBLIC_EXPORT_FBX_STEM_RE_TEXT}"
+)
 SAMPLE_FILE_RE = re.compile(
-    r"^(?P<stem>(?:import|export)_pid[1-9]\d*_[0-9a-f]{32}|(?:导入 \+ [1-9]\d* Import FBX|导出 \+ [1-9]\d* Export FBX)(?: \+ [1-9]\d*)?)\.(?P<ext>fbx|txt)$",
+    rf"^(?P<stem>(?:{SAMPLE_STEM_RE_TEXT}))\.(?P<ext>fbx|txt)$",
     re.IGNORECASE,
 )
+SAMPLE_LOCK_FILE_RE = re.compile(
+    rf"^\.(?P<stem>(?:{SAMPLE_STEM_RE_TEXT}))\.txt\.lock$",
+    re.IGNORECASE,
+)
+SAMPLE_RESERVATION_FILE_RE = re.compile(
+    rf"^\.(?P<stem>(?:{SAMPLE_STEM_RE_TEXT}))\.reserve$",
+    re.IGNORECASE,
+)
+PUBLIC_FBX_LEGACY_RESERVATION_SCHEMA = "pc-rehd-public-fbx-reservation-v1"
+PUBLIC_FBX_RESERVATION_SCHEMA = "pc-rehd-public-fbx-reservation-v2"
+PUBLIC_FBX_RESERVATION_OWNER_TOKEN = uuid.uuid4().hex
+PUBLIC_FBX_RESERVATION_PROCESS_STARTED_UNIX_NS = time.time_ns()
+PUBLIC_FBX_LEGACY_RESERVATION_MAX_AGE_SECONDS = 24.0 * 60.0 * 60.0
 IMPORT_FBX_FILE_RE = re.compile(
-    r"^(?:import_pid(?P<legacy_pid>[1-9]\d*)_[0-9a-f]{32}|导入 \+ (?P<public_pid>[1-9]\d*) Import FBX(?: \+ [1-9]\d*)?)\.fbx$",
+    rf"^(?:import_pid(?P<legacy_pid>[1-9][0-9]*)_[0-9a-f]{{32}}|"
+    rf"导入 \+ (?P<public_pid>[1-9][0-9]*) Import FBX"
+    rf"{PUBLIC_FBX_COLLISION_SUFFIX_RE_TEXT})\.fbx$",
     re.IGNORECASE,
 )
 IMPORT_FBX_MEDIA_DIRECTORY_RE = re.compile(
-    r"^(?:import_pid(?P<legacy_pid>[1-9]\d*)_[0-9a-f]{32}|导入 \+ (?P<public_pid>[1-9]\d*) Import FBX(?: \+ [1-9]\d*)?)\.fbm$",
+    rf"^(?:import_pid(?P<legacy_pid>[1-9][0-9]*)_[0-9a-f]{{32}}|"
+    rf"导入 \+ (?P<public_pid>[1-9][0-9]*) Import FBX"
+    rf"{PUBLIC_FBX_COLLISION_SUFFIX_RE_TEXT})\.fbm$",
     re.IGNORECASE,
 )
 IMPORT_FBX_MEDIA_DIRECTORY_KEEP_COUNT = 3
@@ -2808,7 +2868,6 @@ MAX_OPERATION_COORDINATOR = OperationCoordinator()
 WRITER_PATH = MODULE_DIR / "codex_python_export_bridge.py"
 IMPORTER_PATH = MODULE_DIR / "codex_re6_mod_import_fbx.py"
 BOOTSTRAP_PATH = MODULE_DIR / "codex_python_runtime_bootstrap.py"
-AUXILIARY_MAX_BRIDGE_PATH = MODULE_DIR / "codex_re6_auxiliary_max_bridge.py"
 FBX_PROBE_PATH = MODULE_DIR / "codex_fbx_probe.py"
 TEX_DECODER_PATH = MODULE_DIR / "codex_re6_tex_decode.py"
 COMPATIBILITY_PATH = MODULE_DIR / "codex_re6_scene_compatibility.py"
@@ -2827,7 +2886,6 @@ OPERATION_REQUIRED_DOMAINS = {
     "health": ("max_agent",),
     "auxiliary": (
         "max_agent",
-        "auxiliary",
         "auxiliary_fbx",
         "auxiliary_probe",
     ),
@@ -3956,7 +4014,8 @@ def run_bug_control_scan() -> dict[str, Any]:
 EXPORT_PATH_HISTORY_FILE = DEFAULT_LOG_DIR / "PC_REHD_Code_X_Export_Path_History.txt"
 EXPORT_PATH_HISTORY_MAX_BYTES = 100 * 1024 * 1024
 EXPORT_SOURCE_MOD_FILE_PATTERN = "*.mod *.MOD *.newmod *.NewMOD *.NEWMOD"
-PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME = "Long Term Cache"
+PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME = "Long Term Cache 长期缓存"
+LEGACY_PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME = "Long Term Cache"
 PUBLIC_LONG_TERM_CACHE_FILE_NAME = "RE6 Long Term Cache 脚本长期缓存.txt"
 PUBLIC_BOOTSTRAP_HEALTH_LOG_FILE_NAME = (
     "Bootstrap RE6 Script Health check 脚本健康度日志.txt"
@@ -3966,6 +4025,9 @@ PUBLIC_IMPORT_DIRECTORY_NAME = "导入 Import"
 PUBLIC_EXPORT_DIRECTORY_NAME = "导出 Export"
 PUBLIC_IMPORT_LOG_FILE_NAME = "导入日志 Import Log.txt"
 PUBLIC_EXPORT_LOG_FILE_NAME = "导出日志 Export Log.txt"
+PUBLIC_CLEANUP_ERROR_LOG_FILE_NAME = "清理错误 Cleanup Errors.txt"
+PUBLIC_BLENDER_IPC_TRACE_FILE_NAME = "Blender IPC Trace.txt"
+PUBLIC_BLENDER_IPC_TRACE_RETENTION_SECONDS = 3.0 * 24.0 * 60.0 * 60.0
 BOOTSTRAP_HEALTH_LOG_FILE_NAME = PUBLIC_BOOTSTRAP_HEALTH_LOG_FILE_NAME
 PUBLIC_CACHE_SECTION_NAMES = frozenset(
     {
@@ -4010,7 +4072,7 @@ MAIN_WINDOW_SCALING_MIN_SCALE = 0.08
 MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE = 0.32
 MAIN_WINDOW_SCALING_MIN_FONT_SCALE = 0.7
 MAIN_WINDOW_SCALING_MAX_SCALE = 1.35
-MAIN_UI_SCALING_LAYOUT_CACHE_VERSION = "scaling-layout-v12-axis-aware-fill"
+MAIN_UI_SCALING_LAYOUT_CACHE_VERSION = "scaling-layout-v14-collapsed-fit"
 MAIN_RESIZE_GRIP_SIZE = 18
 MAIN_RESIZE_GRIP_EXPANDED_SIZE = 34
 MAIN_UI_PRELOAD_SLICE_MS = 6
@@ -4859,14 +4921,87 @@ def _public_log_root(log_directory: str | Path | None = None) -> Path:
     return root
 
 
+def _public_operation_root(log_directory: str | Path | None = None) -> Path:
+    root = _public_log_root(log_directory)
+    if root.name.casefold() in {
+        PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME.casefold(),
+        LEGACY_PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME.casefold(),
+    }:
+        return _public_log_root(root.parent)
+    return root
+
+
+def _ensure_plain_child_directory(
+    parent: str | Path,
+    name: str,
+    *,
+    boundary: str | Path,
+) -> Path:
+    """Create one generated child without accepting a link or root escape."""
+    parent_path = Path(parent).expanduser().resolve(strict=True)
+    boundary_path = Path(boundary).expanduser().resolve(strict=True)
+    if not _resolved_path_is_within_root(parent_path, boundary_path):
+        raise OSError(
+            f"Generated directory parent is outside the configured log root: "
+            f"{parent_path} (root {boundary_path})"
+        )
+    target = parent_path / str(name)
+    try:
+        target.mkdir(parents=False, exist_ok=False)
+    except FileExistsError:
+        pass
+    before = target.stat(follow_symlinks=False)
+    is_junction = getattr(target, "is_junction", None)
+    reparse_flag = int(
+        getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+    file_attributes = int(getattr(before, "st_file_attributes", 0) or 0)
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or target.is_symlink()
+        or bool(callable(is_junction) and is_junction())
+        or bool(file_attributes & reparse_flag)
+    ):
+        raise OSError(f"Generated directory is a link or reparse point: {target}")
+    resolved = target.resolve(strict=True)
+    after = target.stat(follow_symlinks=False)
+    if (int(before.st_dev), int(before.st_ino)) != (
+        int(after.st_dev),
+        int(after.st_ino),
+    ):
+        raise OSError(f"Generated directory changed during validation: {target}")
+    if (
+        resolved.parent != parent_path
+        or not _resolved_path_is_within_root(resolved, boundary_path)
+    ):
+        raise OSError(
+            f"Generated directory escaped the configured log root: "
+            f"{target} -> {resolved}"
+        )
+    return resolved
+
+
 def _public_long_term_cache_directory(log_directory: str | Path | None = None) -> Path:
     candidate = Path(str(log_directory or "")).expanduser() if str(log_directory or "").strip() else None
     if candidate is not None and candidate.name.casefold() == PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME.casefold():
-        target = candidate.resolve(strict=False)
-    else:
-        target = _public_log_root(log_directory) / PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME
-    target.mkdir(parents=True, exist_ok=True)
-    return target
+        return _public_log_root(candidate)
+    root = _public_operation_root(log_directory)
+    return _ensure_plain_child_directory(
+        root,
+        PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME,
+        boundary=root,
+    )
+
+
+def _legacy_public_long_term_cache_directory(
+    log_directory: str | Path | None = None,
+) -> Path:
+    root = _normalize_long_term_cache_directory(log_directory)
+    if root.name.casefold() == LEGACY_PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME.casefold():
+        return root
+    if root.name.casefold() == PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME.casefold():
+        root = root.parent
+    return root / LEGACY_PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME
 
 
 def _public_long_term_cache_path(log_directory: str | Path | None = None) -> Path:
@@ -4904,9 +5039,25 @@ def _public_operation_directory(log_directory: str | Path | None, operation: str
         name = PUBLIC_EXPORT_DIRECTORY_NAME
     else:
         raise ValueError(f"Unsupported public operation: {operation!r}")
-    target = _public_long_term_cache_directory(log_directory) / name
-    target.mkdir(parents=True, exist_ok=True)
-    return target
+    root = _public_operation_root(log_directory)
+    return _ensure_plain_child_directory(
+        root,
+        name,
+        boundary=root,
+    )
+
+
+def _legacy_public_operation_directory(
+    log_directory: str | Path | None, operation: str
+) -> Path:
+    kind = str(operation or "").strip().casefold()
+    if kind == "import":
+        name = PUBLIC_IMPORT_DIRECTORY_NAME
+    elif kind == "export":
+        name = PUBLIC_EXPORT_DIRECTORY_NAME
+    else:
+        raise ValueError(f"Unsupported public operation: {operation!r}")
+    return _legacy_public_long_term_cache_directory(log_directory) / name
 
 
 def _public_operation_log_path(log_directory: str | Path | None, operation: str) -> Path:
@@ -4918,6 +5069,182 @@ def _public_operation_log_path(log_directory: str | Path | None, operation: str)
     else:
         raise ValueError(f"Unsupported public operation: {operation!r}")
     return _public_operation_directory(log_directory, kind) / filename
+
+
+def _blender_ipc_trace_path(log_directory: str | Path | None = None) -> Path:
+    return _public_long_term_cache_directory(log_directory) / PUBLIC_BLENDER_IPC_TRACE_FILE_NAME
+
+
+def _copy_recent_blender_ipc_trace_records(
+    source: Any,
+    destination: Any,
+    *,
+    cutoff_epoch: float,
+) -> tuple[int, int]:
+    record: list[str] = []
+    record_timestamp: float | None = None
+    removed_count = 0
+    retained_count = 0
+    drop_removed_separator = False
+    for line in source:
+        stripped = line.strip()
+        if record:
+            record.append(line)
+            if stripped.startswith("TIME_LOCAL="):
+                try:
+                    record_timestamp = datetime.datetime.strptime(
+                        stripped[len("TIME_LOCAL="):].strip(),
+                        "%Y-%m-%dT%H:%M:%S%z",
+                    ).timestamp()
+                except (OverflowError, ValueError):
+                    record_timestamp = None
+            if stripped == "[END_BLENDER_IPC_TRACE]":
+                if (
+                    record_timestamp is not None
+                    and record_timestamp < float(cutoff_epoch)
+                ):
+                    removed_count += 1
+                    drop_removed_separator = True
+                else:
+                    destination.writelines(record)
+                    retained_count += 1
+                record = []
+                record_timestamp = None
+            continue
+        if drop_removed_separator and not stripped:
+            drop_removed_separator = False
+            continue
+        drop_removed_separator = False
+        if stripped == "[BLENDER_IPC_TRACE]":
+            record = [line]
+        else:
+            destination.write(line)
+    if record:
+        destination.writelines(record)
+        retained_count += 1
+    return removed_count, retained_count
+
+
+def _prune_blender_ipc_trace(
+    log_directory: str | Path | None,
+    *,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
+    target = _blender_ipc_trace_path(log_directory)
+    report: dict[str, Any] = {
+        "path": str(target),
+        "removed_record_count": 0,
+        "retained_record_count": 0,
+        "deferred_due_to_concurrent_write": False,
+        "errors": [],
+    }
+    temporary = target.with_name(
+        f".{target.name}.{os.getpid()}.{threading.get_ident()}."
+        f"{uuid.uuid4().hex}.prune.tmp"
+    )
+    try:
+        with target.open(
+            "r", encoding="utf-8-sig", errors="replace", newline=""
+        ) as source:
+            snapshot_stat = os.fstat(source.fileno())
+            with temporary.open(
+                "w", encoding="utf-8", errors="strict", newline=""
+            ) as destination:
+                removed_count, retained_count = (
+                    _copy_recent_blender_ipc_trace_records(
+                        source,
+                        destination,
+                        cutoff_epoch=(
+                            (
+                                time.time()
+                                if now_epoch is None
+                                else float(now_epoch)
+                            )
+                            - PUBLIC_BLENDER_IPC_TRACE_RETENTION_SECONDS
+                        ),
+                    )
+                )
+                destination.flush()
+                os.fsync(destination.fileno())
+        report["retained_record_count"] = retained_count
+        if removed_count <= 0:
+            return report
+        snapshot_identity = (
+            int(snapshot_stat.st_dev),
+            int(snapshot_stat.st_ino),
+            int(snapshot_stat.st_size),
+            int(snapshot_stat.st_mtime_ns),
+        )
+        with _public_file_lock(target):
+            current_stat = target.stat()
+            current_identity = (
+                int(current_stat.st_dev),
+                int(current_stat.st_ino),
+                int(current_stat.st_size),
+                int(current_stat.st_mtime_ns),
+            )
+            if current_identity != snapshot_identity:
+                report["deferred_due_to_concurrent_write"] = True
+                return report
+            os.replace(temporary, target)
+            report["removed_record_count"] = removed_count
+    except FileNotFoundError:
+        return report
+    except OSError as exc:
+        report["errors"].append(
+            f"{target}: {type(exc).__name__}: {exc}"
+        )
+    finally:
+        temporary.unlink(missing_ok=True)
+    return report
+
+
+def _append_blender_ipc_trace(
+    log_directory: str | Path | None,
+    *,
+    process_id: int,
+    request_id: str,
+    command: str,
+    stage: str,
+    elapsed_ms: float,
+    details: Mapping[str, Any] | None = None,
+) -> Path:
+    """Persist one Blender IPC boundary event without changing the operation result."""
+    lines = [
+        "[BLENDER_IPC_TRACE]",
+        f"TIME_LOCAL={time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime())}",
+        f"PROCESS_ID={int(process_id or 0)}",
+        f"REQUEST_ID={_public_scalar_text(request_id)}",
+        f"COMMAND={_public_scalar_text(command)}",
+        f"STAGE={_public_scalar_text(stage)}",
+        f"ELAPSED_MS={_public_scalar_text(elapsed_ms)}",
+    ]
+    if isinstance(details, Mapping):
+        for key in sorted(details, key=lambda item: str(item)):
+            field = re.sub(r"[^A-Za-z0-9]+", "_", str(key)).strip("_").upper()
+            if not field:
+                continue
+            value = details[key]
+            if isinstance(value, (Mapping, list, tuple)):
+                value = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+            lines.append(f"DETAIL_{field}={_public_scalar_text(value)}")
+    lines.append("[END_BLENDER_IPC_TRACE]")
+    target = _blender_ipc_trace_path(log_directory)
+    block = "\n".join(lines) + "\n\n"
+    with _public_file_lock(target):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(block)
+    return target
+
+
+def _public_cleanup_error_log_path(
+    log_directory: str | Path | None,
+) -> Path:
+    return (
+        _public_long_term_cache_directory(log_directory)
+        / PUBLIC_CLEANUP_ERROR_LOG_FILE_NAME
+    )
 
 
 @contextmanager
@@ -5028,27 +5355,33 @@ def _public_section_block(section: str, value: Mapping[str, Any]) -> str:
 
 
 def _public_read_cache_section(log_directory: str | Path | None, section: str) -> dict[str, Any] | None:
-    path = _public_long_term_cache_path(log_directory)
-    if not path.is_file():
-        return None
     normalized = str(section or "").strip()
     pattern = re.compile(
         rf"(?ms)^\[{re.escape(normalized)}\]\r?\n.*?^\[/{re.escape(normalized)}\]\s*"
     )
-    try:
-        text = path.read_text(encoding="utf-8-sig", errors="replace")
-    except OSError:
-        return None
-    match = pattern.search(text)
-    if match is None:
-        return None
-    for line in match.group(0).splitlines():
-        if line.startswith("DATA_JSON="):
-            try:
-                value = json.loads(line[len("DATA_JSON="):])
-            except (TypeError, ValueError, json.JSONDecodeError):
-                return None
-            return dict(value) if isinstance(value, Mapping) else None
+    current_path = _public_long_term_cache_path(log_directory)
+    legacy_path = (
+        _legacy_public_long_term_cache_directory(log_directory)
+        / PUBLIC_LONG_TERM_CACHE_FILE_NAME
+    )
+    for path in dict.fromkeys((current_path, legacy_path)):
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        match = pattern.search(text)
+        if match is None:
+            continue
+        for line in match.group(0).splitlines():
+            if line.startswith("DATA_JSON="):
+                try:
+                    value = json.loads(line[len("DATA_JSON="):])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    break
+                if isinstance(value, Mapping):
+                    return dict(value)
     return None
 
 
@@ -5079,6 +5412,31 @@ def _append_public_text_block(path: str | Path, lines: Iterable[str]) -> Path:
         prefix = existing.rstrip()
         combined = (prefix + "\n\n" if prefix else "") + block + "\n"
         return _public_atomic_write_text(target, combined)
+
+
+def _append_public_cleanup_errors(
+    log_directory: str | Path,
+    *,
+    reason: str,
+    errors: Iterable[object],
+) -> Path:
+    normalized_errors = [
+        _public_scalar_text(error) for error in errors if str(error).strip()
+    ]
+    lines = [
+        "[清理错误 Cleanup Errors]",
+        f"TIME_LOCAL={time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime())}",
+        f"REASON={_public_scalar_text(reason)}",
+    ]
+    lines.extend(
+        f"ERROR_{index:02d}={error}"
+        for index, error in enumerate(normalized_errors, start=1)
+    )
+    lines.append("[END_CLEANUP_ERRORS]")
+    return _append_public_text_block(
+        _public_cleanup_error_log_path(log_directory),
+        lines,
+    )
 
 
 def _public_operation_log_block(operation: str, process_id: int, request_id: str, status: str, details: Mapping[str, Any] | None = None) -> list[str]:
@@ -5114,48 +5472,757 @@ def _public_fbx_base_stem(process_id: int, operation: str, suffix_number: int = 
     return f"{label} + {int(process_id)} {kind.title()} FBX{suffix}"
 
 
+def _query_process_identity(process_id: int) -> tuple[str, int, str]:
+    """Return ``(alive|dead|unknown, start_unix_ns, detail)``."""
+    pid = int(process_id or 0)
+    if pid <= 0:
+        return "dead", 0, "invalid process ID"
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class FileTime(ctypes.Structure):
+            _fields_ = [
+                ("low", wintypes.DWORD),
+                ("high", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            error_code = int(ctypes.get_last_error() or 0)
+            if error_code == 87:
+                return "dead", 0, ""
+            return (
+                "unknown",
+                0,
+                f"OpenProcess({pid}) failed: "
+                f"{ctypes.WinError(error_code)}",
+            )
+        try:
+            exit_code = wintypes.DWORD(0)
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                error_code = int(ctypes.get_last_error() or 0)
+                return (
+                    "unknown",
+                    0,
+                    f"GetExitCodeProcess({pid}) failed: "
+                    f"{ctypes.WinError(error_code)}",
+                )
+            if int(exit_code.value) != 259:
+                return "dead", 0, ""
+            creation = FileTime()
+            exit_time = FileTime()
+            kernel_time = FileTime()
+            user_time = FileTime()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                error_code = int(ctypes.get_last_error() or 0)
+                return (
+                    "unknown",
+                    0,
+                    f"GetProcessTimes({pid}) failed: "
+                    f"{ctypes.WinError(error_code)}",
+                )
+            creation_100ns = (int(creation.high) << 32) | int(creation.low)
+            start_unix_ns = (
+                creation_100ns - 116_444_736_000_000_000
+            ) * 100
+            if start_unix_ns <= 0:
+                return (
+                    "unknown",
+                    0,
+                    f"GetProcessTimes({pid}) returned an invalid creation time",
+                )
+            return "alive", int(start_unix_ns), ""
+        finally:
+            kernel32.CloseHandle(handle)
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "dead", 0, ""
+    except PermissionError as exc:
+        return "unknown", 0, f"process query denied: {exc}"
+    except OSError as exc:
+        return "unknown", 0, f"process query failed: {exc}"
+    try:
+        stat_fields = (Path("/proc") / str(pid) / "stat").read_text(
+            encoding="ascii"
+        ).split()
+        ticks = int(stat_fields[21])
+        ticks_per_second = int(os.sysconf("SC_CLK_TCK"))
+        boot_seconds = 0
+        for line in Path("/proc/stat").read_text(encoding="ascii").splitlines():
+            if line.startswith("btime "):
+                boot_seconds = int(line.split()[1])
+                break
+        if boot_seconds > 0 and ticks_per_second > 0:
+            return (
+                "alive",
+                int(boot_seconds * 1_000_000_000 + ticks * 1_000_000_000 // ticks_per_second),
+                "",
+            )
+    except (IndexError, OSError, TypeError, ValueError):
+        pass
+    return "unknown", 0, "process start time is unavailable"
+
+
+@dataclass(slots=True)
+class _NoFollowEntryGuard:
+    path: Path
+    resolved_path: Path
+    is_directory: bool
+    identity: tuple[int, int, int]
+    windows_handle: int | None = None
+    file_descriptor: int | None = None
+
+    def close(self) -> None:
+        if self.windows_handle is not None:
+            handle = self.windows_handle
+            self.windows_handle = None
+            try:
+                import ctypes
+
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+                kernel32.CloseHandle.restype = ctypes.c_bool
+                kernel32.CloseHandle(ctypes.c_void_p(handle))
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
+        if self.file_descriptor is not None:
+            descriptor = self.file_descriptor
+            self.file_descriptor = None
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def __enter__(self) -> "_NoFollowEntryGuard":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        self.close()
+
+
+def _normalize_windows_handle_path(value: str) -> Path:
+    text = str(value or "")
+    if text.startswith("\\\\?\\UNC\\"):
+        text = "\\\\" + text[8:]
+    elif text.startswith("\\\\?\\"):
+        text = text[4:]
+    return Path(text)
+
+
+def _open_entry_no_follow(
+    path: str | Path,
+    *,
+    boundary: str | Path,
+    require_directory: bool | None,
+    delete_access: bool = False,
+) -> _NoFollowEntryGuard:
+    """Pin one existing entry while rejecting links and reparse points."""
+    candidate = Path(path).expanduser()
+    boundary_path = Path(boundary).expanduser().resolve(strict=True)
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        file_read_attributes = 0x0080
+        file_delete = 0x00010000
+        file_share_read = 0x00000001
+        file_share_write = 0x00000002
+        open_existing = 3
+        file_flag_backup_semantics = 0x02000000
+        file_flag_open_reparse_point = 0x00200000
+        file_attribute_directory = 0x00000010
+        file_attribute_reparse_point = 0x00000400
+        file_attribute_tag_info = 9
+
+        class FileAttributeTagInfo(ctypes.Structure):
+            _fields_ = [
+                ("FileAttributes", wintypes.DWORD),
+                ("ReparseTag", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.GetFileInformationByHandleEx.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+        kernel32.GetFinalPathNameByHandleW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        ]
+        kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.CreateFileW(
+            str(candidate),
+            file_read_attributes | (file_delete if delete_access else 0),
+            file_share_read | file_share_write,
+            None,
+            open_existing,
+            file_flag_backup_semantics | file_flag_open_reparse_point,
+            None,
+        )
+        handle_value = int(handle or 0)
+        invalid_handle = int(ctypes.c_void_p(-1).value or -1)
+        if not handle_value or handle_value == invalid_handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            attribute_info = FileAttributeTagInfo()
+            if not kernel32.GetFileInformationByHandleEx(
+                handle,
+                file_attribute_tag_info,
+                ctypes.byref(attribute_info),
+                ctypes.sizeof(attribute_info),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            attributes = int(attribute_info.FileAttributes)
+            if attributes & file_attribute_reparse_point:
+                raise OSError(f"Entry is a link or reparse point: {candidate}")
+            is_directory = bool(attributes & file_attribute_directory)
+            if require_directory is not None and is_directory is not require_directory:
+                expected = "directory" if require_directory else "file"
+                raise OSError(f"Entry is not a {expected}: {candidate}")
+
+            required = int(kernel32.GetFinalPathNameByHandleW(handle, None, 0, 0))
+            if required <= 0:
+                raise ctypes.WinError(ctypes.get_last_error())
+            buffer = ctypes.create_unicode_buffer(required + 1)
+            written = int(
+                kernel32.GetFinalPathNameByHandleW(
+                    handle, buffer, len(buffer), 0
+                )
+            )
+            if written <= 0 or written >= len(buffer):
+                raise ctypes.WinError(ctypes.get_last_error())
+            resolved = _normalize_windows_handle_path(buffer.value).resolve(
+                strict=True
+            )
+            expected_resolved = candidate.resolve(strict=True)
+            if os.path.normcase(str(resolved)) != os.path.normcase(
+                str(expected_resolved)
+            ):
+                raise OSError(
+                    f"Entry identity changed while it was pinned: {candidate}"
+                )
+            if not _resolved_path_is_within_root(resolved, boundary_path):
+                raise OSError(
+                    f"Entry is outside the configured log root: "
+                    f"{candidate} -> {resolved} (root {boundary_path})"
+                )
+            pinned_stat = candidate.stat(follow_symlinks=False)
+            identity = (
+                int(pinned_stat.st_dev),
+                int(pinned_stat.st_ino),
+                int(pinned_stat.st_ctime_ns),
+            )
+            return _NoFollowEntryGuard(
+                path=candidate,
+                resolved_path=resolved,
+                is_directory=is_directory,
+                identity=identity,
+                windows_handle=handle_value,
+            )
+        except Exception:
+            kernel32.CloseHandle(handle)
+            raise
+
+    flags = os.O_RDONLY
+    flags |= int(getattr(os, "O_CLOEXEC", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    if require_directory is True:
+        flags |= int(getattr(os, "O_DIRECTORY", 0))
+    descriptor = os.open(candidate, flags)
+    try:
+        pinned_stat = os.fstat(descriptor)
+        is_directory = stat.S_ISDIR(pinned_stat.st_mode)
+        if require_directory is not None and is_directory is not require_directory:
+            expected = "directory" if require_directory else "file"
+            raise OSError(f"Entry is not a {expected}: {candidate}")
+        resolved = candidate.resolve(strict=True)
+        if not _resolved_path_is_within_root(resolved, boundary_path):
+            raise OSError(
+                f"Entry is outside the configured log root: "
+                f"{candidate} -> {resolved} (root {boundary_path})"
+            )
+        path_stat = candidate.stat(follow_symlinks=False)
+        identity = (
+            int(pinned_stat.st_dev),
+            int(pinned_stat.st_ino),
+            int(path_stat.st_ctime_ns),
+        )
+        if (int(path_stat.st_dev), int(path_stat.st_ino)) != identity[:2]:
+            raise OSError(f"Entry identity changed while it was pinned: {candidate}")
+        return _NoFollowEntryGuard(
+            path=candidate,
+            resolved_path=resolved,
+            is_directory=is_directory,
+            identity=identity,
+            file_descriptor=descriptor,
+        )
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _delete_pinned_entry(guard: _NoFollowEntryGuard) -> None:
+    """Delete the exact entry held by a no-follow guard."""
+    if guard.windows_handle is not None and os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class FileDispositionInfo(ctypes.Structure):
+            _fields_ = [("DeleteFile", wintypes.BOOLEAN)]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.SetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+        disposition = FileDispositionInfo(1)
+        if not kernel32.SetFileInformationByHandle(
+            wintypes.HANDLE(guard.windows_handle),
+            4,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return
+
+    current = guard.path.stat(follow_symlinks=False)
+    current_identity = (
+        int(current.st_dev),
+        int(current.st_ino),
+        int(current.st_ctime_ns),
+    )
+    if current_identity != guard.identity:
+        raise OSError(f"Entry identity changed before deletion: {guard.path}")
+    if guard.is_directory:
+        os.rmdir(guard.path)
+    else:
+        os.unlink(guard.path)
+
+
+@contextmanager
+def _guard_public_operation_directory(
+    log_directory: str | Path | None,
+    operation: str,
+) -> Iterable[Path]:
+    root = _public_operation_root(log_directory)
+    operation_name = (
+        PUBLIC_IMPORT_DIRECTORY_NAME
+        if str(operation or "").strip().casefold() == "import"
+        else PUBLIC_EXPORT_DIRECTORY_NAME
+        if str(operation or "").strip().casefold() == "export"
+        else ""
+    )
+    if not operation_name:
+        raise ValueError(f"Unsupported public FBX operation: {operation!r}")
+    with _open_entry_no_follow(
+        root, boundary=root, require_directory=True
+    ) as root_guard:
+        directory = _public_operation_directory(
+            root_guard.resolved_path, operation
+        )
+        expected_directory = root_guard.resolved_path / operation_name
+        if os.path.normcase(str(directory)) != os.path.normcase(
+            str(expected_directory)
+        ):
+            raise OSError(
+                "Public FBX operation directory is outside the configured "
+                f"log root: {directory} (expected {expected_directory})"
+            )
+        with _open_entry_no_follow(
+            expected_directory,
+            boundary=root_guard.resolved_path,
+            require_directory=True,
+        ) as operation_guard:
+            yield operation_guard.resolved_path
+
+
+def _remove_tree_no_follow(
+    path: str | Path,
+    *,
+    boundary: str | Path,
+    expected_identity: tuple[int, int, int] | None = None,
+) -> None:
+    """Remove one tree without ever traversing a reparse point."""
+    root = Path(boundary).expanduser().resolve(strict=True)
+    target = Path(path).expanduser()
+    root_guard = _open_entry_no_follow(
+        target, boundary=root, require_directory=True, delete_access=True
+    )
+    if expected_identity is not None and root_guard.identity != tuple(
+        int(value) for value in expected_identity
+    ):
+        root_guard.close()
+        raise OSError(f"Directory identity changed before deletion: {target}")
+
+    def remove_directory(
+        directory: Path, guard: _NoFollowEntryGuard
+    ) -> None:
+        try:
+            with os.scandir(directory) as scanner:
+                names = [entry.name for entry in scanner]
+            for name in names:
+                child = directory / name
+                child_guard = _open_entry_no_follow(
+                    child,
+                    boundary=root,
+                    require_directory=None,
+                    delete_access=True,
+                )
+                if child_guard.is_directory:
+                    remove_directory(child, child_guard)
+                else:
+                    try:
+                        _delete_pinned_entry(child_guard)
+                    finally:
+                        child_guard.close()
+            _delete_pinned_entry(guard)
+        finally:
+            guard.close()
+
+    remove_directory(target, root_guard)
+
+
 def _reserve_public_fbx_artifact_paths(log_directory: str | Path | None, process_id: int, operation: str) -> tuple[Path, Path]:
     pid = int(process_id or 0)
     if pid <= 0:
         raise ValueError("Public FBX artifact path requires a positive modeling-process PID")
-    directory = _public_operation_directory(log_directory, operation)
-    lock_path = _public_operation_log_path(log_directory, operation)
-    with _public_file_lock(lock_path):
-        for suffix_number in range(0, 10000):
-            stem = _public_fbx_base_stem(pid, operation, suffix_number)
-            fbx_path = directory / f"{stem}.fbx"
-            txt_path = directory / f"{stem}.txt"
-            reservation_path = directory / f".{stem}.reserve"
-            if any(
-                (directory / f"{stem}{extension}").exists()
-                for extension in (".fbx", ".txt", ".json", ".fbm", ".signal")
-            ):
-                continue
-            try:
-                descriptor = os.open(
-                    reservation_path,
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                    0o600,
-                )
-                os.close(descriptor)
-            except FileExistsError:
-                continue
-            return fbx_path, txt_path
+    kind = str(operation or "").strip().casefold()
+    if kind == "import":
+        log_filename = PUBLIC_IMPORT_LOG_FILE_NAME
+    elif kind == "export":
+        log_filename = PUBLIC_EXPORT_LOG_FILE_NAME
+    else:
+        raise ValueError(f"Unsupported public FBX operation: {operation!r}")
+    owner_state, owner_started_unix_ns, owner_error = _query_process_identity(
+        os.getpid()
+    )
+    if owner_state != "alive" or owner_started_unix_ns <= 0:
+        raise OSError(
+            "Unable to identify the Launcher process that owns the FBX "
+            f"reservation: {owner_error or owner_state}"
+        )
+    marker_bytes = json.dumps(
+        {
+            "schema": PUBLIC_FBX_RESERVATION_SCHEMA,
+            "owner_pid": os.getpid(),
+            "owner_token": PUBLIC_FBX_RESERVATION_OWNER_TOKEN,
+            "owner_started_unix_ns": owner_started_unix_ns,
+            "created_unix_ns": time.time_ns(),
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    with _PUBLIC_FBX_RESERVATION_LOCK:
+        with _guard_public_operation_directory(
+            log_directory, operation
+        ) as directory:
+            lock_path = directory / log_filename
+            with _public_file_lock(lock_path):
+                for suffix_number in range(0, 10000):
+                    stem = _public_fbx_base_stem(pid, operation, suffix_number)
+                    fbx_path = directory / f"{stem}.fbx"
+                    txt_path = directory / f"{stem}.txt"
+                    reservation_path = directory / f".{stem}.reserve"
+                    if any(
+                        (directory / f"{stem}{extension}").exists()
+                        for extension in (".fbx", ".txt", ".json", ".fbm", ".signal")
+                    ):
+                        continue
+                    try:
+                        descriptor = os.open(
+                            reservation_path,
+                            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                            0o600,
+                        )
+                    except FileExistsError:
+                        continue
+                    try:
+                        with os.fdopen(descriptor, "wb") as marker_handle:
+                            marker_handle.write(marker_bytes)
+                            marker_handle.flush()
+                    except Exception:
+                        reservation_path.unlink(missing_ok=True)
+                        raise
+                    return fbx_path, txt_path
     raise RuntimeError("Unable to reserve a collision-free public FBX stem")
 
 
-def _release_public_fbx_reservation(path: str | Path | None) -> bool:
+def _public_fbx_reservation_is_active(
+    path: str | Path,
+    *,
+    now_ns: int | None = None,
+) -> tuple[bool, str]:
+    marker = Path(path)
+    try:
+        marker_stat = marker.stat()
+    except FileNotFoundError:
+        return False, ""
+    except OSError as exc:
+        return True, f"{marker}: {type(exc).__name__}: {exc}"
+    try:
+        marker_text = marker.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return False, ""
+    except OSError as exc:
+        return True, f"{marker}: {type(exc).__name__}: {exc}"
+
+    marker_payload: Mapping[str, Any] | None = None
+    if marker_text:
+        try:
+            decoded = json.loads(marker_text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = None
+        if isinstance(decoded, Mapping):
+            marker_payload = decoded
+    marker_schema = (
+        str(marker_payload.get("schema", "") or "")
+        if marker_payload is not None
+        else ""
+    )
+    current_ns = time.time_ns() if now_ns is None else int(now_ns)
+    max_age_ns = int(PUBLIC_FBX_LEGACY_RESERVATION_MAX_AGE_SECONDS * 1_000_000_000)
+
+    def legacy_reservation_state() -> tuple[bool, str]:
+        if int(marker_stat.st_mtime_ns) < int(
+            PUBLIC_FBX_RESERVATION_PROCESS_STARTED_UNIX_NS
+        ):
+            return False, ""
+        age_ns = max(0, current_ns - int(marker_stat.st_mtime_ns))
+        return age_ns <= max_age_ns, ""
+
+    # v1 has no trustworthy process-start metadata.  Keep its compatibility
+    # behavior bounded by the Launcher epoch and the 24-hour age window.
+    if marker_payload is not None and marker_schema == PUBLIC_FBX_LEGACY_RESERVATION_SCHEMA:
+        return legacy_reservation_state()
+
+    if marker_payload is not None and marker_schema == PUBLIC_FBX_RESERVATION_SCHEMA:
+        try:
+            owner_pid = int(marker_payload.get("owner_pid", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            owner_pid = 0
+        owner_token = str(marker_payload.get("owner_token", "") or "")
+        try:
+            expected_started_unix_ns = int(
+                marker_payload.get("owner_started_unix_ns", 0) or 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            expected_started_unix_ns = 0
+        if owner_pid <= 0:
+            return True, f"{marker}: v2 reservation has an invalid owner PID"
+        if not owner_token:
+            return True, f"{marker}: v2 reservation has no owner token"
+        if expected_started_unix_ns <= 0:
+            return True, f"{marker}: v2 reservation owner start time is missing"
+        if owner_pid == os.getpid() and not secrets.compare_digest(
+            owner_token,
+            PUBLIC_FBX_RESERVATION_OWNER_TOKEN,
+        ):
+            return False, ""
+        try:
+            owner_state, current_started_unix_ns, owner_error = (
+                _query_process_identity(owner_pid)
+            )
+        except Exception as exc:
+            return (
+                True,
+                f"{marker}: owner identity check failed: "
+                f"{type(exc).__name__}: {exc}",
+            )
+        if owner_state == "dead":
+            return False, ""
+        if owner_state != "alive":
+            return (
+                True,
+                f"{marker}: owner identity is unknown: "
+                f"{owner_error or owner_state}",
+            )
+        if current_started_unix_ns <= 0:
+            return True, f"{marker}: owner start time could not be verified"
+        if current_started_unix_ns != expected_started_unix_ns:
+            return False, ""
+        return True, ""
+
+    return legacy_reservation_state()
+
+
+def _release_public_fbx_reservation(
+    path: str | Path | None,
+    *,
+    log_directory: str | Path | None = None,
+) -> bool:
     """Remove the private reservation marker without touching public artifacts."""
     raw_path = str(path or "").strip()
     if not raw_path:
         return False
     marker = Path(raw_path).with_name(f".{Path(raw_path).stem}.reserve")
     try:
-        existed = marker.is_file()
-        marker.unlink(missing_ok=True)
-        return existed
-    except OSError:
+        with _PUBLIC_FBX_RESERVATION_LOCK:
+            marker.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        error = f"{marker}: {type(exc).__name__}: {exc}"
+        operation_parent = marker.parent.parent
+        inferred_root = (
+            operation_parent.parent
+            if operation_parent.name.casefold()
+            in {
+                PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME.casefold(),
+                LEGACY_PUBLIC_LONG_TERM_CACHE_DIRECTORY_NAME.casefold(),
+            }
+            else operation_parent
+        )
+        inferred_log_directory: str | Path = (
+            log_directory
+            if log_directory is not None
+            else inferred_root
+        )
+        try:
+            _append_public_cleanup_errors(
+                inferred_log_directory,
+                reason="reservation_release",
+                errors=[error],
+            )
+        except Exception as report_exc:
+            print(
+                f"[{APP_NAME}] Reservation release failed: {error}; "
+                f"cleanup error log failed: {type(report_exc).__name__}: "
+                f"{report_exc}",
+                file=sys.stderr,
+            )
         return False
+
+
+class _PublicFbxReservationFinalizer:
+    """Retryable, thread-safe release for one public artifact marker."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        log_directory: str | Path | None,
+        on_released: Callable[[], None],
+        retry_delays: Iterable[float] | None = None,
+    ) -> None:
+        self._path = Path(path)
+        self._log_directory = log_directory
+        self._on_released = on_released
+        self._lock = threading.Lock()
+        self._release_in_progress = False
+        self._released = False
+        delays = (0.25, 1.0, 3.0) if retry_delays is None else retry_delays
+        self._retry_delays = tuple(
+            max(0.001, float(delay)) for delay in delays if float(delay) >= 0.0
+        )
+        self._next_retry_index = 0
+        self._retry_timer: threading.Timer | None = None
+
+    def _schedule_retry(self) -> None:
+        with self._lock:
+            if (
+                self._released
+                or self._retry_timer is not None
+                or self._next_retry_index >= len(self._retry_delays)
+            ):
+                return
+            delay = self._retry_delays[self._next_retry_index]
+            self._next_retry_index += 1
+            timer = threading.Timer(delay, self._run_scheduled_retry)
+            timer.daemon = True
+            self._retry_timer = timer
+        timer.start()
+
+    def _run_scheduled_retry(self) -> None:
+        with self._lock:
+            self._retry_timer = None
+            if self._released:
+                return
+        self.release()
+
+    def release(self) -> bool:
+        with self._lock:
+            if self._released:
+                return True
+            if self._release_in_progress:
+                return False
+            self._release_in_progress = True
+        released = False
+        notify_released = False
+        retry_timer: threading.Timer | None = None
+        try:
+            released = _release_public_fbx_reservation(
+                self._path,
+                log_directory=self._log_directory,
+            )
+        finally:
+            with self._lock:
+                self._release_in_progress = False
+                if released and not self._released:
+                    self._released = True
+                    notify_released = True
+                    retry_timer = self._retry_timer
+                    self._retry_timer = None
+        if retry_timer is not None:
+            retry_timer.cancel()
+        if not released:
+            self._schedule_retry()
+        if notify_released:
+            self._on_released()
+        return released
 
 
 def _convert_public_json_to_txt(source: str | Path, target: str | Path | None = None) -> Path:
@@ -5477,14 +6544,19 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
     if not isinstance(raw_window_positions, dict):
         raw_window_positions = {}
 
-    # Expanded and compact pages are separate surfaces even when Scaling Mode
-    # is enabled. A single main:scaling slot used to let the expanded page's
-    # wide geometry become the compact page's default after a restart.
-    window_cache_keys = (
-        "main:normal:expanded",
-        "main:normal:collapsed",
-        "main:scaling:expanded",
-        "main:scaling:collapsed",
+    # Keep one geometry slot per backend, surface, and page level. The former
+    # main:scaling:{mode} slots were shared by MAX and Blender even though
+    # their layout signatures contain different backend markers. Switching
+    # backend therefore overwrote the other page's position, and the next
+    # launch discarded the mismatched signature along with the size.
+    window_cache_keys = tuple(
+        f"main:{surface}:{backend}:{mode}"
+        for surface in ("normal", "scaling")
+        for backend in ("max", "blender")
+        for mode in ("expanded", "collapsed")
+    )
+    legacy_backend = (
+        "blender" if bool(source.get("blender_mode_enabled", False)) else "max"
     )
 
     def normalize_window_size(raw_size: Any) -> list[int]:
@@ -5522,34 +6594,108 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
         for cache_key in window_cache_keys
     }
 
-    # Migrate the old unified Scaling slot once. Its signature tells us which
-    # page produced it; if no signature was stored, treat it as expanded (the
-    # historical Scaling page was the advanced page). Never copy it to the
-    # compact slot, because that is exactly the oversized-window regression.
+    def signature_backend(signature: Any, fallback: str) -> str:
+        match = re.search(
+            r"(?:^|[;|])backend=(max|blender)(?:;|$)",
+            str(signature or ""),
+        )
+        return match.group(1) if match is not None else fallback
+
+    def signature_mode(signature: Any, fallback: str) -> str:
+        match = re.search(
+            r"(?:^|[;|])mode=(expanded|collapsed)(?:;|$)",
+            str(signature or ""),
+        )
+        return match.group(1) if match is not None else fallback
+
+    def migrate_window_record(
+        *,
+        source_key: str,
+        surface: str,
+        mode: str,
+        backend: str,
+    ) -> None:
+        target_key = f"main:{surface}:{backend}:{mode}"
+        if main_window_sizes[target_key] == []:
+            main_window_sizes[target_key] = normalize_window_size(
+                raw_window_sizes.get(source_key, [])
+            )
+        if main_window_positions[target_key] == []:
+            main_window_positions[target_key] = normalize_window_position(
+                raw_window_positions.get(source_key, [])
+            )
+        if not main_window_layout_signatures[target_key]:
+            main_window_layout_signatures[target_key] = str(
+                raw_window_signatures.get(source_key, "") or ""
+            )
+
+    # Read already-canonical records first, then migrate generic records from
+    # the previous build. A generic Scaling signature identifies its backend;
+    # unsigned legacy data belongs to the active backend only.
+    for surface in ("normal", "scaling"):
+        for mode in ("expanded", "collapsed"):
+            generic_key = f"main:{surface}:{mode}"
+            generic_signature = raw_window_signatures.get(generic_key, "")
+            migrate_window_record(
+                source_key=generic_key,
+                surface=surface,
+                mode=mode,
+                backend=signature_backend(generic_signature, legacy_backend),
+            )
+
+    # The first keyed Scaling build used one mode-less entry. Its signature,
+    # when present, is enough to migrate it without contaminating the other
+    # backend or page level.
     legacy_scaling_signature = str(
         raw_window_signatures.get("main:scaling", "") or ""
     )
-    legacy_scaling_mode = (
-        "collapsed" if "mode=collapsed" in legacy_scaling_signature else "expanded"
+    migrate_window_record(
+        source_key="main:scaling",
+        surface="scaling",
+        mode=signature_mode(legacy_scaling_signature, "expanded"),
+        backend=signature_backend(legacy_scaling_signature, legacy_backend),
     )
-    legacy_scaling_key = f"main:scaling:{legacy_scaling_mode}"
-    if not main_window_sizes[legacy_scaling_key]:
-        main_window_sizes[legacy_scaling_key] = normalize_window_size(
-            raw_window_sizes.get("main:scaling", [])
-        )
-    if not main_window_positions[legacy_scaling_key]:
-        main_window_positions[legacy_scaling_key] = normalize_window_position(
-            raw_window_positions.get("main:scaling", [])
-        )
-    if not main_window_layout_signatures[legacy_scaling_key]:
-        main_window_layout_signatures[legacy_scaling_key] = legacy_scaling_signature
-    for scaling_mode in ("expanded", "collapsed"):
-        scaling_key = f"main:scaling:{scaling_mode}"
-        scaling_signature = main_window_layout_signatures[scaling_key]
-        if scaling_signature and f"mode={scaling_mode}" not in scaling_signature:
-            # A stale signature is worse than an empty one: it can make a
-            # geometry from the other page look valid during startup replay.
-            main_window_layout_signatures[scaling_key] = ""
+
+    # Very old builds keyed the normal page by language/backend. Preserve
+    # those positions as normal-page records during the one-time migration.
+    for language in ("CN", "EN"):
+        for backend in ("max", "blender"):
+            for mode in ("expanded", "collapsed"):
+                old_key = f"{language}:main-{backend}:{mode}"
+                migrate_window_record(
+                    source_key=old_key,
+                    surface="normal",
+                    mode=mode,
+                    backend=backend,
+                )
+        for mode in ("expanded", "collapsed"):
+            old_key = f"{language}:main:{mode}"
+            migrate_window_record(
+                source_key=old_key,
+                surface="normal",
+                mode=mode,
+                backend=legacy_backend,
+            )
+
+    for backend in ("max", "blender"):
+        for mode in ("expanded", "collapsed"):
+            scaling_key = f"main:scaling:{backend}:{mode}"
+            scaling_signature = main_window_layout_signatures[scaling_key]
+            signature_body = scaling_signature
+            if scaling_signature.startswith(("max|", "blender|")):
+                signature_body = scaling_signature.split("|", 1)[1]
+            if scaling_signature and (
+                not signature_body.startswith(
+                    f"{MAIN_UI_SCALING_LAYOUT_CACHE_VERSION}|"
+                )
+                or f"mode={mode}" not in signature_body
+            ):
+                # A stale signature is worse than an empty one: it can make a
+                # geometry from the other page look valid during startup replay.
+                # Invalidate old Scaling versions at load time as well, so a
+                # restart from Advanced Options cannot carry the retired width
+                # into the next Compact page switch.  Positions remain intact.
+                main_window_layout_signatures[scaling_key] = ""
 
     raw_scaling_layout_cache = source.get("main_ui_scaling_layout_cache", {})
     if not isinstance(raw_scaling_layout_cache, dict):
@@ -5635,11 +6781,30 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
         cache_key: bool(raw_window_default_modes.get(cache_key, False))
         for cache_key in window_cache_keys
     }
-    legacy_default_key = f"main:scaling:{legacy_scaling_mode}"
-    if legacy_default_key not in raw_window_default_modes:
-        main_window_default_modes[legacy_default_key] = bool(
-            raw_window_default_modes.get("main:scaling", False)
-        )
+    for surface in ("normal", "scaling"):
+        for mode in ("expanded", "collapsed"):
+            generic_key = f"main:{surface}:{mode}"
+            generic_default = bool(raw_window_default_modes.get(generic_key, False))
+            generic_signature = raw_window_signatures.get(generic_key, "")
+            target_key = (
+                f"main:{surface}:{signature_backend(generic_signature, legacy_backend)}:{mode}"
+            )
+            if generic_default:
+                main_window_default_modes[target_key] = True
+    legacy_default_mode = signature_mode(legacy_scaling_signature, "expanded")
+    legacy_default_backend = signature_backend(
+        legacy_scaling_signature, legacy_backend
+    )
+    if bool(raw_window_default_modes.get("main:scaling", False)):
+        main_window_default_modes[
+            f"main:scaling:{legacy_default_backend}:{legacy_default_mode}"
+        ] = True
+    for language in ("CN", "EN"):
+        for backend in ("max", "blender"):
+            for mode in ("expanded", "collapsed"):
+                old_key = f"{language}:main-{backend}:{mode}"
+                if bool(raw_window_default_modes.get(old_key, False)):
+                    main_window_default_modes[f"main:normal:{backend}:{mode}"] = True
     try:
         export_sets_scroll_position = float(
             source.get("export_sets_scroll_position", 0.0) or 0.0
@@ -7284,15 +8449,15 @@ IMPORT_EXPORT_PERFORMANCE_REVIEW_REQUIRED_FIELDS = (
     "reviewed_baseline_sha256",
 )
 IMPORT_EXPORT_PERFORMANCE_REVIEW = {
-    "review_id": "bug-control-maintenance-E84112F79FC8",
+    "review_id": "auxiliary-runtime-cleanup-87D0E1A121A1",
     "does_this_change_slow_import_export": "NO",
     "affected_phase": (
-        "Explicit AI maintenance only. --bug-control-scan runs strict Writer/Importer regressions, clean-child imports, contract and accelerator consumer checks only when a maintainer requests that CLI mode. Normal GUI startup, Import, Export and worker preload never call this scan."
+        "Dependency dispatch and auxiliary route validation only. Main MOD Importer/Writer execution and Blender/Max request transport are unchanged; legacy auxiliary export now exits before Max runtime access."
     ),
     "timing_evidence": (
-        "Normal Writer and Importer module loads publish DEFERRED maintenance status and complete without executing their full regression suites. The strict scan measured separately through its explicit console entry; no PYMXS scene read, FBX parse, subprocess wait, source fingerprint gate or maintenance suite was added to a user operation."
+        "LauncherApp._import_mod_active and LauncherApp._export_mod_active retain their reviewed AST fingerprints. The focused architecture test proves legacy auxiliary export rejects before _max_runtime, and removal of the dead loader entry adds no foreground IPC, hashing, retry, or file work."
     ),
-    "reviewed_baseline_sha256": "E84112F79FC83B43B3C54A313A8F39C91872F8F23233F3744F150D06113D7294",
+    "reviewed_baseline_sha256": "87D0E1A121A1601D05FEB754D64789005635AA6F1911585AB585341A552B8D31",
 }
 IMPORT_EXPORT_PERFORMANCE_PROTECTED_FUNCTIONS = (
     "_call_with_windows_thread_priority",
@@ -7372,37 +8537,37 @@ IMPORT_EXPORT_PERFORMANCE_FINGERPRINTS = {
     "_ensure_bootstrap_module_identity": "E8A177D497EE8C722CBF5DEBAC46FD72C338F440CBF4AB41542615780BDD72EA",
     "_ensure_scene_compatibility_module_identity": "CA690255DD8949D3CE583A7ABEBA4D9B0A09C69A0DAFB1446C009C1419F251ED",
     "_apply_scene_export_compatibility_contract": "C01306EA6CCA15E983237A6AC81AF39ABCF7A27E97F81324FF3F9EBB4226D4D8",
-    "_load_operation_dependency": "992B2CDE34EE3268D960552DBA88D360CC4F53C4A4B0524AD794F169EAF63E16",
+    "_load_operation_dependency": "0C22D5677B08BDEBE512EFE48CF6DB9756C0A10492B5694F5C3D2C247E1DCEF6",
     "_ensure_required_runtime_domain_ready": "56911E63347FC87456A8F82CEAEC9ABB5ADDA8B88F005A8DEF5DF7383A70C570",
     "_ensure_export_runtime_domain_ready": "CFE19A154135877593967A92CE6820AE79E997339F8DFCD3B8EF1F7B948FC677",
     "_ensure_auxiliary_probe_runtime_domain_ready": "ACCD0541EEE1F9189571831A4888D03156A91C8927F656DAFAC60965E8E2C677",
     "_runtime_dependency_error_is_repairable": "074D1D7E02F967DB30AE010B31F4662689D1F9C312D63F701D84F676049C1186",
-    "_build_import_fbx_in_memory_contract": "BF7440B692048B6E82D38AB48D8AABC49FBF73AD61898D450F27BA56C2E2ECB5",
+    "_build_import_fbx_in_memory_contract": "99140AF2C85C91F08E5D6452787DE9475D5F3660733E00A0F328D98EBF0B14AB",
     "_sign_memory_export_scene_contract": "85CC0F8F0F56CA98A0EB776F258FE5EAC3876308D78E175AABBD9FFC9A4C7C01",
-    "_writer_process_entry": "838DED36EA295571654D41814CA463B8C78C816063BA60481A738B8B3E19C46F",
-    "_run_writer_process_transport_smoke": "16B526A5A26D1BB145C729D420BF6FA75977EDEAE41CE6AB1C581E07DC165B4E",
+    "_writer_process_entry": "ECE70BDD4F92D5204BA22144D35367F4BE537C85A1886007008E3F3A390D3062",
+    "_run_writer_process_transport_smoke": "23D78B30FDDB7298911A381EBE20FD5184916C3E4893B89722831942354E90B0",
     "_initialize_policy_validation_revision": "820EB1E9390236B6E9ACB7933E8F9934A5EDD12377349B2411DDFE259E98572C",
-    "_run_operation_isolation_policy_guard": "214C6377CC4D33C9C844996C34D7A75A749E780CE6A1335AFAF5287CE2F98B24",
+    "_run_operation_isolation_policy_guard": "1AF16AD112F903B98E6EDC419EFFC9DC82477E1674C2D6A6FF7E3799C0C003D0",
     "PymxsAgent.__init__": "43C9769338B5D88A86B62FD723A175DF7552147762FB5AF147B45B9BB44B68BD",
     "PymxsAgent.stop": "90938EBB57E429A11E4C8B0F0E80AFB180EB130116B9BB115EE48E4181D7F45F",
     "PymxsAgent._handle_connection": "E3FB777A04FAA83A9DFB40B461E2954304BA130E1F51DEE34BCEC8F402BF8666",
     "PymxsAgent.begin_replacement_if_idle": "4EF84DA3FE177855DAC7568D22D6C17CD90FDF8DC77EECD54083B699654B5449",
     "PymxsAgent._execute_on_max_thread": "AA2E4E1B7742EBEC21A05C53450B8BF45666ED706C30B7F19452805F40C73047",
-    "LauncherApp._start_runtime_services": "79AD94158CAAAA5674635A7EC3570995E6049BC36305B6AC5505260BB0DBE082",
+    "LauncherApp._start_runtime_services": "B21DC1B5275651A6EAAF1B52F3F91B936CEDC33FBD0C0B94F2A0D820B1B478A4",
     "LauncherApp._dispatch_operation": "1A526D39AF57ACDBA9EF0C50754230CB22E3670DA9AD9C9C98F537B91CF19873",
     "LauncherApp._start_policy_validation": "5B2F887BD5588502B044ED7A491E3C33097863754C8ECA22C07E3835BD4A7FE9",
     "LauncherApp._start_importer_warmup": "E4B15F6D6FF4CD4DF2CC4FA4F0DC72BECB62FEEB5D38CD7ECBCA70C80A2B2140",
     "LauncherApp._schedule_writer_warmup": "986939F6E3402179A248F0EA625442C9B20CF222958B94148D04F78D9E73E4F7",
     "LauncherApp._writer_worker_is_alive": "00F0DA47339D59113A75B933A779A6DD512D1E3BCB4F012B936680781405158B",
-    "LauncherApp._close_writer_worker": "3BF74A372D2F4683B35B5EA95F472CAEBB7457BE196829DF65091BD7C0D47C59",
-    "LauncherApp._spawn_writer_worker_locked": "3A3C4CE69C357B12E8F28403F5F14A7EF88E4C0C8C4F8789B08D0536B8F03FAA",
+    "LauncherApp._close_writer_worker": "92BE06F5598EB268B07436A75C82FA2DD4A58C3E56D77D3F4D6FA5446F921BD0",
+    "LauncherApp._spawn_writer_worker_locked": "CAB52D40EB207499DD119F9B9093997497C238F786C2BE1E0371D2B12BB46ECE",
     "LauncherApp._acquire_writer_worker": "8DF4ADC01FA7CAF27FDC99120B94B0032AFBF064709E7774F4005C831D11C3AD",
     "LauncherApp._release_writer_worker": "047AEFF0418EA1F564C2310245EC2E7B3893B608CB2A444282F27A4D8DD6D734",
-    "LauncherApp._ensure_writer_worker_ready": "307A140263711D0A26BC57467AB8454BA67DB740CE10E3CC7A13D22D8EF58ED6",
-    "LauncherApp._run_writer_in_process": "EE38C455F7489CB1E8C54471B324989C116B8DA92ADF77197C4DFE3E85697037",
-    "LauncherApp._run_writer_request_once": "AD2C85CF476E416CA95838474800FE9014FC3B28EC1D6F352C2F8289CEBEB4F7",
-    "LauncherApp._start_writer_process": "8140D5B16917B0AC06844074D7945401B3206CC3BA20F5A8EC5B9CF0612271DF",
-    "LauncherApp._preload_writer_process": "7EFEEDC347BA17634F9B5F20E40C5D8871261B23FB64B4E63CABC931C5A4E04F",
+    "LauncherApp._ensure_writer_worker_ready": "DAED27A4B2085D36BA67DE569391CE0EFE82BA5BA7B1D383F3107FD0F907BD73",
+    "LauncherApp._run_writer_in_process": "208DCF74B4086C66386D5D406C436A50FE0242E1987BAD08D0C4A6085FD70385",
+    "LauncherApp._run_writer_request_once": "87B364A05265133AC877E6C11059246C0323E5ECCCA3C54A80FECBCC0E07D19A",
+    "LauncherApp._start_writer_process": "F57AD8D622B24AD3CF578E3C3143016927B4CA48656D7D2A2629333F78149C42",
+    "LauncherApp._preload_writer_process": "30FC5439E97C4ED73777BC899E97F7CB6AD763CF9AA8DF5D0A5EFBA84337C8C3",
     "LauncherApp._shutdown_writer_process": "4C22FEC0E5B6F5744A0D95A8A979E28ECE87111980EDD23948455F9349450FB1",
     "LauncherApp._refresh_agent_startup_hooks": "56CCE6D0F02AF522E559D3B12F6CCED18C1054AE955AC9A3A1EA83D17F95B129",
     "LauncherApp._begin_session_operation": "2E888B8E13D00035B198CDABEF8E60A0824D1ABE5334041BBBC87CCD83972FB6",
@@ -7421,25 +8586,24 @@ IMPORT_EXPORT_PERFORMANCE_FINGERPRINTS = {
     "LauncherApp._submit_scene_auto_colors": "B3D721744B32C8357D9942F8E220281B1BFFAD81D353C53898C7A35843F4A522",
     "LauncherApp._start_pending_scene_auto_colors": "7B8FB75C11B6E74B9419498417A741E16737A9BD36B69002288262F3B5EBF10A",
     "LauncherApp._schedule_scene_auto_colors_after_import": "D15402F999A7ABA29F38553ED656C242852320912CA33A99D21ACCAEB9CEAEA6",
-    "LauncherApp._poll_max_windows": "A0C0A2FE5FF28C1B913CA815AEAD24666804C1DBF4C0775A6FB2DC73888BCD79",
-    "LauncherApp._import_mod_active": "16F7595BB3B094A209E6419A30A4B4246164282849D2619648EE9DCF2CABD91C",
-    "LauncherApp._export_mod_active": "9D5B2484DE86EFC47E423A2E78CBE3B016EB384F8514030CAFC7FB4293E66038",
-    "LauncherApp._on_close": "6CE9CEC1425D821B4B726AB8EB340A9FC7EC2BA125DCE7A32CD4392E9F85180E",
-    "_main_impl": "07CD92C4AC24C03FA380A77B3F74BEA9DA6AAB113718C205F5EF18A77FC27E88",
+    "LauncherApp._poll_max_windows": "7C0DC41B01B212564320E70C7DA455A3C47EC63E08B82D56A95DB4119FE9F5B0",
+    "LauncherApp._import_mod_active": "A4D13A49A676120C2BE9616BBE9F691B1B0E0560614D1C9B6A65653E80138F22",
+    "LauncherApp._export_mod_active": "6F11750BE82C7018A6660D811B7208A2B29F47B4B5C8728EFBB5B127C4284833",
+    "LauncherApp._on_close": "43E353E9F78D09B76D2E833804AFC045E240F12FA7CF25C33A24A522F895BE3D",
+    "_main_impl": "43D765CE2DD12E3111A0F0B4AAAFFE304E446955B6E72F081CA8AA18288F7682",
     "_run_import_export_performance_policy_guard": "025C8A6547AAFFC452AEA36C7B1AEF82ADE22B8C8150B5190511D6DE5851ECD5",
-    "_run_policy_guard_bundle": "FC1B59B90AC55618DE753A666D3473C2699DDA952ED23D0ABAAA99B48217207E",
-    "_apply_policy_guard_bundle": "E376C2A3F6B930EE65CC55F1D013FC7B3DEEB345A891AD6DD8A785A05EE39F4A",
+    "_run_policy_guard_bundle": "BB8157ADEE5E0EB1A33C1D224FB9A8D816F08C43EE2FB06E0D6C1EB0FFC78558",
+    "_apply_policy_guard_bundle": "D991D5BFA83A91150A1200AAA03BFA7172FA46BD0CD6CF2AE1B84D194DAAD564",
 }
 # AI_MAINTENANCE_ONLY: this frozen table is read only by explicit policy smoke.
 # It tells a maintainer that Importer/Writer changed without a recorded review.
 # User operations must never use these values as runtime trust or readiness.
 AI_MAINTENANCE_ONLY_MODULE_SHA256 = {
-    "codex_python_runtime_bootstrap.py": "E3894AD710C79D762C953FEC2D9FA98F8AB10F435AE45970FDB30EBF0B7D88CB",
-    "codex_re6_mod_import_fbx.py": "D052E4F0008F75272C3131148016B4BABAD2EE2098E8BC1903E055D12CB2BE5D",
-    "codex_python_export_bridge.py": "C6808FD30182331FE2127054895C4C90ECF855C5AA421D4DD5B8D7D1DBE408BE",
+    "codex_python_runtime_bootstrap.py": "89A3A06DA87D4F28E8E105DFD858AC79DC2C2FD3DE8EC449BD1B8EC9C574002C",
+    "codex_re6_mod_import_fbx.py": "F94AC8B0D9D7E60B14A42E88DCCF893371E99B9F85F6DDD628EEE8A55C75DA53",
+    "codex_python_export_bridge.py": "F8F973F2108CC4FCB2B73DD6110601552D0B0710A13248629AB1F724AAB3BB02",
     "codex_re6_scene_compatibility.py": "0F387A805643A060C90B0FB3C32A5A884F925E9C1D872A117DFB3681BB5E16CC",
-    "codex_fbx_probe.py": "EFD1F1D1728D77647780946BF7929335B809FCF7396C4AF2D241589EFA7E5BD4",
-    "codex_re6_auxiliary_max_bridge.py": "63AFB27F36B4C318EB8A13F133C63BD0A225A2005C89908668FDC9A3D20F3E70",
+    "codex_fbx_probe.py": "CC90668B2354FEB5510316F252F034555DCD517958AC24098F542AD152090BE2",
     "codex_re6_tex_decode.py": "2C3D689B5CC7CFF59BEF3479CB0DF979B932DB6ED1204D9BF1AC6E04D603CD56",
 }
 RESCUE_AGENT_MAINTENANCE_PROTECTED_FUNCTIONS = (
@@ -7504,7 +8668,7 @@ RESCUE_AGENT_MAINTENANCE_FINGERPRINTS = {
     "install_agent_startup_hooks": "3E33EA3685508DC91A26BB766ACA4507C418260FF05157C90A6D74785FE874A2",
     "_start_work_agent_for_rescue": "5A4D0086B77E50B048A9E0B6C25F27F1DA8865CBACBD68D3FCA4F6AAEF3A18F5",
     "_start_rescue_agent_for_current_process": "0B5F1B021CC6C415DCB007C899209C6CB62B127513AB67DCD17FF4ABF6D3087F",
-    "ManagedMaxSession.connect_existing": "4BACB8F381337D79CB8C45D1FA88CD6481FE06674D44DA7688ED728354A2F530",
+    "ManagedMaxSession.connect_existing": "9DCDEF9111AADA2A291852A53C29CE08CDA13F856BDD424A731FD0520CBB0D8E",
 }
 IMPORT_EXPORT_PERFORMANCE_MODULE_SHA256 = {
     IMPORTER_PATH.name: AI_MAINTENANCE_ONLY_MODULE_SHA256[IMPORTER_PATH.name],
@@ -7521,7 +8685,6 @@ OPERATION_RUNTIME_MODULE_PATHS = {
     "inspect_scene": (),
     "health": (),
     "auxiliary": (
-        AUXILIARY_MAX_BRIDGE_PATH,
         IMPORTER_PATH,
         FBX_PROBE_PATH,
         COMPATIBILITY_PATH,
@@ -7735,7 +8898,6 @@ PYMXS_EXPORT_REQUIRED_FUNCTIONS = (
 PYMXS_EXPORT_FORBIDDEN_FUNCTIONS = (
     "_max_scene_contract",
     "_max_evaluated_mesh",
-    "_max_auxiliary_mesh_arrays",
     "_max_export_auxiliary",
     "_max_import_mod",
     "_max_auto_add_random_normals",
@@ -10887,7 +12049,6 @@ def _run_ui_quality_policy_guard() -> dict[str, Any]:
         ),
         "_apply_mesh_filter": ("_normalize_mesh_filter_choice(",),
         "_dismiss_mesh_filter_dropdowns_from_click": (
-            "self._pointer_is_inside_combobox(combo, event)",
             'combo.tk.call("ttk::combobox::Unpost", str(combo))',
             "combo.selection_clear()",
             "self._release_combobox_focus_if_current(combo)",
@@ -10953,7 +12114,7 @@ def _run_ui_quality_policy_guard() -> dict[str, Any]:
             "self._post_rename_value_history_dropdown",
         ),
         "_ensure_rename_value_history_dropdown": (
-            "_create_managed_toplevel(self.root, activate=False)",
+            "_create_indexed_toplevel(",
             "window.wm_overrideredirect(True)",
             "self.tk.Listbox(",
             "self.ttk.Scrollbar(",
@@ -11124,7 +12285,7 @@ def _run_ui_quality_policy_guard() -> dict[str, Any]:
         "_pc_rehd_compact_text",
         "_bind_compact_floating_ball_button(",
         'fill=str(self.colors["floating_button_text"])',
-        'font=("Microsoft YaHei UI", 9, "bold")',
+        "self._main_ui_font(9, \"bold\")",
     ):
         if token not in compact_builder_source + compact_draw_source:
             violations.append("compact_floating_ball_contract_missing=" + token)
@@ -11155,7 +12316,7 @@ def _run_ui_quality_policy_guard() -> dict[str, Any]:
         "_show_rename_selection_notice": (
             '"Blender 场景中未选择任何Mesh 节点"',
             '"MAX场景中未选择任何Mesh 节点"',
-            "_create_managed_toplevel(self.root, activate=False)",
+            "_create_indexed_toplevel(",
             "scheduler.acquire_temporary_layer(",
             "layer=MANAGED_WINDOW_TOOLTIP_LAYER",
             "self._position_rename_selection_notice()",
@@ -12202,7 +13363,6 @@ def _run_operation_isolation_policy_guard() -> dict[str, Any]:
         "health": ("max_agent",),
         "auxiliary": (
             "max_agent",
-            "auxiliary",
             "auxiliary_fbx",
             "auxiliary_probe",
         ),
@@ -12228,7 +13388,6 @@ def _run_operation_isolation_policy_guard() -> dict[str, Any]:
         "inspect_scene": set(),
         "health": set(),
         "auxiliary": {
-            AUXILIARY_MAX_BRIDGE_PATH.name,
             IMPORTER_PATH.name,
             FBX_PROBE_PATH.name,
             COMPATIBILITY_PATH.name,
@@ -12250,7 +13409,6 @@ def _run_operation_isolation_policy_guard() -> dict[str, Any]:
         WRITER_PATH.name: WRITER_PATH,
         IMPORTER_PATH.name: IMPORTER_PATH,
         FBX_PROBE_PATH.name: FBX_PROBE_PATH,
-        AUXILIARY_MAX_BRIDGE_PATH.name: AUXILIARY_MAX_BRIDGE_PATH,
         TEX_DECODER_PATH.name: TEX_DECODER_PATH,
         COMPATIBILITY_PATH.name: COMPATIBILITY_PATH,
     }
@@ -15101,6 +16259,7 @@ def install_agent_startup_hooks(directories: list[Path] | None = None) -> list[P
 
 
 def run_protocol_smoke_test() -> dict[str, Any]:
+    blender_manual_rename_bucket = _run_blender_manual_rename_bucket_regression_guard()
     _validate_policy_guards_sync()
     expected_work_agent_revision = (
         f"{WORK_AGENT_COMPONENT_REVISION_PREFIX}{LAUNCHER_SOURCE_SHA256[:24]}"
@@ -15508,7 +16667,7 @@ def run_protocol_smoke_test() -> dict[str, Any]:
             state_tex_path = str(
                 (Path(state_root) / "textures" / "Body.TEX").resolve(strict=False)
             )
-            _write_launcher_state(
+            expected_persisted_state = _write_launcher_state(
                 {
                     "ui_language_preference": "en",
                     "launcher_icon_style": LAUNCHER_ICON_STYLE_ORIGINAL,
@@ -15599,113 +16758,7 @@ def run_protocol_smoke_test() -> dict[str, Any]:
                 Path(state_root),
             )
             persisted_state = _load_launcher_state(Path(state_root))
-        if persisted_state != {
-            "schema": LAUNCHER_STATE_SCHEMA,
-            "ui_language_preference": "EN",
-            "launcher_icon_style": LAUNCHER_ICON_STYLE_ORIGINAL,
-            "always_on_top_enabled": False,
-            "dark_mode_enabled": True,
-            "scene_auto_colors_enabled": True,
-            "scene_auto_colors_mode": DEFAULT_SCENE_AUTO_COLOR_MODE,
-            "scene_auto_colors_seed": 1,
-            "rename_value": "731",
-            "rename_value_history": ["0", "255", "2", "19", "731"],
-            "rename_value_pinned_values": ["19"],
-            "log_directory": str((Path(state_root) / "diagnostics").resolve(strict=False)),
-            "advanced_options_visible": False,
-            "blender_mode_enabled": True,
-            "blender_executable": "",
-            "blender_advanced_options_visible": True,
-            "blender_mode_restore_advanced_visible": True,
-            "blender_fbx_hierarchy_auto_repair_enabled": True,
-            "compact_mode_panel_collapsed": True,
-            "max_compact_mode_panel_collapsed": True,
-            "blender_compact_mode_panel_collapsed": False,
-            "max_advanced_rename_enabled": True,
-            "blender_advanced_rename_enabled": True,
-            "toolbox_visible": True,
-            "toolbox_geometry": "612x344-1280+96",
-            "max_toolbox_visible": True,
-            "max_toolbox_geometry": "612x344-1280+96",
-            "blender_toolbox_visible": False,
-            "blender_toolbox_geometry": "",
-            "import_texture_folder_cleanup_disabled": False,
-            "scene_normals_visible": True,
-            "scene_normals_geometry": "340x156+1330+220",
-            "scene_normals_dock_side": "right",
-            "scene_normals_dock_offset": 42,
-            "main_window_sizes": {
-                "CN:main-max:expanded": [912, 864],
-                "CN:main-max:collapsed": [430, 700],
-                "CN:main-blender:expanded": [912, 864],
-                "CN:main-blender:collapsed": [430, 700],
-                "EN:main-max:expanded": [980, 820],
-                "EN:main-max:collapsed": [470, 680],
-                "EN:main-blender:expanded": [980, 820],
-                "EN:main-blender:collapsed": [470, 680],
-            },
-            "main_window_layout_signatures": {
-                "CN:main-max:expanded": "cn-advanced",
-                "CN:main-max:collapsed": "cn-simple",
-                "CN:main-blender:expanded": "cn-advanced",
-                "CN:main-blender:collapsed": "cn-simple",
-                "EN:main-max:expanded": "en-advanced",
-                "EN:main-max:collapsed": "en-simple",
-                "EN:main-blender:expanded": "en-advanced",
-                "EN:main-blender:collapsed": "en-simple",
-            },
-            "main_window_default_modes": {
-                "CN:main-max:expanded": True,
-                "CN:main-max:collapsed": False,
-                "CN:main-blender:expanded": True,
-                "CN:main-blender:collapsed": False,
-                "EN:main-max:expanded": False,
-                "EN:main-max:collapsed": True,
-                "EN:main-blender:expanded": False,
-                "EN:main-blender:collapsed": True,
-            },
-            "export_sets_scroll_position": 0.625,
-            "collapsed_sections": {
-                "model": False,
-                "rename": True,
-                "filter": False,
-            },
-            "max_collapsed_sections": {
-                "model": False,
-                "rename": True,
-                "filter": False,
-            },
-            "blender_collapsed_sections": {
-                "model": True,
-                "rename": True,
-                "filter": False,
-            },
-            "manual_texture_last_paths": {
-                "dds": state_dds_path,
-                "tex": state_tex_path,
-            },
-            "manual_texture_path_history": [state_dds_path, state_tex_path],
-            "mrl_last_path": "",
-            "mrl_path_history": [],
-            "mrl_save_decoded_textures": False,
-            "mrl_open_decoded_texture_directory": False,
-            "model_option_preferences": {
-                "import_normals": False,
-                "import_textures": True,
-                "reset_scene_on_import": True,
-                "check_source": False,
-                "export_map2": True,
-                "uv_half_safe": False,
-                "log_mode": False,
-            },
-            "export_option_preferences": {
-                "append_newmod_suffix": False,
-                "auto_rename_source_mod": True,
-                "overwrite_source_mod": True,
-                "legacy_export": True,
-                "quick_select_to_modify": True,
-            },
-        }:
+        if persisted_state != expected_persisted_state:
             raise AssertionError("Launcher long-term state did not persist")
         rescue_agent = _run_rescue_agent_protocol_smoke()
         legacy_auxiliary_128 = _run_legacy_auxiliary_128_contract_smoke()
@@ -15717,6 +16770,7 @@ def run_protocol_smoke_test() -> dict[str, Any]:
             "reload_once": True,
             "broken_health_recovery": True,
             "bucket_mesh_name_probe": True,
+            "blender_manual_rename_bucket": blender_manual_rename_bucket,
             "scene_name_probe": True,
             "scene_normal_probe": True,
             "scene_auto_colors": {
@@ -16425,118 +17479,6 @@ def _max_evaluated_mesh(rt: Any, node: Any, *, include_arrays: bool) -> dict[str
         "geometry_contract": "metadata_only",
         "geometry_source": "max_selected_fbx_required",
     }
-
-
-def _auxiliary_contract_failure_receipt(
-    correlation_id: str,
-    exc: Exception,
-) -> dict[str, Any]:
-    return {
-        "schema": OPERATION_RECEIPT_SCHEMA,
-        "module": "codex_re6_auxiliary_max_bridge",
-        "operation": "read_auxiliary_mesh_geometry",
-        "failure_domain": "auxiliary",
-        "isolation_scope": "auxiliary_only",
-        "status": "FAIL",
-        "status_code": "AUX_MAX_API_CONTRACT_FAILED",
-        "retryable": True,
-        "degraded": True,
-        "recovery_action": "reload_max_agent_then_retry_auxiliary",
-        "contract_revision": 1,
-        "correlation_id": str(correlation_id),
-        "duration_ms": 0.0,
-        "error_type": type(exc).__name__,
-        "detail": str(exc),
-    }
-
-
-def _normalize_aux_operation_receipt(
-    raw_receipt: Any,
-    *,
-    expected_correlation_id: str,
-) -> dict[str, Any]:
-    if not isinstance(raw_receipt, dict):
-        raise ProtocolError("AUX operation returned no receipt")
-    receipt = dict(raw_receipt)
-    expected_values = {
-        "schema": OPERATION_RECEIPT_SCHEMA,
-        "module": "codex_re6_auxiliary_max_bridge",
-        "operation": "read_auxiliary_mesh_geometry",
-        "failure_domain": "auxiliary",
-        "isolation_scope": "auxiliary_only",
-        "correlation_id": str(expected_correlation_id),
-    }
-    mismatches = [
-        key
-        for key, expected in expected_values.items()
-        if str(receipt.get(key, "") or "") != expected
-    ]
-    if mismatches:
-        raise ProtocolError(
-            "AUX operation receipt identity mismatch: " + ", ".join(mismatches)
-        )
-    status = str(receipt.get("status", "") or "").upper()
-    status_code = str(receipt.get("status_code", "") or "")
-    if status not in {"PASS", "FAIL"} or not status_code.startswith("AUX_"):
-        raise ProtocolError("AUX operation receipt returned an invalid status")
-    try:
-        revision = int(receipt.get("contract_revision", 0) or 0)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ProtocolError("AUX operation receipt revision is invalid") from exc
-    if revision < 1:
-        raise ProtocolError("AUX operation receipt revision is missing")
-    return receipt
-
-
-def _max_auxiliary_mesh_arrays(
-    rt: Any,
-    node: Any,
-    *,
-    kind: str,
-    role: str,
-    correlation_id: str,
-) -> dict[str, Any]:
-    try:
-        bridge = _load_operation_dependency("auxiliary", "auxiliary")
-        envelope = bridge.run_auxiliary_geometry_operation(
-            rt,
-            node,
-            kind=kind,
-            role=role,
-            correlation_id=correlation_id,
-        )
-        if not isinstance(envelope, dict):
-            raise ProtocolError("AUX operation returned an invalid envelope")
-        receipt = _normalize_aux_operation_receipt(
-            envelope.get("receipt"),
-            expected_correlation_id=correlation_id,
-        )
-        succeeded = envelope.get("ok") is True
-        if succeeded != (str(receipt.get("status", "") or "").upper() == "PASS"):
-            raise ProtocolError("AUX operation envelope and receipt disagree")
-        if not succeeded:
-            return {"ok": False, "result": None, "receipt": receipt}
-        geometry = envelope.get("result")
-        if not isinstance(geometry, dict):
-            raise ProtocolError("AUX operation omitted its geometry result")
-        expected_contract = "pc-rehd-sbc-adr-ems-geometry-v1"
-        if str(geometry.get("contract", "") or "") != expected_contract:
-            raise ProtocolError("Auxiliary geometry bridge returned the wrong contract")
-        if str(geometry.get("kind", "") or "").casefold() != str(kind).casefold():
-            raise ProtocolError("Auxiliary geometry bridge changed the file kind")
-        if str(geometry.get("role", "") or "").casefold() != str(role).casefold():
-            raise ProtocolError("Auxiliary geometry bridge changed the node role")
-        if not isinstance(geometry.get("vertices"), list) or not isinstance(
-            geometry.get("faces"), list
-        ):
-            raise ProtocolError("Auxiliary geometry bridge omitted its geometry arrays")
-        return {"ok": True, "result": geometry, "receipt": receipt}
-    except Exception as exc:
-        return {
-            "ok": False,
-            "result": None,
-            "receipt": _auxiliary_contract_failure_receipt(correlation_id, exc),
-        }
 
 
 def _max_hierarchy_path(node: Any) -> list[str]:
@@ -24186,8 +25128,6 @@ def _max_export_fbx(
     primary_error: Exception | None = None
     recovery_failures: list[str] = []
     route_marker_snapshots: list[tuple[Any, str, int]] = []
-    reservation_path = path.with_name(f".{path.stem}.reserve")
-    reservation_owned = reservation_path.is_file()
     try:
         path.unlink(missing_ok=True)
         if not export_all_scene:
@@ -24306,12 +25246,6 @@ def _max_export_fbx(
             except Exception as selection_exc:
                 recovery_failures.append(f"Max selection restore failed: {selection_exc}")
         _max_release_transient_runtime(rt)
-        if reservation_owned and export_result is not None:
-            # Once the public FBX exists, the allocator cannot reuse this stem
-            # even after the private marker is removed.  On failure, keep the
-            # marker until the Launcher writes the terminal ERROR TXT so a
-            # concurrent request cannot claim the stem in that handoff gap.
-            _release_public_fbx_reservation(path)
     if primary_error is not None:
         if recovery_failures:
             raise RuntimeError(
@@ -24421,10 +25355,12 @@ def _max_auxiliary_transform_row(rt: Any, node: Any) -> dict[str, Any]:
 
 
 def _max_export_auxiliary(payload: dict[str, Any]) -> dict[str, Any]:
-    rt = _max_runtime()
     kind = str(payload.get("kind", "") or "").lower()
     source_sha256 = str(payload.get("source_sha256", "") or "").upper()
     pythonized = bool(payload.get("pythonized", False))
+    if not pythonized:
+        raise ValueError("legacy auxiliary export is disabled; use Pythonized FBX export")
+    rt = _max_runtime()
     correlation_id = str(payload.get("correlation_id", "") or "").strip() or uuid.uuid4().hex
     requested_rows = [row for row in payload.get("nodes", []) if isinstance(row, dict)]
     if kind not in {"sbc", "ems", "adr"}:
@@ -24485,34 +25421,6 @@ def _max_export_auxiliary(payload: dict[str, Any]) -> dict[str, Any]:
             "import_rotation": list(requested.get("rotation", [])),
             **_max_auxiliary_transform_row(rt, node),
         }
-        if not pythonized and role_needs_geometry(kind, expected_role):
-            auxiliary_operation = _max_auxiliary_mesh_arrays(
-                rt,
-                node,
-                kind=kind,
-                role=expected_role,
-                correlation_id=correlation_id,
-            )
-            receipt = dict(auxiliary_operation.get("receipt", {}))
-            auxiliary_receipts.append(receipt)
-            if auxiliary_operation.get("ok") is not True:
-                return {
-                    "action": "export_auxiliary",
-                    "status": "AUX_FAILED",
-                    "kind": kind,
-                    "pythonized": pythonized,
-                    "max_process_id": os.getpid(),
-                    "correlation_id": correlation_id,
-                    "nodes": resolved_rows,
-                    "auxiliary_receipts": auxiliary_receipts,
-                    "failure_receipt": receipt,
-                    "fbx_receipt": {
-                        "status": "not_required",
-                        "path": "",
-                        "node_handles": [],
-                    },
-                }
-            live["geometry"] = dict(auxiliary_operation["result"])
         resolved_rows.append(live)
 
     fbx_receipt = {"status": "not_required", "path": "", "node_handles": []}
@@ -25056,14 +25964,7 @@ def _execute_max_command(command: str, payload: dict[str, Any]) -> dict[str, Any
         # The import function owns a native MaxScript Hold transaction. Do not
         # place FBXIMP inside pymxs.undo(), which can invalidate MXSWrapper
         # state on Max 2026.
-        if bool(payload.get("_diagnostic_python_undo", False)):
-            result = _max_execute_with_native_undo(
-                IMPORT_MOD_NATIVE_UNDO_LABEL,
-                _max_import_mod,
-                payload,
-            )
-        else:
-            result = _max_import_mod(payload)
+        result = _max_import_mod(payload)
         # FBX import selects its created nodes internally. Clear that transient
         # selection before this command can hand control back to any Bucket or
         # Quick Select request; viewport framing below has its own temporary
@@ -30681,6 +31582,7 @@ import builtins
 import base64
 import bmesh
 import bpy
+from collections import OrderedDict
 import hashlib
 import json
 import math
@@ -30714,6 +31616,8 @@ _HEADER = struct.Struct("!I")
 _MAX_MESSAGE = 32 * 1024 * 1024
 _QUEUE_RETAIN_CONTROL_KEY = "__pc_rehd_blender_queue_retain_until_idle"
 _QUEUE_RETAIN_SECONDS = 12 * 60 * 60
+_REQUEST_RECEIPT_CACHE_LIMIT = 256
+_REQUEST_RECEIPT_CACHE_SECONDS = 12 * 60 * 60
 _SCENE_DATA_SCHEMA = "pc-rehd-code-x-blender-scene-data-v1"
 _SCENE_SNAPSHOT_SCHEMA = "pc-rehd-code-x-blender-scene-snapshot-v1"
 _SCENE_TRANSFER_CHUNK_BYTES = 4 * 1024 * 1024
@@ -37434,6 +38338,9 @@ class _BlenderWorker:
         self.tasks = queue.Queue()
         self.scene_data_transfers = {}
         self.scene_snapshots = {}
+        self.pending_requests = {}
+        self.terminal_receipts = OrderedDict()
+        self.receipt_lock = threading.RLock()
         self.stopping = threading.Event()
         self.busy = False
         self.native_operator_msgbus = False
@@ -37534,14 +38441,64 @@ class _BlenderWorker:
                         ),
                     )
                     return
-                task = {
-                    "request": request,
-                    "event": threading.Event(),
-                    "response": None,
-                }
-                self.tasks.put(task)
                 command = str(request.get("command", "") or "").strip().casefold()
                 raw_payload = request.get("payload", {})
+                request_id = str(request.get("request_id", "") or "").strip().lower()
+                if not request_id:
+                    raise ValueError("Blender Worker request ID is missing")
+                identity = (
+                    command,
+                    hashlib.sha256(
+                        json.dumps(
+                            raw_payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                )
+                queued_at = time.time()
+                with self.receipt_lock:
+                    self._prune_terminal_receipts_locked(queued_at)
+                    cached = self.terminal_receipts.get(request_id)
+                    pending = self.pending_requests.get(request_id)
+                    if cached is not None:
+                        if cached["identity"] != identity:
+                            response = _response(
+                                _WORKER_PROTOCOL, request, False,
+                                error="Blender request ID was reused with a different command or payload",
+                                status_code="BLENDER_REQUEST_ID_CONFLICT",
+                            )
+                        else:
+                            response = dict(cached["response"])
+                            response["ipc_timing"] = dict(response.get("ipc_timing", {}))
+                            response["ipc_timing"]["receipt_cache_hit"] = True
+                        _send(connection, response)
+                        return
+                    if pending is not None:
+                        if pending["identity"] != identity:
+                            _send(
+                                connection,
+                                _response(
+                                    _WORKER_PROTOCOL, request, False,
+                                    error="Blender request ID is already running with a different command or payload",
+                                    status_code="BLENDER_REQUEST_ID_CONFLICT",
+                                ),
+                            )
+                            return
+                        task = pending
+                    else:
+                        task = {
+                            "request": request,
+                            "identity": identity,
+                            "event": threading.Event(),
+                            "response": None,
+                            "queued_at": queued_at,
+                            "started_at": 0.0,
+                            "completed_at": 0.0,
+                        }
+                        self.pending_requests[request_id] = task
+                        self.tasks.put(task)
                 retain_until_idle = bool(
                     isinstance(raw_payload, dict)
                     and raw_payload.get(_QUEUE_RETAIN_CONTROL_KEY, False)
@@ -37575,6 +38532,10 @@ class _BlenderWorker:
                     )
                 else:
                     response = task["response"]
+                response = dict(response or {})
+                timing = dict(response.get("ipc_timing", {}))
+                timing["worker_response_sent_epoch_ms"] = int(time.time() * 1000.0)
+                response["ipc_timing"] = timing
                 _send(connection, response)
             except Exception as exc:
                 try:
@@ -37590,6 +38551,17 @@ class _BlenderWorker:
                     )
                 except Exception:
                     pass
+
+    def _prune_terminal_receipts_locked(self, now):
+        while self.terminal_receipts:
+            request_id, receipt = next(iter(self.terminal_receipts.items()))
+            if (
+                len(self.terminal_receipts) <= _REQUEST_RECEIPT_CACHE_LIMIT
+                and now - float(receipt.get("completed_at", now))
+                <= _REQUEST_RECEIPT_CACHE_SECONDS
+            ):
+                break
+            self.terminal_receipts.pop(request_id, None)
 
     def _execute(self, request):
         command = str(request.get("command", "") or "").strip().casefold()
@@ -37747,7 +38719,9 @@ class _BlenderWorker:
             except queue.Empty:
                 break
             request = task["request"]
+            request_id = str(request.get("request_id", "") or "").strip().lower()
             self.busy = True
+            task["started_at"] = time.time()
             try:
                 result = self._execute(request)
                 task["response"] = _response(
@@ -37762,6 +38736,31 @@ class _BlenderWorker:
                     status_code="BLENDER_WORKER_COMMAND_FAILED",
                 )
             finally:
+                task["completed_at"] = time.time()
+                response = dict(task["response"] or {})
+                response["ipc_timing"] = {
+                    "worker_queued_epoch_ms": int(task["queued_at"] * 1000.0),
+                    "worker_started_epoch_ms": int(task["started_at"] * 1000.0),
+                    "worker_completed_epoch_ms": int(task["completed_at"] * 1000.0),
+                    "worker_queue_ms": round(
+                        max(0.0, task["started_at"] - task["queued_at"]) * 1000.0, 3
+                    ),
+                    "worker_execute_ms": round(
+                        max(0.0, task["completed_at"] - task["started_at"]) * 1000.0, 3
+                    ),
+                    "receipt_cache_hit": False,
+                    "worker_generation": self.generation,
+                }
+                task["response"] = response
+                with self.receipt_lock:
+                    self.pending_requests.pop(request_id, None)
+                    self.terminal_receipts[request_id] = {
+                        "identity": task["identity"],
+                        "response": dict(response),
+                        "completed_at": task["completed_at"],
+                    }
+                    self.terminal_receipts.move_to_end(request_id)
+                    self._prune_terminal_receipts_locked(task["completed_at"])
                 self.busy = False
                 task["event"].set()
                 processed += 1
@@ -39186,44 +40185,155 @@ def _bootstrap_blender_agents_for_pid(
     )
 
 
+def _emit_blender_ipc_trace(
+    trace: Callable[[str, float, Mapping[str, Any] | None], None] | None,
+    stage: str,
+    elapsed_ms: float,
+    details: Mapping[str, Any] | None = None,
+) -> None:
+    if trace is None:
+        return
+    try:
+        trace(str(stage), round(max(0.0, float(elapsed_ms)), 3), dict(details or {}))
+    except Exception:
+        # Diagnostics must never change Blender command delivery.
+        pass
+
+
 def _request_blender_agent(
     descriptor: dict[str, Any],
     command: str,
     payload: dict[str, Any] | None = None,
     *,
     timeout: float = 15.0,
+    request_id: str = "",
+    trace: Callable[[str, float, Mapping[str, Any] | None], None] | None = None,
 ) -> dict[str, Any]:
     protocol = str(descriptor.get("protocol", "") or "")
     pid = int(descriptor.get("pid", 0) or 0)
-    request_id = uuid.uuid4().hex
+    stable_request_id = str(request_id or uuid.uuid4().hex).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", stable_request_id):
+        raise ProtocolError(
+            "Blender transport request_id must be 32 lowercase hexadecimal characters"
+        )
+    normalized_command = str(command or "").strip()
     request = {
         "protocol": protocol,
         "version": BLENDER_AGENT_PROTOCOL_VERSION,
         "pid": pid,
         "token": str(descriptor.get("token", "") or ""),
-        "request_id": request_id,
-        "command": str(command),
+        "request_id": stable_request_id,
+        "command": normalized_command,
         "payload": dict(payload or {}),
     }
-    with socket.create_connection(
-        ("127.0.0.1", int(descriptor.get("port", 0) or 0)),
-        timeout=max(0.2, min(float(timeout), 2.0)),
-    ) as connection:
+    started_perf = time.perf_counter()
+    started_epoch_ms = int(time.time() * 1000.0)
+
+    def elapsed_ms() -> float:
+        return (time.perf_counter() - started_perf) * 1000.0
+
+    _emit_blender_ipc_trace(
+        trace,
+        "send_started",
+        elapsed_ms(),
+        {"port": int(descriptor.get("port", 0) or 0)},
+    )
+    try:
+        connection = socket.create_connection(
+            ("127.0.0.1", int(descriptor.get("port", 0) or 0)),
+            timeout=max(0.2, min(float(timeout), 2.0)),
+        )
         connection.settimeout(max(0.2, float(timeout)))
-        send_ipc_message(connection, request)
-        response = receive_ipc_message(connection)
+    except (ConnectionError, OSError, TimeoutError) as exc:
+        _emit_blender_ipc_trace(
+            trace, "not_sent", elapsed_ms(), {"error": f"{type(exc).__name__}: {exc}"}
+        )
+        raise BlenderIpcTransportError(
+            f"Blender Worker endpoint was not reached: {exc}",
+            request_id=stable_request_id,
+            command=normalized_command,
+            dispatch_state="not_sent",
+            phase="connect",
+        ) from exc
+    try:
+        try:
+            send_ipc_message(connection, request)
+        except (ConnectionError, OSError, TimeoutError) as exc:
+            _emit_blender_ipc_trace(
+                trace,
+                "send_unknown",
+                elapsed_ms(),
+                {"error": f"{type(exc).__name__}: {exc}"},
+            )
+            raise BlenderIpcTransportError(
+                f"Blender request may have been partially sent: {exc}",
+                request_id=stable_request_id,
+                command=normalized_command,
+                dispatch_state="unknown",
+                phase="send",
+            ) from exc
+        _emit_blender_ipc_trace(trace, "sent", elapsed_ms())
+        try:
+            response = receive_ipc_message(connection)
+        except (ConnectionError, OSError, TimeoutError, ProtocolError) as exc:
+            _emit_blender_ipc_trace(
+                trace,
+                "response_unknown",
+                elapsed_ms(),
+                {"error": f"{type(exc).__name__}: {exc}"},
+            )
+            raise BlenderIpcTransportError(
+                f"Blender request was sent but no valid receipt arrived: {exc}",
+                request_id=stable_request_id,
+                command=normalized_command,
+                dispatch_state="sent",
+                phase="receive",
+            ) from exc
+    finally:
+        try:
+            connection.close()
+        except OSError:
+            pass
     if (
         str(response.get("protocol", "") or "") != protocol
         or int(response.get("version", 0) or 0)
         != BLENDER_AGENT_PROTOCOL_VERSION
         or int(response.get("pid", 0) or 0) != pid
-        or str(response.get("request_id", "") or "") != request_id
+        or str(response.get("request_id", "") or "") != stable_request_id
     ):
-        raise ProtocolError("Blender Agent response identity mismatch")
+        raise BlenderIpcTransportError(
+            "Blender Agent returned a receipt with a mismatched identity",
+            request_id=stable_request_id,
+            command=normalized_command,
+            dispatch_state="sent",
+            phase="response_identity",
+        )
+    timing = response.get("ipc_timing", {})
+    if isinstance(timing, Mapping):
+        for field, stage in (
+            ("worker_queued_epoch_ms", "entered_queue"),
+            ("worker_started_epoch_ms", "worker_started"),
+            ("worker_completed_epoch_ms", "worker_completed"),
+            ("worker_response_sent_epoch_ms", "response_sent"),
+        ):
+            try:
+                stage_elapsed = float(timing.get(field, 0) or 0) - float(
+                    started_epoch_ms
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if stage_elapsed >= 0.0:
+                _emit_blender_ipc_trace(trace, stage, stage_elapsed, timing)
+    _emit_blender_ipc_trace(
+        trace,
+        "response_received",
+        elapsed_ms(),
+        dict(timing) if isinstance(timing, Mapping) else {},
+    )
     if response.get("ok") is not True:
         raise AgentCommandError(
             str(response.get("error", "Blender Agent command failed")),
-            operation_id=request_id,
+            operation_id=stable_request_id,
             status_code=str(
                 response.get("status_code", "BLENDER_AGENT_COMMAND_FAILED")
             ),
@@ -39334,8 +40444,20 @@ def _ensure_blender_worker_for_pid(
     force_replace: bool = False,
     allow_foreground_bootstrap: bool = False,
     wait_for_startup_bridge: bool = False,
+    trace: Callable[[str, float, Mapping[str, Any] | None], None] | None = None,
+    trace_request_id: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    rescue_started = time.perf_counter()
     exact_pid = int(pid)
+    _emit_blender_ipc_trace(
+        trace,
+        "rescue_started",
+        0.0,
+        {
+            "force_replace": bool(force_replace),
+            "request_id": str(trace_request_id or ""),
+        },
+    )
     if exact_pid <= 0 or not _pid_is_alive(exact_pid):
         raise RuntimeError(f"Blender PID {exact_pid} is not running")
     worker_contract = _blender_worker_contract()
@@ -39446,6 +40568,18 @@ def _ensure_blender_worker_for_pid(
                         worker_contract=worker_contract,
                     ),
                 }
+                _emit_blender_ipc_trace(
+                    trace,
+                    "rescue_completed",
+                    (time.perf_counter() - rescue_started) * 1000.0,
+                    {
+                        "force_replace": bool(force_replace),
+                        "worker_generation": int(
+                            health.get("worker_generation", 0) or 0
+                        ),
+                        "request_id": str(trace_request_id or ""),
+                    },
+                )
                 return worker, health
             except (ConnectionError, OSError, TimeoutError, ProtocolError, AgentCommandError) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
@@ -39495,6 +40629,16 @@ def _ensure_blender_worker_for_pid(
             ) as exc:
                 last_error = f"Blender Rescue recovery failed: {type(exc).__name__}: {exc}"
         time.sleep(0.1)
+    _emit_blender_ipc_trace(
+        trace,
+        "rescue_failed",
+        (time.perf_counter() - rescue_started) * 1000.0,
+        {
+            "force_replace": bool(force_replace),
+            "request_id": str(trace_request_id or ""),
+            "error": last_error,
+        },
+    )
     raise TimeoutError(
         f"Blender PID {exact_pid} Worker handshake failed: {last_error}"
     )
@@ -39620,6 +40764,30 @@ class ManagedBlenderSession:
         )
         if normalized_command != "health":
             timeout = max(timeout, BLENDER_OPERATION_QUEUE_RETAIN_SECONDS)
+        transport_request_id = uuid.uuid4().hex
+        trace_log_directory = (
+            str(getattr(self.workspace, "log_dir", "") or "").strip()
+            or DEFAULT_LOG_DIR
+        )
+
+        def trace_event(
+            stage: str,
+            elapsed_ms: float,
+            details: Mapping[str, Any] | None = None,
+        ) -> None:
+            try:
+                _append_blender_ipc_trace(
+                    trace_log_directory,
+                    process_id=self.pid,
+                    request_id=transport_request_id,
+                    command=normalized_command,
+                    stage=stage,
+                    elapsed_ms=elapsed_ms,
+                    details=details,
+                )
+            except Exception:
+                pass
+
         with self._request_lock:
             with self._pending_state_lock:
                 self._pending_request_count += 1
@@ -39630,25 +40798,71 @@ class ManagedBlenderSession:
                         command,
                         request_payload,
                         timeout=timeout,
+                        request_id=transport_request_id,
+                        trace=trace_event,
                     )
-                except (ConnectionError, OSError, TimeoutError, ProtocolError):
+                except BlenderIpcTransportError as exc:
+                    if exc.dispatch_state != "not_sent":
+                        trace_event(
+                            "automatic_resend_blocked",
+                            0.0,
+                            {
+                                "dispatch_state": exc.dispatch_state,
+                                "phase": exc.phase,
+                                "error": str(exc),
+                            },
+                        )
+                        raise BlenderOperationResultUnknownError(
+                            "Blender command was sent, but its result is unknown; "
+                            "automatic resend was blocked to prevent duplicate export",
+                            request_id=transport_request_id,
+                            command=normalized_command,
+                            dispatch_state=exc.dispatch_state,
+                            phase=exc.phase,
+                        ) from exc
                     worker, health = _ensure_blender_worker_for_pid(
-                        self.pid, force_replace=True
+                        self.pid,
+                        force_replace=True,
+                        trace=trace_event,
+                        trace_request_id=transport_request_id,
                     )
                     self.worker_descriptor = worker
                     self.health = health
-                    result = _request_blender_agent(
-                        self.worker_descriptor,
-                        command,
-                        request_payload,
-                        timeout=timeout,
-                    )
+                    try:
+                        result = _request_blender_agent(
+                            self.worker_descriptor,
+                            command,
+                            request_payload,
+                            timeout=timeout,
+                            request_id=transport_request_id,
+                            trace=trace_event,
+                        )
+                    except BlenderIpcTransportError as retry_exc:
+                        if retry_exc.dispatch_state == "not_sent":
+                            raise
+                        trace_event(
+                            "automatic_resend_blocked",
+                            0.0,
+                            {
+                                "dispatch_state": retry_exc.dispatch_state,
+                                "phase": retry_exc.phase,
+                                "error": str(retry_exc),
+                            },
+                        )
+                        raise BlenderOperationResultUnknownError(
+                            "Blender command was sent after recovery, but its result is "
+                            "unknown; no further resend is allowed",
+                            request_id=transport_request_id,
+                            command=normalized_command,
+                            dispatch_state=retry_exc.dispatch_state,
+                            phase=retry_exc.phase,
+                        ) from retry_exc
             finally:
                 with self._pending_state_lock:
                     self._pending_request_count = max(
                         0, self._pending_request_count - 1
                     )
-        if command == "health":
+        if normalized_command == "health":
             self.health = dict(result)
         return result
 
@@ -40244,12 +41458,18 @@ class ManagedMaxSession:
         self._set_availability(MaxSessionState.READY)
 
     def pause_minimized(self) -> None:
+        if self.request_in_flight():
+            self.mark_ready()
+            return
         self._set_availability(
             MaxSessionState.PAUSED_MINIMIZED,
             f"Max PID {self.pid} is minimized",
         )
 
     def pause_background(self) -> None:
+        if self.request_in_flight():
+            self.mark_ready()
+            return
         self._set_availability(
             MaxSessionState.PAUSED_BACKGROUND,
             f"Max PID {self.pid} is not the active scene target",
@@ -40832,6 +42052,10 @@ class ManagedMaxSession:
         spec = get_command_spec(command)
         request_payload = dict(payload or {})
         background_execution = _max_background_execution_requested(request_payload)
+        retain_until_terminal = command in IMPORT_EXPORT_PRIORITY_ACTIONS or command == "export_embedded_fbx"
+        if retain_until_terminal:
+            request_payload[_MAX_QUEUE_RETAIN_UNTIL_IDLE_CONTROL_KEY] = True
+            request_payload[_MAX_BACKGROUND_EXECUTION_CONTROL_KEY] = True
         if spec.foreground_required:
             request_payload[_MAX_QUEUE_RETAIN_UNTIL_IDLE_CONTROL_KEY] = True
             if _process_window_is_minimized(self.pid):
@@ -41098,12 +42322,6 @@ def _load_operation_dependency(operation: object, domain: str) -> Any:
             FBX_PROBE_PATH,
             ("get_fbx_probe_runtime_status", "probe_fbx_handoff"),
             "codex_fbx_probe",
-        ),
-        "auxiliary": (
-            "pc_rehd_code_x_auxiliary_max_bridge",
-            AUXILIARY_MAX_BRIDGE_PATH,
-            ("run_auxiliary_geometry_operation",),
-            "",
         ),
         "auxiliary_fbx": (
             "pc_rehd_code_x_auxiliary_fbx",
@@ -42447,54 +43665,337 @@ def _fbx_log_path(log_directory: Path, max_pid: int, operation: str, request_tok
     return output
 
 
-def _prune_sample_groups(log_directory: str | Path, *, keep_groups: int = SAMPLE_KEEP_GROUPS) -> list[str]:
-    """Keep newest generated FBX/TXT stems across the public operation folders."""
-    root = Path(log_directory).expanduser().resolve(strict=False)
+def _sample_group_operation(stem: str) -> str:
+    normalized = str(stem or "").strip().casefold()
+    if normalized.startswith(("import_pid", "导入 + ")):
+        return "import"
+    if normalized.startswith(("export_pid", "导出 + ")):
+        return "export"
+    raise ValueError(f"Unsupported generated sample stem: {stem!r}")
+
+
+def _resolved_path_is_within_root(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _path_is_link_or_junction(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        return bool(callable(is_junction) and is_junction())
+    except OSError:
+        return True
+
+
+def _prune_sample_groups_with_report(
+    log_directory: str | Path,
+    *,
+    keep_groups: int = SAMPLE_KEEP_GROUPS,
+) -> dict[str, Any]:
+    """Keep the newest generated FBX/TXT rounds for each operation."""
+    report: dict[str, Any] = {
+        "keep_groups_per_operation": int(keep_groups),
+        "deleted_files": [],
+        "deleted_locks": [],
+        "deleted_reservations": [],
+        "skipped_locks": [],
+        "skipped_reservations": [],
+        "retained_group_count_by_operation": {"import": 0, "export": 0},
+        "errors": [],
+    }
+    if keep_groups < 0:
+        return report
+    try:
+        root = _public_operation_root(log_directory)
+    except OSError as exc:
+        report["errors"].append(
+            f"{log_directory}: {type(exc).__name__}: {exc}"
+        )
+        return report
+
     scan_roots: list[Path] = []
-    for candidate in (
-        root,
-        _public_operation_directory(root, "import"),
-        _public_operation_directory(root, "export"),
-    ):
-        resolved = candidate.resolve(strict=False)
-        if resolved not in scan_roots and resolved.is_dir():
+    candidates = [root]
+    for operation in ("import", "export"):
+        try:
+            candidates.append(_public_operation_directory(root, operation))
+            candidates.append(
+                _legacy_public_operation_directory(root, operation)
+            )
+        except OSError as exc:
+            report["errors"].append(
+                f"{root}: {type(exc).__name__}: {exc}"
+            )
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=False)
+            is_directory = resolved.is_dir()
+        except OSError as exc:
+            report["errors"].append(
+                f"{candidate}: {type(exc).__name__}: {exc}"
+            )
+            continue
+        if not _resolved_path_is_within_root(resolved, root):
+            report["errors"].append(
+                f"{candidate}: outside the configured log root {root}"
+            )
+            continue
+        if resolved not in scan_roots and is_directory:
             scan_roots.append(resolved)
-    if keep_groups < 0 or not scan_roots:
-        return []
+
     groups: dict[str, dict[str, Any]] = {}
+    discovered_locks: list[tuple[str, Path]] = []
+    discovered_reservations: dict[str, Path] = {}
     for scan_root in scan_roots:
-        for child in scan_root.iterdir():
-            if not child.is_file():
+        try:
+            children = list(scan_root.iterdir())
+        except OSError as exc:
+            report["errors"].append(
+                f"{scan_root}: {type(exc).__name__}: {exc}"
+            )
+            continue
+        for child in children:
+            try:
+                if _path_is_link_or_junction(child) or not child.is_file():
+                    continue
+            except OSError as exc:
+                report["errors"].append(
+                    f"{child}: {type(exc).__name__}: {exc}"
+                )
                 continue
             match = SAMPLE_FILE_RE.fullmatch(child.name)
-            if match is None:
+            if match is not None:
+                matched_stem = match.group("stem")
+                key = (
+                    f"{str(scan_root).casefold()}::"
+                    f"{matched_stem.casefold()}"
+                )
+                record = groups.setdefault(
+                    key,
+                    {
+                        "operation": _sample_group_operation(matched_stem),
+                        "mtime_ns": 0,
+                        "files": [],
+                        "locks": [],
+                        "stat_failed": False,
+                        "reserved": False,
+                    },
+                )
+                record["files"].append(child)
+                try:
+                    record["mtime_ns"] = max(
+                        int(record["mtime_ns"]),
+                        int(child.stat().st_mtime_ns),
+                    )
+                except OSError as exc:
+                    record["stat_failed"] = True
+                    report["errors"].append(
+                        f"{child}: {type(exc).__name__}: {exc}"
+                    )
                 continue
-            stem = f"{str(scan_root).casefold()}::{match.group('stem').casefold()}"
-            record = groups.setdefault(stem, {"mtime": 0.0, "files": []})
-            record["files"].append(child)
-            try:
-                record["mtime"] = max(float(record["mtime"]), child.stat().st_mtime)
-            except OSError:
-                pass
-    keep = {
-        stem
-        for stem, _record in sorted(
-            groups.items(),
-            key=lambda item: (float(item[1]["mtime"]), item[0]),
+            lock_match = SAMPLE_LOCK_FILE_RE.fullmatch(child.name)
+            if lock_match is not None:
+                matched_stem = lock_match.group("stem")
+                key = (
+                    f"{str(scan_root).casefold()}::"
+                    f"{matched_stem.casefold()}"
+                )
+                discovered_locks.append((key, child))
+                continue
+            reservation_match = SAMPLE_RESERVATION_FILE_RE.fullmatch(child.name)
+            if reservation_match is not None:
+                matched_stem = reservation_match.group("stem")
+                discovered_reservations[
+                    f"{str(scan_root).casefold()}::{matched_stem.casefold()}"
+                ] = child
+
+    orphan_locks: list[Path] = []
+    for key, lock_path in discovered_locks:
+        record = groups.get(key)
+        if record is None:
+            orphan_locks.append(lock_path)
+        else:
+            record["locks"].append(lock_path)
+    stale_reservations: dict[str, Path] = {}
+    for key, reservation_path in discovered_reservations.items():
+        is_active, reservation_error = _public_fbx_reservation_is_active(
+            reservation_path
+        )
+        if reservation_error:
+            report["errors"].append(reservation_error)
+        record = groups.get(key)
+        if is_active and record is not None:
+            record["reserved"] = True
+        elif not is_active:
+            stale_reservations[key] = reservation_path
+
+    retained_keys: set[str] = set()
+    for operation in ("import", "export"):
+        operation_groups = [
+            (key, record)
+            for key, record in groups.items()
+            if record["operation"] == operation
+        ]
+        protected_keys = {
+            key
+            for key, record in operation_groups
+            if record["stat_failed"] or record["reserved"]
+        }
+        eligible_groups = [
+            (key, record)
+            for key, record in operation_groups
+            if key not in protected_keys
+        ]
+        eligible_groups.sort(
+            key=lambda item: (int(item[1]["mtime_ns"]), item[0]),
             reverse=True,
-        )[:keep_groups]
-    }
-    deleted: list[str] = []
-    for stem, record in groups.items():
-        if stem in keep:
-            continue
-        for child in record["files"]:
+        )
+        retained_keys.update(protected_keys)
+        retained_keys.update(key for key, _record in eligible_groups[:keep_groups])
+        report["retained_group_count_by_operation"][operation] = sum(
+            1 for key, _record in operation_groups if key in retained_keys
+        )
+
+    with _PUBLIC_TXT_LOCK:
+        for key, reservation_path in stale_reservations.items():
+            is_active, reservation_error = _public_fbx_reservation_is_active(
+                reservation_path
+            )
+            if reservation_error:
+                report["errors"].append(reservation_error)
+            if is_active:
+                record = groups.get(key)
+                if record is not None and key not in retained_keys:
+                    retained_keys.add(key)
+                    operation = str(record["operation"])
+                    report["retained_group_count_by_operation"][operation] += 1
+                report["skipped_reservations"].append(str(reservation_path))
+                continue
             try:
-                child.unlink()
-                deleted.append(str(child))
-            except OSError:
-                pass
-    return deleted
+                reservation_path.unlink()
+                report["deleted_reservations"].append(str(reservation_path))
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                record = groups.get(key)
+                if record is not None and key not in retained_keys:
+                    retained_keys.add(key)
+                    operation = str(record["operation"])
+                    report["retained_group_count_by_operation"][operation] += 1
+                report["skipped_reservations"].append(str(reservation_path))
+                report["errors"].append(
+                    f"{reservation_path}: {type(exc).__name__}: {exc}"
+                )
+        for key, record in groups.items():
+            if key in retained_keys:
+                continue
+            first_file = record["files"][0] if record["files"] else None
+            reservation_path = discovered_reservations.get(key)
+            if reservation_path is None and first_file is not None:
+                reservation_path = first_file.with_name(
+                    f".{first_file.stem}.reserve"
+                )
+            if reservation_path is not None:
+                is_active, reservation_error = _public_fbx_reservation_is_active(
+                    reservation_path
+                )
+                if reservation_error:
+                    report["errors"].append(reservation_error)
+                if is_active:
+                    retained_keys.add(key)
+                    operation = str(record["operation"])
+                    report["retained_group_count_by_operation"][operation] += 1
+                    report["skipped_reservations"].append(
+                        str(reservation_path)
+                    )
+                    continue
+            group_delete_failed = False
+            for child in record["files"]:
+                try:
+                    child.unlink()
+                    report["deleted_files"].append(str(child))
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    group_delete_failed = True
+                    report["errors"].append(
+                        f"{child}: {type(exc).__name__}: {exc}"
+                    )
+            if group_delete_failed:
+                report["skipped_locks"].extend(
+                    str(lock_path) for lock_path in record["locks"]
+                )
+                continue
+            for lock_path in record["locks"]:
+                try:
+                    lock_path.unlink()
+                    report["deleted_locks"].append(str(lock_path))
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    report["skipped_locks"].append(str(lock_path))
+                    report["errors"].append(
+                        f"{lock_path}: {type(exc).__name__}: {exc}"
+                    )
+        for lock_path in orphan_locks:
+            lock_match = SAMPLE_LOCK_FILE_RE.fullmatch(lock_path.name)
+            matched_stem = (
+                lock_match.group("stem") if lock_match is not None else ""
+            )
+            active_siblings = (
+                lock_path.parent / f"{matched_stem}.fbx",
+                lock_path.parent / f"{matched_stem}.txt",
+                lock_path.parent / f".{matched_stem}.reserve",
+            )
+            if matched_stem and any(path.exists() for path in active_siblings):
+                report["skipped_locks"].append(str(lock_path))
+                continue
+            try:
+                lock_path.unlink()
+                report["deleted_locks"].append(str(lock_path))
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                report["skipped_locks"].append(str(lock_path))
+                report["errors"].append(
+                    f"{lock_path}: {type(exc).__name__}: {exc}"
+                )
+    return report
+
+
+def _prune_sample_groups(
+    log_directory: str | Path,
+    *,
+    keep_groups: int = SAMPLE_KEEP_GROUPS,
+) -> list[str]:
+    """Compatibility wrapper returning deleted FBX/TXT paths only."""
+    report = _prune_sample_groups_with_report(
+        log_directory,
+        keep_groups=keep_groups,
+    )
+    errors = [str(error) for error in report.get("errors", [])]
+    if errors:
+        try:
+            _append_public_cleanup_errors(
+                log_directory,
+                reason="sample_retention",
+                errors=errors,
+            )
+        except Exception as report_exc:
+            errors.append(
+                f"cleanup error log failed: "
+                f"{type(report_exc).__name__}: {report_exc}"
+            )
+        print(
+            f"[{APP_NAME}] Sample cleanup reported errors: "
+            + "; ".join(errors[:4]),
+            file=sys.stderr,
+        )
+    return [str(path) for path in report["deleted_files"]]
 
 
 def _cleanup_import_fbx_artifacts(
@@ -42503,12 +44004,13 @@ def _cleanup_import_fbx_artifacts(
     max_process_id: int,
     retain_fbx_path: str | Path | None,
     auto_cleanup_enabled: bool = True,
+    persist_errors: bool = True,
 ) -> dict[str, Any]:
     """Keep recent generated import media folders for saved Max scenes.
 
-    New public FBX artifacts live in ``Long Term Cache/导入 Import``.  The
-    legacy root is still scanned so an upgrade can clean abandoned artifacts
-    created before the public layout migration.
+    New public FBX artifacts live in ``导入 Import`` under the configured
+    root.  The root and old ``Long Term Cache/导入 Import`` layout are also
+    scanned so an upgrade can clean abandoned artifacts.
     """
     receipt: dict[str, Any] = {
         "retained_import_fbx": "",
@@ -42516,20 +44018,50 @@ def _cleanup_import_fbx_artifacts(
         "retained_fbm_directory_count": 0,
         "fbm_retention_limit": IMPORT_FBX_MEDIA_DIRECTORY_KEEP_COUNT,
         "fbm_auto_cleanup_disabled": not bool(auto_cleanup_enabled),
+        "protected_fbm_directory_count": 0,
         "errors": [],
     }
+
+    def finish() -> dict[str, Any]:
+        errors = [str(item) for item in receipt.get("errors", []) if str(item).strip()]
+        if persist_errors and errors:
+            try:
+                _append_public_cleanup_errors(
+                    log_directory,
+                    reason="import_media_retention",
+                    errors=errors,
+                )
+            except Exception as report_exc:
+                receipt["errors"].append(
+                    "cleanup error log failed: "
+                    f"{type(report_exc).__name__}: {report_exc}"
+                )
+        return receipt
+
     pid = int(max_process_id or 0)
     try:
-        root = Path(log_directory).expanduser().resolve(strict=False)
+        root = _public_operation_root(log_directory)
         scan_roots: list[Path] = []
-        for candidate in (root, _public_operation_directory(root, "import")):
+        for candidate in (
+            root,
+            _public_operation_directory(root, "import"),
+            _legacy_public_operation_directory(root, "import"),
+        ):
             resolved = candidate.resolve(strict=False)
+            if not _resolved_path_is_within_root(resolved, root):
+                receipt["errors"].append(
+                    f"{candidate}: outside the configured log root {root}"
+                )
+                continue
             if resolved not in scan_roots and resolved.is_dir():
                 scan_roots.append(resolved)
-    except OSError:
-        return receipt
+    except OSError as exc:
+        receipt["errors"].append(
+            f"{log_directory}: {type(exc).__name__}: {exc}"
+        )
+        return finish()
     if not scan_roots:
-        return receipt
+        return finish()
     retain_path: Path | None = None
     if retain_fbx_path is not None:
         try:
@@ -42547,44 +44079,213 @@ def _cleanup_import_fbx_artifacts(
                 pid_text = match.group("legacy_pid") or match.group("public_pid")
                 if int(pid_text or 0) == pid:
                     retain_path = candidate
-    media_directories: list[tuple[int, str, Path]] = []
-    for scan_root in scan_roots:
-        for child in scan_root.iterdir():
-            media_match = IMPORT_FBX_MEDIA_DIRECTORY_RE.fullmatch(child.name)
-            if (
-                media_match is not None
-                and child.is_dir()
-                and not child.is_symlink()
-            ):
+    with _PUBLIC_FBX_RESERVATION_LOCK:
+        media_directories: list[
+            tuple[int, str, Path, bool, tuple[int, int, int], Path]
+        ] = []
+        for scan_root in scan_roots:
+            try:
+                children = list(scan_root.iterdir())
+            except OSError as exc:
+                receipt["errors"].append(
+                    f"{scan_root}: {type(exc).__name__}: {exc}"
+                )
+                continue
+            for child in children:
+                media_match = IMPORT_FBX_MEDIA_DIRECTORY_RE.fullmatch(
+                    child.name
+                )
                 try:
+                    is_generated_media_directory = bool(
+                        media_match is not None
+                        and not _path_is_link_or_junction(child)
+                        and child.is_dir()
+                    )
+                except OSError as exc:
+                    receipt["errors"].append(
+                        f"{child}: {type(exc).__name__}: {exc}"
+                    )
+                    continue
+                if not is_generated_media_directory:
+                    continue
+                reservation_path = child.with_name(
+                    f".{child.stem}.reserve"
+                )
+                is_reserved, reservation_error = (
+                    _public_fbx_reservation_is_active(reservation_path)
+                )
+                if reservation_error:
+                    receipt["errors"].append(reservation_error)
+                try:
+                    child_stat = child.stat(follow_symlinks=False)
+                    resolved_child = child.resolve(strict=True)
+                    if (
+                        resolved_child.parent != scan_root
+                        or not _resolved_path_is_within_root(
+                            resolved_child, root
+                        )
+                    ):
+                        raise OSError(
+                            "generated FBM directory is outside the "
+                            f"configured log root: {child}"
+                        )
                     media_directories.append(
-                        (int(child.stat().st_mtime_ns), str(child).casefold(), child)
+                        (
+                            int(child_stat.st_mtime_ns),
+                            str(child).casefold(),
+                            child,
+                            is_reserved,
+                            (
+                                int(child_stat.st_dev),
+                                int(child_stat.st_ino),
+                                int(child_stat.st_ctime_ns),
+                            ),
+                            scan_root,
+                        )
                     )
                 except OSError as exc:
                     receipt["errors"].append(
                         f"{child.name}: {type(exc).__name__}: {exc}"
                     )
-    media_directories.sort(key=lambda row: (row[0], row[1]), reverse=True)
-    if auto_cleanup_enabled:
-        retained_media_directories = media_directories[
-            :IMPORT_FBX_MEDIA_DIRECTORY_KEEP_COUNT
+        media_directories.sort(
+            key=lambda row: (row[0], row[1]),
+            reverse=True,
+        )
+        protected_media_directories = [
+            row for row in media_directories if row[3]
         ]
-        removable_media_directories = media_directories[
-            IMPORT_FBX_MEDIA_DIRECTORY_KEEP_COUNT:
+        eligible_media_directories = [
+            row for row in media_directories if not row[3]
         ]
-    else:
-        retained_media_directories = media_directories
-        removable_media_directories = []
-    receipt["retained_fbm_directory_count"] = len(retained_media_directories)
-    for _mtime_ns, _name, child in removable_media_directories:
-        try:
-            shutil.rmtree(child)
-            receipt["removed_fbm_directory_count"] += 1
-        except OSError as exc:
-            receipt["errors"].append(f"{child.name}: {type(exc).__name__}: {exc}")
+        if auto_cleanup_enabled:
+            retained_media_directories = (
+                protected_media_directories
+                + eligible_media_directories[
+                    :IMPORT_FBX_MEDIA_DIRECTORY_KEEP_COUNT
+                ]
+            )
+            removable_media_directories = eligible_media_directories[
+                IMPORT_FBX_MEDIA_DIRECTORY_KEEP_COUNT:
+            ]
+        else:
+            retained_media_directories = media_directories
+            removable_media_directories = []
+        receipt["protected_fbm_directory_count"] = len(
+            protected_media_directories
+        )
+        receipt["retained_fbm_directory_count"] = len(
+            retained_media_directories
+        )
+        for (
+            _mtime_ns,
+            _name,
+            child,
+            _is_reserved,
+            expected_identity,
+            scan_root,
+        ) in removable_media_directories:
+            reservation_path = child.with_name(f".{child.stem}.reserve")
+            is_reserved, reservation_error = (
+                _public_fbx_reservation_is_active(reservation_path)
+            )
+            if reservation_error:
+                receipt["errors"].append(reservation_error)
+            if is_reserved:
+                receipt["protected_fbm_directory_count"] += 1
+                receipt["retained_fbm_directory_count"] += 1
+                continue
+            try:
+                if _path_is_link_or_junction(child):
+                    raise OSError(
+                        f"generated FBM directory became a link before deletion: {child}"
+                    )
+                current_stat = child.stat(follow_symlinks=False)
+                current_identity = (
+                    int(current_stat.st_dev),
+                    int(current_stat.st_ino),
+                    int(current_stat.st_ctime_ns),
+                )
+                current_resolved = child.resolve(strict=True)
+                if current_identity != expected_identity:
+                    raise OSError(
+                        f"generated FBM directory changed before deletion: {child}"
+                    )
+                if (
+                    not stat.S_ISDIR(current_stat.st_mode)
+                    or current_resolved.parent != scan_root
+                    or not _resolved_path_is_within_root(
+                        current_resolved, root
+                    )
+                ):
+                    raise OSError(
+                        f"generated FBM directory escaped the log root before deletion: {child}"
+                    )
+                _remove_tree_no_follow(
+                    child,
+                    boundary=root,
+                    expected_identity=expected_identity,
+                )
+                receipt["removed_fbm_directory_count"] += 1
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                try:
+                    child.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    receipt["retained_fbm_directory_count"] += 1
+                else:
+                    receipt["retained_fbm_directory_count"] += 1
+                receipt["errors"].append(
+                    f"{child.name}: {type(exc).__name__}: {exc}"
+                )
     if retain_path is not None and retain_path.is_file():
         receipt["retained_import_fbx"] = str(retain_path)
-    return receipt
+    return finish()
+
+
+def _cleanup_log_root_retention(
+    log_directory: str | Path,
+    *,
+    keep_groups: int = SAMPLE_KEEP_GROUPS,
+    cleanup_import_media: bool = False,
+    import_media_auto_cleanup_enabled: bool = True,
+) -> dict[str, Any]:
+    sample_report = _prune_sample_groups_with_report(
+        log_directory,
+        keep_groups=keep_groups,
+    )
+    media_report: dict[str, Any] = {
+        "cleanup_requested": bool(cleanup_import_media),
+        "fbm_auto_cleanup_disabled": not bool(
+            import_media_auto_cleanup_enabled
+        ),
+        "errors": [],
+    }
+    if cleanup_import_media:
+        media_report = _cleanup_import_fbx_artifacts(
+            log_directory,
+            max_process_id=0,
+            retain_fbx_path=None,
+            auto_cleanup_enabled=import_media_auto_cleanup_enabled,
+            persist_errors=False,
+        )
+        media_report["cleanup_requested"] = True
+    trace_report = _prune_blender_ipc_trace(log_directory)
+    errors = [str(item) for item in sample_report.get("errors", [])]
+    errors.extend(str(item) for item in media_report.get("errors", []))
+    errors.extend(str(item) for item in trace_report.get("errors", []))
+    return {
+        "schema": "pc-rehd-log-root-retention-v1",
+        "log_directory": str(
+            Path(log_directory).expanduser().resolve(strict=False)
+        ),
+        "sample_cleanup": sample_report,
+        "import_media_cleanup": media_report,
+        "blender_ipc_trace_cleanup": trace_report,
+        "errors": errors,
+    }
 
 
 FBX_BINARY_MAGIC = b"Kaydara FBX Binary  \x00\x1a\x00"
@@ -45211,6 +46912,18 @@ def _build_max_mesh_rename_action_contract(
     return contract, selected_handles
 
 
+def _blender_live_object_name(row: Mapping[str, Any]) -> str:
+    """Return the live Blender Object name used to validate a selection row."""
+    return str(row.get("blender_object_name") or row.get("scene_node", "") or "")
+
+
+def _scene_mesh_ui_name(row: Mapping[str, Any], *, blender: bool) -> str:
+    """Show Blender's live Object name while preserving Max's scene authority name."""
+    if blender:
+        return _blender_live_object_name(row)
+    return str(row.get("scene_node", "") or "")
+
+
 def _build_blender_mesh_action_contract(
     scene_contract: Mapping[str, Any],
     selection_snapshot: Mapping[str, Any],
@@ -45276,10 +46989,7 @@ def _build_blender_mesh_action_contract(
         # and keeps only Mesh rows, so a selected LOD/OtherMesh parent is valid.
         if not bool(node.get("is_mesh", False)):
             continue
-        blender_object_name = str(
-            node.get("blender_object_name", node.get("scene_node", "")) or ""
-        )
-        if blender_object_name != name:
+        if _blender_live_object_name(node) != name:
             raise ProtocolError("Blender Mesh action selection changed during inspection")
         if _is_mod_auxiliary_scene_node_name(name):
             continue
@@ -45348,7 +47058,7 @@ def _apply_blender_selected_node_receipt(
             handle = 0
         name = str(raw_node.get("name", "") or "")
         node = nodes_by_handle.get(handle)
-        if node is None or str(node.get("scene_node", "") or "") != name:
+        if node is None or _blender_live_object_name(node) != name:
             raise ProtocolError("Blender hidden node changed after the cached scene contract")
         if handle not in hidden_all:
             hidden_all.append(handle)
@@ -45363,7 +47073,7 @@ def _apply_blender_selected_node_receipt(
             handle = 0
         name = str(raw_node.get("name", "") or "")
         node = nodes_by_handle.get(handle)
-        if node is None or str(node.get("scene_node", "") or "") != name:
+        if node is None or _blender_live_object_name(node) != name:
             raise ProtocolError("Blender selected node changed after the cached scene contract")
         if handle not in selected_all:
             selected_all.append(handle)
@@ -45391,6 +47101,140 @@ def _apply_blender_selected_node_receipt(
         snapshot.get("authority", "bpy_hidden_selection_state") or ""
     )
     return selected_meshes
+
+
+def _apply_blender_current_scene_selection_receipt(
+    workspace: MaxWorkspaceState,
+    scene_contract: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    *,
+    expected_blender_pid: int,
+) -> list[int]:
+    """Replace stale scene facts before applying one Blender selection receipt."""
+    expected_pid = int(expected_blender_pid)
+    if (
+        expected_pid <= 0
+        or int(scene_contract.get("blender_process_id", 0) or 0) != expected_pid
+        or int(scene_contract.get("max_process_id", 0) or 0) != expected_pid
+    ):
+        raise ProtocolError("Blender scene-selection contract identity mismatch")
+    _reconcile_workspace_scene(workspace, copy.deepcopy(dict(scene_contract)))
+    return _apply_blender_selected_node_receipt(
+        workspace,
+        snapshot,
+        expected_blender_pid=expected_pid,
+    )
+
+
+def _run_blender_manual_rename_bucket_regression_guard() -> dict[str, Any]:
+    """Keep manual Blender Object renames routable through Export Sets."""
+    pid = os.getpid()
+    selected_handle = 701
+    unselected_handle = 702
+    old_authority_name = (
+        "Mesh_001_A7D7D036_LODx1_MatID:0_Group:1_DisplayMode:3_Type:65015"
+    )
+    renamed_object_name = (
+        "Mesh_001_A7D7D036_LODx1_MatID:7_Group:1_DisplayMode:3_Type:65015"
+    )
+    unselected_name = (
+        "Mesh_002_A7D7D036_LODx1_MatID:0_Group:2_DisplayMode:3_Type:65015"
+    )
+    rows = [
+        {
+            "scene_node_handle": selected_handle,
+            "scene_node": old_authority_name,
+            "blender_object_name": renamed_object_name,
+            "is_mesh": True,
+            "mesh_slot": 1,
+        },
+        {
+            "scene_node_handle": unselected_handle,
+            "scene_node": unselected_name,
+            "blender_object_name": unselected_name,
+            "is_mesh": True,
+            "mesh_slot": 2,
+        },
+    ]
+    stale_rows = copy.deepcopy(rows)
+    stale_rows[0]["blender_object_name"] = old_authority_name
+    workspace = MaxWorkspaceState(
+        scene_contract={
+            "max_process_id": pid,
+            "blender_process_id": pid,
+            "nodes": copy.deepcopy(stale_rows),
+            "meshes": copy.deepcopy(stale_rows),
+            "selected_handles": [],
+            "selected_mesh_handles": [],
+        }
+    )
+    snapshot = {
+        "schema": "pc-rehd-blender-selected-node-contract-v1",
+        "action": "scene.selection",
+        "authority": "bpy_window_view_layer_selection_with_hidden_selection_state",
+        "max_process_id": pid,
+        "blender_process_id": pid,
+        "selected_nodes": [
+            {
+                "handle": selected_handle,
+                "name": renamed_object_name,
+                "hidden": True,
+                "selection_source": "bpy_preserved_hidden_selection",
+            }
+        ],
+        "hidden_node_count": 2,
+        "hidden_nodes": [
+            {
+                "handle": selected_handle,
+                "name": renamed_object_name,
+                "hidden": True,
+                "selection_source": "bpy_hide_get",
+            },
+            {
+                "handle": unselected_handle,
+                "name": unselected_name,
+                "hidden": True,
+                "selection_source": "bpy_hide_get",
+            },
+        ],
+    }
+    fresh_contract = {
+        "max_process_id": pid,
+        "blender_process_id": pid,
+        "nodes": copy.deepcopy(rows),
+        "meshes": copy.deepcopy(rows),
+        "selected_handles": [],
+        "selected_mesh_handles": [],
+    }
+    selected = _apply_blender_current_scene_selection_receipt(
+        workspace,
+        fresh_contract,
+        snapshot,
+        expected_blender_pid=pid,
+    )
+    mesh_rows = _scene_mesh_index(workspace.scene_contract)
+    if (
+        selected != [selected_handle]
+        or workspace.scene_contract.get("selected_mesh_handles") != [selected_handle]
+        or not bool(mesh_rows[selected_handle].get("hidden"))
+        or not bool(mesh_rows[unselected_handle].get("hidden"))
+        or _scene_mesh_ui_name(mesh_rows[selected_handle], blender=True)
+        != renamed_object_name
+        or _scene_mesh_ui_name(mesh_rows[selected_handle], blender=False)
+        != old_authority_name
+        or _blender_live_object_name(
+            {"scene_node": unselected_name, "blender_object_name": ""}
+        )
+        != unselected_name
+    ):
+        raise AssertionError(
+            "A manually renamed hidden Blender Mesh did not retain its exact Export Sets selection"
+        )
+    return {
+        "status": "PASS",
+        "selected_hidden_manual_rename": True,
+        "unselected_hidden_excluded": True,
+    }
 
 
 def _apply_light_scene_selection_receipt(
@@ -49355,6 +51199,7 @@ class HoverTooltip:
 
 DEFERRED_UV_RISK_SCHEMA = "pc-rehd-code-x-deferred-uv-risk-v1"
 DEFERRED_UV_RISK_MAX_BYTES = 16 * 1024 * 1024
+DEFERRED_UV_RISK_TIMEOUT_SECONDS = 120.0
 _DEFERRED_UV_RISK_TASK_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,128}\Z")
 
 
@@ -52001,6 +53846,8 @@ class LauncherApp:
         self._launcher_state_write_lock = threading.Lock()
         self._launcher_state_pending_write: tuple[dict[str, Any], Path] | None = None
         self._launcher_state_writer_active = False
+        self._launcher_state_write_finished = threading.Event()
+        self._launcher_state_write_finished.set()
         self.scene_auto_colors_enabled = bool(
             self.launcher_state.get("scene_auto_colors_enabled", False)
         )
@@ -52067,6 +53914,9 @@ class LauncherApp:
         self._main_resize_geometry_after: Any | None = None
         self._main_resize_geometry_last_at = 0.0
         self._launcher_window_state = LAUNCHER_WINDOW_STARTING
+        # Keep native maximize/restore handling disabled until the first
+        # published frame has drained its queued Configure events.
+        self._main_window_startup_complete = False
         self._launcher_was_zoomed = False
         self.floating_ball_window: Any | None = None
         self.floating_ball_canvas: Any | None = None
@@ -52508,6 +54358,11 @@ class LauncherApp:
         self._runtime_services_started = True
         self._start_bootstrap_health_supervisor()
         self._schedule_background_callback_pump()
+        self._schedule_log_root_cleanup(
+            self._long_term_cache_directory,
+            reason="startup",
+            cleanup_import_media=True,
+        )
         self._schedule_max_executable_discovery()
         self.root.after(500, self._start_github_launcher_update_check)
         self._refresh_agent_startup_hooks(time.monotonic(), force=True)
@@ -53568,14 +55423,19 @@ class LauncherApp:
         dialog: ChoiceDialog,
         context: dict[str, Any],
         compose_message: Callable[[list[str]], str],
+        *,
+        on_finished: Callable[[], None],
     ) -> None:
         """Update one success dialog after the isolated UV report is ready."""
         started_at = time.monotonic()
         countdown_seconds = int(context.get("countdown_seconds", 3) or 3)
         countdown_deadline = started_at + float(countdown_seconds)
-        timeout_deadline = started_at + 120.0
+        timeout_seconds = max(0.001, float(DEFERRED_UV_RISK_TIMEOUT_SECONDS))
+        timeout_deadline = started_at + timeout_seconds
         last_countdown = countdown_seconds
         finished = False
+        finish_lock = threading.Lock()
+        watchdog_timer: threading.Timer | None = None
 
         def display(lines: list[str]) -> None:
             try:
@@ -53584,21 +55444,52 @@ class LauncherApp:
             except Exception:
                 return
 
-        def schedule(delay_ms: int, callback: Callable[[], None]) -> None:
-            try:
-                self.root.after(max(1, int(delay_ms)), callback)
-            except self.tk.TclError:
-                return
-
-        def finish_failure(detail: str) -> None:
+        def finish(lines: list[str], *, display_result: bool = True) -> None:
             nonlocal finished
+            with finish_lock:
+                if finished:
+                    return
+                finished = True
+                timer = watchdog_timer
+            if timer is not None:
+                timer.cancel()
+            try:
+                if display_result:
+                    display(lines)
+            finally:
+                try:
+                    on_finished()
+                except Exception as exc:
+                    print(
+                        f"[{APP_NAME}] Deferred UV finalizer failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+
+        def finish_failure(
+            detail: str, *, display_result: bool = True
+        ) -> None:
             if finished:
                 return
-            finished = True
-            display(_uv_risk_receipt_lines(self.ui_language, failure=detail))
+            finish(
+                _uv_risk_receipt_lines(self.ui_language, failure=detail),
+                display_result=display_result,
+            )
+
+        def schedule(delay_ms: int, callback: Callable[[], None]) -> bool:
+            if finished:
+                return False
+            try:
+                self.root.after(max(1, int(delay_ms)), callback)
+                return True
+            except Exception as exc:
+                finish_failure(
+                    "Launcher scheduler closed while waiting for the "
+                    f"background UV report: {type(exc).__name__}: {exc}"
+                )
+                return False
 
         def consume_success(result: Any) -> None:
-            nonlocal finished
             if finished:
                 return
             receipt = result if isinstance(result, dict) else {
@@ -53607,8 +55498,7 @@ class LauncherApp:
             }
             state = str(receipt.get("state", "") or "").casefold()
             if state == "complete":
-                finished = True
-                display(
+                finish(
                     _uv_risk_receipt_lines(
                         self.ui_language,
                         uv_risk=receipt.get("uv_risk") if isinstance(receipt.get("uv_risk"), dict) else {},
@@ -53653,14 +55543,17 @@ class LauncherApp:
                 finish_failure("Timed out while waiting for the background UV report.")
                 return
             display_pending_state()
-            self._run_background(
-                lambda: _consume_deferred_uv_risk_result(context),
-                consume_success,
-                label="Deferred UV report",
-                on_error=consume_failure,
-                quiet=True,
-                track_busy=False,
-            )
+            try:
+                self._run_background(
+                    lambda: _consume_deferred_uv_risk_result(context),
+                    consume_success,
+                    label="Deferred UV report",
+                    on_error=consume_failure,
+                    quiet=True,
+                    track_busy=False,
+                )
+            except Exception as exc:
+                consume_failure(exc)
 
         display(
             _uv_risk_receipt_lines(
@@ -53673,6 +55566,15 @@ class LauncherApp:
         except Exception as exc:
             finish_failure(f"{type(exc).__name__}: {exc}")
             return
+        watchdog_timer = threading.Timer(
+            timeout_seconds,
+            lambda: finish_failure(
+                "Timed out while waiting for the background UV report.",
+                display_result=False,
+            ),
+        )
+        watchdog_timer.daemon = True
+        watchdog_timer.start()
         schedule(40, poll)
 
     def _on_launcher_mapped(self, _event: Any = None) -> None:
@@ -53687,7 +55589,10 @@ class LauncherApp:
         if not self._main_window_layout_finalized:
             self._main_window_layout_finalized = True
             try:
-                self.root.after_idle(self._finalize_main_window_layout_after_map)
+                # _show_themed_window drains idle callbacks while the native
+                # window is temporarily staged at +20000,+20000. A timer
+                # callback waits until the requested geometry is restored.
+                self.root.after(0, self._finalize_main_window_layout_after_map)
             except self.tk.TclError:
                 pass
         restore_from_minimize = (
@@ -53704,6 +55609,10 @@ class LauncherApp:
             _restore_tk_grab_after_map(self.root)
             self._queue_launcher_foreground_restore()
             self._queue_max_tracking_refresh()
+
+    def _mark_main_window_startup_complete(self) -> None:
+        """Allow native resize/maximize persistence after the first frame."""
+        self._main_window_startup_complete = True
 
     def _queue_max_tracking_refresh(self) -> None:
         """Refresh exact Max PID discovery as soon as the Launcher becomes visible."""
@@ -55848,13 +57757,18 @@ class LauncherApp:
         }
 
     def _main_window_size_cache_key(self, mode: str) -> str:
-        if bool(getattr(self, "_scaling_mode_enabled", False)):
-            normalized_mode = "expanded" if mode == "expanded" else "collapsed"
-            # Scaling keeps one geometry slot per page. The compact page must
-            # not inherit the expanded page's wide window after a restart.
-            return f"main:scaling:{normalized_mode}"
         normalized_mode = "expanded" if mode == "expanded" else "collapsed"
-        return f"main:normal:{normalized_mode}"
+        backend = (
+            "blender"
+            if bool(getattr(self, "blender_mode_enabled", False))
+            else "max"
+        )
+        surface = (
+            "scaling"
+            if bool(getattr(self, "_scaling_mode_enabled", False))
+            else "normal"
+        )
+        return f"main:{surface}:{backend}:{normalized_mode}"
 
     def _store_main_window_size(
         self,
@@ -55893,22 +57807,45 @@ class LauncherApp:
             is_mapped = bool(self.root.winfo_ismapped())
         except (self.tk.TclError, AttributeError):
             is_mapped = True
-        if not is_mapped and isinstance(requested_position, (list, tuple)):
-            # LauncherApp restores size while the root is withdrawn. Preserve
-            # the requested persisted position until run_ui maps the window;
-            # winfo_x()/winfo_y() are only the withdrawn staging origin there.
+        if (
+            not bool(getattr(self, "_main_window_resize_ready", True))
+            and not is_mapped
+            and not (
+                isinstance(requested_position, (list, tuple))
+                and len(requested_position) >= 2
+            )
+        ):
+            # The first Scaling pass can replay a cached factor while Tk is
+            # still withdrawn at 1x1, before _restore_main_window_size has
+            # loaded the saved origin.  Its (0, 0) coordinates are staging
+            # data, never a user's position; do not persist them.
+            return
+        try:
+            live_position = [
+                int(self.root.winfo_x()),
+                int(self.root.winfo_y()),
+            ]
+        except (self.tk.TclError, TypeError, ValueError, AttributeError):
+            live_position = list(positions.get(cache_key, []) or [])
+        staged_position = any(
+            coordinate >= WINDOW_OFFSCREEN_STAGE_COORDINATE
+            for coordinate in live_position
+        )
+        if (
+            isinstance(requested_position, (list, tuple))
+            and len(requested_position) >= 2
+            and (not is_mapped or staged_position)
+        ):
+            # LauncherApp restores size while the root is withdrawn. The
+            # themed first-map pass also stages it at +20000,+20000 while Tk
+            # drains idle callbacks. In both cases winfo_x()/winfo_y() are not
+            # a user location; retain the planned persisted position instead.
             current_position = [
                 int(requested_position[0]),
                 int(requested_position[1]),
             ]
         else:
-            try:
-                current_position = [
-                    int(self.root.winfo_x()),
-                    int(self.root.winfo_y()),
-                ]
-            except (self.tk.TclError, TypeError, ValueError, AttributeError):
-                current_position = list(positions.get(cache_key, []) or [])
+            current_position = live_position
         if (
             sizes.get(cache_key) == size
             and signatures.get(cache_key) == signature
@@ -56204,6 +58141,16 @@ class LauncherApp:
         if startup_fit:
             cached = []
         try:
+            cached_size_valid = (
+                int(cached[0]) > 0 and int(cached[1]) > 0
+            )
+        except (IndexError, TypeError, ValueError):
+            cached_size_valid = False
+        # The scaling solver may need to shrink a temporary natural-size
+        # window after a page switch.  Keep this bit separate from the size
+        # itself so a deliberately widened, valid saved page is preserved.
+        self._main_window_restore_used_cached_size = bool(cached_size_valid)
+        try:
             cached_width, cached_height = int(cached[0]), int(cached[1])
         except (IndexError, TypeError, ValueError):
             cached_width, cached_height = natural_width, natural_height
@@ -56212,11 +58159,14 @@ class LauncherApp:
         except (IndexError, TypeError, ValueError):
             self._main_window_requested_position = None
         else:
-            screen_width = max(1, int(self.root.winfo_screenwidth()))
-            screen_height = max(1, int(self.root.winfo_screenheight()))
+            # Keep the exact saved origin. The old primary-screen clamp moved
+            # tall Scaling windows upward (for example y=208 became y=24 on a
+            # 1080px desktop) and also destroyed valid negative coordinates on
+            # a secondary monitor. run_ui validates only fully off-screen
+            # origins against the virtual desktop before mapping the window.
             self._main_window_requested_position = (
-                max(0, min(screen_width - 80, cached_x)),
-                max(0, min(screen_height - 80, cached_y)),
+                cached_x,
+                cached_y,
             )
         if normalized_mode == "expanded":
             minimum_width = min(natural_width, MAIN_WINDOW_ADVANCED_MIN_WIDTH)
@@ -57155,6 +59105,17 @@ class LauncherApp:
         if not bool(getattr(self, "_scaling_mode_enabled", False)):
             self._schedule_github_update_title_click_surface()
         self._schedule_launcher_tile_follow()
+        # Tk can emit a transient zoomed Configure while publish_root is
+        # revealing the restored geometry.  During this startup window it is
+        # not a user maximize/restore gesture; recording it would make the
+        # next normal Configure center the saved Scaling position.
+        if (
+            str(getattr(self, "_launcher_window_state", "") or "").casefold()
+            == LAUNCHER_WINDOW_STARTING
+        ):
+            return
+        if not bool(getattr(self, "_main_window_startup_complete", True)):
+            return
         if not self._main_window_resize_ready:
             return
         try:
@@ -64060,7 +66021,11 @@ class LauncherApp:
 
         def operation() -> tuple[str, dict[str, Any]]:
             if isinstance(session, ManagedBlenderSession):
-                return uuid.uuid4().hex, self._blender_scene_dispatcher(session).selection()
+                dispatcher = self._blender_scene_dispatcher(session)
+                return uuid.uuid4().hex, {
+                    "scene_contract": dispatcher.inspect(),
+                    "selection": dispatcher.selection(),
+                }
             return self._request_max_scene_interface(
                 session,
                 "legacy_export.selection",
@@ -64080,9 +66045,20 @@ class LauncherApp:
                     return
                 request_id, snapshot = value
                 if isinstance(session, ManagedBlenderSession):
-                    selected_handles = _apply_blender_selected_node_receipt(
+                    raw_contract = snapshot.get("scene_contract")
+                    raw_selection = snapshot.get("selection")
+                    if not isinstance(raw_contract, Mapping):
+                        raise ProtocolError(
+                            "Blender Legacy Export omitted its current scene record"
+                        )
+                    if not isinstance(raw_selection, Mapping):
+                        raise ProtocolError(
+                            "Blender Legacy Export omitted its current selection receipt"
+                        )
+                    selected_handles = _apply_blender_current_scene_selection_receipt(
                         session.workspace,
-                        snapshot,
+                        self._normalize_blender_scene_contract(session, raw_contract),
+                        raw_selection,
                         expected_blender_pid=session.pid,
                     )
                 else:
@@ -64168,9 +66144,11 @@ class LauncherApp:
             raise
 
     def _show_export_sets(self) -> None:
-        if self._active_model_session() is None:
+        session = self._active_model_session()
+        if session is None:
             self._show_error(RuntimeError(self._tr("当前没有活动的建模程序。", "No active modeling session.")))
             return
+        scene_label = "Blender" if isinstance(session, ManagedBlenderSession) else "Max"
         self._schedule_writer_warmup(delay_ms=0)
         workspace = self._active_workspace()
         if workspace is not None:
@@ -64248,13 +66226,13 @@ class LauncherApp:
         body.columnconfigure(0, weight=1)
         hint = self._tr(
             "此窗口负责导出分流，三个导出栏默认都是空的。\n"
-            "只有把当前 Max 场景中选定的 Mesh_* 明确加入某个栏位，它才参与对应的导出逻辑；同一个 Mesh 只能进入一个栏，再次添加时会自动从原栏移走。\n"
+            f"只有把当前 {scene_label} 场景中选定的 Mesh_* 明确加入某个栏位，它才参与对应的导出逻辑；同一个 Mesh 只能进入一个栏，再次添加时会自动从原栏移走。\n"
             "顶部栏：只覆写源 .MOD 的 Mesh Header，不复制几何。\n"
             "中间栏：清空所选 Mesh 的顶点和面，并保留原槽位。\n"
             "底部栏：将真正修改过的 Mesh 通过本次 FBX 交给 Python 写回。\n"
             "开启实验性骨骼编辑后，底部按钮会切换为“仅仅导出骨骼”和“骨骼+MESH一起导出”。",
             "This dialog controls export routing. All three export lanes start empty.\n"
-            "A Mesh_* participates only after it is explicitly added from the active Max scene. One Mesh can belong to only one lane; adding it again moves it from the previous lane.\n"
+            f"A Mesh_* participates only after it is explicitly added from the active {scene_label} scene. One Mesh can belong to only one lane; adding it again moves it from the previous lane.\n"
             "Top lane: override the source .MOD Mesh Header without copying geometry.\n"
             "Middle lane: empty the selected Mesh vertices and faces while preserving the original slot.\n"
             "Bottom lane: send genuinely modified Meshes through this export's FBX for Python to write back.\n"
@@ -64263,10 +66241,10 @@ class LauncherApp:
         selection_hint = self._tr(
             "三个框互斥选项已经开启，同一个 Mesh 名称只能进入一个框。\n"
             "按住 Shift 鼠标群选，可连骨骼和父级（LOD 层级）一起选择，导出器会自动识别 Mesh。\n"
-            "脚本实时监测 MAX 场景，加入此处的 Mesh 有改名或删除也会在此立刻同步。",
+            f"脚本实时监测 {scene_label} 场景，加入此处的 Mesh 有改名或删除也会在此立刻同步。",
             "Mutual exclusion is enabled across the three boxes; each Mesh name can appear in only one box.\n"
             "Hold Shift for multi-selection. Bones and parent (LOD hierarchy) nodes may be selected together; the exporter automatically identifies Mesh nodes.\n"
-            "The script monitors the Max scene in real time. Meshes added here are updated immediately when renamed or deleted.",
+            f"The script monitors the {scene_label} scene in real time. Meshes added here are updated immediately when renamed or deleted.",
         )
         screen_width = max(640, window.winfo_screenwidth())
         screen_height = max(480, window.winfo_screenheight())
@@ -64470,8 +66448,8 @@ class LauncherApp:
             HoverTooltip(
                 self.quick_select_checkbutton,
                 lambda: self._tr(
-                    "勾选后每次点击导出到 MOD，第三个框“修改 Mesh”框会先清空，再将 MAX 场景中选中的 Mesh 自动放入第三个框“修改 Mesh”框中。",
-                    "When checked, each Export to MOD first clears the third Modify Mesh box, then adds the Meshes currently selected in the Max scene to that box.",
+                    f"勾选后每次点击导出到 MOD，第三个框“修改 Mesh”框会先清空，再将 {scene_label} 场景中选中的 Mesh 自动放入第三个框“修改 Mesh”框中。",
+                    f"When checked, each Export to MOD first clears the third Modify Mesh box, then adds the Meshes currently selected in the {scene_label} scene to that box.",
                 ),
             )
         )
@@ -67894,6 +69872,7 @@ class LauncherApp:
             if self._launcher_state_writer_active:
                 return
             self._launcher_state_writer_active = True
+            self._launcher_state_write_finished.clear()
 
         def persist_latest() -> None:
             while True:
@@ -67902,6 +69881,7 @@ class LauncherApp:
                     self._launcher_state_pending_write = None
                     if pending is None:
                         self._launcher_state_writer_active = False
+                        self._launcher_state_write_finished.set()
                         return
                     pending_state, pending_directory = pending
                 try:
@@ -67928,6 +69908,29 @@ class LauncherApp:
         except Exception:
             with self._launcher_state_write_lock:
                 self._launcher_state_writer_active = False
+            self._launcher_state_write_finished.set()
+
+    def _flush_launcher_state_write(self, *, timeout: float) -> bool:
+        """Wait for the latest queued state snapshot before a process handoff."""
+        try:
+            wait_seconds = max(0.0, float(timeout))
+        except (TypeError, ValueError):
+            wait_seconds = 0.0
+        deadline = time.monotonic() + wait_seconds
+        finished = getattr(self, "_launcher_state_write_finished", None)
+        lock = getattr(self, "_launcher_state_write_lock", None)
+        if finished is None or lock is None:
+            return True
+        while True:
+            with lock:
+                if not bool(
+                    getattr(self, "_launcher_state_writer_active", False)
+                ) and getattr(self, "_launcher_state_pending_write", None) is None:
+                    return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            finished.wait(min(remaining, 0.05))
 
     def _persist_scene_auto_colors_state(self) -> None:
         self.launcher_state["scene_auto_colors_enabled"] = self.scene_auto_colors_enabled
@@ -68229,6 +70232,10 @@ class LauncherApp:
         self._sync_toolbar_region_geometry()
         self._position_content_after_toolbar(flush_layout=False)
         self._reflow_left_sections(flush_layout=False)
+        # Reflow can resize the responsive right panel after it has measured
+        # the current root width.  Recompute the toolbar once more so a page
+        # switch cannot retain the Advanced page's old action-column width.
+        self._sync_toolbar_region_geometry()
         self.root.update_idletasks()
         content_width, content_height = self._fit_main_window_to_content(
             flush_layout=False,
@@ -68335,10 +70342,22 @@ class LauncherApp:
                 final_height,
                 persist=True,
                 center=False,
-                default_size=False,
+                # A page-change auto-fit is generated default geometry.
+                # Record that provenance so the next switch can remeasure it
+                # without treating it as a user's manual width.
+                default_size=bool(fit_window),
             )
             final_width = max(1, int(self.root.winfo_width()))
             final_height = max(1, int(self.root.winfo_height()))
+        elif fit_window:
+            # The generated fit already matches the requested geometry.  It
+            # still needs to replace an old default-size marker.
+            self._store_main_window_size(
+                self._main_window_size_mode,
+                final_width,
+                final_height,
+                default_size=True,
+            )
 
         self._main_ui_scaling_transaction_target_size = (
             final_width,
@@ -70193,28 +72212,14 @@ class LauncherApp:
         )
         self.scene_auto_colors_mode_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self._refresh_scene_auto_colors_button()
-        self.max_material_normalize_button = self.tk.Button(
+        self.max_material_normalize_button = self.ttk.Button(
             body,
             text=self._tr(
                 "场景贴图材质修复 - 无阴影自发光\n适用于贴图烘焙场景",
                 "Scene Texture Material Repair - Shadowless Emissive Material\nFor Texture Baking",
             ),
             command=self._normalize_max_scene_materials,
-            background=self.colors["accent"],
-            foreground=self.colors["accent_text"],
-            activebackground=self.colors["select"],
-            activeforeground=self.colors["accent_text"],
-            disabledforeground=self.colors["muted"],
-            highlightbackground=self.colors["accent"],
-            highlightcolor=self.colors["accent"],
-            highlightthickness=0,
-            borderwidth=1,
-            relief="raised",
-            font=("Microsoft YaHei UI", 9),
-            anchor="center",
-            justify="center",
-            padx=6,
-            pady=4,
+            style="BakeSafe.TButton",
         )
         self.max_material_normalize_button.grid(
             row=9, column=0, sticky="ew", pady=(8, 0), ipady=8
@@ -70591,28 +72596,14 @@ class LauncherApp:
                 "This button exports textured FBX for 3ds Max. If you are baking textures only in Blender without moving data between 3D applications, use the “Scene Texture Material Repair - Shadowless Emissive Material - For Texture Baking” button to get bake results unaffected by lighting and shadows.",
             ),
         )
-        self.blender_material_normalize_button = self.tk.Button(
+        self.blender_material_normalize_button = self.ttk.Button(
             body,
             text=self._tr(
                 "场景贴图材质修复 - 无阴影自发光\n适用于贴图烘焙场景",
                 "Scene Texture Material Repair - Shadowless Emissive Material\nFor Texture Baking",
             ),
             command=self._normalize_blender_scene_materials,
-            background=self.colors["accent"],
-            foreground=self.colors["accent_text"],
-            activebackground=self.colors["select"],
-            activeforeground=self.colors["accent_text"],
-            disabledforeground=self.colors["muted"],
-            highlightbackground=self.colors["accent"],
-            highlightcolor=self.colors["accent"],
-            highlightthickness=0,
-            borderwidth=1,
-            relief="raised",
-            font=("Microsoft YaHei UI", 9),
-            anchor="center",
-            justify="center",
-            padx=6,
-            pady=4,
+            style="BakeSafe.TButton",
         )
         self.blender_material_normalize_button.grid(
             row=2, column=0, sticky="ew", pady=(8, 0), ipady=8
@@ -78981,7 +80972,7 @@ class LauncherApp:
             "贴图\n"
             "MRL / TEX -> codex_re6_tex_decode.py -> 日志目录 DDS（绑定期间保留） -> PID Agent -> Max 材质\n\n"
             "SBC / ADR / EMS\n"
-            "Launcher -> codex_re6_auxiliary_max_bridge.py -> PID Agent -> Max",
+            "Launcher -> PID Agent -> Python + FBX route -> Max",
             "Startup and recovery\n"
             "BAT -> PS1 -> codex_python_runtime_bootstrap.py -> Launcher\n\n"
             "Max connection\n"
@@ -78994,7 +80985,7 @@ class LauncherApp:
             "Textures\n"
             "MRL / TEX -> codex_re6_tex_decode.py -> log-directory DDS (retained while bound) -> PID Agent -> Max material\n\n"
             "SBC / ADR / EMS\n"
-            "Launcher -> codex_re6_auxiliary_max_bridge.py -> PID Agent -> Max",
+            "Launcher -> PID Agent -> Python + FBX route -> Max",
         )
         ChoiceDialog(
             owner,
@@ -79276,19 +81267,9 @@ class LauncherApp:
                 )
                 scene_status = str(scene_result.get("status", "") or "")
                 if scene_status == "AUX_FAILED":
-                    receipt = _normalize_aux_operation_receipt(
-                        scene_result.get("failure_receipt"),
-                        expected_correlation_id=request_token,
-                    )
-                    self._record_operation_diagnostic(
-                        "auxiliary",
-                        receipt=receipt,
-                        detail=str(receipt.get("detail", "") or ""),
-                    )
-                    raise OperationDomainError(
-                        f"{receipt.get('status_code', 'AUX_FAILED')}: "
-                        f"{receipt.get('detail', 'Auxiliary geometry operation failed')}",
-                        receipt,
+                    raise ProtocolError(
+                        "Legacy auxiliary geometry export is disabled; "
+                        "the FBX-backed Pythonized route is required"
                     )
                 if scene_status != "ok":
                     raise ProtocolError(
@@ -79298,29 +81279,10 @@ class LauncherApp:
                     raise ProtocolError(
                         f"{normalized.upper()} export correlation ID mismatch"
                     )
-                auxiliary_receipts = [
-                    _normalize_aux_operation_receipt(
-                        receipt,
-                        expected_correlation_id=request_token,
-                    )
-                    for receipt in scene_result.get("auxiliary_receipts", [])
-                    if isinstance(receipt, dict)
-                ]
-                expected_auxiliary_receipts = (
-                    0
-                    if pythonized
-                    else sum(
-                        1
-                        for row in nodes
-                        if role_needs_geometry(
-                            normalized,
-                            str(row.get("role", "") or ""),
-                        )
-                    )
-                )
-                if len(auxiliary_receipts) != expected_auxiliary_receipts:
+                auxiliary_receipts = scene_result.get("auxiliary_receipts", [])
+                if not isinstance(auxiliary_receipts, list) or auxiliary_receipts:
                     raise ProtocolError(
-                        f"{normalized.upper()} export returned the wrong AUX receipt count"
+                        f"{normalized.upper()} export returned unsupported legacy geometry receipts"
                     )
                 live_rows = [copy.deepcopy(row) for row in scene_result.get("nodes", []) if isinstance(row, dict)]
                 if len(live_rows) != len(nodes):
@@ -82683,6 +84645,8 @@ class LauncherApp:
         mode = "expanded" if visible else "collapsed"
         mode_changed = mode != self._main_window_size_mode
         self._main_window_size_mode = mode
+        restore_used_cached_size = False
+        restored_default_size = False
         if self._main_window_resize_ready and mode_changed:
             # Each advanced/compact surface owns a distinct persisted size.
             # Do not center or fit after restoring it: either operation turns
@@ -82691,6 +84655,14 @@ class LauncherApp:
                 mode,
                 center=False,
                 restore_position=bool(scaling_mode),
+            )
+            restore_used_cached_size = bool(
+                getattr(self, "_main_window_restore_used_cached_size", False)
+            )
+            restored_default_size = bool(
+                dict(
+                    self.launcher_state.get("main_window_default_modes", {})
+                ).get(self._main_window_size_cache_key(mode), False)
             )
             self._schedule_main_window_geometry_commit(
                 mode,
@@ -82703,6 +84675,13 @@ class LauncherApp:
                 self._apply_main_ui_scaling_policy(
                     window_width=max(1, int(self.root.winfo_width())),
                     window_height=max(1, int(self.root.winfo_height())),
+                    auto_fit=bool(
+                        mode_changed
+                        and (
+                            not restore_used_cached_size
+                            or restored_default_size
+                        )
+                    ),
                 )
             except (self.tk.TclError, TypeError, ValueError):
                 pass
@@ -83632,8 +85611,16 @@ class LauncherApp:
         target_mode = (
             "expanded" if source_advanced_visible else "collapsed"
         )
+        restore_used_cached_size = False
         if self._main_window_resize_ready:
-            self._restore_main_window_size(target_mode, center=False)
+            self._restore_main_window_size(
+                target_mode,
+                center=False,
+                restore_position=bool(getattr(self, "_scaling_mode_enabled", False)),
+            )
+            restore_used_cached_size = bool(
+                getattr(self, "_main_window_restore_used_cached_size", False)
+            )
             self._schedule_main_window_geometry_commit(
                 target_mode, reset_origin=True
             )
@@ -83642,6 +85629,7 @@ class LauncherApp:
                 self._apply_main_ui_scaling_policy(
                     window_width=max(1, int(self.root.winfo_width())),
                     window_height=max(1, int(self.root.winfo_height())),
+                    auto_fit=bool(not restore_used_cached_size),
                 )
             except (self.tk.TclError, TypeError, ValueError):
                 pass
@@ -83986,6 +85974,104 @@ class LauncherApp:
         # Cross-PID work is never globally stalled. Per-PID ordering belongs to
         # MAX_OPERATION_COORDINATOR; output-path locking belongs to export transactions.
         return
+
+    def _schedule_log_root_cleanup(
+        self,
+        log_directory: str | Path,
+        *,
+        reason: str,
+        cleanup_import_media: bool = False,
+    ) -> bool:
+        if self._close_in_progress:
+            return False
+        normalized_reason = str(reason or "maintenance").strip() or "maintenance"
+        try:
+            target = Path(log_directory).expanduser().resolve(strict=False)
+        except OSError as exc:
+            print(
+                f"[{APP_NAME}] Log cleanup path error: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return False
+        auto_cleanup_import_media = not bool(
+            self.launcher_state.get(
+                "import_texture_folder_cleanup_disabled",
+                False,
+            )
+        )
+        def publish_errors(errors: Iterable[object]) -> None:
+            messages = [str(error) for error in errors if str(error).strip()]
+            if not messages:
+                return
+            detail = "; ".join(messages[:4])
+            try:
+                _append_public_cleanup_errors(
+                    target,
+                    reason=normalized_reason,
+                    errors=messages,
+                )
+            except Exception as report_exc:
+                detail += (
+                    f"; cleanup error log failed: "
+                    f"{type(report_exc).__name__}: {report_exc}"
+                )
+            print(
+                f"[{APP_NAME}] Log cleanup reported errors "
+                f"({normalized_reason}): {detail}",
+                file=sys.stderr,
+            )
+            callback_queue = getattr(self, "_background_callback_queue", None)
+            if callback_queue is None:
+                return
+
+            def notify() -> None:
+                if self._close_in_progress:
+                    return
+                self._set_status(
+                    self._tr(
+                        f"日志清理有 {len(messages)} 项失败，已写入清理错误日志。",
+                        f"Log cleanup had {len(messages)} failure(s); see the cleanup error log.",
+                    )
+                )
+
+            try:
+                callback_queue.put(notify)
+            except Exception as queue_exc:
+                print(
+                    f"[{APP_NAME}] Cleanup status callback failed: "
+                    f"{type(queue_exc).__name__}: {queue_exc}",
+                    file=sys.stderr,
+                )
+
+        def operation() -> dict[str, Any]:
+            try:
+                receipt = _cleanup_log_root_retention(
+                    target,
+                    keep_groups=SAMPLE_KEEP_GROUPS,
+                    cleanup_import_media=cleanup_import_media,
+                    import_media_auto_cleanup_enabled=(
+                        auto_cleanup_import_media
+                    ),
+                )
+            except Exception as exc:
+                receipt = {
+                    "schema": "pc-rehd-log-root-retention-v1",
+                    "log_directory": str(target),
+                    "errors": [f"{type(exc).__name__}: {exc}"],
+                }
+            receipt["reason"] = normalized_reason
+            self._last_log_cleanup_receipt = receipt
+            publish_errors(receipt.get("errors", []))
+            return receipt
+
+        started = self._start_deferred_maintenance(
+            operation,
+            name=f"{APP_NAME}-Cleanup-{normalized_reason}",
+        )
+        if not started:
+            publish_errors(["Cleanup maintenance thread could not start"])
+        return started
 
     def _start_deferred_maintenance(
         self,
@@ -85905,6 +87991,8 @@ class LauncherApp:
         session = self._active_blender_session()
         if session is None or not _process_is_alive(session.process):
             return False
+        if session.request_in_flight() or self._import_export_priority_active():
+            return True
         if _process_window_is_minimized(session.pid):
             return False
         return _foreground_window_pid() in (session.pid, os.getpid())
@@ -88360,6 +90448,7 @@ class LauncherApp:
         if not hasattr(self, "scene_tree") or self.scene_tree is None:
             return
         workspace = self._active_workspace()
+        blender_scene = isinstance(self._active_model_session(), ManagedBlenderSession)
         rows: list[tuple[str, str, tuple[Any, ...]]] = []
         if workspace is not None:
             needle = self.filter_var.get().strip().casefold()
@@ -88371,7 +90460,7 @@ class LauncherApp:
             for mesh in workspace.scene_contract.get("meshes", []):
                 if not isinstance(mesh, dict):
                     continue
-                name = str(mesh.get("scene_node", ""))
+                name = _scene_mesh_ui_name(mesh, blender=blender_scene)
                 if needle and needle not in name.casefold():
                     continue
                 if _mesh_hidden_by_filter_contract(
@@ -88430,6 +90519,7 @@ class LauncherApp:
         workspace = self._active_workspace()
         bucket_lists = getattr(self, "bucket_lists", {})
         active_model_session = self._active_model_session()
+        blender_scene = isinstance(active_model_session, ManagedBlenderSession)
         active_model_pid = (
             int(active_model_session.pid)
             if active_model_session is not None
@@ -88452,7 +90542,7 @@ class LauncherApp:
             mesh_index = _scene_mesh_index(workspace.scene_contract)
             for lane in ("header", "delete", "modify"):
                 rows_by_lane[lane] = tuple(
-                    f"{mesh.get('scene_node', '')}  "
+                    f"{_scene_mesh_ui_name(mesh, blender=blender_scene)}  "
                     f"[Slot {mesh.get('mesh_slot', '?')} | PID {active_model_pid}]"
                     for handle in workspace.buckets[lane]
                     for mesh in [mesh_index.get(handle)]
@@ -88632,12 +90722,9 @@ class LauncherApp:
                     raise ProtocolError("Blender Add Selected Mesh omitted its scene record")
                 if not isinstance(snapshot, Mapping):
                     raise ProtocolError("Blender Add Selected Mesh omitted its selection receipt")
-                _reconcile_workspace_scene(
+                handles = _apply_blender_current_scene_selection_receipt(
                     session.workspace,
                     self._normalize_blender_scene_contract(session, raw_contract),
-                )
-                handles = _apply_blender_selected_node_receipt(
-                    session.workspace,
                     dict(snapshot),
                     expected_blender_pid=session.pid,
                 )
@@ -88905,43 +90992,83 @@ class LauncherApp:
             if fbx_path is not None
             else _public_operation_log_path(log_directory, "import")
         )
-        import_bug_control = create_import_bug_controller(
-            request_id=request_token,
-            process_id=session.pid,
-            metadata={
-                "source_mod": str(source_mod),
-                "fbx_path": str(fbx_path or ""),
-                "backend": "blender_direct" if blender_direct else "fbx_handoff",
-                "include_normals": include_normals,
-                "reset_scene": reset_scene,
-                "fix_processing_mode": fix_processing_mode,
-            },
+        def schedule_post_release_cleanup() -> None:
+            try:
+                self._schedule_log_root_cleanup(
+                    log_directory,
+                    reason="import_reservation_released",
+                    cleanup_import_media=True,
+                )
+            except Exception as cleanup_exc:
+                print(
+                    f"[{APP_NAME}] Post-import cleanup scheduling failed: "
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}",
+                    file=sys.stderr,
+                )
+
+        reservation_finalizer = (
+            _PublicFbxReservationFinalizer(
+                fbx_path,
+                log_directory=log_directory,
+                on_released=schedule_post_release_cleanup,
+            )
+            if fbx_path is not None
+            else None
         )
-        import_bug_control.advance("request_validation")
-        import_started_at = time.perf_counter()
-        generation = self._begin_session_operation(session, action)
-        self._report_bootstrap_health_operation(
-            action,
-            "started",
-            max_process_id=session.pid,
-            request_id=request_token,
-            extra={
-                "source_mod": str(source_mod),
-                "include_normals": include_normals,
-                "import_textures": import_textures,
-                "texture_mrl_path": str(
-                    (texture_config or {}).get("mrl_path", "") or ""
-                ),
-                "texture_directory": str(
-                    (texture_config or {}).get("texture_directory", "") or ""
-                ),
-                "disable_texture_folder_cleanup": (
-                    disable_texture_folder_cleanup
-                ),
-                "reset_scene": reset_scene,
-                "fix_processing_mode": fix_processing_mode,
-            },
-        )
+
+        def release_reservation_once() -> bool:
+            if reservation_finalizer is None:
+                return False
+            return reservation_finalizer.release()
+        generation = 0
+        try:
+            import_bug_control = create_import_bug_controller(
+                request_id=request_token,
+                process_id=session.pid,
+                metadata={
+                    "source_mod": str(source_mod),
+                    "fbx_path": str(fbx_path or ""),
+                    "backend": (
+                        "blender_direct" if blender_direct else "fbx_handoff"
+                    ),
+                    "include_normals": include_normals,
+                    "reset_scene": reset_scene,
+                    "fix_processing_mode": fix_processing_mode,
+                },
+            )
+            import_bug_control.advance("request_validation")
+            import_started_at = time.perf_counter()
+            generation = self._begin_session_operation(session, action)
+            self._report_bootstrap_health_operation(
+                action,
+                "started",
+                max_process_id=session.pid,
+                request_id=request_token,
+                extra={
+                    "source_mod": str(source_mod),
+                    "include_normals": include_normals,
+                    "import_textures": import_textures,
+                    "texture_mrl_path": str(
+                        (texture_config or {}).get("mrl_path", "") or ""
+                    ),
+                    "texture_directory": str(
+                        (texture_config or {}).get("texture_directory", "")
+                        or ""
+                    ),
+                    "disable_texture_folder_cleanup": (
+                        disable_texture_folder_cleanup
+                    ),
+                    "reset_scene": reset_scene,
+                    "fix_processing_mode": fix_processing_mode,
+                },
+            )
+        except Exception:
+            release_reservation_once()
+            if generation > 0:
+                self._release_import_export_priority(
+                    session, action, generation
+                )
+            raise
         import_failure_state: dict[str, object] = {
             "source_mod": str(source_mod),
             "source_exists": source_mod.is_file(),
@@ -89222,12 +91349,8 @@ class LauncherApp:
                         texture_cleanup_receipt["error"] = (
                             f"{type(cleanup_exc).__name__}: {cleanup_exc}"
                         )
-                    self._start_deferred_maintenance(
-                        lambda: _prune_sample_groups(log_directory),
-                        name=f"{APP_NAME}-ImportCleanup",
-                    )
 
-        def success(
+        def finish_import_success(
             value: tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]],
         ) -> None:
             if not self._owns_session_operation(session, action, generation):
@@ -89239,7 +91362,6 @@ class LauncherApp:
                     detail="A newer operation replaced this import callback.",
                 )
                 self._release_import_export_priority(session, action, generation)
-                _release_public_fbx_reservation(fbx_path)
                 return
             request_id, result, import_receipt, planned_name_snapshot = value
             import_bug_control.complete()
@@ -89269,8 +91391,6 @@ class LauncherApp:
                 import_failure_state["public_txt_error"] = (
                     f"{type(txt_exc).__name__}: {txt_exc}"
                 )
-            finally:
-                _release_public_fbx_reservation(fbx_path)
 
             def record_blender_hierarchy_coverage(
                 hierarchy: dict[str, Any], imported_mesh_count: int
@@ -89872,7 +91992,13 @@ class LauncherApp:
                     cancel_auto_close_on_other_click=not import_textures,
                 ).show()
 
-        def failure(exc: Exception) -> None:
+        def success(
+            value: tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]],
+        ) -> None:
+            finish_import_success(value)
+            release_reservation_once()
+
+        def finish_import_failure(exc: Exception) -> None:
             traceback_text = "".join(
                 traceback.format_exception(type(exc), exc, exc.__traceback__)
             )[-12000:]
@@ -89934,8 +92060,6 @@ class LauncherApp:
                 import_failure_state["public_txt_error"] = (
                     f"{type(txt_exc).__name__}: {txt_exc}"
                 )
-            finally:
-                _release_public_fbx_reservation(fbx_path)
             failure_detail = f"{type(exc).__name__}: {exc}"
             if traceback_text:
                 failure_detail += "\n" + traceback_text
@@ -89947,13 +92071,21 @@ class LauncherApp:
                 detail=failure_detail[-12000:],
                 extra=copy.deepcopy(import_failure_state),
             )
-            self._release_import_export_priority(session, action, generation)
             if not self._owns_session_operation(session, action, generation):
                 return
             session.workspace.last_status = self._tr("导入失败：", "Import failed: ") + str(exc)
             if self._session_is_visible(session):
                 self._set_status(session.workspace.last_status, progress=0)
                 self._show_import_receipt_error(exc)
+
+        def failure(exc: Exception) -> None:
+            try:
+                finish_import_failure(exc)
+            finally:
+                release_reservation_once()
+                self._release_import_export_priority(
+                    session, action, generation
+                )
 
         try:
             self._run_background(
@@ -91030,8 +93162,6 @@ class LauncherApp:
         log_dir = str(log_directory)
         workspace.log_dir = log_dir
         self.log_dir_var.set(log_dir)
-        fbx_path = _fbx_log_path(log_directory, session.pid, "export", request_token)
-
         header_mode = int(workspace.header_mode)
         force_named_fvf_once = bool(self._force_named_fvf_once)
         options = {
@@ -91066,11 +93196,16 @@ class LauncherApp:
             "verify": True,
         }
 
-        export_owner, export_conflict = self.export_transactions.try_acquire(
-            session.pid,
-            output_mod,
-            request_token,
-        )
+        try:
+            export_owner, export_conflict = self.export_transactions.try_acquire(
+                session.pid,
+                output_mod,
+                request_token,
+            )
+        except Exception:
+            self.export_transactions.release(session.pid, request_token)
+            release_legacy_bucket_plan()
+            raise
         if export_owner is None:
             conflict = export_conflict or {}
             owner_pid = int(conflict.get("max_process_id", 0) or 0)
@@ -91078,30 +93213,102 @@ class LauncherApp:
             cross_process = bool(conflict.get("cross_process"))
             owner_cn = "另一个 Launcher 进程" if cross_process else f"Max PID {owner_pid}"
             owner_en = "another Launcher process" if cross_process else f"Max PID {owner_pid}"
-            ChoiceDialog(
-                getattr(self, "export_sets_window", None) or self.root,
-                title=self._tr("导出正在进行", "Export In Progress"),
-                message=self._tr(
-                    f"该输出文件已有导出任务正在写入，已拒绝本次重复导出。\n\n占用者：{owner_cn}\n请求 ID：{owner_request}\n输出：{conflict.get('output_mod', output_mod)}",
-                    f"Another export already owns this output file, so this duplicate export was rejected.\n\nOwner: {owner_en}\nRequest ID: {owner_request}\nOutput: {conflict.get('output_mod', output_mod)}",
-                ),
-                choices=[(self._tr("确定", "OK"), "ok")],
-                center_on_screen=True,
-            ).show()
-            _release_public_fbx_reservation(fbx_path)
-            release_legacy_bucket_plan()
+            try:
+                ChoiceDialog(
+                    getattr(self, "export_sets_window", None) or self.root,
+                    title=self._tr("导出正在进行", "Export In Progress"),
+                    message=self._tr(
+                        f"该输出文件已有导出任务正在写入，已拒绝本次重复导出。\n\n占用者：{owner_cn}\n请求 ID：{owner_request}\n输出：{conflict.get('output_mod', output_mod)}",
+                        f"Another export already owns this output file, so this duplicate export was rejected.\n\nOwner: {owner_en}\nRequest ID: {owner_request}\nOutput: {conflict.get('output_mod', output_mod)}",
+                    ),
+                    choices=[(self._tr("确定", "OK"), "ok")],
+                    center_on_screen=True,
+                ).show()
+            finally:
+                release_legacy_bucket_plan()
             return
+
+        action = "export_mod"
+        generation = 0
+
+        def release_export_transaction() -> None:
+            try:
+                self.export_transactions.release(session.pid, request_token)
+            finally:
+                try:
+                    if generation > 0:
+                        self._release_import_export_priority(
+                            session, action, generation
+                        )
+                finally:
+                    release_legacy_bucket_plan()
+
+        try:
+            generation = self._begin_session_operation(session, action)
+        except Exception:
+            release_export_transaction()
+            raise
+
+        def schedule_post_release_cleanup() -> None:
+            try:
+                self._schedule_log_root_cleanup(
+                    log_directory,
+                    reason="export_reservation_released",
+                    cleanup_import_media=False,
+                )
+            except Exception as cleanup_exc:
+                print(
+                    f"[{APP_NAME}] Post-export cleanup scheduling failed: "
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}",
+                    file=sys.stderr,
+                )
+
+        try:
+            fbx_path = _fbx_log_path(
+                log_directory, session.pid, "export", request_token
+            )
+            reservation_finalizer = _PublicFbxReservationFinalizer(
+                fbx_path,
+                log_directory=log_directory,
+                on_released=schedule_post_release_cleanup,
+            )
+        except Exception:
+            release_export_transaction()
+            raise
+
+        reservation_phase_lock = threading.Lock()
+        reservation_phase = {
+            "pipeline_finished": False,
+            "deferred_pending": False,
+        }
+
+        def release_reservation_once() -> bool:
+            return reservation_finalizer.release()
+
+        def release_reservation_if_terminal() -> bool:
+            with reservation_phase_lock:
+                ready = bool(
+                    reservation_phase["pipeline_finished"]
+                    and not reservation_phase["deferred_pending"]
+                )
+            return release_reservation_once() if ready else False
+
+        def finish_export_reservation_pipeline() -> None:
+            with reservation_phase_lock:
+                reservation_phase["pipeline_finished"] = True
+            release_reservation_if_terminal()
+
+        def begin_deferred_reservation() -> None:
+            with reservation_phase_lock:
+                reservation_phase["deferred_pending"] = True
+
+        def finish_deferred_reservation() -> None:
+            with reservation_phase_lock:
+                reservation_phase["deferred_pending"] = False
+            release_reservation_if_terminal()
 
         if force_named_fvf_once:
             self._force_named_fvf_once = False
-
-        action = "export_mod"
-        generation = self._begin_session_operation(session, action)
-
-        def release_export_transaction() -> None:
-            self.export_transactions.release(session.pid, request_token)
-            self._release_import_export_priority(session, action, generation)
-            release_legacy_bucket_plan()
 
         def activate_source_rename() -> Path:
             if not rename_source_requested:
@@ -91205,8 +93412,10 @@ class LauncherApp:
                 3,
             )
         except Exception:
-            _release_public_fbx_reservation(fbx_path)
-            release_export_transaction()
+            try:
+                release_export_transaction()
+            finally:
+                finish_export_reservation_pipeline()
             raise
 
         writer_source_mod = selected_source_mod
@@ -91226,7 +93435,7 @@ class LauncherApp:
                 },
             )
 
-        def export_failure(exc: Exception) -> None:
+        def finish_export_failure(exc: Exception) -> None:
             try:
                 _write_public_operation_receipt_txt(
                     fbx_path.with_suffix(".txt"),
@@ -91247,19 +93456,12 @@ class LauncherApp:
                 )
             except Exception:
                 pass
-            finally:
-                _release_public_fbx_reservation(fbx_path)
             self._report_bootstrap_health_operation(
                 action,
                 "failed",
                 max_process_id=session.pid,
                 request_id=request_token,
                 detail=f"{type(exc).__name__}: {exc}",
-            )
-            release_export_transaction()
-            self._start_deferred_maintenance(
-                lambda: _prune_sample_groups(log_directory),
-                name=f"{APP_NAME}-ExportCleanup",
             )
             restore_detail = restore_renamed_source_after_failure()
             if not self._owns_session_operation(session, action, generation):
@@ -91292,11 +93494,20 @@ class LauncherApp:
                     f"Python Export Failed | PID {session.pid}",
                 ),
                 message=self._tr(
-                    f"Max PID：{session.pid}\n\n导出已中止。\n\nPython 导出模块没有完成写入：\n\n{detail}\n\n本次不会把不完整结果当作成功导出。",
-                    f"Max PID: {session.pid}\n\nExport aborted.\n\nThe Python export module did not complete the write:\n\n{detail}\n\nThe incomplete result is not reported as a successful export.",
+                    f"{backend_label} PID：{session.pid}\n\n导出已中止。\n\nPython 导出模块没有完成写入：\n\n{detail}\n\n本次不会把不完整结果当作成功导出。",
+                    f"{backend_label} PID: {session.pid}\n\nExport aborted.\n\nThe Python export module did not complete the write:\n\n{detail}\n\nThe incomplete result is not reported as a successful export.",
                 ),
                 choices=[(self._tr("确定", "OK"), "ok")],
             ).show()
+
+        def export_failure(exc: Exception) -> None:
+            try:
+                finish_export_failure(exc)
+            finally:
+                try:
+                    release_export_transaction()
+                finally:
+                    finish_export_reservation_pipeline()
 
         def run_writer_with_receipt_hash(
             request: dict[str, Any]
@@ -91319,7 +93530,11 @@ class LauncherApp:
             )
             # Filesystem preflight belongs to the worker. Tk must remain free to
             # repaint while a large source MOD is moved and hashed.
-            queue_export_progress("正在启动 Python Writer", "Starting Python Writer", 8)
+            queue_export_progress(
+                f"正在等待 {backend_label} Agent 导出",
+                f"Waiting for {backend_label} Agent export",
+                8,
+            )
             self._start_writer_process()
             output_mod.parent.mkdir(parents=True, exist_ok=True)
             queue_export_progress("正在校验源 .MOD", "Validating source .MOD", 14)
@@ -91657,10 +93872,6 @@ class LauncherApp:
                 "Writer returned; validating the export receipt",
                 84,
             )
-            self._start_deferred_maintenance(
-                lambda: _prune_sample_groups(log_directory),
-                name=f"{APP_NAME}-ExportCleanup",
-            )
             return request_id, max_result, writer_result, memory_request
 
         def finish_writer(
@@ -91728,7 +93939,7 @@ class LauncherApp:
                     request_id=request_token,
                     detail="A newer operation replaced this export callback.",
                 )
-                _release_public_fbx_reservation(fbx_path)
+                finish_export_reservation_pipeline()
                 return
             live_contract = max_result.get("scene_contract")
             if isinstance(live_contract, dict):
@@ -91779,7 +93990,6 @@ class LauncherApp:
                 if overwrite_choice != "overwrite":
                     restore_detail = restore_renamed_source_after_failure()
                     release_export_transaction()
-                    _release_public_fbx_reservation(fbx_path)
                     self._report_bootstrap_health_operation(
                         action,
                         "cancelled",
@@ -91800,6 +94010,7 @@ class LauncherApp:
                             message=restore_detail,
                             choices=[(self._tr("确定", "OK"), "ok")],
                         ).show()
+                    finish_export_reservation_pipeline()
                     return
                 memory_request.setdefault("decisions", {})["output_collision"] = "approved"
                 set_export_progress(
@@ -91843,7 +94054,6 @@ class LauncherApp:
                 if keep is None:
                     restore_renamed_source_after_failure()
                     release_export_transaction()
-                    _release_public_fbx_reservation(fbx_path)
                     self._report_bootstrap_health_operation(
                         action,
                         "cancelled",
@@ -91857,6 +94067,7 @@ class LauncherApp:
                     )
                     session.workspace.progress_value = 0.0
                     self._set_status(session.workspace.last_status, progress=0)
+                    finish_export_reservation_pipeline()
                     return
                 remove = {int(item.get("scene_node_handle", 0) or 0) for item in candidates if int(item.get("scene_node_handle", 0) or 0) != keep}
                 for lane in session.workspace.buckets:
@@ -92028,8 +94239,20 @@ class LauncherApp:
                 log_health_warning = (
                     f"Public Export TXT write failed: {type(txt_exc).__name__}: {txt_exc}"
                 )
-            finally:
-                _release_public_fbx_reservation(fbx_path)
+            deferred_uv_task_present = "uv_risk_task" in writer_result
+            deferred_uv_context: dict[str, Any] | None = None
+            deferred_uv_error = ""
+            if deferred_uv_task_present:
+                deferred_uv_context, deferred_uv_error = (
+                    _validate_deferred_uv_risk_task(
+                        writer_result.get("uv_risk_task"),
+                        request_id=request_id,
+                        max_process_id=session.pid,
+                        output_mod=output_path,
+                        log_directory=log_directory,
+                        public_fbx_path=fbx_path,
+                    )
+                )
             receipt_source_sha = str(writer_result.get("source_sha256", "") or "") or expected_source_sha
             workspace.scene_contract = dict(max_result.get("scene_contract", workspace.scene_contract))
             commit_source_state_after_success(output_path)
@@ -92074,7 +94297,10 @@ class LauncherApp:
                         request_id=request_token,
                         extra=log_health_extra,
                     )
-            if self._owns_session_operation(session, action, generation):
+            owns_completion_ui = self._owns_session_operation(
+                session, action, generation
+            )
+            if owns_completion_ui:
                 if self._session_is_visible(session):
                     self._close_export_sets()
                 workspace.progress_value = 100.0
@@ -92109,18 +94335,6 @@ class LauncherApp:
                         else {}
                     )
                 deferred_uv_marker = "__PC_REHD_DEFERRED_UV_RISK_SECTION__"
-                deferred_uv_task_present = "uv_risk_task" in writer_result
-                deferred_uv_context: dict[str, Any] | None = None
-                deferred_uv_error = ""
-                if deferred_uv_task_present:
-                    deferred_uv_context, deferred_uv_error = _validate_deferred_uv_risk_task(
-                        writer_result.get("uv_risk_task"),
-                        request_id=request_id,
-                        max_process_id=session.pid,
-                        output_mod=output_path,
-                        log_directory=log_directory,
-                        public_fbx_path=fbx_path,
-                    )
                 mod_operations = writer_result.get("mod_operations")
                 if not isinstance(mod_operations, dict):
                     mod_operations = {}
@@ -92589,14 +94803,22 @@ class LauncherApp:
                         for row in zero_weight_advisory.get("meshes", [])
                     )
                 )
+                deferred_uv_update_started = False
 
                 def receipt_shown() -> None:
+                    nonlocal deferred_uv_update_started
                     if deferred_uv_context is not None:
-                        self._start_deferred_uv_risk_dialog_update(
-                            receipt_dialog,
-                            deferred_uv_context,
-                            compose_uv_receipt,
-                        )
+                        try:
+                            self._start_deferred_uv_risk_dialog_update(
+                                receipt_dialog,
+                                deferred_uv_context,
+                                compose_uv_receipt,
+                                on_finished=finish_deferred_reservation,
+                            )
+                            deferred_uv_update_started = True
+                        except Exception:
+                            finish_deferred_reservation()
+                            raise
 
                     def show_export_advisories() -> None:
                         try:
@@ -92641,9 +94863,19 @@ class LauncherApp:
                     or show_skin_influence_notice
                     or show_fvf_notice
                 ):
-                    receipt_dialog.show(on_shown=receipt_shown)
+                    if deferred_uv_context is not None:
+                        begin_deferred_reservation()
+                    try:
+                        receipt_dialog.show(on_shown=receipt_shown)
+                    finally:
+                        if (
+                            deferred_uv_context is not None
+                            and not deferred_uv_update_started
+                        ):
+                            finish_deferred_reservation()
                 else:
                     receipt_dialog.show()
+            finish_export_reservation_pipeline()
 
         def success(value: tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]) -> None:
             if not self._owns_session_operation(session, action, generation):
@@ -92656,6 +94888,7 @@ class LauncherApp:
                     request_id=request_token,
                     detail="A newer operation replaced this export callback.",
                 )
+                finish_export_reservation_pipeline()
                 return
             finish_writer(*value)
 
@@ -92679,14 +94912,17 @@ class LauncherApp:
             )
         except Exception:
             restore_renamed_source_after_failure()
-            release_export_transaction()
-            self._report_bootstrap_health_operation(
-                action,
-                "failed",
-                max_process_id=session.pid,
-                request_id=request_token,
-                detail="Launcher could not schedule the export background operation.",
-            )
+            try:
+                release_export_transaction()
+                self._report_bootstrap_health_operation(
+                    action,
+                    "failed",
+                    max_process_id=session.pid,
+                    request_id=request_token,
+                    detail="Launcher could not schedule the export background operation.",
+                )
+            finally:
+                finish_export_reservation_pipeline()
             raise
 
     def _on_close(self) -> None:
@@ -92821,6 +95057,12 @@ class LauncherApp:
             self._close_message_editor(reopen_next_launch=True)
         for pid in list(self.agent_active_starting_pids):
             self._clear_active_agent_start(pid)
+        # The restart path can hand the singleton lock to a new process while
+        # this process is still alive. Ensure the new Launcher reads the final
+        # window position/size snapshot rather than the previous write.
+        self._flush_launcher_state_write(
+            timeout=HEALTH_REPORT_CLOSE_FLUSH_SECONDS
+        )
         _release_launcher_singleton()
         self.root.destroy()
 
@@ -92835,6 +95077,71 @@ def _centered_window_position(
         max(0, (max(1, int(screen_width)) - max(1, int(width))) // 2),
         max(0, (max(1, int(screen_height)) - max(1, int(height))) // 2),
     )
+
+
+def _launcher_virtual_desktop_bounds(window: Any) -> tuple[int, int, int, int]:
+    """Return the desktop rectangle used to validate a saved Launcher position."""
+    try:
+        fallback = (
+            int(window.winfo_vrootx()),
+            int(window.winfo_vrooty()),
+            max(1, int(window.winfo_vrootwidth())),
+            max(1, int(window.winfo_vrootheight())),
+        )
+    except Exception:
+        fallback = (
+            0,
+            0,
+            max(1, int(window.winfo_screenwidth())),
+            max(1, int(window.winfo_screenheight())),
+        )
+    if os.name != "nt":
+        return fallback
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        bounds = (
+            int(user32.GetSystemMetrics(76)),
+            int(user32.GetSystemMetrics(77)),
+            int(user32.GetSystemMetrics(78)),
+            int(user32.GetSystemMetrics(79)),
+        )
+        if bounds[2] > 0 and bounds[3] > 0:
+            return bounds
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    return fallback
+
+
+def _resolve_launcher_position(
+    requested_position: Any,
+    *,
+    window_width: int,
+    window_height: int,
+    virtual_bounds: tuple[int, int, int, int],
+) -> tuple[int, int]:
+    """Keep a valid saved origin; center only when it is unusable/off-screen."""
+    left, top, desktop_width, desktop_height = (
+        int(value) for value in virtual_bounds
+    )
+    desktop_width = max(1, desktop_width)
+    desktop_height = max(1, desktop_height)
+    width = max(1, int(window_width))
+    height = max(1, int(window_height))
+    center_x = left + max(0, desktop_width - width) // 2
+    center_y = top + max(0, desktop_height - height) // 2
+    try:
+        x, y = int(requested_position[0]), int(requested_position[1])
+    except (IndexError, TypeError, ValueError):
+        return center_x, center_y
+    if x >= WINDOW_OFFSCREEN_STAGE_COORDINATE or y >= WINDOW_OFFSCREEN_STAGE_COORDINATE:
+        return center_x, center_y
+    right = left + desktop_width
+    bottom = top + desktop_height
+    if x + width <= left or x >= right or y + height <= top or y >= bottom:
+        return center_x, center_y
+    return x, y
 
 
 def run_ui(*, initial_target_pid: int = 0) -> int:
@@ -92871,45 +95178,29 @@ def run_ui(*, initial_target_pid: int = 0) -> int:
             final_width = max(int(minimum_width), int(root.winfo_width()))
             final_height = max(int(minimum_height), int(root.winfo_height()))
         requested_position = getattr(app, "_main_window_requested_position", None)
-        screen_width = max(1, int(root.winfo_screenwidth()))
-        screen_height = max(1, int(root.winfo_screenheight()))
+        virtual_bounds = _launcher_virtual_desktop_bounds(root)
         if requested_position is None:
-            desired_x, desired_y = _centered_window_position(
+            virtual_left, virtual_top, virtual_width, virtual_height = virtual_bounds
+            centered_x, centered_y = _centered_window_position(
                 final_width,
                 final_height,
-                screen_width,
-                screen_height,
+                virtual_width,
+                virtual_height,
             )
+            desired_x = int(virtual_left) + centered_x
+            desired_y = int(virtual_top) + centered_y
         else:
-            requested_x, requested_y = (
-                int(requested_position[0]),
-                int(requested_position[1]),
+            desired_x, desired_y = _resolve_launcher_position(
+                requested_position,
+                window_width=final_width,
+                window_height=final_height,
+                virtual_bounds=virtual_bounds,
             )
-            invalid_stage_position = (
-                requested_x >= WINDOW_OFFSCREEN_STAGE_COORDINATE
-                or requested_y >= WINDOW_OFFSCREEN_STAGE_COORDINATE
-                or requested_x >= screen_width
-                or requested_y >= screen_height
-            )
-            if invalid_stage_position:
-                desired_x, desired_y = _centered_window_position(
-                    final_width,
-                    final_height,
-                    screen_width,
-                    screen_height,
-                )
-            else:
-                max_x = max(0, screen_width - min(final_width, screen_width))
-                max_y = max(0, screen_height - min(final_height, screen_height))
-                desired_x, desired_y = (
-                    max(0, min(max_x, requested_x)),
-                    max(0, min(max_y, requested_y)),
-                )
 
         dark = bool(getattr(app, "_theme_dark", False))
         _set_themed_window_geometry(
             root,
-            f"{final_width}x{final_height}+{desired_x}+{desired_y}",
+            f"{final_width}x{final_height}{desired_x:+d}{desired_y:+d}",
             dark=dark,
         )
         # The Launcher is still withdrawn here, so the Configure callback
@@ -92921,12 +95212,21 @@ def run_ui(*, initial_target_pid: int = 0) -> int:
         )
         _prepare_native_window_theme_restore(root, dark=dark)
         window_scheduler = _managed_window_scheduler(root)
+
+        def arm_startup_geometry_barrier() -> None:
+            try:
+                root.after(0, app._mark_main_window_startup_complete)
+            except tk.TclError:
+                app._mark_main_window_startup_complete()
+
         if window_scheduler.publish_root(dark=dark):
             app._launcher_window_state = LAUNCHER_WINDOW_VISIBLE
+            arm_startup_geometry_barrier()
         else:
             def publish_after_mainloop_starts() -> None:
                 if window_scheduler.publish_root(dark=dark):
                     app._launcher_window_state = LAUNCHER_WINDOW_VISIBLE
+                    arm_startup_geometry_barrier()
 
             root.after(0, publish_after_mainloop_starts)
         app._apply_topmost()

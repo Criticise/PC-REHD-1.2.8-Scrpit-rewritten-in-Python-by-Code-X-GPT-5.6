@@ -1091,7 +1091,6 @@ MODULE_REQUIREMENTS = {
     # this policy and the clean-copy probe in the same change.
     "codex_re6_mod_import_fbx": (),
     "codex_re6_tex_decode": (),
-    "codex_re6_auxiliary_max_bridge": (),
 }
 
 IMPORT_RUNTIME_MODULES = (
@@ -1104,7 +1103,7 @@ EXPORT_RUNTIME_MODULES = (
     "codex_fbx_probe",
 )
 TEXTURE_RUNTIME_MODULES = ("codex_re6_tex_decode",)
-AUXILIARY_RUNTIME_MODULES = ("codex_re6_auxiliary_max_bridge",)
+AUXILIARY_RUNTIME_MODULES = ()
 AUXILIARY_PROBE_RUNTIME_MODULES = ("codex_fbx_probe",)
 ALL_RUNTIME_MODULES = tuple(
     dict.fromkeys(
@@ -9621,12 +9620,10 @@ HEALTH_SUPERVISOR_WATCHED_SOURCES = {
     "importer": "codex_re6_mod_import_fbx.py",
     "fbx_probe": "codex_fbx_probe.py",
     "tex_decode": "codex_re6_tex_decode.py",
-    "auxiliary_max_bridge": "codex_re6_auxiliary_max_bridge.py",
 }
 HEALTH_SUPERVISOR_LIGHTWEIGHT_IMPORTS = (
     "codex_fbx_probe",
     "codex_re6_tex_decode",
-    "codex_re6_auxiliary_max_bridge",
 )
 
 # Source syntax checks run on every supervisor heartbeat. Keep the compiled
@@ -9859,7 +9856,6 @@ def _run_operation_domain_isolation_regression_guard() -> dict[str, object]:
         "codex_python_export_bridge.py",
         "codex_fbx_probe.py",
         "codex_re6_tex_decode.py",
-        "codex_re6_auxiliary_max_bridge.py",
     )
     violations: list[str] = []
     for file_name in business_modules:
@@ -11632,7 +11628,6 @@ def run_system_preflight(*, repair: bool) -> dict[str, object]:
     capability_rows = (
         ("fbx_probe", "FBX parsing capability", "codex_fbx_probe", True),
         ("texture_tools", "Texture decode capability", "codex_re6_tex_decode", False),
-        ("auxiliary_formats", "SBC/ADR/EMS auxiliary capability", "codex_re6_auxiliary_max_bridge", False),
     )
     # The aggregate inventory spans every capability and is diagnostic only.
     # Required operation rows below remain authoritative for PASS/FAIL.

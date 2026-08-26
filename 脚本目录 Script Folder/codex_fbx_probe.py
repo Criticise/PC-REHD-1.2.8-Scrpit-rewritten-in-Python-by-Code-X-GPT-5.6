@@ -1226,7 +1226,9 @@ def _select_binary_fbx_corner_geometry(
     return geometry, _binary_fbx_normal_fidelity_audit(status="exact", geometry=geometry)
 
 
-def _binary_fbx_mesh_model_identity_queues(path: Path) -> dict[tuple[str, str], list[dict[str, Any]]]:
+def _binary_fbx_model_identity_context(
+    path: Path,
+) -> tuple[dict[tuple[str, str], list[dict[str, Any]]], list[dict[str, Any]]]:
     """Read Max FBX Model identity and the explicit Anim Handle route marker.
 
     FBX ``MaxHandle`` is an exporter-local serialization ID, not the Max
@@ -1244,9 +1246,10 @@ def _binary_fbx_mesh_model_identity_queues(path: Path) -> dict[tuple[str, str], 
     objects_root = next((node for node in roots if node.name == "Objects"), None)
     connections_root = next((node for node in roots if node.name == "Connections"), None)
     if objects_root is None:
-        return {}
+        return {}, []
 
     models: dict[int, dict[str, Any]] = {}
+    route_models: dict[int, dict[str, Any]] = {}
     geometry_fingerprints: dict[int, str] = {}
     for node in objects_root.children:
         if node.name == "Geometry" and node.properties and isinstance(node.properties[0], int):
@@ -1261,8 +1264,6 @@ def _binary_fbx_mesh_model_identity_queues(path: Path) -> dict[tuple[str, str], 
             continue
         model_name = _clean_binary_fbx_object_name(node.properties[1])
         model_type = str(node.properties[2] or "")
-        if model_type.casefold() != "mesh" or model_name == "":
-            continue
         max_handle = 0
         route_handle = 0
         for container in node.children:
@@ -1280,7 +1281,7 @@ def _binary_fbx_mesh_model_identity_queues(path: Path) -> dict[tuple[str, str], 
                         max_handle = 0
                 elif property_name == "UDP3DSMAX" and len(values) >= 5:
                     route_handle = _parse_max_fbx_route_handle(values[-1])
-        models[int(model_id)] = {
+        model_identity = {
             "fbx_model_id": int(model_id),
             "fbx_model_name": model_name,
             "fbx_model_type": model_type,
@@ -1293,6 +1294,13 @@ def _binary_fbx_mesh_model_identity_queues(path: Path) -> dict[tuple[str, str], 
             "fbx_parent_name": "",
             "fbx_geometry_fingerprint": "",
         }
+        if route_handle > 0:
+            route_models[int(model_id)] = {
+                **model_identity,
+                "fbx_geometry_connected": False,
+            }
+        if model_type.casefold() == "mesh" and model_name != "":
+            models[int(model_id)] = model_identity
 
     if connections_root is not None:
         for node in connections_root.children:
@@ -1315,6 +1323,8 @@ def _binary_fbx_mesh_model_identity_queues(path: Path) -> dict[tuple[str, str], 
                 models[int(parent_id)]["fbx_geometry_fingerprint"] = geometry_fingerprints[
                     int(child_id)
                 ]
+            if int(parent_id) in route_models and int(child_id) in geometry_fingerprints:
+                route_models[int(parent_id)]["fbx_geometry_connected"] = True
 
     queues: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for model_id in sorted(models):
@@ -1324,7 +1334,20 @@ def _binary_fbx_mesh_model_identity_queues(path: Path) -> dict[tuple[str, str], 
             str(row["fbx_parent_name"]).casefold(),
         )
         queues.setdefault(key, []).append(row)
+    observations = [route_models[model_id] for model_id in sorted(route_models)]
+    return queues, observations
+
+
+def _binary_fbx_mesh_model_identity_queues(path: Path) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    queues, _observations = _binary_fbx_model_identity_context(path)
     return queues
+
+
+def extract_fbx_route_model_observations(path: str | Path) -> list[dict[str, Any]]:
+    """Return route-marked FBX Model facts without making export decisions."""
+
+    _queues, observations = _binary_fbx_model_identity_context(Path(path))
+    return observations
 
 
 def _take_binary_fbx_mesh_model_identity(
@@ -3394,14 +3417,18 @@ def _probe_scene_handoff(
 def probe_fbx_handoff(path: str | Path, *, max_snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
     fbx_path, scene = _require_scene(path)
     skin_context = _build_binary_fbx_skin_evaluation_context(fbx_path, scene)
+    binary_model_queues, route_model_observations = _binary_fbx_model_identity_context(
+        fbx_path
+    )
     payload = _probe_scene_handoff(
         scene,
         fbx_path=str(fbx_path),
         max_snapshot=max_snapshot,
         skin_context=skin_context,
-        binary_model_queues=_binary_fbx_mesh_model_identity_queues(fbx_path),
+        binary_model_queues=binary_model_queues,
         binary_corner_context=_build_binary_fbx_corner_geometry_context(fbx_path),
     )
+    payload["route_models"] = route_model_observations
     fbx_axes = _scene_axis_receipt(scene)
     payload["fbx_axes"] = fbx_axes
     payload["summary"]["fbx_axes"] = fbx_axes
