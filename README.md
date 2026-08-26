@@ -308,6 +308,35 @@ Code X 项目自有源码由 AI 协助生成，并经过人工审核确认设计
 
 </details>
 
+<details>
+<summary>Thoughts from the Prompt Engineer, Human Tester, and Idea Giver</summary>
+
+This project is best understood as a prompt-engineering and hands-on testing effort. The human side is intentionally simple: I provide the ideas, direction, practical feedback, and in-person testing.
+
+A big shout-out goes to OpenAI's ChatGPT 5.6 Sol and Terra. Their strongest reasoning capabilities made this project possible.
+
+For now, the codebase is still messy. It has only just crossed the threshold of being runnable, and many hidden edge cases and failure modes remain.
+
+That is one of the drawbacks of AI-assisted coding: implementation can move very quickly, but review may show that one part is useful while another is unsafe, incomplete, or logically different from the original idea. I hope we can eventually resolve those problems for good.
+
+The architecture was inspired by REEM Script and by Maliwei777's PC-REHD 1.2.8 MaxScript work. The current workflow is:
+
+`Game mod files → FBX → 3D software → FBX → game mod files`
+
+The TTK GUI is old and visually dated, and it needs a proper rework.
+
+The export phase is written entirely in Python and is not yet optimal. Cython or Rust modules could make it faster in the future.
+
+I have explored creating a native Blender model workflow, but I am not yet capable of bringing it to a reliable level. The current state of AI-assisted coding has similar limitations, and some results have been disappointing. Choosing FBX is therefore a practical compromise: it may be a step back from software-specific native support, but it offers broader compatibility.
+
+FBX is not a generic format, either. Moving an FBX file from 3ds Max into Blender can introduce noticeable visual differences; Max-to-Max round trips are usually the most predictable. This remains a headache, and there is still no universal open-source solution that handles every 3D-software combination.
+
+Without AI assistance, this modernization might never have begun. One night, it started with a single patch to make a 2012 3ds Max script compatible with 3ds Max 2026. That was when I knew it was time to set sail.
+
+Thank you.
+
+</details>
+
 ```text
 .. / .-.. --- ...- . / -.-- --- ..- / --. .-. .- -. -.. .--. .- --..--
 .. / .-. . .- .-.. .-.. -.-- / .-- .. ... .... . -.. / - .... .- - / -.-- --- ..- / .... .- ...- . / .-.. .. ...- . -..
