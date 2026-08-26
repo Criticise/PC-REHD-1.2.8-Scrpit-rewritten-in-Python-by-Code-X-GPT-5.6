@@ -154,6 +154,35 @@ The record below is transcribed from the comments in the archived `PC_REHD-v1_2_
 
 </details>
 
+<details>
+<summary>Thoughts from the Prompt Engineer, Human Tester, and Idea Giver</summary>
+
+This project is best understood as a prompt-engineering and hands-on testing effort. The human side is intentionally simple: I provide the ideas, direction, practical feedback, and in-person testing.
+
+A big shout-out goes to OpenAI's ChatGPT 5.6 Sol and Terra. Their strongest reasoning capabilities made this project possible.
+
+For now, the codebase is still messy. It has only just crossed the threshold of being runnable, and many hidden edge cases and failure modes remain.
+
+That is one of the drawbacks of AI-assisted coding: implementation can move very quickly, but review may show that one part is useful while another is unsafe, incomplete, or logically different from the original idea. I hope we can eventually resolve those problems for good.
+
+The architecture was inspired by REEM Script and by Maliwei777's PC-REHD 1.2.8 MaxScript work. The current workflow is:
+
+`Game mod files → FBX → 3D software → FBX → game mod files`
+
+The TTK GUI is old and visually dated, and it needs a proper rework.
+
+The export phase is written entirely in Python and is not yet optimal. Cython or Rust modules could make it faster in the future.
+
+I have explored creating a native Blender model workflow, but I am not yet capable of bringing it to a reliable level. The current state of AI-assisted coding has similar limitations, and some results have been disappointing. Choosing FBX is therefore a practical compromise: it may be a step back from software-specific native support, but it offers broader compatibility.
+
+FBX is not a generic format, either. Moving an FBX file from 3ds Max into Blender can introduce noticeable visual differences; Max-to-Max round trips are usually the most predictable. This remains a headache, and there is still no universal open-source solution that handles every 3D-software combination.
+
+Without AI assistance, this modernization might never have begun. One night, it started with a single patch to make a 2012 3ds Max script compatible with 3ds Max 2026. That was when I knew it was time to set sail.
+
+Thank you.
+
+</details>
+
 ---
 
 ## 中文
@@ -309,31 +338,31 @@ Code X 项目自有源码由 AI 协助生成，并经过人工审核确认设计
 </details>
 
 <details>
-<summary>Thoughts from the Prompt Engineer, Human Tester, and Idea Giver</summary>
+<summary>提示工程师、人工测试者与创意提出者的想法</summary>
 
-This project is best understood as a prompt-engineering and hands-on testing effort. The human side is intentionally simple: I provide the ideas, direction, practical feedback, and in-person testing.
+这个项目更适合被理解为一次提示工程与亲自测试的实践。人的部分其实很简单：我提供想法、方向、实际反馈，并亲自进行测试。
 
-A big shout-out goes to OpenAI's ChatGPT 5.6 Sol and Terra. Their strongest reasoning capabilities made this project possible.
+特别感谢 OpenAI 的 ChatGPT 5.6 Sol 和 Terra。它们最强的推理能力让这个项目成为可能。
 
-For now, the codebase is still messy. It has only just crossed the threshold of being runnable, and many hidden edge cases and failure modes remain.
+目前代码库仍然比较杂乱。它只是刚刚达到可运行的门槛，底层还存在许多隐藏的边界情况和失败路径。
 
-That is one of the drawbacks of AI-assisted coding: implementation can move very quickly, but review may show that one part is useful while another is unsafe, incomplete, or logically different from the original idea. I hope we can eventually resolve those problems for good.
+这也是 AI 辅助编程的局限之一：代码可以很快生成，但经过审查后，可能会发现其中一部分有用，另一部分却不安全、不完整，或者在逻辑上偏离了最初的想法。我希望我们最终能够彻底解决这些问题。
 
-The architecture was inspired by REEM Script and by Maliwei777's PC-REHD 1.2.8 MaxScript work. The current workflow is:
+这个架构受 REEM Script，以及 Maliwei777 的 PC-REHD 1.2.8 MaxScript 工作启发。目前的工作流程是：
 
-`Game mod files → FBX → 3D software → FBX → game mod files`
+`游戏 MOD 文件 → FBX → 3D 软件 → FBX → 游戏 MOD 文件`
 
-The TTK GUI is old and visually dated, and it needs a proper rework.
+TTK GUI 已经老旧且显示模糊，需要进行彻底重做。
 
-The export phase is written entirely in Python and is not yet optimal. Cython or Rust modules could make it faster in the future.
+导出阶段完全使用 Python 编写，目前还没有达到最佳性能。未来如果改用 Cython 或 Rust 模块，可能会进一步提速。
 
-I have explored creating a native Blender model workflow, but I am not yet capable of bringing it to a reliable level. The current state of AI-assisted coding has similar limitations, and some results have been disappointing. Choosing FBX is therefore a practical compromise: it may be a step back from software-specific native support, but it offers broader compatibility.
+我曾尝试创建原生 Blender 模型工作流，但目前还没有能力把它做到可靠的程度。现阶段 AI 辅助编程也有类似限制，有些结果仍然令人失望。因此选择 FBX 是一种现实的折中：它可能比针对每个 3D 软件分别提供原生支持退后一步，但可以换来更广泛的兼容性。
 
-FBX is not a generic format, either. Moving an FBX file from 3ds Max into Blender can introduce noticeable visual differences; Max-to-Max round trips are usually the most predictable. This remains a headache, and there is still no universal open-source solution that handles every 3D-software combination.
+FBX 也不是通用格式。将 3ds Max 导出的 FBX 导入 Blender，可能会产生明显的视觉差异；而 Max 到 Max 的往返通常最可预测。这一直让人头疼，目前也没有一个能处理所有 3D 软件组合的通用开源方案。
 
-Without AI assistance, this modernization might never have begun. One night, it started with a single patch to make a 2012 3ds Max script compatible with 3ds Max 2026. That was when I knew it was time to set sail.
+没有 AI 的帮助，这次现代化工作也许根本不会开始。它始于某个夜晚的一次小修补：让一个 2012 年的 3ds Max 脚本兼容 3ds Max 2026。那一刻，我知道是时候扬帆起航了。
 
-Thank you.
+谢谢。
 
 </details>
 
