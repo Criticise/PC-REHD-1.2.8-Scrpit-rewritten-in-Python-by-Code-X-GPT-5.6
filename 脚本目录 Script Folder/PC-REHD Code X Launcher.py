@@ -31582,7 +31582,6 @@ import builtins
 import base64
 import bmesh
 import bpy
-from collections import OrderedDict
 import hashlib
 import json
 import math
@@ -31616,8 +31615,6 @@ _HEADER = struct.Struct("!I")
 _MAX_MESSAGE = 32 * 1024 * 1024
 _QUEUE_RETAIN_CONTROL_KEY = "__pc_rehd_blender_queue_retain_until_idle"
 _QUEUE_RETAIN_SECONDS = 12 * 60 * 60
-_REQUEST_RECEIPT_CACHE_LIMIT = 256
-_REQUEST_RECEIPT_CACHE_SECONDS = 12 * 60 * 60
 _SCENE_DATA_SCHEMA = "pc-rehd-code-x-blender-scene-data-v1"
 _SCENE_SNAPSHOT_SCHEMA = "pc-rehd-code-x-blender-scene-snapshot-v1"
 _SCENE_TRANSFER_CHUNK_BYTES = 4 * 1024 * 1024
@@ -33051,39 +33048,6 @@ def _blender_rna_same(left, right):
     return False
 
 
-_HIDDEN_SELECTION_HANDLES_BY_SCENE = {}
-
-
-def _hidden_selection_handles(scene):
-    """Keep selection intent that Blender clears when an object is hidden."""
-    scene_handle = _pointer(scene)
-    live_handles = {_pointer(node) for node in getattr(scene, "objects", ())}
-    handles = {
-        int(handle)
-        for handle in _HIDDEN_SELECTION_HANDLES_BY_SCENE.get(scene_handle, set())
-        if int(handle) in live_handles
-    }
-    if handles:
-        _HIDDEN_SELECTION_HANDLES_BY_SCENE[scene_handle] = handles
-    else:
-        _HIDDEN_SELECTION_HANDLES_BY_SCENE.pop(scene_handle, None)
-    return handles
-
-
-def _store_hidden_selection_handles(scene, handles):
-    scene_handle = _pointer(scene)
-    live_handles = {_pointer(node) for node in getattr(scene, "objects", ())}
-    retained = {
-        int(handle)
-        for handle in handles
-        if int(handle) in live_handles
-    }
-    if retained:
-        _HIDDEN_SELECTION_HANDLES_BY_SCENE[scene_handle] = retained
-    else:
-        _HIDDEN_SELECTION_HANDLES_BY_SCENE.pop(scene_handle, None)
-
-
 def _node_hidden_in_view_layer(node, view_layer=None):
     try:
         if view_layer is not None:
@@ -33251,6 +33215,15 @@ def _scene_selection_view_scopes(scene):
     return scopes
 
 
+def _active_scene_selection_scope():
+    """Return the one scene/ViewLayer pair authoritative for live selection."""
+    scene = getattr(bpy.context, "scene", None)
+    view_layer = getattr(bpy.context, "view_layer", None)
+    if scene is None or view_layer is None:
+        return None
+    return scene, view_layer
+
+
 def _set_node_hidden_in_view_layer(node, hidden, view_layer):
     try:
         node.hide_set(bool(hidden), view_layer=view_layer)
@@ -33285,110 +33258,138 @@ def _set_node_selected_in_view_layer(node, selected, view_layer):
     return False
 
 
-def _outliner_selected_object_handles(scene):
-    """Return current Outliner object roots, including non-Mesh parents."""
-    handles = set()
+def _active_scene_outliner_selected_object_handles(scene, view_layer):
+    """Read live Object selections from the active scene's current Outliner."""
     scene_object_handles = {
-        _pointer(node) for node in getattr(scene, "objects", ()) if _pointer(node) > 0
+        _pointer(node)
+        for node in getattr(scene, "objects", ())
+        if _pointer(node) > 0
     }
-    for window in getattr(bpy.context.window_manager, "windows", ()):
-        if getattr(window, "scene", None) is not scene:
-            continue
-        view_layer = getattr(window, "view_layer", None)
-        screen = getattr(window, "screen", None)
-        if view_layer is None or screen is None:
-            continue
-        active_node = getattr(getattr(view_layer, "objects", None), "active", None)
-        active_handle = _pointer(active_node)
-        if active_handle in scene_object_handles:
-            try:
-                active_selected = bool(active_node.select_get(view_layer=view_layer))
-            except Exception:
-                active_selected = False
-            if active_selected:
-                handles.add(active_handle)
-        for area in getattr(screen, "areas", ()):
-            if str(getattr(area, "type", "") or "") != "OUTLINER":
-                continue
-            region = next(
-                (
-                    value for value in getattr(area, "regions", ())
-                    if str(getattr(value, "type", "") or "") == "WINDOW"
-                ),
-                None,
-            )
-            if region is None:
-                continue
-            try:
-                with bpy.context.temp_override(
-                    window=window,
-                    screen=screen,
-                    area=area,
-                    region=region,
-                    scene=scene,
-                    view_layer=view_layer,
-                ):
-                    selected_ids = list(getattr(bpy.context, "selected_ids", ()))
-            except Exception:
-                continue
-            for value in selected_ids:
-                handle = _pointer(value)
-                if handle in scene_object_handles:
-                    handles.add(handle)
-    return handles
+    if not scene_object_handles:
+        return set()
+
+    manager = getattr(bpy.context, "window_manager", None)
+    context_window = getattr(bpy.context, "window", None)
+    window = None
+    if (
+        context_window is not None
+        and _blender_rna_same(getattr(context_window, "scene", None), scene)
+        and _blender_rna_same(
+            getattr(context_window, "view_layer", None), view_layer
+        )
+    ):
+        window = context_window
+    else:
+        # Timer callbacks may not expose bpy.context.window. Pick one window
+        # for the already authoritative scene/ViewLayer; never merge windows.
+        for candidate in getattr(manager, "windows", ()):
+            if (
+                _blender_rna_same(getattr(candidate, "scene", None), scene)
+                and _blender_rna_same(
+                    getattr(candidate, "view_layer", None), view_layer
+                )
+            ):
+                window = candidate
+                break
+    if window is None:
+        return set()
+    screen = getattr(window, "screen", None)
+    if screen is None:
+        return set()
+
+    outliner_areas = [
+        area
+        for area in getattr(screen, "areas", ())
+        if str(getattr(area, "type", "") or "") == "OUTLINER"
+    ]
+    active_area = getattr(bpy.context, "area", None)
+    if (
+        active_area is not None
+        and str(getattr(active_area, "type", "") or "") == "OUTLINER"
+        and any(_blender_rna_same(area, active_area) for area in outliner_areas)
+    ):
+        outliner_areas = [active_area]
+    if not outliner_areas:
+        return set()
+
+    selected_handles = set()
+    # One Outliner context is sufficient: selected_ids is Blender's live
+    # selection for that editor, including hidden Objects selected in Outliner.
+    area = outliner_areas[0]
+    region = next(
+        (
+            candidate
+            for candidate in getattr(area, "regions", ())
+            if str(getattr(candidate, "type", "") or "") == "WINDOW"
+        ),
+        None,
+    )
+    if region is None:
+        return selected_handles
+    try:
+        with bpy.context.temp_override(
+            window=window,
+            screen=screen,
+            area=area,
+            region=region,
+            scene=scene,
+            view_layer=view_layer,
+        ):
+            selected_ids = list(getattr(bpy.context, "selected_ids", ()) or ())
+    except Exception:
+        return selected_handles
+    for value in selected_ids:
+        handle = _pointer(value)
+        if handle in scene_object_handles:
+            selected_handles.add(handle)
+    return selected_handles
 
 
 def _selected_mesh_scope_with_temporary_scene_visibility():
     """Read selection without changing Blender visibility or Outliner state."""
-    scene = bpy.context.scene
-    scopes = _scene_selection_view_scopes(scene)
-    nodes_by_handle = {
-        _pointer(node): node for node in getattr(scene, "objects", ())
-    }
-    shadow_handles = _hidden_selection_handles(scene)
-    outliner_root_handles = _outliner_selected_object_handles(scene)
+    active_scope = _active_scene_selection_scope()
+    scopes = [active_scope] if active_scope is not None else []
     native_root_handles = set()
     for scope_scene, view_layer in scopes:
         for node in getattr(scope_scene, "objects", ()):
-            if _node_hidden_in_view_layer(node, view_layer):
-                continue
             try:
                 if bool(node.select_get(view_layer=view_layer)):
                     native_root_handles.add(_pointer(node))
             except Exception:
                 continue
-    # A new visible/Outliner selection is authoritative. Only fall back to the
-    # hidden-selection shadow when Blender has no readable current roots.
-    current_root_handles = native_root_handles | outliner_root_handles
-    selection_intent_handles = current_root_handles or shadow_handles
+    active_area_type = str(
+        getattr(getattr(bpy.context, "area", None), "type", "") or ""
+    ).upper()
+    outliner_root_handles = set()
+    if active_scope is not None and active_area_type != "VIEW_3D":
+        outliner_root_handles = _active_scene_outliner_selected_object_handles(
+            active_scope[0], active_scope[1]
+        )
+    if active_area_type == "OUTLINER":
+        # Outliner selection is authoritative here, including hidden Objects.
+        current_root_handles = outliner_root_handles
+    elif active_area_type == "VIEW_3D":
+        # A plain 3D View click replaces stale Outliner-only selection intent.
+        current_root_handles = native_root_handles
+    else:
+        # Timer callbacks often have no area context. In that case both reads
+        # belong to the same active scene/ViewLayer and hidden roots need the
+        # Outliner side of the live selection.
+        current_root_handles = native_root_handles | outliner_root_handles
     receipt = _selected_mesh_scope(
-        explicit_root_handles=selection_intent_handles
+        explicit_root_handles=current_root_handles
     )
-    if current_root_handles:
-        selected_root_handles = {
-            int(handle or 0)
-            for handle in receipt.get("selected_root_handles", [])
-            if int(handle or 0) > 0
-        }
-        hidden_root_handles = {
-            handle
-            for handle in selected_root_handles
-            if (
-                (node := nodes_by_handle.get(handle)) is not None
-                and not _is_re6_bound_sphere(node)
-                and any(
-                    _node_hidden_in_view_layer(node, view_layer)
-                    for _scope_scene, view_layer in scopes
-                )
-            )
-        }
-        _store_hidden_selection_handles(scene, hidden_root_handles)
     receipt["temporarily_revealed_node_count"] = 0
     receipt["outliner_selected_node_count"] = len(outliner_root_handles)
-    receipt["outliner_selected_mesh_count"] = sum(
-        1
-        for handle in outliner_root_handles
-        if str(getattr(nodes_by_handle.get(handle), "type", "") or "") == "MESH"
+    receipt["outliner_selected_mesh_count"] = (
+        sum(
+            1
+            for node in getattr(active_scope[0], "objects", ())
+            if _pointer(node) in outliner_root_handles
+            and str(getattr(node, "type", "") or "") == "MESH"
+        )
+        if active_scope is not None
+        else 0
     )
     return receipt
 
@@ -33776,7 +33777,6 @@ def _focus_imported_viewport(payload):
 
     previous_selected = []
     previous_active = None
-    previous_hidden_selection_handles = _hidden_selection_handles(scene)
     selection_changed = False
     try:
         with viewport_override():
@@ -33844,7 +33844,6 @@ def _focus_imported_viewport(payload):
                 receipt["selection_restore_error"] = "%s: %s" % (
                     type(restore_exc).__name__, restore_exc
                 )
-            _store_hidden_selection_handles(scene, previous_hidden_selection_handles)
     return receipt
 
 
@@ -34132,10 +34131,6 @@ def _bone_contract(armature, bone, selected_handles):
 def _scene_contract(selected_handles=None):
     objects = list(bpy.context.scene.objects)
     if selected_handles is None:
-        # Blender clears Object.select_get() as soon as hide_set(True) runs.
-        # Keep the pre-hide selection intent so hidden Meshes remain available
-        # to the Python Bucket filter without making them visible again.
-        hidden_selection_handles = _hidden_selection_handles(bpy.context.scene)
         selected_handles = set()
         for node in objects:
             try:
@@ -34143,12 +34138,6 @@ def _scene_contract(selected_handles=None):
                     selected_handles.add(_pointer(node))
             except Exception:
                 pass
-            handle = _pointer(node)
-            if (
-                handle in hidden_selection_handles
-                and _node_hidden_in_view_layer(node, bpy.context.view_layer)
-            ):
-                selected_handles.add(handle)
     else:
         provided_selected_handles = selected_handles
         selected_handles = set()
@@ -34477,29 +34466,14 @@ def _node_map_apply(payload):
 def _selected_mesh_scope(*, explicit_root_handles=()):
     # Return the direct selection roots and their complete Object descendants.
     # Launcher owns the final real-Mesh filter against its inspected contract.
-    # Timer callbacks do not reliably inherit the artist's active Window view
-    # layer. Read each real Blender Window view layer explicitly. Blender clears
-    # native selection for hidden objects can be unavailable, so explicit
-    # Outliner roots and the preserved hidden-root intent supplement it.
-    view_scopes = []
-    seen_scopes = set()
-    for window in getattr(bpy.context.window_manager, "windows", ()):
-        scene = getattr(window, "scene", None)
-        view_layer = getattr(window, "view_layer", None)
-        if scene is None or view_layer is None:
-            continue
-        key = (_pointer(scene), _pointer(view_layer))
-        if key in seen_scopes:
-            continue
-        seen_scopes.add(key)
-        view_scopes.append((scene, view_layer))
-    if not view_scopes:
-        view_scopes.append((bpy.context.scene, bpy.context.view_layer))
+    # Worker commands run on Blender's main thread; the active scene/ViewLayer
+    # is the sole authority and an empty selection remains empty.
+    active_scope = _active_scene_selection_scope()
+    view_scopes = [active_scope] if active_scope is not None else []
     selected_roots_by_handle = {}
     nodes_by_handle = {}
     hidden_by_handle = {}
     for scene, view_layer in view_scopes:
-        hidden_selection_handles = _hidden_selection_handles(scene)
         for node in scene.objects:
             handle = _pointer(node)
             nodes_by_handle[handle] = node
@@ -34520,18 +34494,6 @@ def _selected_mesh_scope(*, explicit_root_handles=()):
                     hidden=hidden,
                     source="bpy_select_get",
                 )
-            elif handle in hidden_selection_handles:
-                if hidden:
-                    selected_roots_by_handle[handle] = _selection_node_row(
-                        node,
-                        hidden=True,
-                        source="bpy_preserved_hidden_selection",
-                    )
-                else:
-                    # It is visible again, so native Blender selection becomes
-                    # authoritative and the temporary shadow is no longer valid.
-                    hidden_selection_handles.discard(handle)
-        _store_hidden_selection_handles(scene, hidden_selection_handles)
     for value in explicit_root_handles:
         try:
             handle = int(value or 0)
@@ -34577,7 +34539,7 @@ def _selected_mesh_scope(*, explicit_root_handles=()):
         "schema": "pc-rehd-blender-selected-node-contract-v1",
         "action": "scene.selection",
         "mode": "selected_root_descendant_scope",
-        "authority": "bpy_window_view_layer_selection_with_hidden_selection_state",
+        "authority": "bpy_active_scene_view_layer_selection_with_hidden_state",
         "scope": "selected_root_name_handle_plus_all_object_descendants_and_hidden_node_witness",
         "max_process_id": os.getpid(),
         "blender_process_id": os.getpid(),
@@ -34839,6 +34801,10 @@ def _track_outliner_active_mesh(node):
 
 
 def _scene_select(payload):
+    scene = getattr(bpy.context, "scene", None)
+    view_layer = getattr(bpy.context, "view_layer", None)
+    if scene is None or view_layer is None:
+        raise RuntimeError("Blender scene selection has no active scene/ViewLayer")
     requested_handles = []
     for value in payload.get("node_handles", []):
         try:
@@ -34847,47 +34813,35 @@ def _scene_select(payload):
             continue
         if handle > 0 and handle not in requested_handles:
             requested_handles.append(handle)
-    objects_by_handle = {
-        _pointer(node): node for node in bpy.context.scene.objects
-    }
-    hidden_selection_handles = _hidden_selection_handles(bpy.context.scene)
+    objects_by_handle = {_pointer(node): node for node in scene.objects}
     requested_handle_set = set(requested_handles)
     selected = []
     hidden_selected = []
     missing = []
     active_node = None
-    for node in bpy.context.scene.objects:
+    for node in scene.objects:
         handle = _pointer(node)
         if handle in requested_handle_set:
-            # Keep an already-selected hidden target selected. Blender may not
-            # allow a hidden object to be selected again after clearing it.
             continue
-        hidden_selection_handles.discard(handle)
-        try:
-            node.select_set(False)
-        except Exception:
-            continue
+        _set_node_selected_in_view_layer(node, False, view_layer)
     for handle in requested_handles:
         node = objects_by_handle.get(handle)
         if node is None or node.type != "MESH" or _is_re6_bound_sphere(node):
             missing.append(handle)
             continue
-        was_hidden = _node_hidden_in_view_layer(node, bpy.context.view_layer)
+        was_hidden = _node_hidden_in_view_layer(node, view_layer)
         if was_hidden:
-            try:
-                node.hide_set(False)
-            except Exception:
+            if not _set_node_hidden_in_view_layer(node, False, view_layer):
                 missing.append(handle)
                 continue
         try:
-            node.select_set(True)
-            if bool(node.select_get()):
+            if not _set_node_selected_in_view_layer(node, True, view_layer):
+                missing.append(handle)
+            elif bool(node.select_get(view_layer=view_layer)):
                 selected.append(handle)
                 if was_hidden:
-                    hidden_selection_handles.add(handle)
                     hidden_selected.append(handle)
                 else:
-                    hidden_selection_handles.discard(handle)
                     active_node = node
             else:
                 missing.append(handle)
@@ -34895,14 +34849,10 @@ def _scene_select(payload):
             missing.append(handle)
         finally:
             if was_hidden:
-                try:
-                    node.hide_set(True)
-                except Exception:
-                    pass
-    _store_hidden_selection_handles(bpy.context.scene, hidden_selection_handles)
+                _set_node_hidden_in_view_layer(node, True, view_layer)
     if active_node is not None:
         try:
-            bpy.context.view_layer.objects.active = active_node
+            view_layer.objects.active = active_node
         except Exception:
             pass
     result = {
@@ -35137,7 +35087,6 @@ def _scene_filter(payload):
             + repr(unresolved_targets[:12])
         )
 
-    hidden_selection_handles = _hidden_selection_handles(scene)
     clear_selection = bool(payload.get("clear_selection", False))
     hidden = 0
     shown = 0
@@ -35153,17 +35102,6 @@ def _scene_filter(payload):
     # Apply visibility to every live Blender window/view layer. Timer callbacks
     # do not reliably inherit the user's visible 3D View context.
     for node, handle, is_bound_sphere, should_hide in visibility_plan:
-        was_selected = False
-        try:
-            was_selected = bool(node.select_get())
-        except Exception:
-            pass
-        if is_bound_sphere or clear_selection:
-            hidden_selection_handles.discard(handle)
-        elif should_hide and was_selected:
-            # hide_set(True) clears Blender's native selection bit. Preserve
-            # the exact user intent before the visual filter changes it.
-            hidden_selection_handles.add(handle)
         changed_for_node = False
         for _scope_scene, view_layer in view_scopes:
             previous_hidden = _node_hidden_in_view_layer(node, view_layer)
@@ -35189,13 +35127,6 @@ def _scene_filter(payload):
             shown += 1
         if clear_selection:
             node.select_set(False)
-        elif not should_hide and handle in hidden_selection_handles:
-            # Re-showing a filtered Mesh restores its normal Blender selection
-            # and releases the temporary hidden-selection witness.
-            try:
-                node.select_set(True)
-            finally:
-                hidden_selection_handles.discard(handle)
     try:
         bpy.context.view_layer.update()
     except Exception:
@@ -35213,7 +35144,6 @@ def _scene_filter(payload):
             "apply=%s | verify=%s"
             % (visibility_errors[:12], verification_errors[:12])
         )
-    _store_hidden_selection_handles(scene, hidden_selection_handles)
     return _record_blender_scene_undo(
         {
             "hidden": hidden,
@@ -35222,7 +35152,7 @@ def _scene_filter(payload):
             "requested_hide_count": len(target_rows),
             "resolved_hide_handles": sorted(resolved_hidden_handles),
             "visibility_scope_count": len(view_scopes),
-            "preserved_hidden_selection_count": len(hidden_selection_handles),
+            "preserved_hidden_selection_count": 0,
             "mesh_type_restore": {
                 "schema": "pc-rehd-blender-mesh-type-recovery-v1",
                 "source_sha256": recovery_source_sha256,
@@ -38290,6 +38220,7 @@ def _blender_worker_capabilities():
         "agent.compatibility_probe",
         "scene.summary",
         "scene.inspect",
+        "scene.inspect_selection",
         "scene.selection",
         "scene.rename.prepare",
         "scene.rebuild_lod_hierarchy",
@@ -38338,9 +38269,6 @@ class _BlenderWorker:
         self.tasks = queue.Queue()
         self.scene_data_transfers = {}
         self.scene_snapshots = {}
-        self.pending_requests = {}
-        self.terminal_receipts = OrderedDict()
-        self.receipt_lock = threading.RLock()
         self.stopping = threading.Event()
         self.busy = False
         self.native_operator_msgbus = False
@@ -38446,59 +38374,19 @@ class _BlenderWorker:
                 request_id = str(request.get("request_id", "") or "").strip().lower()
                 if not request_id:
                     raise ValueError("Blender Worker request ID is missing")
-                identity = (
-                    command,
-                    hashlib.sha256(
-                        json.dumps(
-                            raw_payload,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    ).hexdigest(),
-                )
                 queued_at = time.time()
-                with self.receipt_lock:
-                    self._prune_terminal_receipts_locked(queued_at)
-                    cached = self.terminal_receipts.get(request_id)
-                    pending = self.pending_requests.get(request_id)
-                    if cached is not None:
-                        if cached["identity"] != identity:
-                            response = _response(
-                                _WORKER_PROTOCOL, request, False,
-                                error="Blender request ID was reused with a different command or payload",
-                                status_code="BLENDER_REQUEST_ID_CONFLICT",
-                            )
-                        else:
-                            response = dict(cached["response"])
-                            response["ipc_timing"] = dict(response.get("ipc_timing", {}))
-                            response["ipc_timing"]["receipt_cache_hit"] = True
-                        _send(connection, response)
-                        return
-                    if pending is not None:
-                        if pending["identity"] != identity:
-                            _send(
-                                connection,
-                                _response(
-                                    _WORKER_PROTOCOL, request, False,
-                                    error="Blender request ID is already running with a different command or payload",
-                                    status_code="BLENDER_REQUEST_ID_CONFLICT",
-                                ),
-                            )
-                            return
-                        task = pending
-                    else:
-                        task = {
-                            "request": request,
-                            "identity": identity,
-                            "event": threading.Event(),
-                            "response": None,
-                            "queued_at": queued_at,
-                            "started_at": 0.0,
-                            "completed_at": 0.0,
-                        }
-                        self.pending_requests[request_id] = task
-                        self.tasks.put(task)
+                # Every connection owns one fresh task. The queue is the only
+                # ordering mechanism; completed Worker results are never cached
+                # or reused for a later request.
+                task = {
+                    "request": request,
+                    "event": threading.Event(),
+                    "response": None,
+                    "queued_at": queued_at,
+                    "started_at": 0.0,
+                    "completed_at": 0.0,
+                }
+                self.tasks.put(task)
                 retain_until_idle = bool(
                     isinstance(raw_payload, dict)
                     and raw_payload.get(_QUEUE_RETAIN_CONTROL_KEY, False)
@@ -38551,17 +38439,6 @@ class _BlenderWorker:
                     )
                 except Exception:
                     pass
-
-    def _prune_terminal_receipts_locked(self, now):
-        while self.terminal_receipts:
-            request_id, receipt = next(iter(self.terminal_receipts.items()))
-            if (
-                len(self.terminal_receipts) <= _REQUEST_RECEIPT_CACHE_LIMIT
-                and now - float(receipt.get("completed_at", now))
-                <= _REQUEST_RECEIPT_CACHE_SECONDS
-            ):
-                break
-            self.terminal_receipts.pop(request_id, None)
 
     def _execute(self, request):
         command = str(request.get("command", "") or "").strip().casefold()
@@ -38644,6 +38521,16 @@ class _BlenderWorker:
             return _focus_imported_viewport(payload)
         if command == "scene.inspect":
             return {"scene_contract": _scene_contract()}
+        if command == "scene.inspect_selection":
+            # Scene identity and selection must come from one Blender main-thread
+            # task so Launcher never combines two different scene moments.
+            selection = _selected_mesh_scope_with_temporary_scene_visibility()
+            return {
+                "scene_contract": _scene_contract(
+                    selected_handles=selection.get("selected_root_handles", ())
+                ),
+                "selection": selection,
+            }
         if command == "scene.selection":
             return _selected_mesh_scope_with_temporary_scene_visibility()
         if command == "scene.rename.prepare":
@@ -38719,7 +38606,6 @@ class _BlenderWorker:
             except queue.Empty:
                 break
             request = task["request"]
-            request_id = str(request.get("request_id", "") or "").strip().lower()
             self.busy = True
             task["started_at"] = time.time()
             try:
@@ -38748,19 +38634,9 @@ class _BlenderWorker:
                     "worker_execute_ms": round(
                         max(0.0, task["completed_at"] - task["started_at"]) * 1000.0, 3
                     ),
-                    "receipt_cache_hit": False,
                     "worker_generation": self.generation,
                 }
                 task["response"] = response
-                with self.receipt_lock:
-                    self.pending_requests.pop(request_id, None)
-                    self.terminal_receipts[request_id] = {
-                        "identity": task["identity"],
-                        "response": dict(response),
-                        "completed_at": task["completed_at"],
-                    }
-                    self.terminal_receipts.move_to_end(request_id)
-                    self._prune_terminal_receipts_locked(task["completed_at"])
                 self.busy = False
                 task["event"].set()
                 processed += 1
@@ -40754,6 +40630,7 @@ class ManagedBlenderSession:
             or normalized_command.startswith("scene.snapshot.")
             or normalized_command in {
                 "scene.inspect",
+                "scene.inspect_selection",
                 "scene.rename.prepare",
                 "scene.repair_re6_fbx_hierarchy",
                 "scene.rename",
@@ -40946,6 +40823,14 @@ class BlenderSceneDataDispatcher:
 
     def selection(self) -> dict[str, Any]:
         return self._require_session().request("scene.selection")
+
+    def inspect_selection(self) -> dict[str, Any]:
+        result = self._require_session().request("scene.inspect_selection")
+        if not isinstance(result.get("scene_contract"), Mapping):
+            raise ProtocolError("Blender scene.inspect_selection omitted scene_contract")
+        if not isinstance(result.get("selection"), Mapping):
+            raise ProtocolError("Blender scene.inspect_selection omitted selection")
+        return dict(result)
 
     def rename_prepare(self) -> dict[str, Any]:
         result = self._require_session().request("scene.rename.prepare")
@@ -47098,7 +46983,10 @@ def _apply_blender_selected_node_receipt(
                 continue
             row["hidden"] = row_handle in hidden_handle_set
     workspace.scene_contract["selection_authority"] = str(
-        snapshot.get("authority", "bpy_hidden_selection_state") or ""
+        snapshot.get(
+            "authority", "bpy_active_scene_view_layer_selection_with_hidden_state"
+        )
+        or ""
     )
     return selected_meshes
 
@@ -47171,7 +47059,7 @@ def _run_blender_manual_rename_bucket_regression_guard() -> dict[str, Any]:
     snapshot = {
         "schema": "pc-rehd-blender-selected-node-contract-v1",
         "action": "scene.selection",
-        "authority": "bpy_window_view_layer_selection_with_hidden_selection_state",
+        "authority": "bpy_active_scene_view_layer_selection_with_hidden_state",
         "max_process_id": pid,
         "blender_process_id": pid,
         "selected_nodes": [
@@ -47179,7 +47067,7 @@ def _run_blender_manual_rename_bucket_regression_guard() -> dict[str, Any]:
                 "handle": selected_handle,
                 "name": renamed_object_name,
                 "hidden": True,
-                "selection_source": "bpy_preserved_hidden_selection",
+                "selection_source": "bpy_active_scene_view_layer_selection",
             }
         ],
         "hidden_node_count": 2,
@@ -66021,11 +65909,7 @@ class LauncherApp:
 
         def operation() -> tuple[str, dict[str, Any]]:
             if isinstance(session, ManagedBlenderSession):
-                dispatcher = self._blender_scene_dispatcher(session)
-                return uuid.uuid4().hex, {
-                    "scene_contract": dispatcher.inspect(),
-                    "selection": dispatcher.selection(),
-                }
+                return uuid.uuid4().hex, self._inspect_blender_scene_selection(session)
             return self._request_max_scene_interface(
                 session,
                 "legacy_export.selection",
@@ -73022,8 +72906,9 @@ class LauncherApp:
         generation = self._begin_session_operation(session, action)
 
         def operation() -> list[dict[str, str | int]]:
-            contract = self._inspect_blender_scene(session)
-            selection = self._blender_scene_dispatcher(session).selection()
+            snapshot = self._inspect_blender_scene_selection(session)
+            contract = snapshot["scene_contract"]
+            selection = snapshot["selection"]
             selected_handles: set[int] = set()
             for key in ("selected_mesh_handles", "selected_handles"):
                 values = selection.get(key, []) if isinstance(selection, Mapping) else []
@@ -73876,9 +73761,11 @@ class LauncherApp:
         generation = self._begin_session_operation(session, action)
 
         def operation() -> dict[str, Any]:
-            contract = self._inspect_blender_scene(session)
-            selection = self._blender_scene_dispatcher(session).selection()
-            return {"contract": contract, "selection": selection}
+            snapshot = self._inspect_blender_scene_selection(session)
+            return {
+                "contract": snapshot["scene_contract"],
+                "selection": snapshot["selection"],
+            }
 
         def success(snapshot: dict[str, Any]) -> None:
             if (
@@ -74198,9 +74085,11 @@ class LauncherApp:
                 state["poll_inflight"] = True
 
                 def poll_operation() -> dict[str, Any]:
-                    contract = self._inspect_blender_scene(session)
-                    selection = self._blender_scene_dispatcher(session).selection()
-                    return {"contract": contract, "selection": selection}
+                    snapshot = self._inspect_blender_scene_selection(session)
+                    return {
+                        "contract": snapshot["scene_contract"],
+                        "selection": snapshot["selection"],
+                    }
 
                 def poll_success(value: dict[str, Any]) -> None:
                     state["poll_inflight"] = False
@@ -88894,6 +88783,23 @@ class LauncherApp:
             session, self._blender_scene_dispatcher(session).inspect()
         )
 
+    def _inspect_blender_scene_selection(
+        self,
+        session: ManagedBlenderSession,
+    ) -> dict[str, Any]:
+        """Read the current Blender scene and selection in one Worker task."""
+        snapshot = self._blender_scene_dispatcher(session).inspect_selection()
+        raw_contract = snapshot.get("scene_contract")
+        raw_selection = snapshot.get("selection")
+        if not isinstance(raw_contract, Mapping) or not isinstance(raw_selection, Mapping):
+            raise ProtocolError("Blender atomic scene-selection receipt is incomplete")
+        return {
+            "scene_contract": self._normalize_blender_scene_contract(
+                session, raw_contract
+            ),
+            "selection": dict(raw_selection),
+        }
+
     def _request_blender_scene_snapshot(
         self,
         session: ManagedBlenderSession,
@@ -90702,10 +90608,7 @@ class LauncherApp:
         def operation() -> tuple[str, dict[str, Any]]:
             if isinstance(session, ManagedBlenderSession):
                 dispatcher = self._blender_scene_dispatcher(session)
-                return uuid.uuid4().hex, {
-                    "scene_contract": dispatcher.inspect(),
-                    "selection": dispatcher.selection(),
-                }
+                return uuid.uuid4().hex, dispatcher.inspect_selection()
             return self._request_max_scene_interface(
                 session,
                 f"export_sets.{lane}",
