@@ -9,4 +9,6 @@
 - Old update checkers always report an update; newer update-check mechanisms are enforced
 - MAX/Blender scene nodes one time no cache policy that might mislead; FBX exclusively decides geometry
 - Fixed normal anomalies in RE6 FVF BB424024/BB424025
-- Fixed MOD export normal fidelity: the exported normal representation, values, and count now remain consistent with the source FBX.
+- FVF B0983013/14, 0CB68015/16, A8FAB018/19, and D877801B bone-index padding exports as 00 Mesh Teeth vanished issue fixed
+- Corrected FVF CBF6C01A import/source-truth/export handling to one little-endian u16 bone-index field at offsets 6..7
+- Fixed MOD export normal fidelity: the exported normal representation, values, and count now remain consistent with the source FBX
