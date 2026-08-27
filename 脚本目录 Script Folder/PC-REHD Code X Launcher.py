@@ -4236,7 +4236,8 @@ LAUNCHER_ICON_STYLES = frozenset(
     {LAUNCHER_ICON_STYLE_UMBRELLA, LAUNCHER_ICON_STYLE_ORIGINAL}
 )
 EXPORT_SETS_WINDOW_SIZE_FILE_NAME = "PC_REHD_Code_X_Export_Sets_Window_Size.json"
-EXPORT_SETS_ORIGINAL_SIZE = (600, 997)
+EXPORT_SETS_LEGACY_ORIGINAL_SIZE = (600, 997)
+EXPORT_SETS_ORIGINAL_SIZE = (760, 1020)
 LEGACY_AGENT_REGISTRY_DIR = DEFAULT_LOG_DIR / "agents"
 # Max officially auto-loads MAXScript startup files, not Python files. Keep
 # the Python Agent source outside the startup folder and enter its existing
@@ -6449,7 +6450,10 @@ def _load_export_sets_window_size(log_directory: str | Path | None = None) -> li
             raw = json.loads(legacy_path.read_text(encoding="utf-8")) if legacy_path.is_file() else {}
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
             raw = {}
-    return _normalize_export_sets_window_size(raw)
+    size = _normalize_export_sets_window_size(raw)
+    if tuple(size) == EXPORT_SETS_LEGACY_ORIGINAL_SIZE:
+        return list(EXPORT_SETS_ORIGINAL_SIZE)
+    return size
 
 
 def _write_export_sets_window_size(
@@ -8603,7 +8607,7 @@ AI_MAINTENANCE_ONLY_MODULE_SHA256 = {
     "codex_re6_mod_import_fbx.py": "F94AC8B0D9D7E60B14A42E88DCCF893371E99B9F85F6DDD628EEE8A55C75DA53",
     "codex_python_export_bridge.py": "F8F973F2108CC4FCB2B73DD6110601552D0B0710A13248629AB1F724AAB3BB02",
     "codex_re6_scene_compatibility.py": "0F387A805643A060C90B0FB3C32A5A884F925E9C1D872A117DFB3681BB5E16CC",
-    "codex_fbx_probe.py": "CC90668B2354FEB5510316F252F034555DCD517958AC24098F542AD152090BE2",
+    "codex_fbx_probe.py": "0F0BE261D64FAEE8C762838DA439C8AC1E962498B75DA6F74B682BDF7A17840A",
     "codex_re6_tex_decode.py": "2C3D689B5CC7CFF59BEF3479CB0DF979B932DB6ED1204D9BF1AC6E04D603CD56",
 }
 RESCUE_AGENT_MAINTENANCE_PROTECTED_FUNCTIONS = (
@@ -8850,6 +8854,7 @@ PYMXS_EXPORT_ALLOWED_RUNTIME_CALLS = (
     "rt.delete",
     "rt.exportFile",
     "rt.getAnimByHandle",
+    "rt.getCommandPanelTaskMode",
     "rt.getHandleByAnim",
     "rt.getNodeByName",
     "rt.getNumFaces",
@@ -8861,6 +8866,7 @@ PYMXS_EXPORT_ALLOWED_RUNTIME_CALLS = (
     "rt.meshop.getMapSupport",
     "rt.pluginManager.loadClass",
     "rt.select",
+    "rt.setCommandPanelTaskMode",
     "rt.addModifier",
     "rt.addModifierWithLocalData",
     "rt.copy",
@@ -8872,8 +8878,10 @@ PYMXS_EXPORT_ALLOWED_RUNTIME_CALLS = (
 PYMXS_EXPORT_ALLOWED_RUNTIME_VALUES = (
     "rt.Editable_Mesh",
     "rt.FBXEXP",
+    "rt.modPanel",
     "rt.objects",
     "rt.selection",
+    "rt.subObjectLevel",
 )
 PYMXS_EXPORT_ALLOWED_UI_AGENT_COMMANDS = (
     "health",
@@ -8971,6 +8979,7 @@ _PYMXS_APPROVED_RUNTIME_CALLS = frozenset(
         "rt.execute",
         "rt.exportFile",
         "rt.getAnimByHandle",
+        "rt.getCommandPanelTaskMode",
         "rt.getFace",
         "rt.getFaceMatID",
         "rt.getHandleByAnim",
@@ -16260,6 +16269,7 @@ def install_agent_startup_hooks(directories: list[Path] | None = None) -> list[P
 
 def run_protocol_smoke_test() -> dict[str, Any]:
     blender_manual_rename_bucket = _run_blender_manual_rename_bucket_regression_guard()
+    blender_worker_live_scene = _run_blender_worker_live_scene_regression_guard()
     _validate_policy_guards_sync()
     expected_work_agent_revision = (
         f"{WORK_AGENT_COMPONENT_REVISION_PREFIX}{LAUNCHER_SOURCE_SHA256[:24]}"
@@ -16771,6 +16781,7 @@ def run_protocol_smoke_test() -> dict[str, Any]:
             "broken_health_recovery": True,
             "bucket_mesh_name_probe": True,
             "blender_manual_rename_bucket": blender_manual_rename_bucket,
+            "blender_worker_live_scene": blender_worker_live_scene,
             "scene_name_probe": True,
             "scene_normal_probe": True,
             "scene_auto_colors": {
@@ -19874,6 +19885,113 @@ def _max_restore_export_selection(
     )
     if nodes:
         rt.select(nodes)
+
+
+def _max_capture_modify_panel_state(rt: Any) -> dict[str, Any]:
+    """Capture the Modify command-panel state before export mutates selection."""
+    state: dict[str, Any] = {
+        "task_mode_captured": False,
+        "modify_mode": False,
+        "current_object_captured": False,
+        "sub_object_level_captured": False,
+        "pin_stack_captured": False,
+    }
+    try:
+        task_mode = rt.getCommandPanelTaskMode()
+    except Exception:
+        return state
+    state.update({"task_mode": task_mode, "task_mode_captured": True})
+    mode_text = str(task_mode or "").strip().casefold().lstrip("#")
+    modify_mode = mode_text == "modify"
+    if not modify_mode:
+        try:
+            modify_mode = bool(task_mode == rt.Name("modify"))
+        except Exception:
+            modify_mode = False
+    state["modify_mode"] = modify_mode
+    if not modify_mode:
+        return state
+    try:
+        panel = rt.modPanel
+    except Exception:
+        panel = None
+    if panel is None:
+        return state
+    try:
+        current_object = panel.getCurrentObject()
+        if current_object is not None:
+            state.update(
+                {
+                    "current_object": current_object,
+                    "current_object_captured": True,
+                }
+            )
+    except Exception:
+        pass
+    try:
+        sub_object_level = rt.subObjectLevel
+        if sub_object_level is not None:
+            state.update(
+                {
+                    "sub_object_level": sub_object_level,
+                    "sub_object_level_captured": True,
+                }
+            )
+    except Exception:
+        pass
+    try:
+        pin_stack = panel.getPinStack()
+        if pin_stack is not None:
+            state.update(
+                {
+                    "pin_stack": bool(pin_stack),
+                    "pin_stack_captured": True,
+                }
+            )
+    except Exception:
+        pass
+    return state
+
+
+def _max_restore_modify_panel_state(
+    rt: Any,
+    state: Mapping[str, Any] | None,
+) -> list[str]:
+    """Restore a previously captured Modify command-panel state."""
+    if not isinstance(state, Mapping) or not bool(state.get("task_mode_captured")):
+        return []
+    failures: list[str] = []
+    try:
+        rt.setCommandPanelTaskMode(state.get("task_mode"))
+    except Exception as exc:
+        failures.append(f"task mode: {type(exc).__name__}: {exc}")
+    if not bool(state.get("modify_mode")):
+        return failures
+    try:
+        panel = rt.modPanel
+    except Exception:
+        panel = None
+    if panel is None:
+        return failures + ["Modify panel is unavailable"]
+    if bool(state.get("current_object_captured")):
+        try:
+            try:
+                panel.setCurrentObject(state.get("current_object"), ui=False)
+            except TypeError:
+                panel.setCurrentObject(state.get("current_object"))
+        except Exception as exc:
+            failures.append(f"current object: {type(exc).__name__}: {exc}")
+    if bool(state.get("sub_object_level_captured")):
+        try:
+            rt.subObjectLevel = state.get("sub_object_level")
+        except Exception as exc:
+            failures.append(f"sub-object level: {type(exc).__name__}: {exc}")
+    if bool(state.get("pin_stack_captured")):
+        try:
+            panel.setPinStack(bool(state.get("pin_stack")))
+        except Exception as exc:
+            failures.append(f"pin stack: {type(exc).__name__}: {exc}")
+    return failures
 
 
 def _max_resolve_scene_interface_nodes(
@@ -25128,6 +25246,7 @@ def _max_export_fbx(
     primary_error: Exception | None = None
     recovery_failures: list[str] = []
     route_marker_snapshots: list[tuple[Any, str, int]] = []
+    modify_panel_state = _max_capture_modify_panel_state(rt)
     try:
         path.unlink(missing_ok=True)
         if not export_all_scene:
@@ -25245,6 +25364,10 @@ def _max_export_fbx(
                 )
             except Exception as selection_exc:
                 recovery_failures.append(f"Max selection restore failed: {selection_exc}")
+        recovery_failures.extend(
+            f"Max Modify panel restore failed: {failure}"
+            for failure in _max_restore_modify_panel_state(rt, modify_panel_state)
+        )
         _max_release_transient_runtime(rt)
     if primary_error is not None:
         if recovery_failures:
@@ -25515,6 +25638,7 @@ def _max_prepare_export_map2_unwrap(
         "failed": [],
         "nodes": [],
     }
+    previous_modify_panel_state = _max_capture_modify_panel_state(rt)
     previous_output_type = rt.collapse.getoutputtype()
     previous_collapse_to = rt.collapse.getcollapseto()
     try:
@@ -25708,6 +25832,12 @@ def _max_prepare_export_map2_unwrap(
             receipt["failed"].append(
                 f"Collapse settings restore failed: {type(exc).__name__}: {exc}"
             )
+        receipt["failed"].extend(
+            f"Max Modify panel restore failed: {failure}"
+            for failure in _max_restore_modify_panel_state(
+                rt, previous_modify_panel_state
+            )
+        )
     if receipt["failed"]:
         raise RuntimeError(" | ".join(str(detail) for detail in receipt["failed"]))
     return receipt
@@ -31661,7 +31791,6 @@ _FULL_RE6_MESH_HEADER_NAME_RE = re.compile(
     r"(?P<import_suffix>_Import_?(?:[2-9]|[1-9]\d+)(?:_[1-9]\d*)?)?"
     r"(?P<blender_suffix>\.\d{3})?$"
 )
-_RE6_FULL_MESH_HEADER_PROPERTY = "CodexRe6FullMeshHeader"
 _FBX_HIERARCHY_CONTRACT_SCHEMA = "pc-rehd-blender-fbx-hierarchy-v1"
 _FBX_HIERARCHY_CONTRACT_REVISION = 1
 _FBX_HIERARCHY_CONTRACT_ID_PROPERTY = "PC_REHD_FBX_HIERARCHY_CONTRACT_ID"
@@ -31671,6 +31800,8 @@ _FBX_HIERARCHY_SOURCE_MODEL_ID_PROPERTY = "PC_REHD_SOURCE_FBX_MODEL_ID"
 _FBX_HIERARCHY_SOURCE_PARENT_MODEL_ID_PROPERTY = "PC_REHD_SOURCE_PARENT_MODEL_ID"
 _FBX_HIERARCHY_SOURCE_PARENT_NAME_PROPERTY = "PC_REHD_SOURCE_PARENT_NAME"
 _FBX_HIERARCHY_SOURCE_MODEL_NAME_PROPERTY = "PC_REHD_SOURCE_FBX_MODEL_NAME"
+_FBX_HIERARCHY_SOURCE_MAX_HANDLE_FIELD = "source_max_handle"
+_FBX_HIERARCHY_SOURCE_ROUTE_HANDLE_FIELD = "source_route_handle"
 _FBX_HIERARCHY_SOURCE_SHA256_PROPERTY = "PC_REHD_SOURCE_FBX_SHA256"
 _FBX_HIERARCHY_SOURCE_GRAPH_SHA256_PROPERTY = "PC_REHD_SOURCE_FBX_GRAPH_SHA256"
 _FBX_HIERARCHY_SCENE_REGISTRY_PROPERTY = "PC_REHD_FBX_HIERARCHY_CONTRACTS"
@@ -31680,6 +31811,9 @@ _FBX_HIERARCHY_AUTO_REPAIR_ENABLED = True
 _FBX_HIERARCHY_IMPORT_WATCHES = {}
 _FBX_HIERARCHY_EXPORT_WATCHES = {}
 _FBX_HIERARCHY_IDLE_OBJECT_HANDLES = {}
+_FBX_HIERARCHY_MANUAL_IMPORT_ARMS = {}
+_FBX_HIERARCHY_HANDLED_IMPORT_KEYS = set()
+_FBX_HIERARCHY_HANDLED_IMPORT_BASELINES = {}
 _FBX_HIERARCHY_IMPORT_WATCH_TIMEOUT_SECONDS = 60.0
 _FBX_HIERARCHY_REPAIR_UNDO_LIMIT = 16
 _FBX_HIERARCHY_REPAIR_UNDO_STACK = {}
@@ -31703,6 +31837,7 @@ _FBX_HIERARCHY_REPAIR_SCENE_KEYS = (
 )
 _FBX_HIERARCHY_MSGBUS_OWNER = object()
 _FBX_HIERARCHY_MSGBUS_REGISTERED = False
+_FBX_HIERARCHY_MONITOR_STARTED = False
 _FBX_HIERARCHY_MSGBUS_WAKE_PENDING = False
 _FBX_HIERARCHY_MONITOR_FALLBACK_SECONDS = 0.05
 _FBX_HIERARCHY_MONITOR_NEXT_POLL = 0.0
@@ -31729,6 +31864,233 @@ def _fbx_hierarchy_file_sha256(path):
                 break
             digest.update(block)
     return digest.hexdigest().upper()
+
+
+def _fbx_hierarchy_identity_number(value):
+    text = str(value or "").strip().strip('"').strip("'")
+    return text if re.fullmatch(r"[1-9]\d*", text) else ""
+
+
+def _fbx_hierarchy_operator_filepath(operator, params=None):
+    """Resolve a selector's final FBX path from filepath or directory/files."""
+    filepath = str(getattr(operator, "filepath", "") or "").strip()
+    directory = getattr(operator, "directory", "") if operator is not None else ""
+    files = getattr(operator, "files", ()) if operator is not None else ()
+    if params is not None:
+        if not directory:
+            directory = getattr(params, "directory", "")
+        if not files:
+            files = getattr(params, "files", ())
+    if isinstance(directory, bytes):
+        directory = directory.decode("utf-8", "replace")
+    if not filepath and directory:
+        names = []
+        for item in files or ():
+            name = str(getattr(item, "name", "") or "").strip()
+            if name:
+                names.append(name)
+        fbx_names = [
+            name for name in names
+            if os.path.splitext(name)[1].casefold() == ".fbx"
+        ]
+        selected_names = names if len(names) == 1 else fbx_names
+        if len(selected_names) == 1:
+            filepath = os.path.join(str(directory), selected_names[0])
+    if not filepath and params is not None and directory:
+        filename = str(getattr(params, "filename", "") or "").strip()
+        if filename:
+            filepath = os.path.join(str(directory), filename)
+    if not filepath:
+        return ""
+    try:
+        filepath = os.path.abspath(bpy.path.abspath(filepath))
+    except Exception:
+        filepath = os.path.abspath(filepath)
+    return filepath
+
+
+def _fbx_hierarchy_last_fbx_import_path():
+    """Read the path saved by Blender after a manual FBX file selector closes."""
+    window_manager = getattr(bpy.context, "window_manager", None)
+    getter = getattr(window_manager, "operator_properties_last", None)
+    if not callable(getter):
+        return ""
+    for operator_name in (
+        "WM_OT_fbx_import",
+        "WM_OT_drop_import_file",
+        "wm.fbx_import",
+        "wm.drop_import_file",
+    ):
+        try:
+            properties = getter(operator_name)
+            filepath = _fbx_hierarchy_operator_filepath(properties)
+        except Exception:
+            continue
+        if filepath and os.path.splitext(filepath)[1].casefold() == ".fbx":
+            return filepath
+    return ""
+
+
+def _fbx_hierarchy_manual_import_transition(
+    *,
+    active_rows,
+    armed,
+    idle_handles,
+    current_handles,
+    last_filepath,
+    now,
+    timeout_seconds,
+):
+    """Decide when a manual FBX selector is armed or ready to capture."""
+    def _handles(values):
+        result = set()
+        for value in values or ():
+            try:
+                result.add(int(value))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return result
+
+    imports = [
+        row for row in (active_rows or ())
+        if isinstance(row, dict)
+        and row.get("operator_id") in {"wm.fbx_import", "wm.drop_import_file"}
+    ]
+    idle = _handles(idle_handles)
+    current = _handles(current_handles)
+    if imports:
+        row = imports[0]
+        try:
+            operator_handle = int(row.get("operator_handle", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            operator_handle = 0
+        filepath = str(row.get("filepath", "") or "").strip()
+        if isinstance(armed, dict) and int(armed.get("operator_handle", 0) or 0) == operator_handle:
+            before = _handles(armed.get("before_handles", ()))
+            observed_at = float(armed.get("observed_at", now) or now)
+        else:
+            before = set(idle)
+            observed_at = float(now)
+        next_armed = {
+            "operator_handle": operator_handle,
+            "before_handles": before,
+            "observed_at": observed_at,
+        }
+        if filepath:
+            return {
+                "action": "CAPTURE",
+                "origin": (
+                    "native_drag_drop"
+                    if row.get("operator_id") == "wm.drop_import_file"
+                    else "native_file_browser"
+                ),
+                "operator_handle": operator_handle,
+                "filepath": filepath,
+                "before_handles": before,
+                "armed": None,
+            }
+        return {"action": "ARM", "armed": next_armed}
+    if not isinstance(armed, dict):
+        return {"action": "IDLE", "armed": None}
+    before = _handles(armed.get("before_handles", ()))
+    try:
+        observed_at = float(armed.get("observed_at", now) or now)
+    except (TypeError, ValueError, OverflowError):
+        observed_at = float(now)
+    if current - before:
+        filepath = str(last_filepath or "").strip()
+        if filepath:
+            return {
+                "action": "CAPTURE",
+                "origin": "operator_properties_last",
+                "operator_handle": int(armed.get("operator_handle", 0) or 0),
+                "filepath": filepath,
+                "before_handles": before,
+                "armed": None,
+            }
+    if float(now) - observed_at > float(timeout_seconds):
+        return {"action": "CANCEL", "armed": None}
+    return {"action": "WAIT", "armed": armed}
+
+
+def _fbx_hierarchy_manual_import_rows(rows, armed):
+    """Prefer live selector rows while an empty-path selector is armed."""
+    normalized = [row for row in (rows or ()) if isinstance(row, dict)]
+    if not isinstance(armed, dict):
+        return normalized
+    live_rows = [
+        row
+        for row in normalized
+        if str(row.get("source", "") or "") != "operator_history"
+    ]
+    if not live_rows:
+        return []
+    try:
+        armed_handle = int(armed.get("operator_handle", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        armed_handle = 0
+    matching = []
+    for row in live_rows:
+        try:
+            row_handle = int(row.get("operator_handle", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            row_handle = 0
+        if armed_handle and row_handle == armed_handle:
+            matching.append(row)
+    return matching or live_rows
+
+
+def _fbx_hierarchy_history_import_is_duplicate(
+    *,
+    key,
+    source,
+    handled_keys,
+    handled_baselines,
+    current_handles,
+    watch_active,
+):
+    """Ignore retained history rows only while they describe the same import."""
+    if str(source or "") != "operator_history":
+        return False
+    if not key or key not in handled_keys:
+        return False
+
+    def _handles(values):
+        result = set()
+        for value in values or ():
+            try:
+                result.add(int(value))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return result
+
+    baseline = handled_baselines.get(key)
+    active_snapshot = None
+    if isinstance(watch_active, dict):
+        key_watch_active = key in watch_active
+        active_snapshot = watch_active.get(key)
+    elif isinstance(watch_active, (set, frozenset, tuple, list)):
+        key_watch_active = key in watch_active
+    else:
+        key_watch_active = bool(watch_active) and baseline is None
+    if key_watch_active:
+        if active_snapshot is not None and _handles(current_handles) - _handles(
+            active_snapshot
+        ):
+            handled_keys.discard(key)
+            handled_baselines.pop(key, None)
+            return False
+        return True
+    if baseline is None:
+        if not key_watch_active:
+            handled_keys.discard(key)
+            return False
+        return True
+    if baseline is not None and _handles(current_handles) - _handles(baseline):
+        handled_keys.discard(key)
+        handled_baselines.pop(key, None)
+        return False
+    return True
 
 
 def _fbx_hierarchy_source_contract_from_fbx(path):
@@ -31874,12 +32236,33 @@ def _fbx_hierarchy_source_contract_from_fbx(path):
         name = raw_name if marker < 0 else raw_name[:marker]
         if model_id in models:
             raise ValueError("FBX hierarchy contract found duplicate Model IDs")
+        identity = {}
+        for container in read_children(node):
+            if container["name"] != b"Properties70":
+                continue
+            for property_node in read_children(container):
+                values = property_node["properties"]
+                if property_node["name"] != b"P" or len(values) < 5:
+                    continue
+                property_name = str(values[0] or "")
+                if property_name == "MaxHandle":
+                    value = _fbx_hierarchy_identity_number(values[4])
+                    if value:
+                        identity[_FBX_HIERARCHY_SOURCE_MAX_HANDLE_FIELD] = value
+                elif property_name == "UDP3DSMAX":
+                    route_match = re.search(
+                        r"(?im)^\s*CodexRe6FbxRouteHandle\s*=\s*([1-9]\d*)\s*$",
+                        str(values[4] or ""),
+                    )
+                    if route_match is not None:
+                        identity[_FBX_HIERARCHY_SOURCE_ROUTE_HANDLE_FIELD] = route_match.group(1)
         models[model_id] = {
             "source_model_id": str(model_id),
             "source_model_name": name,
             "source_model_type": str(model_type or ""),
             "source_parent_model_id": "0",
             "source_parent_name": "",
+            **identity,
         }
     if not models:
         raise ValueError("FBX hierarchy contract found no Model records")
@@ -31984,6 +32367,18 @@ def _fbx_hierarchy_validate_contract(raw_contract, source_path):
             ):
                 raise ValueError("Blender FBX hierarchy contract has an invalid Model identity")
             source_ids.add(source_id)
+            identity = {}
+            for field in (
+                _FBX_HIERARCHY_SOURCE_MAX_HANDLE_FIELD,
+                _FBX_HIERARCHY_SOURCE_ROUTE_HANDLE_FIELD,
+            ):
+                if field not in raw_row:
+                    continue
+                raw_identity = raw_row.get(field, "")
+                identity_value = _fbx_hierarchy_identity_number(raw_identity)
+                if raw_identity not in (None, "") and not identity_value:
+                    raise ValueError("Blender FBX hierarchy contract has an invalid Model identity field")
+                identity[field] = identity_value
             models.append(
                 {
                     "source_model_id": source_id,
@@ -31991,6 +32386,7 @@ def _fbx_hierarchy_validate_contract(raw_contract, source_path):
                     "source_model_type": str(raw_row.get("source_model_type", "") or ""),
                     "source_parent_model_id": parent_id,
                     "source_parent_name": str(raw_row.get("source_parent_name", "") or ""),
+                    **identity,
                 }
             )
         if any(
@@ -32038,6 +32434,41 @@ def _fbx_hierarchy_name_candidates(node):
     duplicate = re.sub(r"\.\d{3}$", "", value)
     if duplicate and duplicate not in candidates:
         candidates.append(duplicate)
+    return candidates
+
+
+def _fbx_hierarchy_source_identity_candidates(row):
+    candidates = []
+    for field, identity_name in (
+        (_FBX_HIERARCHY_SOURCE_MAX_HANDLE_FIELD, "max_handle"),
+        (_FBX_HIERARCHY_SOURCE_ROUTE_HANDLE_FIELD, "route_handle"),
+    ):
+        value = _fbx_hierarchy_identity_number(row.get(field, ""))
+        if value:
+            candidates.append((identity_name, value))
+    return candidates
+
+
+def _fbx_hierarchy_node_identity_candidates(node):
+    candidates = []
+    for owner in (node, getattr(node, "data", None)):
+        if owner is None:
+            continue
+        getter = getattr(owner, "get", None)
+        if not callable(getter):
+            continue
+        for property_name, identity_name in (
+            ("MaxHandle", "max_handle"),
+            ("CodexRe6FbxRouteHandle", "route_handle"),
+        ):
+            try:
+                value = _fbx_hierarchy_identity_number(getter(property_name, ""))
+            except Exception:
+                value = ""
+            if value:
+                candidate = (identity_name, value)
+                if candidate not in candidates:
+                    candidates.append(candidate)
     return candidates
 
 
@@ -32255,11 +32686,14 @@ def _fbx_hierarchy_apply_import_contract(
         }
     models = [dict(row) for row in contract.get("models", []) if isinstance(row, dict)]
     source_by_name = {}
+    source_by_identity = {}
     source_by_id = {}
     for row in models:
         source_id = str(row.get("source_model_id", "") or "")
         source_by_id[source_id] = row
         source_by_name.setdefault(str(row.get("source_model_name", "") or "").casefold(), []).append(row)
+        for identity in _fbx_hierarchy_source_identity_candidates(row):
+            source_by_identity.setdefault(identity, []).append(row)
     mapping = {}
     ambiguous = []
     unmatched_relevant = []
@@ -32272,15 +32706,29 @@ def _fbx_hierarchy_apply_import_contract(
             unmatched_relevant.append(str(node.name))
             continue
         matches = []
-        for candidate in _fbx_hierarchy_name_candidates(node):
-            rows = source_by_name.get(candidate.casefold(), [])
-            if len(rows) == 1:
-                matches = rows
-                break
+        identity_matches = []
+        identity_conflict = False
+        for identity in _fbx_hierarchy_node_identity_candidates(node):
+            rows = source_by_identity.get(identity, [])
             if len(rows) > 1:
-                ambiguous.append(str(node.name))
-                matches = []
+                identity_conflict = True
                 break
+            if len(rows) == 1 and rows[0] not in identity_matches:
+                identity_matches.append(rows[0])
+        if identity_conflict or len(identity_matches) > 1:
+            ambiguous.append(str(node.name))
+        elif len(identity_matches) == 1:
+            matches = identity_matches
+        else:
+            for candidate in _fbx_hierarchy_name_candidates(node):
+                rows = source_by_name.get(candidate.casefold(), [])
+                if len(rows) == 1:
+                    matches = rows
+                    break
+                if len(rows) > 1:
+                    ambiguous.append(str(node.name))
+                    matches = []
+                    break
         if not matches:
             if str(getattr(node, "type", "") or "") == "MESH":
                 unmatched_relevant.append(str(node.name))
@@ -32546,20 +32994,9 @@ def _fbx_hierarchy_restore_scene_contract(nodes=None, *, strict):
     }
 
 
-def _re6_mesh_authority_name(node):
-    """Use the complete Header carried through FBX custom properties first."""
-    preserved = _property_text(node, _RE6_FULL_MESH_HEADER_PROPERTY).strip()
-    if _FULL_RE6_MESH_HEADER_NAME_RE.fullmatch(preserved) is not None:
-        return preserved
+def _re6_mesh_live_object_name(node):
+    """Return the current Blender scene Object name with no saved fallback."""
     return str(getattr(node, "name", "") or "").strip()
-
-
-def _set_re6_mesh_authority_name(node, value):
-    name = str(value or "").strip()
-    if _FULL_RE6_MESH_HEADER_NAME_RE.fullmatch(name) is None:
-        raise ValueError("Blender Mesh Header must use the complete RE6 name format")
-    node[_RE6_FULL_MESH_HEADER_PROPERTY] = name
-    return name
 
 
 def _compact_re6_mesh_name_facts(value):
@@ -32762,7 +33199,6 @@ _NODE_MAP_CANONICAL_NAME_PROPERTY = "PC_REHD_CANONICAL_NAME"
 _NODE_MAP_HEADER_PROPERTY = "PC_REHD_FULL_MESH_HEADER_JSON"
 _NODE_MAP_HEADER_SHA256_PROPERTY = "PC_REHD_FULL_MESH_HEADER_SHA256"
 _NODE_MAP_SOURCE_SHA256_PROPERTY = "PC_REHD_NODE_MAP_SOURCE_SHA256"
-_NODE_MAP_HEADER_LOD_PROPERTY = "PC_REHD_HEADER_LOD_LEVEL"
 _NODE_MAP_SCHEMA = "pc-rehd-blender-node-map-v1"
 _NODE_MAP_ID_RE = re.compile(r"(?i)^[0-9a-f]{32}$")
 _NODE_MAP_CANONICAL_NAME_RE = re.compile(r"(?i)^mesh_\d{3,}$")
@@ -32858,7 +33294,7 @@ def _import_name_ordinal(name):
 
 
 def _mesh_lod_level(node):
-    name = _re6_mesh_authority_name(node)
+    name = _re6_mesh_live_object_name(node)
     compact_lod = _mesh_name_facts(name).get("lod_level")
     if compact_lod is not None:
         return int(compact_lod)
@@ -32997,7 +33433,6 @@ def _rebuild_lod_hierarchy(meshes=None, helper_scope=None):
         mesh.parent = target
         mesh.matrix_parent_inverse = target.matrix_world.inverted_safe()
         mesh.matrix_world = world_matrix
-        mesh["CodexRe6BlenderHierarchy"] = helper_name
         routed.append(
             {
                 "mesh_name": str(mesh.name),
@@ -33917,11 +34352,8 @@ def _blender_fbx_loss_all_zero_area_faces(node, source_face_count):
 
 def _mesh_contract(node, selected_handles):
     handle = _pointer(node)
-    authority_name = _re6_mesh_authority_name(node)
-    facts = _mesh_name_facts(authority_name)
-    declared_mesh_type = _optional_integer_property(node, "PC_REHD_MESH_TYPE")
-    if declared_mesh_type is not None and 0 <= declared_mesh_type <= 0xFFFF:
-        facts["mesh_type"] = declared_mesh_type
+    live_object_name = _re6_mesh_live_object_name(node)
+    facts = _mesh_name_facts(live_object_name)
     imported_slot = (
         _integer_property(node, "PC_REHD_PHYSICAL_SLOT")
         or _integer_property(node, "CodexV4ImportedMeshIndex")
@@ -33975,7 +34407,6 @@ def _mesh_contract(node, selected_handles):
         blender_degenerate_header_only or blender_all_zero_area_fbx_faces
     )
     parent = node.parent
-    declared_parent = _property_text(node, "PC_REHD_PARENT_NAME")
     skin_bones = [
         {
             "skin_bone_id": index + 1,
@@ -33990,7 +34421,7 @@ def _mesh_contract(node, selected_handles):
     full_mesh_header_sha256 = _property_text(node, _NODE_MAP_HEADER_SHA256_PROPERTY)
     node_map_source_sha256 = _property_text(node, _NODE_MAP_SOURCE_SHA256_PROPERTY)
     return {
-        "scene_node": authority_name,
+        "scene_node": live_object_name,
         "blender_object_name": str(node.name),
         "scene_node_handle": handle,
         "class_name": "Editable_Mesh",
@@ -33999,17 +34430,15 @@ def _mesh_contract(node, selected_handles):
         "is_geometry": True,
         "is_bone": False,
         "imported_bone_handle_marker": False,
-        "parent_name": declared_parent or (str(parent.name) if parent is not None else ""),
+        "parent_name": str(parent.name) if parent is not None else "",
         "parent_handle": _pointer(parent) if parent is not None else 0,
         "hierarchy_path": _hierarchy_path(node),
         "selected": handle in selected_handles,
         "hidden": _node_hidden_in_view_layer(node, bpy.context.view_layer),
         "is_mesh": True,
-        "mesh_slot": imported_slot or scene_slot or None,
+        "mesh_slot": scene_slot or None,
         "mesh_slot_basis": (
-            "blender_physical_slot_property"
-            if imported_slot > 0
-            else "scene_name_authoritative"
+            "scene_name_authoritative"
             if scene_slot > 0
             else "unresolved_scene_name"
         ),
@@ -34065,7 +34494,6 @@ def _mesh_contract(node, selected_handles):
         "fix_processing_mode": (
             _property_text(node, "CodexRe6FixProcessingMode") or "codex"
         ),
-        "header_fvf": source_fvf,
         "compatibility_routing": "launcher_python",
         "auto_header_only": False,
         "source_passthrough": False,
@@ -34130,6 +34558,16 @@ def _bone_contract(armature, bone, selected_handles):
 
 def _scene_contract(selected_handles=None):
     objects = list(bpy.context.scene.objects)
+    # Manual Outliner renames are scene edits. Route their current LOD names
+    # before taking one live contract; no prior Worker result is consulted.
+    _rebuild_lod_hierarchy(
+        [
+            node
+            for node in objects
+            if node.type == "MESH" and _is_complete_re6_hierarchy_name(node)
+        ],
+        helper_scope=objects,
+    )
     if selected_handles is None:
         selected_handles = set()
         for node in objects:
@@ -34345,7 +34783,7 @@ def _node_map_snapshot():
                 "physical_mesh_slot": _integer_property(node, "PC_REHD_PHYSICAL_SLOT"),
                 "display_mesh_slot": _integer_property(node, "CodexV4DisplayMeshIndex"),
                 "scene_name_mesh_slot": _mesh_name_facts(
-                    _re6_mesh_authority_name(node)
+                    _re6_mesh_live_object_name(node)
                 ).get("scene_name_mesh_slot"),
                 "full_mesh_header": full_mesh_header,
                 "full_mesh_header_sha256": _property_text(node, _NODE_MAP_HEADER_SHA256_PROPERTY),
@@ -34442,7 +34880,6 @@ def _node_map_apply(payload):
         node[_NODE_MAP_HEADER_PROPERTY] = header_json
         node[_NODE_MAP_HEADER_SHA256_PROPERTY] = header_digest
         node[_NODE_MAP_SOURCE_SHA256_PROPERTY] = source_sha256
-        node[_NODE_MAP_HEADER_LOD_PROPERTY] = int(header["lod_level"])
         node["PC_REHD_PHYSICAL_SLOT"] = int(physical_slot)
         node["CodexV4ImportedMeshIndex"] = int(physical_slot)
         node["CodexV4DisplayMeshIndex"] = int(display_slot)
@@ -34606,7 +35043,6 @@ def _scene_node_map_rename(payload):
     for node, header, header_json, header_digest in changed_nodes:
         node[_NODE_MAP_HEADER_PROPERTY] = header_json
         node[_NODE_MAP_HEADER_SHA256_PROPERTY] = header_digest
-        node[_NODE_MAP_HEADER_LOD_PROPERTY] = int(header["lod_level"])
         node["PC_REHD_SOURCE_FVF"] = "0x%08X" % int(header["fvf_info"])
         node["CodexRe6SourceFVF"] = "0x%08X" % int(header["fvf_info"])
         node["PC_REHD_MESH_TYPE"] = int(header["meshtype"])
@@ -34638,15 +35074,14 @@ def _scene_node_map_rename(payload):
 
 def _blender_mesh_rename_callback_row(node):
     """Return only the live fields changed or reparented by a Mesh rename."""
-    authority_name = _re6_mesh_authority_name(node)
-    facts = _mesh_name_facts(authority_name)
+    live_object_name = _re6_mesh_live_object_name(node)
+    facts = _mesh_name_facts(live_object_name)
     parent = getattr(node, "parent", None)
-    declared_parent = _property_text(node, "PC_REHD_PARENT_NAME")
     return {
-        "scene_node": authority_name,
+        "scene_node": live_object_name,
         "blender_object_name": str(getattr(node, "name", "") or ""),
         "scene_node_handle": _pointer(node),
-        "parent_name": declared_parent or (
+        "parent_name": (
             str(getattr(parent, "name", "") or "") if parent is not None else ""
         ),
         "parent_handle": _pointer(parent) if parent is not None else 0,
@@ -34691,11 +35126,6 @@ def _scene_rename(payload):
         node.name = "__PC_REHD_RENAME_%s_%s" % (os.getpid(), index)
     for node, new_name in zip(selected, final_names):
         node.name = new_name
-        # The scene contract reads this persistent Header before Object.name.
-        # Update both values together so a later field rename starts from the
-        # name the user just committed instead of restoring an older field.
-        if _FULL_RE6_MESH_HEADER_NAME_RE.fullmatch(new_name) is not None:
-            _set_re6_mesh_authority_name(node, new_name)
         renamed.append({"handle": _pointer(node), "name": str(node.name)})
     hierarchy = _rebuild_lod_hierarchy(selected)
     selection_receipt = _scene_select(
@@ -34878,9 +35308,9 @@ def _scene_filter(payload):
     nodes_by_handle = {_pointer(node): node for node in mesh_nodes}
     nodes_by_name = {str(node.name): node for node in mesh_nodes}
     for node in mesh_nodes:
-        authority_name = _re6_mesh_authority_name(node)
-        if authority_name:
-            nodes_by_name.setdefault(authority_name, node)
+        live_object_name = _re6_mesh_live_object_name(node)
+        if live_object_name:
+            nodes_by_name.setdefault(live_object_name, node)
     nodes_by_mapping_id = {}
     for node in mesh_nodes:
         mapping_id = _property_text(node, _NODE_MAPPING_ID_PROPERTY).lower()
@@ -34899,7 +35329,7 @@ def _scene_filter(payload):
         if slot <= 0:
             try:
                 slot = int(
-                    _mesh_name_facts(_re6_mesh_authority_name(node)).get(
+                    _mesh_name_facts(_re6_mesh_live_object_name(node)).get(
                         "scene_name_mesh_slot"
                     )
                     or 0
@@ -35196,7 +35626,7 @@ def _blender_mrl_slot(node):
         slot = _integer_property(node, "PC_REHD_PHYSICAL_SLOT")
     if slot > 0:
         return slot
-    facts = _mesh_name_facts(_re6_mesh_authority_name(node))
+    facts = _mesh_name_facts(_re6_mesh_live_object_name(node))
     try:
         return int(facts.get("scene_name_mesh_slot") or 0)
     except (TypeError, ValueError, OverflowError):
@@ -36205,8 +36635,47 @@ def _native_fbx_import(path, *, use_custom_normals):
 def _fbx_hierarchy_file_browser_operations():
     """Observe native FBX file selectors without replacing Blender's operators."""
     rows = []
+    seen = {}
     window_manager = getattr(bpy.context, "window_manager", None)
+
+    def append_operator(window, operator, params=None, source="file_browser"):
+        if operator is None:
+            return
+        operator_id = str(getattr(operator, "bl_idname", "") or "").casefold()
+        if operator_id == "wm_ot_fbx_import":
+            operator_id = "wm.fbx_import"
+        elif operator_id == "wm_ot_drop_import_file":
+            operator_id = "wm.drop_import_file"
+        elif operator_id == "export_scene_ot_fbx":
+            operator_id = "export_scene.fbx"
+        if operator_id not in {
+            "wm.fbx_import",
+            "wm.drop_import_file",
+            "export_scene.fbx",
+        }:
+            return
+        operator_handle = _pointer(operator)
+        filepath = _fbx_hierarchy_operator_filepath(operator, params)
+        if filepath and os.path.splitext(filepath)[1].casefold() != ".fbx":
+            return
+        row = {
+            "operator_id": operator_id,
+            "operator_handle": operator_handle,
+            "filepath": filepath,
+            "scene": getattr(window, "scene", None) or bpy.context.scene,
+            "source": str(source),
+        }
+        dedupe_key = (operator_id, operator_handle, str(source))
+        if operator_handle and dedupe_key in seen:
+            rows[seen[dedupe_key]] = row if filepath else rows[seen[dedupe_key]]
+            return
+        if operator_handle:
+            seen[dedupe_key] = len(rows)
+        rows.append(row)
+
     for window in getattr(window_manager, "windows", ()):
+        for operator in getattr(window, "modal_operators", ()):
+            append_operator(window, operator, source="modal_operator")
         screen = getattr(window, "screen", None)
         for area in getattr(screen, "areas", ()):
             if str(getattr(area, "type", "") or "") != "FILE_BROWSER":
@@ -36217,33 +36686,10 @@ def _fbx_hierarchy_file_browser_operations():
             operator = getattr(space, "active_operator", None)
             if operator is None:
                 operator = getattr(space, "operator", None)
-            operator_id = str(getattr(operator, "bl_idname", "") or "").casefold()
-            if operator_id == "wm_ot_fbx_import":
-                operator_id = "wm.fbx_import"
-            elif operator_id == "export_scene_ot_fbx":
-                operator_id = "export_scene.fbx"
-            if operator_id not in {"wm.fbx_import", "export_scene.fbx"}:
-                continue
-            filepath = str(getattr(operator, "filepath", "") or "").strip()
             params = getattr(space, "params", None)
-            if not filepath and params is not None:
-                directory = getattr(params, "directory", b"")
-                if isinstance(directory, bytes):
-                    directory = directory.decode("utf-8", "replace")
-                filename = str(getattr(params, "filename", "") or "").strip()
-                if directory and filename:
-                    filepath = os.path.join(str(directory), filename)
-            filepath = os.path.abspath(bpy.path.abspath(filepath)) if filepath else ""
-            if filepath and os.path.splitext(filepath)[1].casefold() != ".fbx":
-                continue
-            rows.append(
-                {
-                    "operator_id": operator_id,
-                    "operator_handle": _pointer(operator),
-                    "filepath": filepath,
-                    "scene": getattr(window, "scene", None) or bpy.context.scene,
-                }
-            )
+            append_operator(window, operator, params, source="file_browser")
+    for operator in getattr(window_manager, "operators", ()):
+        append_operator(None, operator, source="operator_history")
     return rows
 
 
@@ -36284,8 +36730,70 @@ def _fbx_hierarchy_import_snapshot(nodes):
     return tuple(sorted(snapshot))
 
 
+def _fbx_hierarchy_import_identity_batches(contract, nodes):
+    """Split merged native imports by the preserved source Model identity."""
+    if not isinstance(contract, dict) or not bool(contract.get("contract_available", True)):
+        return [list(nodes)]
+    source_by_identity = {}
+    source_by_name = {}
+    for row in contract.get("models", []):
+        if not isinstance(row, dict):
+            continue
+        source_id = str(row.get("source_model_id", "") or "")
+        if not source_id:
+            continue
+        source_by_name.setdefault(
+            str(row.get("source_model_name", "") or "").casefold(), []
+        ).append(row)
+        for identity in _fbx_hierarchy_source_identity_candidates(row):
+            source_by_identity.setdefault(identity, []).append(row)
+
+    def source_id_for_node(node):
+        for identity in _fbx_hierarchy_node_identity_candidates(node):
+            rows = source_by_identity.get(identity, [])
+            if len(rows) == 1:
+                return str(rows[0].get("source_model_id", "") or "")
+        for candidate in _fbx_hierarchy_name_candidates(node):
+            rows = source_by_name.get(candidate.casefold(), [])
+            if len(rows) == 1:
+                return str(rows[0].get("source_model_id", "") or "")
+        return ""
+
+    occurrences = {}
+    entries = []
+    has_duplicate = False
+    for node in nodes:
+        source_id = source_id_for_node(node)
+        if source_id:
+            ordinal = int(occurrences.get(source_id, 0))
+            occurrences[source_id] = ordinal + 1
+            has_duplicate = has_duplicate or ordinal > 0
+        else:
+            ordinal = None
+        entries.append((node, ordinal))
+    if not has_duplicate:
+        return [list(nodes)]
+
+    batch_count = max(occurrences.values(), default=1)
+    batches = [[] for _index in range(batch_count)]
+    for node, ordinal in entries:
+        # Objects without a preserved identity are non-model helpers in the
+        # native FBX output; keep them with the first batch.
+        index = ordinal if ordinal is not None and ordinal < batch_count else 0
+        batches[index].append(node)
+    return [batch for batch in batches if batch]
+
+
 def _fbx_hierarchy_schedule_import_repair(
-    scene, filepath, before_handles, *, contract=None, key=None, origin="native_import"
+    scene,
+    filepath,
+    before_handles,
+    *,
+    contract=None,
+    key=None,
+    operation_key=None,
+    capture_handles=None,
+    origin="native_import",
 ):
     """Keep an already-read source hierarchy contract until native import ends."""
     scene_handle = _pointer(scene)
@@ -36294,10 +36802,25 @@ def _fbx_hierarchy_schedule_import_repair(
     watch_key = key or (
         str(origin), normalized_path.casefold(), uuid.uuid4().hex
     )
-    _FBX_HIERARCHY_IMPORT_WATCHES[scene_handle] = {
+    if operation_key is None and isinstance(watch_key, (tuple, list)) and len(watch_key) == 2:
+        try:
+            operation_key = (
+                scene_handle,
+                int(watch_key[0] or 0),
+                str(watch_key[1] or "").casefold(),
+            )
+        except (TypeError, ValueError, OverflowError):
+            operation_key = None
+    watch = {
         "key": watch_key,
+        "operation_key": operation_key,
         "filepath": normalized_path,
         "before_handles": {int(value) for value in before_handles},
+        "capture_handles": (
+            {int(value) for value in capture_handles}
+            if capture_handles
+            else None
+        ),
         "observed_at": now,
         "stable_snapshot": (),
         "stable_passes": 0,
@@ -36305,6 +36828,12 @@ def _fbx_hierarchy_schedule_import_repair(
         "source_contract_read_at": now if isinstance(contract, dict) else 0.0,
         "origin": str(origin or "native_import"),
     }
+    scene_watches = _FBX_HIERARCHY_IMPORT_WATCHES.setdefault(scene_handle, [])
+    if not any(
+        isinstance(existing, dict) and existing.get("key") == watch_key
+        for existing in scene_watches
+    ):
+        scene_watches.append(watch)
     status = (
         "CONTRACT_READY"
         if isinstance(contract, dict)
@@ -36323,34 +36852,186 @@ def _fbx_hierarchy_schedule_import_repair(
     }
 
 
+def _fbx_hierarchy_record_import_baseline(watch, handles):
+    if not isinstance(watch, dict):
+        return
+    operation_key = watch.get("operation_key")
+    if operation_key is not None:
+        _FBX_HIERARCHY_HANDLED_IMPORT_BASELINES[operation_key] = set(handles or ())
+
+
 def _fbx_hierarchy_monitor_native_import(operations):
     scene = bpy.context.scene
     scene_handle = _pointer(scene)
+    current_handles = {_pointer(node) for node in scene.objects}
+    scene_watches = _FBX_HIERARCHY_IMPORT_WATCHES.get(scene_handle, [])
+    if isinstance(scene_watches, dict):
+        scene_watches = [scene_watches]
+    elif not isinstance(scene_watches, (list, tuple)):
+        scene_watches = []
+    def _handles(values):
+        result = set()
+        for value in values or ():
+            try:
+                result.add(int(value))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return result
+
+    def _watch_expected_handles(watch):
+        if not isinstance(watch, dict) or watch.get("capture_handles") is None:
+            return None
+        return _handles(watch.get("before_handles")) | _handles(
+            watch.get("capture_handles")
+        )
+
+    # Keep one logical history key per operator/path, while retaining the
+    # object boundary for every active watch. A missing capture snapshot means
+    # the watch is still waiting for its first imported object.
+    active_watch_keys = {}
+    for watch in scene_watches:
+        if not isinstance(watch, dict):
+            continue
+        operation_key = watch.get("operation_key")
+        if operation_key is None:
+            continue
+        snapshot = _watch_expected_handles(watch)
+        if operation_key not in active_watch_keys:
+            active_watch_keys[operation_key] = snapshot
+        elif snapshot is not None:
+            existing_snapshot = active_watch_keys[operation_key]
+            if existing_snapshot is None:
+                active_watch_keys[operation_key] = set(snapshot)
+            else:
+                existing_snapshot.update(snapshot)
+    armed = _FBX_HIERARCHY_MANUAL_IMPORT_ARMS.get(scene_handle)
     imports = [
         row for row in operations
-        if row["operator_id"] == "wm.fbx_import" and row["scene"] is scene
+        if row.get("operator_id") in {"wm.fbx_import", "wm.drop_import_file"}
+        and row.get("scene") is scene
     ]
-    if imports:
-        row = imports[0]
-        filepath = str(row.get("filepath", "") or "")
+    pending_imports = []
+    for row in imports:
+        filepath = str(row.get("filepath", "") or "").casefold()
+        try:
+            operator_handle = int(row.get("operator_handle", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            operator_handle = 0
+        operation_key = (
+            (scene_handle, operator_handle, filepath)
+            if filepath
+            else None
+        )
+        if _fbx_hierarchy_history_import_is_duplicate(
+            key=operation_key,
+            source=row.get("source", ""),
+            handled_keys=_FBX_HIERARCHY_HANDLED_IMPORT_KEYS,
+            handled_baselines=_FBX_HIERARCHY_HANDLED_IMPORT_BASELINES,
+            current_handles=current_handles,
+            watch_active=active_watch_keys,
+        ):
+            continue
+        pending_imports.append(row)
+    imports = _fbx_hierarchy_manual_import_rows(pending_imports, armed)
+    imports = [
+        row
+        for row in imports
+        if str(row.get("filepath", "") or "").strip()
+        or str(row.get("source", "") or "") != "operator_history"
+    ]
+    idle_handles = _FBX_HIERARCHY_IDLE_OBJECT_HANDLES.get(
+        scene_handle, current_handles
+    )
+    last_filepath = (
+        _fbx_hierarchy_last_fbx_import_path()
+        if not any(
+            str(row.get("filepath", "") or "").strip() for row in imports
+        )
+        and isinstance(armed, dict)
+        else ""
+    )
+    decision = _fbx_hierarchy_manual_import_transition(
+        active_rows=imports,
+        armed=armed,
+        idle_handles=idle_handles,
+        current_handles=current_handles,
+        last_filepath=last_filepath,
+        now=time.monotonic(),
+        timeout_seconds=_FBX_HIERARCHY_IMPORT_WATCH_TIMEOUT_SECONDS,
+    )
+    action = str(decision.get("action", "IDLE") or "IDLE")
+    if action == "ARM":
+        _FBX_HIERARCHY_MANUAL_IMPORT_ARMS[scene_handle] = decision["armed"]
+        return
+    if action == "WAIT":
+        _FBX_HIERARCHY_MANUAL_IMPORT_ARMS[scene_handle] = decision["armed"]
+        return
+    if action == "CANCEL":
+        _FBX_HIERARCHY_MANUAL_IMPORT_ARMS.pop(scene_handle, None)
+        _FBX_HIERARCHY_IDLE_OBJECT_HANDLES[scene_handle] = current_handles
+        return
+    if action == "CAPTURE":
+        filepath = str(decision.get("filepath", "") or "")
+        try:
+            operator_handle = int(decision.get("operator_handle", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            operator_handle = 0
+        operation_key = (
+            (scene_handle, operator_handle, filepath.casefold())
+            if filepath
+            else None
+        )
+        if operation_key is not None:
+            _FBX_HIERARCHY_HANDLED_IMPORT_BASELINES.pop(operation_key, None)
+            _FBX_HIERARCHY_HANDLED_IMPORT_KEYS.add(operation_key)
+            if len(_FBX_HIERARCHY_HANDLED_IMPORT_KEYS) > 512:
+                _FBX_HIERARCHY_HANDLED_IMPORT_KEYS.clear()
+                _FBX_HIERARCHY_HANDLED_IMPORT_BASELINES.clear()
+                _FBX_HIERARCHY_HANDLED_IMPORT_KEYS.add(operation_key)
         if filepath and os.path.isfile(filepath):
-            key = (int(row["operator_handle"]), filepath.casefold())
-            previous = _FBX_HIERARCHY_IMPORT_WATCHES.get(scene_handle)
-            if previous is None or previous.get("key") != key:
-                # The operator stack can become visible after Blender has
-                # already created its first Model. Use the last idle snapshot,
-                # captured before any FBX operator existed, so no imported
-                # Model escapes the source-contract repair.
-                before_handles = _FBX_HIERARCHY_IDLE_OBJECT_HANDLES.get(
-                    scene_handle
+            current_scene_watches = _FBX_HIERARCHY_IMPORT_WATCHES.setdefault(
+                scene_handle, []
+            )
+            if isinstance(current_scene_watches, dict):
+                current_scene_watches = [current_scene_watches]
+                _FBX_HIERARCHY_IMPORT_WATCHES[scene_handle] = current_scene_watches
+            elif not isinstance(current_scene_watches, list):
+                current_scene_watches = []
+                _FBX_HIERARCHY_IMPORT_WATCHES[scene_handle] = current_scene_watches
+            key = (operator_handle, filepath.casefold())
+            same_key_watches = [
+                watch
+                for watch in current_scene_watches
+                if isinstance(watch, dict)
+                and watch.get("operation_key") == operation_key
+            ]
+            batch_before = _handles(
+                decision.get("before_handles", current_handles)
+            )
+            for watch in current_scene_watches:
+                expected = _watch_expected_handles(watch)
+                if expected is None:
+                    expected = _handles(watch.get("before_handles", ()))
+                batch_before.update(expected)
+            new_batch_handles = current_handles - batch_before
+            unresolved_same_key = any(
+                watch.get("capture_handles") is None
+                for watch in same_key_watches
+            )
+            duplicate_capture = bool(same_key_watches) and (
+                unresolved_same_key or not new_batch_handles
+            )
+            if not duplicate_capture:
+                # Repeated observations keep the logical history key, but a
+                # real second import receives its own watch batch key.
+                watch_key = (
+                    key
+                    if not same_key_watches
+                    else (operator_handle, filepath.casefold(), uuid.uuid4().hex)
                 )
-                if before_handles is None:
-                    before_handles = {
-                        _pointer(node) for node in scene.objects
-                    }
-                # Read the original binary FBX while Blender's native import
-                # operator is still active. The contract is then immutable
-                # in Worker memory before any reparenting can occur.
+                capture_handles = new_batch_handles or None
+                # Read the original binary FBX before any reparenting can
+                # occur. The contract is immutable in Worker memory.
                 try:
                     contract = _fbx_hierarchy_source_contract_from_fbx(filepath)
                 except Exception as exc:
@@ -36361,75 +37042,132 @@ def _fbx_hierarchy_monitor_native_import(operations):
                 _fbx_hierarchy_schedule_import_repair(
                     scene,
                     filepath,
-                    before_handles,
+                    batch_before,
                     contract=contract,
-                    key=key,
-                    origin="native_file_browser",
+                    key=watch_key,
+                    operation_key=operation_key,
+                    capture_handles=capture_handles,
+                    origin=str(decision.get("origin", "native_file_browser")),
                 )
+        current_scene_watches = _FBX_HIERARCHY_IMPORT_WATCHES.get(scene_handle, [])
+        if operation_key is not None and not any(
+            isinstance(watch, dict)
+            and watch.get("operation_key") == operation_key
+            for watch in (
+                [current_scene_watches]
+                if isinstance(current_scene_watches, dict)
+                else current_scene_watches
+                if isinstance(current_scene_watches, (list, tuple))
+                else []
+            )
+        ):
+            _FBX_HIERARCHY_HANDLED_IMPORT_BASELINES[operation_key] = set(
+                current_handles
+            )
+        _FBX_HIERARCHY_MANUAL_IMPORT_ARMS.pop(scene_handle, None)
         return
-    watch = _FBX_HIERARCHY_IMPORT_WATCHES.get(scene_handle)
-    if not isinstance(watch, dict):
+    if not scene_watches:
         _FBX_HIERARCHY_IDLE_OBJECT_HANDLES[scene_handle] = {
             _pointer(node) for node in scene.objects
         }
         return
     now = time.monotonic()
-    if (
-        now - float(watch.get("observed_at", 0.0) or 0.0)
-        > _FBX_HIERARCHY_IMPORT_WATCH_TIMEOUT_SECONDS
-    ):
-        _FBX_HIERARCHY_IMPORT_WATCHES.pop(scene_handle, None)
-        _FBX_HIERARCHY_IDLE_OBJECT_HANDLES[scene_handle] = {
-            _pointer(node) for node in scene.objects
-        }
-        return
-    before_handles = {int(value) for value in watch.get("before_handles", set())}
-    imported = [node for node in scene.objects if _pointer(node) not in before_handles]
-    if not imported:
-        return
-    try:
-        bpy.context.view_layer.update()
-    except Exception:
-        pass
-    snapshot = _fbx_hierarchy_import_snapshot(imported)
-    if snapshot != watch.get("stable_snapshot"):
-        watch["stable_snapshot"] = snapshot
-        watch["stable_passes"] = 1
-        return
-    stable_passes = int(watch.get("stable_passes", 0) or 0)
-    if stable_passes < 2:
-        watch["stable_passes"] = stable_passes + 1
-        return
-    contract = watch.get("contract")
-    if not isinstance(contract, dict):
-        _FBX_HIERARCHY_IMPORT_WATCHES.pop(scene_handle, None)
-        _FBX_HIERARCHY_IDLE_OBJECT_HANDLES[scene_handle] = {
-            _pointer(node) for node in scene.objects
-        }
-        return
-    _FBX_HIERARCHY_IMPORT_WATCHES.pop(scene_handle, None)
-    try:
-        if not bool(contract.get("contract_available", True)):
-            return
-        if not _fbx_hierarchy_contract_has_overlap(contract, imported):
-            return
-        receipt = _fbx_hierarchy_apply_import_contract(
-            contract,
-            imported,
-            strict=True,
-            full_source_hierarchy=True,
-            record_evidence=False,
+    remaining_watches = []
+    for watch in scene_watches:
+        if not isinstance(watch, dict):
+            continue
+        if (
+            now - float(watch.get("observed_at", 0.0) or 0.0)
+            > _FBX_HIERARCHY_IMPORT_WATCH_TIMEOUT_SECONDS
+        ):
+            _fbx_hierarchy_record_import_baseline(watch, current_handles)
+            continue
+        before_handles = _handles(watch.get("before_handles", set()))
+        captured_handles = watch.get("capture_handles")
+        if captured_handles is None:
+            imported = [
+                node
+                for node in scene.objects
+                if _pointer(node) not in before_handles
+            ]
+            if imported:
+                captured_handles = {_pointer(node) for node in imported}
+                watch["capture_handles"] = set(captured_handles)
+        else:
+            captured_handles = _handles(captured_handles)
+            imported = [
+                node
+                for node in scene.objects
+                if _pointer(node) in captured_handles
+            ]
+        if not imported:
+            remaining_watches.append(watch)
+            continue
+        identity_batches = _fbx_hierarchy_import_identity_batches(
+            watch.get("contract"), imported
         )
-        if int(receipt.get("routed_model_count", 0) or 0) > 0:
-            try:
-                bpy.ops.ed.undo_push(message="PC-REHD Restore Source FBX Hierarchy")
-            except Exception:
-                pass
-    except Exception:
-        # A native manual import must remain untouched if its full source
-        # contract cannot be proven. The explicit repair tool can report it.
-        pass
-    finally:
+        if len(identity_batches) > 1:
+            base_key = watch.get("key")
+            for batch_index, batch in enumerate(identity_batches):
+                if not batch:
+                    continue
+                split_watch = dict(watch)
+                split_watch["key"] = (base_key, int(batch_index))
+                split_watch["capture_handles"] = {
+                    _pointer(node) for node in batch
+                }
+                split_watch["stable_snapshot"] = ()
+                split_watch["stable_passes"] = 0
+                remaining_watches.append(split_watch)
+            continue
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
+        snapshot = _fbx_hierarchy_import_snapshot(imported)
+        if snapshot != watch.get("stable_snapshot"):
+            watch["stable_snapshot"] = snapshot
+            watch["stable_passes"] = 1
+            remaining_watches.append(watch)
+            continue
+        stable_passes = int(watch.get("stable_passes", 0) or 0)
+        if stable_passes < 2:
+            watch["stable_passes"] = stable_passes + 1
+            remaining_watches.append(watch)
+            continue
+        contract = watch.get("contract")
+        if not isinstance(contract, dict):
+            _fbx_hierarchy_record_import_baseline(watch, current_handles)
+            continue
+        try:
+            if not bool(contract.get("contract_available", True)):
+                continue
+            if not _fbx_hierarchy_contract_has_overlap(contract, imported):
+                continue
+            receipt = _fbx_hierarchy_apply_import_contract(
+                contract,
+                imported,
+                strict=True,
+                full_source_hierarchy=True,
+                record_evidence=False,
+            )
+            if int(receipt.get("routed_model_count", 0) or 0) > 0:
+                try:
+                    bpy.ops.ed.undo_push(
+                        message="PC-REHD Restore Source FBX Hierarchy"
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            # A native manual import must remain untouched if its full source
+            # contract cannot be proven. The explicit repair tool can report it.
+            pass
+        finally:
+            _fbx_hierarchy_record_import_baseline(watch, current_handles)
+    if remaining_watches:
+        _FBX_HIERARCHY_IMPORT_WATCHES[scene_handle] = remaining_watches
+    else:
+        _FBX_HIERARCHY_IMPORT_WATCHES.pop(scene_handle, None)
         _FBX_HIERARCHY_IDLE_OBJECT_HANDLES[scene_handle] = {
             _pointer(node) for node in scene.objects
         }
@@ -36504,11 +37242,19 @@ def _fbx_hierarchy_monitor_native_file_operations(force=False):
 def _fbx_hierarchy_monitor_metrics(msgbus_registered):
     count = int(_FBX_HIERARCHY_MONITOR_SCAN_COUNT)
     total = float(_FBX_HIERARCHY_MONITOR_TOTAL_SECONDS)
+    pending_import_repairs = sum(
+        len(value)
+        if isinstance(value, (list, tuple))
+        else 1
+        if isinstance(value, dict)
+        else 0
+        for value in _FBX_HIERARCHY_IMPORT_WATCHES.values()
+    )
     return {
         "auto_repair_enabled": bool(_FBX_HIERARCHY_AUTO_REPAIR_ENABLED),
         "msgbus_registered": bool(msgbus_registered),
         "event_wake_count": int(_FBX_HIERARCHY_MONITOR_EVENT_WAKE_COUNT),
-        "pending_import_repairs": len(_FBX_HIERARCHY_IMPORT_WATCHES),
+        "pending_import_repairs": pending_import_repairs,
         "import_repair_mode": "contract_before_native_import_completion",
         "fallback_interval_ms": int(
             _FBX_HIERARCHY_MONITOR_FALLBACK_SECONDS * 1000.0
@@ -36602,6 +37348,9 @@ def _fbx_hierarchy_configure_auto_repair(enabled, *, persist):
         _FBX_HIERARCHY_IMPORT_WATCHES.clear()
         _FBX_HIERARCHY_EXPORT_WATCHES.clear()
         _FBX_HIERARCHY_IDLE_OBJECT_HANDLES.clear()
+        _FBX_HIERARCHY_MANUAL_IMPORT_ARMS.clear()
+        _FBX_HIERARCHY_HANDLED_IMPORT_KEYS.clear()
+        _FBX_HIERARCHY_HANDLED_IMPORT_BASELINES.clear()
         if not requested:
             _fbx_hierarchy_unregister_native_operator_msgbus()
         return {
@@ -36617,6 +37366,9 @@ def _fbx_hierarchy_configure_auto_repair(enabled, *, persist):
     _FBX_HIERARCHY_IMPORT_WATCHES.clear()
     _FBX_HIERARCHY_EXPORT_WATCHES.clear()
     _FBX_HIERARCHY_IDLE_OBJECT_HANDLES.clear()
+    _FBX_HIERARCHY_MANUAL_IMPORT_ARMS.clear()
+    _FBX_HIERARCHY_HANDLED_IMPORT_KEYS.clear()
+    _FBX_HIERARCHY_HANDLED_IMPORT_BASELINES.clear()
     if requested:
         registered = _fbx_hierarchy_register_native_operator_msgbus()
     else:
@@ -36681,10 +37433,28 @@ def _fbx_hierarchy_read_startup_auto_repair_state():
 
 
 def _fbx_hierarchy_start_auto_repair_monitor():
+    global _FBX_HIERARCHY_MONITOR_STARTED
+    if _FBX_HIERARCHY_MONITOR_STARTED:
+        return {
+            "action": "scene.configure_fbx_hierarchy_auto_repair",
+            "auto_repair_enabled": bool(_FBX_HIERARCHY_AUTO_REPAIR_ENABLED),
+            "native_operator_msgbus": bool(_FBX_HIERARCHY_MSGBUS_REGISTERED),
+            "pending_import_repairs": sum(
+                len(value)
+                if isinstance(value, (list, tuple))
+                else 1
+                if isinstance(value, dict)
+                else 0
+                for value in _FBX_HIERARCHY_IMPORT_WATCHES.values()
+            ),
+        }
     enabled = _fbx_hierarchy_read_startup_auto_repair_state()
     if enabled is None:
         enabled = True
-    return _fbx_hierarchy_configure_auto_repair(enabled, persist=False)
+    result = _fbx_hierarchy_configure_auto_repair(enabled, persist=False)
+    if not bool(result.get("deferred_until_scene_ready", False)):
+        _FBX_HIERARCHY_MONITOR_STARTED = True
+    return result
 
 
 def _import_fbx(payload):
@@ -36708,6 +37478,7 @@ def _import_fbx(payload):
     source_hierarchy_contract = _fbx_hierarchy_validate_contract(
         payload.get("fbx_hierarchy_contract"), path
     )
+    _FBX_HIERARCHY_MANUAL_IMPORT_ARMS.pop(_pointer(bpy.context.scene), None)
     before = {_pointer(node) for node in bpy.context.scene.objects}
     preexisting_material_handles = {_pointer(material) for material in bpy.data.materials}
     preexisting_image_handles = {_pointer(image) for image in bpy.data.images}
@@ -36788,12 +37559,10 @@ def _import_fbx(payload):
             continue
         mesh["PC_REHD_MESH_TYPE"] = int(mesh_type)
         restored_mesh_type_slots.append(int(slot))
-        header_name = full_headers_by_slot.get(slot)
-        if header_name is not None:
-            _set_re6_mesh_authority_name(mesh, header_name)
+        if full_headers_by_slot.get(slot) is not None:
             restored_full_header_slots.append(int(slot))
-    # Preserve the complete Header as explicit scene metadata after the native
-    # importer has proved that its visible Mesh name is already complete.
+    # The current Object name remains the only scene Header authority. Record
+    # slots already verified above without creating a second saved Header.
     for mesh in imported_meshes:
         slot = _integer_property(mesh, "PC_REHD_PHYSICAL_SLOT") or _integer_property(
             mesh, "CodexV4ImportedMeshIndex"
@@ -36801,7 +37570,6 @@ def _import_fbx(payload):
         header_name = full_headers_by_slot.get(slot)
         if header_name is None or int(slot) in restored_full_header_slots:
             continue
-        _set_re6_mesh_authority_name(mesh, header_name)
         restored_full_header_slots.append(int(slot))
     missing_mesh_type_slots = sorted(
         set(mesh_types_by_slot) - set(restored_mesh_type_slots)
@@ -36840,6 +37608,7 @@ def _import_fbx(payload):
         path,
         before,
         contract=source_hierarchy_contract,
+        capture_handles=[_pointer(node) for node in imported],
         origin="launcher_fbx_import",
     )
     hierarchy["candidate_node_count"] = len(imported)
@@ -36971,6 +37740,7 @@ def _import_3ds_max_exported_fbx(payload):
     source_hierarchy_contract = _fbx_hierarchy_validate_contract(
         payload.get("fbx_hierarchy_contract"), path
     )
+    _FBX_HIERARCHY_MANUAL_IMPORT_ARMS.pop(_pointer(bpy.context.scene), None)
     before = {_pointer(node) for node in bpy.context.scene.objects}
     outcome = _native_fbx_import(
         path,
@@ -38007,9 +38777,7 @@ def _scene_snapshot_mesh(node):
         _property_text(node, "PC_REHD_PARSER_FVF")
         or _property_text(node, "CodexRe6ParserFVF")
     ) or source_fvf
-    parent_name = _property_text(node, "PC_REHD_PARENT_NAME") or (
-        str(node.parent.name) if node.parent is not None else ""
-    )
+    parent_name = str(node.parent.name) if node.parent is not None else ""
     return {
         "node_name": str(node.name),
         "scene_node": str(node.name),
@@ -44579,6 +45347,23 @@ def _fbx_binary_model_custom_properties(record: Mapping[str, Any]) -> dict[str, 
     return values
 
 
+def _fbx_binary_model_identity_fields(record: Mapping[str, Any]) -> dict[str, str]:
+    """Return stable exporter identities preserved on imported Blender Objects."""
+    properties = _fbx_binary_model_custom_properties(record)
+    fields: dict[str, str] = {}
+    max_handle = str(properties.get("MaxHandle", "") or "").strip().strip('"')
+    if re.fullmatch(r"[1-9]\d*", max_handle):
+        fields["source_max_handle"] = max_handle
+    route_text = str(properties.get("UDP3DSMAX", "") or "")
+    route_match = re.search(
+        r"(?im)^\s*CodexRe6FbxRouteHandle\s*=\s*([1-9]\d*)\s*$",
+        route_text,
+    )
+    if route_match is not None:
+        fields["source_route_handle"] = route_match.group(1)
+    return fields
+
+
 def _fbx_source_model_hierarchy_contract(path: str | Path) -> dict[str, Any]:
     """Capture the source FBX Model graph before Blender can rewrite parent links."""
     source = Path(path).expanduser().resolve(strict=True)
@@ -44613,15 +45398,15 @@ def _fbx_source_model_hierarchy_contract(path: str | Path) -> dict[str, Any]:
         record = models_by_id[model_id]
         parent_id = int(parent_ids.get(model_id, 0))
         parent = models_by_id.get(parent_id)
-        models.append(
-            {
+        row = {
                 "source_model_id": str(model_id),
                 "source_model_name": str(record["name"]),
                 "source_model_type": str(record["type"]),
                 "source_parent_model_id": str(parent_id),
                 "source_parent_name": str(parent["name"]) if parent is not None else "",
             }
-        )
+        row.update(_fbx_binary_model_identity_fields(record))
+        models.append(row)
     graph_payload = {
         "schema": BLENDER_FBX_HIERARCHY_CONTRACT_SCHEMA,
         "revision": BLENDER_FBX_HIERARCHY_CONTRACT_REVISION,
@@ -47122,6 +47907,214 @@ def _run_blender_manual_rename_bucket_regression_guard() -> dict[str, Any]:
         "status": "PASS",
         "selected_hidden_manual_rename": True,
         "unselected_hidden_excluded": True,
+    }
+
+
+def _run_blender_worker_live_scene_regression_guard() -> dict[str, Any]:
+    """Prove Worker scene facts come from the current Blender Object."""
+    worker_source = _blender_worker_template_source()
+    worker_tree = ast.parse(worker_source)
+    definitions = {
+        node.name: node
+        for node in worker_tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    required = {
+        "_re6_mesh_live_object_name",
+        "_mesh_name_facts",
+        "_mesh_lod_level",
+        "_mesh_contract",
+        "_scene_contract",
+        "_scene_snapshot_mesh",
+    }
+    missing = sorted(required - set(definitions))
+    if missing:
+        raise AssertionError(
+            "Blender Worker live-scene functions are missing: " + ", ".join(missing)
+        )
+
+    wanted_assignments = {
+        "_LOD_NAME_RE",
+        "_MESH_SLOT_RE",
+        "_FVF_NAME_RE",
+        "_MESH_TOKEN_PATTERNS",
+    }
+    probe_body: list[ast.stmt] = []
+    for node in worker_tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in wanted_assignments
+            for target in node.targets
+        ):
+            probe_body.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in {
+            "_re6_mesh_live_object_name",
+            "_mesh_name_facts",
+            "_mesh_lod_level",
+        }:
+            probe_body.append(node)
+    namespace: dict[str, Any] = {"re": re}
+    exec(
+        compile(
+            ast.Module(body=probe_body, type_ignores=[]),
+            "<blender-worker-live-scene-probe>",
+            "exec",
+        ),
+        namespace,
+    )
+
+    live_name = (
+        "Mesh_082_14D40020_LODx255_MatID:48_Group:0_"
+        "DisplayMode:3_Type:65015"
+    )
+    stale_header = (
+        "Mesh_082_14D40020_LODx2_MatID:48_Group:0_"
+        "DisplayMode:3_Type:65015"
+    )
+
+    class ProbeData:
+        name = (
+            "Mesh_082_14D40020_LODx249_MatID:48_Group:0_"
+            "DisplayMode:3_Type:65015"
+        )
+
+    class ProbeNode:
+        name = live_name
+        data = ProbeData()
+
+        @staticmethod
+        def get(key: str, default: object = "") -> object:
+            if key == "CodexRe6FullMeshHeader":
+                return stale_header
+            if key == "PC_REHD_PARENT_NAME":
+                return "LodGroup_2"
+            if key == "PC_REHD_MESH_TYPE":
+                return 4128
+            return default
+
+    probe = ProbeNode()
+    if namespace["_re6_mesh_live_object_name"](probe) != live_name:
+        raise AssertionError(
+            "Blender Worker reused a stored Header or Mesh datablock name"
+        )
+    if namespace["_mesh_lod_level"](probe) != 255:
+        raise AssertionError(
+            "Blender Worker did not parse LOD 255 from the live Object name"
+        )
+    probe.name = "User_Invalid_Mesh_Name"
+    if (
+        namespace["_re6_mesh_live_object_name"](probe) != probe.name
+        or namespace["_mesh_lod_level"](probe) is not None
+    ):
+        raise AssertionError(
+            "Blender Worker fell back to stored metadata after an invalid live rename"
+        )
+
+    mesh_contract_source = ast.get_source_segment(
+        worker_source, definitions["_mesh_contract"]
+    ) or ""
+    snapshot_mesh_source = ast.get_source_segment(
+        worker_source, definitions["_scene_snapshot_mesh"]
+    ) or ""
+    retired_cache_markers = (
+        "CodexRe6FullMeshHeader",
+        "PC_REHD_HEADER_LOD_LEVEL",
+        "CodexRe6BlenderHierarchy",
+    )
+    remaining_cache_markers = [
+        marker for marker in retired_cache_markers if marker in worker_source
+    ]
+    if remaining_cache_markers:
+        raise AssertionError(
+            "Blender Worker still stores retired scene-value caches: "
+            + ", ".join(remaining_cache_markers)
+        )
+    for stale_property in ("PC_REHD_PARENT_NAME", "PC_REHD_MESH_TYPE"):
+        if stale_property in mesh_contract_source:
+            raise AssertionError(
+                "Blender Worker live Mesh contract still reads " + stale_property
+            )
+    if "PC_REHD_PARENT_NAME" in snapshot_mesh_source:
+        raise AssertionError(
+            "Blender Worker geometry snapshot still reads a stored parent name"
+        )
+    explicit_mesh_contract_keys = {
+        key.value
+        for node in ast.walk(definitions["_mesh_contract"])
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
+        for key in node.value.keys
+        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    }
+    if "header_fvf" in explicit_mesh_contract_keys:
+        raise AssertionError(
+            "Blender Worker overwrote the live Object-name FVF with stored source FVF"
+        )
+    scene_contract = definitions["_scene_contract"]
+    rebuild_lines = [
+        node.lineno
+        for node in ast.walk(scene_contract)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_rebuild_lod_hierarchy"
+    ]
+    mesh_contract_lines = [
+        node.lineno
+        for node in ast.walk(scene_contract)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_mesh_contract"
+    ]
+    if (
+        not rebuild_lines
+        or not mesh_contract_lines
+        or min(rebuild_lines) >= min(mesh_contract_lines)
+    ):
+        raise AssertionError(
+            "Blender Worker did not synchronize live LOD parents before inspection"
+        )
+
+    worker_class = next(
+        (
+            node
+            for node in worker_tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "_BlenderWorker"
+        ),
+        None,
+    )
+    if worker_class is None:
+        raise AssertionError("Blender Worker class is missing")
+    forbidden_state = {
+        "scene_cache",
+        "scene_contract_cache",
+        "selection_cache",
+        "mesh_header_cache",
+        "last_scene_contract",
+        "last_selection",
+    }
+    worker_state = {
+        target.attr
+        for node in ast.walk(worker_class)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        if isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+    }
+    found_forbidden_state = sorted(worker_state & forbidden_state)
+    if found_forbidden_state:
+        raise AssertionError(
+            "Blender Worker retains scene-result state: "
+            + ", ".join(found_forbidden_state)
+        )
+    return {
+        "status": "PASS",
+        "scene_node_authority": "bpy_object_name",
+        "lod_level": 255,
+        "mesh_datablock_name_ignored": True,
+        "stored_header_fallback": False,
+        "stored_parent_fallback": False,
+        "stored_type_override": False,
+        "live_lod_hierarchy_sync": True,
+        "persistent_scene_result_cache": False,
     }
 
 
@@ -66124,10 +67117,10 @@ class LauncherApp:
         )
         selection_hint = self._tr(
             "三个框互斥选项已经开启，同一个 Mesh 名称只能进入一个框。\n"
-            "按住 Shift 鼠标群选，可连骨骼和父级（LOD 层级）一起选择，导出器会自动识别 Mesh。\n"
+            "按住 Shift 鼠标群选，可连骨骼和父级（LOD 层级）一起选择，导出器会自动识别 Mesh。选中父级节点会自动全选子节点，如果子集合有要反选的，一定不要勾选父级别。\n"
             f"脚本实时监测 {scene_label} 场景，加入此处的 Mesh 有改名或删除也会在此立刻同步。",
             "Mutual exclusion is enabled across the three boxes; each Mesh name can appear in only one box.\n"
-            "Hold Shift for multi-selection. Bones and parent (LOD hierarchy) nodes may be selected together; the exporter automatically identifies Mesh nodes.\n"
+            "Hold Shift for multi-selection. Bones and parent (LOD hierarchy) nodes may be selected together; the exporter automatically identifies Mesh nodes. Selecting a parent node automatically includes all of its child nodes. If any child nodes need to be excluded, make sure the parent level is not selected.\n"
             f"The script monitors the {scene_label} scene in real time. Meshes added here are updated immediately when renamed or deleted.",
         )
         screen_width = max(640, window.winfo_screenwidth())
@@ -66173,7 +67166,7 @@ class LauncherApp:
             max(1, math.ceil(self._measure_ui_text(line) / selection_hint_wrap_width))
             for line in selection_hint.splitlines()
         )
-        bucket_list_height = max(5, min(8, selection_hint_lines + 1))
+        bucket_list_height = max(7, min(10, selection_hint_lines + 1))
         target_group = self.ttk.LabelFrame(
             body,
             text=self._tr("显示导出路径", "Export Destination"),
@@ -66510,7 +67503,7 @@ class LauncherApp:
                     max(1, math.ceil(self._measure_ui_text(line) / available_width))
                     for line in selection_hint.splitlines()
                 )
-                required_height = max(5, min(8, required_lines + 1))
+                required_height = max(7, min(10, required_lines + 1))
                 if int(target_listbox.cget("height")) != required_height:
                     target_listbox.configure(height=required_height)
 
@@ -96181,3 +97174,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     else:
         _start_rescue_agent_for_current_process()
+

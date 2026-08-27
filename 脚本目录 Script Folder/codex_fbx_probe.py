@@ -1054,6 +1054,7 @@ def _binary_fbx_read_corner_geometry(node: _BinaryFbxNode) -> dict[str, Any]:
         "corner_count": len(source_indices),
         "normal": None,
         "uv_channels": [],
+        "uv_errors": [],
         "strict_error": "",
     }
 
@@ -1106,8 +1107,14 @@ def _binary_fbx_read_corner_geometry(node: _BinaryFbxNode) -> dict[str, Any]:
             uv["name"] = _binary_fbx_layer_text(uv_node, "Name") or f"map{uv_layer_index + 1}"
             result["uv_channels"].append(uv)
         except Exception as exc:
-            result["strict_error"] = f"uv_layer_{uv_layer_index + 1}_invalid: {exc}"
-            return result
+            # UV channels are optional for normal fidelity.  A missing Map 2
+            # (or an empty optional UV layer emitted beside Map 1) must not
+            # downgrade the already decoded corner normalId stream to the
+            # legacy vertex-normal path.
+            result["uv_errors"].append(
+                f"uv_layer_{uv_layer_index + 1}_invalid: {exc}"
+            )
+            continue
     return result
 
 
@@ -1119,6 +1126,7 @@ def _build_binary_fbx_corner_geometry_context(path: Path) -> dict[str, Any]:
     """
     context: dict[str, Any] = {
         "by_fingerprint": {},
+        "by_geometry_id": {},
         "status": "available",
         "error": "",
     }
@@ -1152,6 +1160,9 @@ def _build_binary_fbx_corner_geometry_context(path: Path) -> dict[str, Any]:
             fingerprint = str(geometry.get("fingerprint", ""))
             if fingerprint != "":
                 context["by_fingerprint"].setdefault(fingerprint, []).append(geometry)
+            geometry_id = int(geometry.get("geometry_id", 0) or 0)
+            if geometry_id > 0:
+                context["by_geometry_id"].setdefault(geometry_id, []).append(geometry)
     except Exception as exc:
         context["status"] = "unavailable"
         context["error"] = f"binary_corner_reader_error: {type(exc).__name__}: {exc}"
@@ -1204,18 +1215,41 @@ def _disable_ufbx_normal_sources(audit: dict[str, Any]) -> dict[str, Any]:
 def _select_binary_fbx_corner_geometry(
     mesh: Any,
     context: dict[str, Any] | None,
+    binary_identity: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     if not isinstance(context, dict) or context.get("status") != "available":
         reason = str(context.get("error", "") if isinstance(context, dict) else "") or "binary_corner_reader_unavailable"
         return None, _binary_fbx_normal_fidelity_audit(status="fallback", reason=reason)
     fingerprint = _ufbx_mesh_geometry_fingerprint(mesh)
-    if fingerprint == "":
-        return None, _binary_fbx_normal_fidelity_audit(status="fallback", reason="ufbx_geometry_fingerprint_unavailable")
-    candidates = context.get("by_fingerprint", {}).get(fingerprint, [])
-    if len(candidates) != 1:
-        reason = "raw_geometry_not_found" if len(candidates) == 0 else "raw_geometry_ambiguous"
-        return None, _binary_fbx_normal_fidelity_audit(status="fallback", reason=reason)
-    geometry = candidates[0]
+    geometry_id = int(
+        binary_identity.get("fbx_geometry_id", 0)
+        if isinstance(binary_identity, dict)
+        else 0
+    )
+    if geometry_id > 0:
+        candidates = context.get("by_geometry_id", {}).get(geometry_id, [])
+        if len(candidates) != 1:
+            reason = "raw_geometry_id_not_found" if len(candidates) == 0 else "raw_geometry_id_ambiguous"
+            return None, _binary_fbx_normal_fidelity_audit(status="fallback", reason=reason)
+        geometry = candidates[0]
+        selected_fingerprint = str(geometry.get("fingerprint", "") or "")
+        if fingerprint != "" and selected_fingerprint != "" and fingerprint != selected_fingerprint:
+            return None, _binary_fbx_normal_fidelity_audit(
+                status="fallback",
+                reason="raw_geometry_identity_fingerprint_mismatch",
+                geometry=geometry,
+            )
+    else:
+        if fingerprint == "":
+            return None, _binary_fbx_normal_fidelity_audit(
+                status="fallback",
+                reason="ufbx_geometry_fingerprint_unavailable",
+            )
+        candidates = context.get("by_fingerprint", {}).get(fingerprint, [])
+        if len(candidates) != 1:
+            reason = "raw_geometry_not_found" if len(candidates) == 0 else "raw_geometry_ambiguous"
+            return None, _binary_fbx_normal_fidelity_audit(status="fallback", reason=reason)
+        geometry = candidates[0]
     strict_error = str(geometry.get("strict_error", "") or "")
     if strict_error != "":
         return None, _binary_fbx_normal_fidelity_audit(
@@ -1292,6 +1326,7 @@ def _binary_fbx_model_identity_context(
             ),
             "fbx_parent_model_id": 0,
             "fbx_parent_name": "",
+            "fbx_geometry_id": 0,
             "fbx_geometry_fingerprint": "",
         }
         if route_handle > 0:
@@ -1302,6 +1337,7 @@ def _binary_fbx_model_identity_context(
         if model_type.casefold() == "mesh" and model_name != "":
             models[int(model_id)] = model_identity
 
+    geometry_ids_by_model: dict[int, list[int]] = {}
     if connections_root is not None:
         for node in connections_root.children:
             values = node.properties
@@ -1320,11 +1356,21 @@ def _binary_fbx_model_identity_context(
                         parent.get("fbx_model_name", "") or ""
                     )
             if int(parent_id) in models and int(child_id) in geometry_fingerprints:
-                models[int(parent_id)]["fbx_geometry_fingerprint"] = geometry_fingerprints[
-                    int(child_id)
-                ]
+                geometry_ids_by_model.setdefault(int(parent_id), []).append(int(child_id))
             if int(parent_id) in route_models and int(child_id) in geometry_fingerprints:
                 route_models[int(parent_id)]["fbx_geometry_connected"] = True
+
+    for model_id, row in models.items():
+        geometry_ids = list(dict.fromkeys(geometry_ids_by_model.get(model_id, [])))
+        if len(geometry_ids) == 1:
+            geometry_id = geometry_ids[0]
+            row["fbx_geometry_id"] = geometry_id
+            row["fbx_geometry_fingerprint"] = geometry_fingerprints.get(geometry_id, "")
+        elif len(geometry_ids) > 1:
+            # A Model linked to multiple Geometry objects has no single raw
+            # identity. Leave the ID empty so the existing non-blocking
+            # fingerprint fallback decides whether a unique match exists.
+            row["fbx_geometry_connection_count"] = len(geometry_ids)
 
     queues: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for model_id in sorted(models):
@@ -2343,6 +2389,11 @@ def _extract_mesh_geometry_from_binary_corner_layers(
             else None
         )
 
+        first_corner_by_position = [-1 for _ in range(len(positions_src))]
+        for corner_index, position_index in enumerate(geom_indices):
+            if first_corner_by_position[position_index] < 0:
+                first_corner_by_position[position_index] = corner_index
+
         out_positions: list[list[float]] = []
         out_max_positions: list[list[float]] = []
         out_world_positions: list[list[float]] = []
@@ -2352,8 +2403,8 @@ def _extract_mesh_geometry_from_binary_corner_layers(
         out_skinned_normals: list[list[float]] = []
         out_uvs: list[list[float]] = []
         out_face_indices: list[int] = []
-        out_source_vertex_indices: list[int] = []
-        out_source_corner_indices: list[int] = []
+        out_source_vertex_indices = list(range(len(positions_src)))
+        out_source_corner_indices = list(first_corner_by_position)
         out_geom_face_indices: list[int] = []
         out_uv_channel_payloads = [
             {
@@ -2364,7 +2415,52 @@ def _extract_mesh_geometry_from_binary_corner_layers(
             }
             for channel in uv_channels
         ]
-        vertex_map: dict[tuple[int, tuple[tuple[float, float], ...], tuple[int, int, int]], int] = {}
+
+        # FBX normalId is only an indirect lookup into LayerElementNormal.Values;
+        # it is not vertex identity. Using normalId (or a corner UV index) in a
+        # vertex key expands the authored position table into polygon corners,
+        # even when those IDs decode to the same vector. Keep the original FBX
+        # position count/order and bind each position to its first authored
+        # corner value. A real MOD seam must already have its own position index.
+        for position_index, local_position_value in enumerate(positions_src):
+            corner_index = first_corner_by_position[position_index]
+            if corner_index >= 0:
+                normal_id = int(normal_corner_indices[corner_index])
+                corner_normal = _normalize_normal_vec3(normal_values[normal_id])
+                primary_uv = _default_vec2()
+                if uv_channels:
+                    primary_direct_index = int(uv_channels[0]["corner_indices"][corner_index])
+                    primary_uv = list(uv_channels[0]["values"][primary_direct_index])
+            else:
+                corner_normal = _default_normal()
+                primary_uv = _default_vec2()
+
+            local_position = _vec3_to_list(local_position_value)
+            world_position = _transform_position_row_major(local_position, prepared_transform)
+            max_position = (
+                _transform_position_row_major(world_position, world_to_max_matrix)
+                if world_to_max_matrix is not None
+                else _fbx_world_to_max_vec3(world_position)
+            )
+            out_positions.append(local_position)
+            out_world_positions.append(max_position)
+            out_max_positions.append(max_position)
+            out_normals.append(corner_normal)
+            out_max_normals.append(_fbx_authored_corner_normal_to_max(corner_normal))
+
+            skinned_position = local_position
+            skinned_position_index = _resolve_vertex_attr_index(
+                len(skinned_positions_src),
+                position_index=position_index,
+                corner_index=corner_index,
+                vertex_count=vertex_count,
+                index_count=index_count,
+            )
+            if skinned_position_index is not None and 0 <= skinned_position_index < len(skinned_positions_src):
+                skinned_position = _vec3_to_list(skinned_positions_src[skinned_position_index])
+            out_skinned_positions.append(list(skinned_position))
+            out_skinned_normals.append(list(corner_normal))
+            out_uvs.append(list(primary_uv))
 
         for face_begin, face_size in raw_faces:
             face_vertex_ids: list[int] = []
@@ -2373,65 +2469,10 @@ def _extract_mesh_geometry_from_binary_corner_layers(
             for local_offset in range(int(face_size)):
                 corner_index = int(face_begin) + local_offset
                 position_index = int(geom_indices[corner_index])
-                normal_direct_index = int(normal_corner_indices[corner_index])
-                corner_normal = _normalize_normal_vec3(normal_values[normal_direct_index])
-                corner_uvs: list[list[float]] = []
-                uv_key_parts: list[tuple[float, float]] = []
                 for channel_index, channel in enumerate(uv_channels):
                     direct_index = int(channel["corner_indices"][corner_index])
-                    uv = list(channel["values"][direct_index])
-                    corner_uvs.append(uv)
-                    uv_key_parts.append(_uv_key_from_value(uv))
                     face_uv_channel_ids[channel_index].append(direct_index)
-                primary_uv = corner_uvs[0] if corner_uvs else _default_vec2()
-                authored_max_normal = _fbx_authored_corner_normal_to_max(corner_normal)
-                normal_key = _encode_re6_normal_key_from_fbx_corner(authored_max_normal)
-                key = (position_index, tuple(uv_key_parts), normal_key)
-                vertex_id = vertex_map.get(key)
-                if vertex_id is None:
-                    vertex_id = len(out_positions)
-                    vertex_map[key] = vertex_id
-                    local_position = _vec3_to_list(positions_src[position_index])
-                    world_position = _transform_position_row_major(local_position, prepared_transform)
-                    # Blender's Mesh node carries its export axis basis and
-                    # object scale. The MOD position writer needs the restored
-                    # Max-space row rather than a raw local or FBX-world row.
-                    max_position = (
-                        _transform_position_row_major(world_position, world_to_max_matrix)
-                        if world_to_max_matrix is not None
-                        else _fbx_world_to_max_vec3(world_position)
-                    )
-                    out_positions.append(local_position)
-                    out_world_positions.append(max_position)
-                    out_max_positions.append(max_position)
-                    out_normals.append(corner_normal)
-                    out_max_normals.append(authored_max_normal)
-                    skinned_position = local_position
-                    skinned_position_index = _resolve_vertex_attr_index(
-                        len(skinned_positions_src),
-                        position_index=position_index,
-                        corner_index=corner_index,
-                        vertex_count=vertex_count,
-                        index_count=index_count,
-                    )
-                    if skinned_position_index is not None and 0 <= skinned_position_index < len(skinned_positions_src):
-                        skinned_position = _vec3_to_list(skinned_positions_src[skinned_position_index])
-                    out_skinned_positions.append(list(skinned_position))
-                    skinned_normal = corner_normal
-                    skinned_normal_index = _resolve_vertex_attr_index(
-                        len(skinned_normals_src),
-                        position_index=position_index,
-                        corner_index=corner_index,
-                        vertex_count=vertex_count,
-                        index_count=index_count,
-                    )
-                    if skinned_normal_index is not None and 0 <= skinned_normal_index < len(skinned_normals_src):
-                        skinned_normal = _vec3_to_list(skinned_normals_src[skinned_normal_index])
-                    out_skinned_normals.append(list(skinned_normal))
-                    out_uvs.append(list(primary_uv))
-                    out_source_vertex_indices.append(position_index)
-                    out_source_corner_indices.append(corner_index)
-                face_vertex_ids.append(vertex_id)
+                face_vertex_ids.append(position_index)
                 face_geom_vertex_ids.append(position_index)
 
             for tri_offset in range(1, len(face_vertex_ids) - 1):
@@ -2461,7 +2502,7 @@ def _extract_mesh_geometry_from_binary_corner_layers(
                 "output_vertex_count": len(out_positions),
                 "output_corner_count": len(out_face_indices),
                 "output_triangle_count": len(out_face_indices) // 3,
-                "normal_split_vertex_count": len(out_positions),
+                "normal_split_vertex_count": 0,
                 "normal_space": "fbx_authored_corner_no_mesh_node_transform",
                 "position_mode": "binary_fbx_node_axis_to_max",
             }
@@ -3121,6 +3162,7 @@ def _extract_scene_mesh_contracts(
         binary_corner_geometry, normal_fidelity = _select_binary_fbx_corner_geometry(
             mesh,
             binary_corner_context,
+            binary_identity,
         )
         geometry = _extract_mesh_geometry(
             mesh,
@@ -3231,6 +3273,7 @@ def _probe_scene_handoff(
         binary_corner_geometry, normal_fidelity = _select_binary_fbx_corner_geometry(
             mesh,
             binary_corner_context,
+            binary_identity,
         )
         geometry = _extract_mesh_geometry(
             mesh,
