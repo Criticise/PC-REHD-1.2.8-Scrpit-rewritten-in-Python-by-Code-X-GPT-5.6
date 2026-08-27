@@ -10,4 +10,3 @@
 - MAX/Blender scene nodes one time no cache policy that might mislead; FBX exclusively decides geometry
 - Fixed normal anomalies in RE6 FVF BB424024/BB424025
 - Fixed MOD export normal fidelity: the exported normal representation, values, and count now remain consistent with the source FBX.
-- 修复导出到 MOD 时的法线保真度：导出的法线种类、法线值和法线数量现在与源 FBX 保持一致。
