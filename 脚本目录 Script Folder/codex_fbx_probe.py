@@ -145,12 +145,30 @@ def get_fbx_probe_runtime_status() -> dict[str, Any]:
             "bridge_status": "OK",
             "classification": "runtime_available",
             "component": "ufbx",
+            "mode": "ufbx_native",
+            "substitute_available": True,
             "runtime_retryable": False,
         }
     if isinstance(UFBX_IMPORT_FAILURE, dict):
-        return dict(UFBX_IMPORT_FAILURE)
-    missing_error = UFBX_IMPORT_ERROR or ModuleNotFoundError("ufbx is not available")
-    return classify_fbx_probe_exception(missing_error, stage="import")
+        payload = dict(UFBX_IMPORT_FAILURE)
+    else:
+        missing_error = UFBX_IMPORT_ERROR or ModuleNotFoundError("ufbx is not available")
+        payload = classify_fbx_probe_exception(missing_error, stage="import")
+    # UFBX is an accelerator for the Probe, not a prerequisite for MOD export.
+    # Keep the original import diagnostics, but advertise the deterministic
+    # binary-reader lane so Launcher health checks do not block the operation.
+    payload.update(
+        {
+            "status": "ok",
+            "bridge_status": "OK",
+            "classification": "runtime_substitute_available",
+            "mode": "ufbx_missed_substitute",
+            "substitute_available": True,
+            "runtime_retryable": False,
+            "native_failure": True,
+        }
+    )
+    return payload
 
 
 MESH_SLOT_RE = re.compile(r"\bMESH[_\s-]*(\d{1,4})(?=\b|[_\s-])", re.IGNORECASE)
@@ -167,6 +185,9 @@ MAX_FBX_ROUTE_USER_PROPERTY = "CodexRe6FbxRouteHandle"
 MAX_FBX_ROUTE_USER_PROPERTY_RE = re.compile(
     rf"^\s*{re.escape(MAX_FBX_ROUTE_USER_PROPERTY)}\s*=\s*(?P<handle>\d+)\s*[Pp]?\s*$"
 )
+# A Max scene may contain duplicate Mesh names.  Its FBX route therefore
+# cannot use Blender's unmarked name/slot fallback.
+MAX_ALLOW_UNMARKED_ROUTE_FALLBACK = False
 
 
 @dataclass(slots=True)
@@ -210,6 +231,270 @@ def normalize_match_name(name: str | None) -> str:
     if not name:
         return ""
     return re.sub(r"[^A-Z0-9]+", "", name.upper())
+
+
+# Probe receives only a bounded, read-only description of the Launcher
+# buckets.  It is an optimization hint, never a writer authorization.
+FBX_PROBE_ROUTE_HINT_SCHEMA = "pc-rehd-fbx-probe-route-hints-v1"
+FBX_PROBE_ROUTE_RECEIPT_SCHEMA = "pc-rehd-fbx-probe-route-receipt-v1"
+_PROBE_SOURCE_ROUTES = frozenset(
+    {
+        "skin_without_fbx_faces",
+        "unskinned_with_fbx_faces",
+        "unskinned_without_fbx_faces",
+        "max_model_null_header_only",
+    }
+)
+_UNSKINNED_MESH_EDIT_EXPORT_AUTHORIZED_REASONS = frozenset(
+    {
+        "enabled_for_ordinary_export",
+        "enabled_for_bones_plus_mesh",
+    }
+)
+
+
+def _int_or_default(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
+
+
+def _normalize_probe_route_hints(route_hints: Any) -> dict[str, Any]:
+    """Normalize Launcher lane facts without accepting a final topology route."""
+    if not isinstance(route_hints, dict):
+        return {
+            "status": "absent",
+            "schema": FBX_PROBE_ROUTE_HINT_SCHEMA,
+            "rows": [],
+            "by_handle": {},
+            "by_fbx_route_handle": {},
+            "by_slot": {},
+            "by_name": {},
+            "explicit_route_required": False,
+            "backend_kind": "",
+        }
+    schema = str(route_hints.get("schema", "") or "")
+    if schema not in {"", FBX_PROBE_ROUTE_HINT_SCHEMA}:
+        return {
+            "status": "invalid_schema",
+            "schema": schema,
+            "rows": [],
+            "by_handle": {},
+            "by_fbx_route_handle": {},
+            "by_slot": {},
+            "by_name": {},
+            "explicit_route_required": False,
+            "backend_kind": "",
+        }
+    backend_kind = str(route_hints.get("backend_kind", "") or "").strip().lower()
+    explicit_route_required = bool(
+        route_hints.get("explicit_route_required") is True
+        or backend_kind == "max_fbx"
+    ) and not MAX_ALLOW_UNMARKED_ROUTE_FALLBACK
+    normalized_rows: list[dict[str, Any]] = []
+    for raw_row in route_hints.get("rows", []):
+        if not isinstance(raw_row, dict):
+            continue
+        raw_lane = str(raw_row.get("lane", "") or "").strip().lower()
+        lane = "header" if raw_lane == "lod0" else raw_lane
+        if lane not in {"header", "delete", "modify"}:
+            continue
+        handle = _int_or_default(raw_row.get("scene_node_handle"), 0)
+        fbx_route_handle = _int_or_default(
+            raw_row.get("fbx_route_handle", raw_row.get("expected_fbx_route_handle")),
+            0,
+        )
+        slot = _int_or_default(raw_row.get("mesh_slot"), 0)
+        names = {
+            normalize_match_name(raw_row.get(field_name))
+            for field_name in (
+                "scene_node",
+                "node_name",
+                "mesh_name",
+                "match_name",
+                "mesh_name_match",
+            )
+            if normalize_match_name(raw_row.get(field_name))
+        }
+        if handle <= 0 and slot <= 0 and not names:
+            continue
+        # The lane is the only fact accepted from the hint.  Modify routes
+        # remain pending until Probe reads the current FBX topology.
+        route = (
+            "header_only"
+            if lane == "header"
+            else "delete"
+            if lane == "delete"
+            else "topology_pending"
+        )
+        normalized_rows.append(
+            {
+                "lane": lane,
+                "route": route,
+                "scene_node_handle": handle,
+                "fbx_route_handle": fbx_route_handle,
+                "expected_fbx_route_handle": fbx_route_handle,
+                "mesh_slot": slot,
+                "names": sorted(names),
+                "requires_selected_fbx": bool(raw_row.get("requires_selected_fbx", False)),
+            }
+        )
+
+    raw_unskinned_policy = route_hints.get("unskinned_mesh_edit_export")
+    if not isinstance(raw_unskinned_policy, dict):
+        raw_unskinned_policy = {}
+    policy_requested = _coerce_bool(raw_unskinned_policy.get("requested"), False)
+    policy_enabled = _coerce_bool(raw_unskinned_policy.get("enabled"), False)
+    policy_backend = str(
+        raw_unskinned_policy.get("backend_kind", "") or ""
+    ).strip().lower()
+    policy_reason = str(
+        raw_unskinned_policy.get("policy_reason", "") or ""
+    ).strip()
+    unskinned_policy = {
+        "requested": policy_requested,
+        "enabled": policy_enabled,
+        "backend_kind": policy_backend,
+        "policy_reason": policy_reason,
+        "authorized": bool(
+            policy_requested
+            and policy_enabled
+            and policy_backend == "max_fbx"
+            and policy_reason in _UNSKINNED_MESH_EDIT_EXPORT_AUTHORIZED_REASONS
+        ),
+    }
+
+    by_handle: dict[int, list[dict[str, Any]]] = {}
+    by_fbx_route_handle: dict[int, list[dict[str, Any]]] = {}
+    by_slot: dict[int, list[dict[str, Any]]] = {}
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for row in normalized_rows:
+        handle = _int_or_default(row.get("scene_node_handle"), 0)
+        if handle > 0:
+            by_handle.setdefault(handle, []).append(row)
+        fbx_route_handle = _int_or_default(row.get("fbx_route_handle"), 0)
+        if fbx_route_handle > 0:
+            by_fbx_route_handle.setdefault(fbx_route_handle, []).append(row)
+        slot = _int_or_default(row.get("mesh_slot"), 0)
+        if slot > 0:
+            by_slot.setdefault(slot, []).append(row)
+        for name in row.get("names", []):
+            if name:
+                candidates = by_name.setdefault(str(name), [])
+                if row not in candidates:
+                    candidates.append(row)
+    return {
+        "status": "ok",
+        "schema": FBX_PROBE_ROUTE_HINT_SCHEMA,
+        "authority": str(
+            route_hints.get("authority", "launcher_bucket_receipt") or "launcher_bucket_receipt"
+        ),
+        "unskinned_mesh_edit_export": unskinned_policy,
+        "rows": normalized_rows,
+        "by_handle": by_handle,
+        "by_fbx_route_handle": by_fbx_route_handle,
+        "by_slot": by_slot,
+        "by_name": by_name,
+        "explicit_route_required": explicit_route_required,
+        "backend_kind": backend_kind,
+    }
+
+
+def _probe_route_hint_for_mesh(
+    mesh: Any,
+    instance_node: Any | None,
+    binary_identity: dict[str, Any],
+    route_hints: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    if not isinstance(route_hints, dict) or route_hints.get("status") != "ok":
+        return None, str(route_hints.get("status", "absent") if isinstance(route_hints, dict) else "absent")
+
+    explicit_route_required = bool(route_hints.get("explicit_route_required", False))
+    route_handle = _int_or_default(binary_identity.get("fbx_route_handle"), 0)
+    if explicit_route_required:
+        # MAX identity is authoritative.  A missing or wrong marker must not
+        # fall through to a duplicate name/slot; the caller will discard this
+        # instance and leave the selected row for the correctly marked node.
+        if route_handle > 0:
+            candidates = route_hints.get("by_fbx_route_handle", {}).get(route_handle, [])
+            if len(candidates) == 1:
+                return candidates[0], "route_handle"
+            if len(candidates) > 1:
+                return None, "ambiguous_route_handle"
+            return None, "identity_excluded"
+        possible = []
+        for value in (
+            getattr(instance_node, "name", "") if instance_node is not None else "",
+            getattr(mesh, "name", ""),
+            binary_identity.get("fbx_model_name", ""),
+        ):
+            name_key = normalize_match_name(value)
+            if name_key:
+                possible.extend(route_hints.get("by_name", {}).get(name_key, []))
+            slot_hint = infer_mesh_slot_hint(str(value or ""))
+            slot = _int_or_default(slot_hint.get("slot"), 0) if isinstance(slot_hint, dict) else 0
+            if slot > 0:
+                possible.extend(route_hints.get("by_slot", {}).get(slot, []))
+        if possible:
+            return None, "identity_excluded"
+        return None, "unmatched"
+
+    if route_handle > 0:
+        candidates = route_hints.get("by_handle", {}).get(route_handle, [])
+        if len(candidates) == 1:
+            return candidates[0], "route_handle"
+        if len(candidates) > 1:
+            return None, "ambiguous_route_handle"
+
+    slot_values: set[int] = set()
+    for value in (
+        getattr(instance_node, "name", "") if instance_node is not None else "",
+        getattr(mesh, "name", ""),
+        binary_identity.get("fbx_model_name", ""),
+    ):
+        slot_hint = infer_mesh_slot_hint(str(value or ""))
+        if isinstance(slot_hint, dict):
+            slot = _int_or_default(slot_hint.get("slot"), 0)
+            if slot > 0:
+                slot_values.add(slot)
+    for slot in sorted(slot_values):
+        candidates = route_hints.get("by_slot", {}).get(slot, [])
+        if len(candidates) == 1:
+            return candidates[0], "mesh_slot"
+        if len(candidates) > 1:
+            return None, "ambiguous_mesh_slot"
+
+    for value in (
+        getattr(instance_node, "name", "") if instance_node is not None else "",
+        getattr(mesh, "name", ""),
+        binary_identity.get("fbx_model_name", ""),
+    ):
+        name_key = normalize_match_name(value)
+        candidates = route_hints.get("by_name", {}).get(name_key, []) if name_key else []
+        if len(candidates) == 1:
+            return candidates[0], "name"
+        if len(candidates) > 1:
+            return None, "ambiguous_name"
+    return None, "unmatched"
+
+
+def _probe_topology_route(
+    has_skin: bool,
+    triangle_count: int,
+    *,
+    allow_unskinned_geometry: bool = False,
+) -> str:
+    """The single Probe-owned four-way topology policy."""
+    if has_skin and triangle_count <= 0:
+        return "skin_without_fbx_faces"
+    if not has_skin and triangle_count > 0 and allow_unskinned_geometry:
+        return "fbx_geometry"
+    if not has_skin and triangle_count > 0:
+        return "unskinned_with_fbx_faces"
+    if not has_skin:
+        return "unskinned_without_fbx_faces"
+    return "fbx_geometry"
 
 
 def _infer_blender_compact_mesh_facts(name: str | None) -> dict[str, int] | None:
@@ -452,6 +737,38 @@ def _scene_axis_receipt(scene: Any) -> dict[str, Any]:
     }
 
 
+def _scene_unit_receipt(scene: Any) -> dict[str, Any]:
+    """Report the FBX scene unit used by the already-loaded UFBX scene.
+
+    UFBX exposes positions in scene units.  The MOD writer's position basis is
+    centimetres, so consumers need this request-scoped fact to convert MAX's
+    inch exports without re-reading the FBX.  Missing metadata is deliberately
+    reported rather than guessed so legacy callers keep their prior behavior.
+    """
+    settings = getattr(scene, "settings", None)
+    try:
+        unit_meters = float(getattr(settings, "unit_meters"))
+        original_unit_meters = float(
+            getattr(settings, "original_unit_meters", unit_meters)
+        )
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return {"status": "missing", "source": "ufbx_scene_settings"}
+    if (
+        not math.isfinite(unit_meters)
+        or not math.isfinite(original_unit_meters)
+        or unit_meters <= 0.0
+        or original_unit_meters <= 0.0
+    ):
+        return {"status": "invalid", "source": "ufbx_scene_settings"}
+    return {
+        "status": "reported",
+        "unit_meters": unit_meters,
+        "original_unit_meters": original_unit_meters,
+        "scale_to_centimeters": unit_meters / 0.01,
+        "source": "ufbx_scene_settings",
+    }
+
+
 def _restore_max_space_geometry(
     geometry: dict[str, Any],
     mesh: Any,
@@ -652,6 +969,48 @@ _FBX_BINARY_ARRAY_LAYOUTS = {
     "b": ("B", 1),
     "c": ("B", 1),
 }
+_FBX_BINARY_SHARED_DECODE_ARRAY_NAMES = frozenset(
+    {
+        "Indexes",
+        "Weights",
+        "Transform",
+        "TransformLink",
+        "Vertices",
+        "PolygonVertexIndex",
+        "Normals",
+        "NormalsIndex",
+        "UV",
+        "UVIndex",
+    }
+)
+
+
+@dataclass(slots=True)
+class _BinaryFbxLazyArray:
+    data: bytes
+    offset: int
+    stored_size: int
+    value_count: int
+    encoding: int
+    property_type: str
+    decoded: list[Any] | None = None
+
+    def decode(self) -> list[Any]:
+        if self.decoded is not None:
+            return self.decoded
+        raw_value = self.data[self.offset : self.offset + self.stored_size]
+        if self.encoding == 1:
+            raw_value = zlib.decompress(raw_value)
+        elif self.encoding != 0:
+            raise ValueError(f"Binary FBX array has unsupported encoding {self.encoding}")
+        item_format, item_size = _FBX_BINARY_ARRAY_LAYOUTS[self.property_type]
+        expected_size = int(self.value_count) * item_size
+        if len(raw_value) != expected_size:
+            raise ValueError("Binary FBX array byte count does not match its element count")
+        self.decoded = list(
+            struct.unpack("<" + item_format * int(self.value_count), raw_value)
+        )
+        return self.decoded
 
 
 @dataclass(slots=True)
@@ -659,6 +1018,46 @@ class _BinaryFbxNode:
     name: str
     properties: list[Any]
     children: list["_BinaryFbxNode"]
+
+
+@dataclass(slots=True)
+class _BinaryFbxDocument:
+    """Request-scoped binary FBX parse shared by Probe consumers.
+
+    The document deliberately owns the raw bytes and parsed tree for one
+    request only.  It is not a path/global cache, so a later export cannot
+    observe mutable state from an earlier export.
+    """
+
+    path: Path
+    data: bytes
+    version: int
+    roots: list[_BinaryFbxNode]
+    decode_array_names: frozenset[str]
+    read_count: int = 1
+    tree_build_count: int = 1
+
+    def receipt(self) -> dict[str, Any]:
+        lazy_total = 0
+        lazy_decoded = 0
+        pending = list(self.roots)
+        while pending:
+            node = pending.pop()
+            pending.extend(node.children)
+            for value in node.properties:
+                if isinstance(value, _BinaryFbxLazyArray):
+                    lazy_total += 1
+                    if value.decoded is not None:
+                        lazy_decoded += 1
+        return {
+            "status": "available",
+            "path": str(self.path),
+            "read_count": int(self.read_count),
+            "tree_build_count": int(self.tree_build_count),
+            "decoded_array_name_count": len(self.decode_array_names),
+            "lazy_array_count": lazy_total,
+            "lazy_array_decoded_count": lazy_decoded,
+        }
 
 
 def _binary_fbx_require_range(data: bytes, offset: int, size: int, *, label: str) -> None:
@@ -704,19 +1103,17 @@ def _read_binary_fbx_property(
         value_count, encoding, stored_size = struct.unpack_from("<III", data, offset)
         offset += 12
         _binary_fbx_require_range(data, offset, stored_size, label=f"{property_type} array")
-        raw_value = data[offset : offset + stored_size]
+        array_offset = offset
         offset += stored_size
-        if not decode_array:
-            return None, offset
-        if encoding == 1:
-            raw_value = zlib.decompress(raw_value)
-        elif encoding != 0:
-            raise ValueError(f"Binary FBX array has unsupported encoding {encoding}")
-        item_format, item_size = _FBX_BINARY_ARRAY_LAYOUTS[property_type]
-        expected_size = int(value_count) * item_size
-        if len(raw_value) != expected_size:
-            raise ValueError("Binary FBX array byte count does not match its element count")
-        return list(struct.unpack("<" + item_format * int(value_count), raw_value)), offset
+        lazy_array = _BinaryFbxLazyArray(
+            data=data,
+            offset=array_offset,
+            stored_size=int(stored_size),
+            value_count=int(value_count),
+            encoding=int(encoding),
+            property_type=property_type,
+        )
+        return (lazy_array.decode() if decode_array else lazy_array), offset
     raise ValueError(f"Binary FBX has unsupported property type {property_type!r}")
 
 
@@ -775,7 +1172,12 @@ def _read_binary_fbx_roots(
     path: Path,
     *,
     decode_array_names: frozenset[str] | None = None,
+    binary_document: _BinaryFbxDocument | None = None,
 ) -> list[_BinaryFbxNode]:
+    if binary_document is not None:
+        if Path(path).resolve() != binary_document.path.resolve():
+            raise ValueError("Binary FBX document belongs to a different path")
+        return binary_document.roots
     data = path.read_bytes()
     if not data.startswith(_FBX_BINARY_SIGNATURE):
         raise ValueError("FBX is not a supported binary FBX file")
@@ -784,8 +1186,10 @@ def _read_binary_fbx_roots(
     if version < 7000:
         raise ValueError(f"Binary FBX version {version} is not supported for skin evaluation")
     header_size = 25 if version >= 7500 else 13
-    decode_names = decode_array_names or frozenset(
-        {"Indexes", "Weights", "Transform", "TransformLink"}
+    decode_names = (
+        frozenset({"Indexes", "Weights", "Transform", "TransformLink"})
+        if decode_array_names is None
+        else frozenset(decode_array_names)
     )
     roots: list[_BinaryFbxNode] = []
     offset = len(_FBX_BINARY_SIGNATURE) + 4
@@ -802,10 +1206,53 @@ def _read_binary_fbx_roots(
     return roots
 
 
+def _build_binary_fbx_document(
+    path: Path,
+    *,
+    decode_array_names: frozenset[str] | None = None,
+) -> _BinaryFbxDocument:
+    """Read and parse one binary FBX for all consumers in one Probe request."""
+    data = path.read_bytes()
+    if not data.startswith(_FBX_BINARY_SIGNATURE):
+        raise ValueError("FBX is not a supported binary FBX file")
+    _binary_fbx_require_range(data, len(_FBX_BINARY_SIGNATURE), 4, label="version")
+    version = struct.unpack_from("<I", data, len(_FBX_BINARY_SIGNATURE))[0]
+    if version < 7000:
+        raise ValueError(f"Binary FBX version {version} is not supported for skin evaluation")
+    header_size = 25 if version >= 7500 else 13
+    decode_names = (
+        _FBX_BINARY_SHARED_DECODE_ARRAY_NAMES
+        if decode_array_names is None
+        else frozenset(decode_array_names)
+    )
+    roots: list[_BinaryFbxNode] = []
+    offset = len(_FBX_BINARY_SIGNATURE) + 4
+    while offset < len(data) - header_size:
+        root, offset = _read_binary_fbx_node(
+            data,
+            offset,
+            version=version,
+            decode_array_names=frozenset(decode_names),
+        )
+        if root is None:
+            break
+        roots.append(root)
+    return _BinaryFbxDocument(
+        path=Path(path),
+        data=data,
+        version=int(version),
+        roots=roots,
+        decode_array_names=frozenset(decode_names),
+    )
+
+
 def _binary_fbx_node_child_value(node: _BinaryFbxNode, child_name: str) -> Any:
     for child in node.children:
         if child.name == child_name and child.properties:
-            return child.properties[0]
+            value = child.properties[0]
+            if isinstance(value, _BinaryFbxLazyArray):
+                return value.decode()
+            return value
     return None
 
 
@@ -1118,7 +1565,14 @@ def _binary_fbx_read_corner_geometry(node: _BinaryFbxNode) -> dict[str, Any]:
     return result
 
 
-def _build_binary_fbx_corner_geometry_context(path: Path) -> dict[str, Any]:
+def _build_binary_fbx_corner_geometry_context(
+    path: Path,
+    *,
+    binary_document: _BinaryFbxDocument | None = None,
+    target_geometry_ids: set[int] | None = None,
+    target_geometry_names: set[str] | None = None,
+    target_filter_active: bool = False,
+) -> dict[str, Any]:
     """Build an exact Geometry fingerprint lookup for authored corner channels.
 
     This is advisory at the file level: a malformed Geometry must not block
@@ -1133,6 +1587,7 @@ def _build_binary_fbx_corner_geometry_context(path: Path) -> dict[str, Any]:
     try:
         roots = _read_binary_fbx_roots(
             path,
+            binary_document=binary_document,
             decode_array_names=frozenset(
                 {
                     "Vertices",
@@ -1150,6 +1605,13 @@ def _build_binary_fbx_corner_geometry_context(path: Path) -> dict[str, Any]:
         for node in objects_root.children:
             if node.name != "Geometry":
                 continue
+            geometry_id = int(node.properties[0]) if node.properties and isinstance(node.properties[0], int) else 0
+            geometry_name = _clean_binary_fbx_object_name(node.properties[1]) if len(node.properties) > 1 else ""
+            if target_filter_active:
+                id_match = geometry_id > 0 and geometry_id in (target_geometry_ids or set())
+                name_match = normalize_match_name(geometry_name) in (target_geometry_names or set())
+                if not id_match and not name_match:
+                    continue
             try:
                 geometry = _binary_fbx_read_corner_geometry(node)
             except Exception as exc:
@@ -1262,6 +1724,13 @@ def _select_binary_fbx_corner_geometry(
 
 def _binary_fbx_model_identity_context(
     path: Path,
+    *,
+    binary_document: _BinaryFbxDocument | None = None,
+    target_handles: set[int] | None = None,
+    target_names: set[str] | None = None,
+    target_slots: set[int] | None = None,
+    target_filter_active: bool = False,
+    explicit_route_required: bool = False,
 ) -> tuple[dict[tuple[str, str], list[dict[str, Any]]], list[dict[str, Any]]]:
     """Read Max FBX Model identity and the explicit Anim Handle route marker.
 
@@ -1273,6 +1742,7 @@ def _binary_fbx_model_identity_context(
     """
     roots = _read_binary_fbx_roots(
         path,
+        binary_document=binary_document,
         decode_array_names=frozenset(
             {"Indexes", "Weights", "Transform", "TransformLink", "Vertices", "PolygonVertexIndex"}
         ),
@@ -1284,13 +1754,10 @@ def _binary_fbx_model_identity_context(
 
     models: dict[int, dict[str, Any]] = {}
     route_models: dict[int, dict[str, Any]] = {}
-    geometry_fingerprints: dict[int, str] = {}
+    geometry_nodes: dict[int, _BinaryFbxNode] = {}
     for node in objects_root.children:
         if node.name == "Geometry" and node.properties and isinstance(node.properties[0], int):
-            geometry_fingerprints[int(node.properties[0])] = _binary_fbx_geometry_fingerprint(
-                _binary_fbx_node_child_value(node, "Vertices"),
-                _binary_fbx_node_child_value(node, "PolygonVertexIndex"),
-            )
+            geometry_nodes[int(node.properties[0])] = node
         if node.name != "Model" or len(node.properties) < 3:
             continue
         model_id = node.properties[0]
@@ -1355,9 +1822,9 @@ def _binary_fbx_model_identity_context(
                     models[int(child_id)]["fbx_parent_name"] = str(
                         parent.get("fbx_model_name", "") or ""
                     )
-            if int(parent_id) in models and int(child_id) in geometry_fingerprints:
+            if int(parent_id) in models and int(child_id) in geometry_nodes:
                 geometry_ids_by_model.setdefault(int(parent_id), []).append(int(child_id))
-            if int(parent_id) in route_models and int(child_id) in geometry_fingerprints:
+            if int(parent_id) in route_models and int(child_id) in geometry_nodes:
                 route_models[int(parent_id)]["fbx_geometry_connected"] = True
 
     for model_id, row in models.items():
@@ -1365,12 +1832,54 @@ def _binary_fbx_model_identity_context(
         if len(geometry_ids) == 1:
             geometry_id = geometry_ids[0]
             row["fbx_geometry_id"] = geometry_id
-            row["fbx_geometry_fingerprint"] = geometry_fingerprints.get(geometry_id, "")
         elif len(geometry_ids) > 1:
             # A Model linked to multiple Geometry objects has no single raw
             # identity. Leave the ID empty so the existing non-blocking
             # fingerprint fallback decides whether a unique match exists.
             row["fbx_geometry_connection_count"] = len(geometry_ids)
+
+    normalized_handles = {
+        _int_or_default(value, 0)
+        for value in (target_handles or set())
+        if _int_or_default(value, 0) > 0
+    }
+    normalized_names = {
+        normalize_match_name(value)
+        for value in (target_names or set())
+        if normalize_match_name(value)
+    }
+    normalized_slots = {
+        _int_or_default(value, 0)
+        for value in (target_slots or set())
+        if _int_or_default(value, 0) > 0
+    }
+    selected_model_ids: set[int] = set()
+    for model_id, row in models.items():
+        model_name = str(row.get("fbx_model_name", "") or "")
+        slot_hint = infer_mesh_slot_hint(model_name)
+        slot = (
+            _int_or_default(slot_hint.get("slot"), 0)
+            if isinstance(slot_hint, dict)
+            else 0
+        )
+        if explicit_route_required:
+            # MAX duplicate names are not identity.  Decode only Models whose
+            # FBX marker is one of the Launcher route Handles; unmarked
+            # siblings remain lightweight candidates for identity exclusion.
+            selected = (
+                _int_or_default(row.get("fbx_route_handle"), 0) in normalized_handles
+            )
+        else:
+            selected = not target_filter_active or (
+                _int_or_default(row.get("fbx_route_handle"), 0) in normalized_handles
+                or normalize_match_name(model_name) in normalized_names
+                or slot in normalized_slots
+            )
+        geometry_id = _int_or_default(row.get("fbx_geometry_id"), 0)
+        geometry_node = geometry_nodes.get(geometry_id)
+        if not selected or geometry_node is None:
+            continue
+        selected_model_ids.add(int(model_id))
 
     queues: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for model_id in sorted(models):
@@ -1380,12 +1889,50 @@ def _binary_fbx_model_identity_context(
             str(row["fbx_parent_name"]).casefold(),
         )
         queues.setdefault(key, []).append(row)
+    # Geometry fingerprints are needed only when identity lookup is
+    # ambiguous (duplicate name/parent keys or duplicate bare names).  A
+    # unique Model identity is already sufficient and must not decode its
+    # large Vertices/PolygonVertexIndex arrays during Stage A.
+    rows_by_name: dict[str, list[dict[str, Any]]] = {}
+    for rows in queues.values():
+        for row in rows:
+            rows_by_name.setdefault(
+                normalize_match_name(row.get("fbx_model_name", "")), []
+            ).append(row)
+    for key, rows in queues.items():
+        ambiguous_key = len(rows) > 1
+        for row in rows:
+            model_id = _int_or_default(row.get("fbx_model_id"), 0)
+            model_name_key = normalize_match_name(row.get("fbx_model_name", ""))
+            if (
+                model_id not in selected_model_ids
+                or not model_name_key
+                or not (ambiguous_key or len(rows_by_name.get(model_name_key, [])) > 1)
+            ):
+                continue
+            geometry_id = _int_or_default(row.get("fbx_geometry_id"), 0)
+            geometry_node = geometry_nodes.get(geometry_id)
+            if geometry_node is None:
+                continue
+            # This is deliberately the only Stage-A path that may decode
+            # authored Geometry arrays, and only for an ambiguous identity.
+            row["fbx_geometry_fingerprint"] = _binary_fbx_geometry_fingerprint(
+                _binary_fbx_node_child_value(geometry_node, "Vertices"),
+                _binary_fbx_node_child_value(geometry_node, "PolygonVertexIndex"),
+            )
     observations = [route_models[model_id] for model_id in sorted(route_models)]
     return queues, observations
 
 
-def _binary_fbx_mesh_model_identity_queues(path: Path) -> dict[tuple[str, str], list[dict[str, Any]]]:
-    queues, _observations = _binary_fbx_model_identity_context(path)
+def _binary_fbx_mesh_model_identity_queues(
+    path: Path,
+    *,
+    binary_document: _BinaryFbxDocument | None = None,
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    queues, _observations = _binary_fbx_model_identity_context(
+        path,
+        binary_document=binary_document,
+    )
     return queues
 
 
@@ -1399,6 +1946,8 @@ def extract_fbx_route_model_observations(path: str | Path) -> list[dict[str, Any
 def _take_binary_fbx_mesh_model_identity(
     queues: dict[tuple[str, str], list[dict[str, Any]]],
     instance_node: Any | None,
+    *,
+    preferred_route_handles: set[int] | None = None,
 ) -> dict[str, Any]:
     if instance_node is None:
         return {}
@@ -1406,9 +1955,22 @@ def _take_binary_fbx_mesh_model_identity(
     parent_name = str(getattr(getattr(instance_node, "parent", None), "name", "") or "")
     key = (node_name.casefold(), parent_name.casefold())
     rows = queues.get(key)
-    geometry_fingerprint = _ufbx_mesh_geometry_fingerprint(getattr(instance_node, "mesh", None))
     if rows and len(rows) == 1:
         return dict(rows.pop(0))
+    if rows and preferred_route_handles:
+        preferred = [
+            row
+            for row in rows
+            if _int_or_default(row.get("fbx_route_handle"), 0) in preferred_route_handles
+        ]
+        if len(preferred) == 1:
+            rows.remove(preferred[0])
+            return dict(preferred[0])
+    geometry_fingerprint = ""
+    if rows and len(rows) > 1:
+        geometry_fingerprint = _ufbx_mesh_geometry_fingerprint(
+            getattr(instance_node, "mesh", None)
+        )
     if rows and geometry_fingerprint:
         matches = [
             row
@@ -1429,6 +1991,10 @@ def _take_binary_fbx_mesh_model_identity(
                 queues[candidate].remove(row)
                 break
         return dict(row)
+    if candidate_rows and not geometry_fingerprint:
+        geometry_fingerprint = _ufbx_mesh_geometry_fingerprint(
+            getattr(instance_node, "mesh", None)
+        )
     if geometry_fingerprint:
         matches = [
             row
@@ -1443,6 +2009,173 @@ def _take_binary_fbx_mesh_model_identity(
                     break
             return dict(row)
     return {}
+
+
+def _clone_binary_fbx_model_identity_queues(
+    queues: dict[tuple[str, str], list[dict[str, Any]]] | None,
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """Clone identity rows so route discovery cannot consume final rows."""
+    if not isinstance(queues, dict):
+        return {}
+    return {
+        key: [dict(row) for row in rows if isinstance(row, dict)]
+        for key, rows in queues.items()
+        if isinstance(rows, list)
+    }
+
+
+def _binary_fbx_target_selector(
+    queues: dict[tuple[str, str], list[dict[str, Any]]] | None,
+    *,
+    target_handles: set[int],
+    target_names: set[str],
+    target_slots: set[int],
+) -> tuple[set[int], set[str], set[str]]:
+    """Resolve requested export identities before decoding exact Geometry."""
+    geometry_ids: set[int] = set()
+    geometry_names: set[str] = set()
+    mesh_names: set[str] = set()
+    for rows in (queues or {}).values():
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            route_handle = _int_or_default(row.get("fbx_route_handle"), 0)
+            model_name = str(row.get("fbx_model_name", "") or "")
+            model_name_key = normalize_match_name(model_name)
+            slot_hint = infer_mesh_slot_hint(model_name)
+            slot = _int_or_default(slot_hint.get("slot"), 0) if isinstance(slot_hint, dict) else 0
+            selected = (
+                route_handle > 0
+                and route_handle in target_handles
+            ) or (
+                model_name_key != ""
+                and model_name_key in target_names
+            ) or (
+                slot > 0
+                and slot in target_slots
+            )
+            if not selected:
+                continue
+            geometry_id = _int_or_default(row.get("fbx_geometry_id"), 0)
+            if geometry_id > 0:
+                geometry_ids.add(geometry_id)
+            if model_name_key:
+                geometry_names.add(model_name_key)
+                mesh_names.add(model_name_key)
+    # A Blender export may not carry the Max UDP route marker.  The caller's
+    # stable scene names remain a bounded fallback for Geometry selection.
+    geometry_names.update(target_names)
+    mesh_names.update(target_names)
+    return geometry_ids, geometry_names, mesh_names
+
+
+def _probe_mesh_triangle_count(mesh: Any) -> int:
+    triangle_count = int(getattr(mesh, "num_triangles", 0) or 0)
+    if triangle_count > 0:
+        return triangle_count
+    total = 0
+    for face in _safe_list(getattr(mesh, "faces", None)):
+        try:
+            total += max(0, int(face[1]) - 2)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            continue
+    return total
+
+
+def _probe_mesh_has_skin(mesh: Any) -> bool:
+    return len(_safe_list(getattr(mesh, "skin_deformers", None))) > 0
+
+
+def _probe_stage_a_mesh_target(
+    mesh: Any,
+    instance_node: Any | None,
+    binary_identity: dict[str, Any],
+    *,
+    target_handles: set[int],
+    target_names: set[str],
+    target_slots: set[int],
+    filter_active: bool,
+) -> bool:
+    if not filter_active:
+        return True
+    route_handle = _int_or_default(binary_identity.get("fbx_route_handle"), 0)
+    if route_handle > 0 and route_handle in target_handles:
+        return True
+    for value in (
+        getattr(instance_node, "name", "") if instance_node is not None else "",
+        getattr(mesh, "name", ""),
+        binary_identity.get("fbx_model_name", ""),
+    ):
+        if normalize_match_name(value) in target_names:
+            return True
+    for value in (
+        infer_mesh_slot_hint(getattr(instance_node, "name", "") if instance_node is not None else ""),
+        infer_mesh_slot_hint(getattr(mesh, "name", "")),
+    ):
+        if isinstance(value, dict) and _int_or_default(value.get("slot"), 0) in target_slots:
+            return True
+    return False
+
+
+def _build_lightweight_mesh_geometry(
+    mesh: Any,
+    *,
+    normal_fidelity: dict[str, Any],
+    vertex_count: int | None = None,
+    index_count: int | None = None,
+    triangle_count: int | None = None,
+) -> dict[str, Any]:
+    """Return route-only facts without allocating authored vertex rows."""
+    if vertex_count is None:
+        vertex_count = int(getattr(mesh, "num_vertices", 0) or 0)
+    if index_count is None:
+        index_count = int(getattr(mesh, "num_indices", 0) or 0)
+    if triangle_count is None:
+        triangle_count = _probe_mesh_triangle_count(mesh)
+    return {
+        "positions": [],
+        "max_positions": [],
+        "world_positions": [],
+        "skinned_positions": [],
+        "skinned_max_positions": [],
+        "skinned_world_positions": [],
+        "normals": [],
+        "max_normals": [],
+        "skinned_normals": [],
+        "skinned_max_normals": [],
+        "skinned_is_local": False,
+        "uvs": [],
+        "face_indices": [],
+        "source_vertex_indices": [],
+        "fbx_export_corner_indices": [],
+        "fbx_geom_face_indices": [],
+        "fbx_export_face_indices": [],
+        "fbx_uv_channels": [],
+        "vertex_count": vertex_count,
+        "index_count": index_count,
+        "triangle_count": triangle_count,
+        "normal_fidelity": dict(normal_fidelity),
+        "fbx_skin_pose_evaluation_status": "stage_a_route_discovery",
+    }
+
+
+def _build_lightweight_skin_summary(
+    mesh: Any,
+    *,
+    has_skin: bool | None = None,
+) -> dict[str, Any]:
+    """Expose only Skin presence for Stage A route discovery."""
+    if has_skin is None:
+        has_skin = _probe_mesh_has_skin(mesh)
+    return {
+        "skin_deformer_count": 1 if has_skin else 0,
+        "bone_names": [],
+        "max_weights_per_vertex": 0,
+        "weighted_vertex_count": 0,
+        "weight_rows_available": False,
+    }
 
 
 def _binary_fbx_matrix(value: Any) -> list[float] | None:
@@ -1535,9 +2268,14 @@ def _shared_cluster_prebind(bindings: list[dict[str, Any]]) -> list[float] | Non
     return list(candidate)
 
 
-def _build_binary_fbx_skin_clusters(path: Path) -> tuple[dict[str, list[dict[str, Any]]], str]:
+def _build_binary_fbx_skin_clusters(
+    path: Path,
+    *,
+    binary_document: _BinaryFbxDocument | None = None,
+    target_mesh_names: set[str] | None = None,
+) -> tuple[dict[str, list[dict[str, Any]]], str]:
     try:
-        roots = _read_binary_fbx_roots(path)
+        roots = _read_binary_fbx_roots(path, binary_document=binary_document)
     except Exception as exc:
         return {}, f"binary_parse_error:{type(exc).__name__}:{exc}"
     objects_root = next((node for node in roots if node.name == "Objects"), None)
@@ -1571,21 +2309,18 @@ def _build_binary_fbx_skin_clusters(path: Path) -> tuple[dict[str, list[dict[str
             and str(node.properties[2]) == class_name
         )
 
+    normalized_target_mesh_names = (
+        None
+        if target_mesh_names is None
+        else {
+            normalize_match_name(value)
+            for value in target_mesh_names
+            if normalize_match_name(value)
+        }
+    )
     result: dict[str, list[dict[str, Any]]] = {}
     for cluster_id, cluster in objects_by_id.items():
         if not object_type_matches(cluster_id, "Deformer", "Cluster"):
-            continue
-        transform = _binary_fbx_matrix(_binary_fbx_node_child_value(cluster, "Transform"))
-        transform_link = _binary_fbx_matrix(_binary_fbx_node_child_value(cluster, "TransformLink"))
-        indexes = _binary_fbx_node_child_value(cluster, "Indexes")
-        weights = _binary_fbx_node_child_value(cluster, "Weights")
-        if (
-            transform is None
-            or transform_link is None
-            or not isinstance(indexes, list)
-            or not isinstance(weights, list)
-            or len(indexes) != len(weights)
-        ):
             continue
         bone_ids = [
             object_id
@@ -1606,20 +2341,40 @@ def _build_binary_fbx_skin_clusters(path: Path) -> tuple[dict[str, list[dict[str
         ]
         if len(geometry_ids) != 1:
             continue
-        mesh_model_ids = [
+        mesh_model_ids = list(dict.fromkeys(
+            [
             object_id
             for object_id in parents_by_child.get(geometry_ids[0], [])
             if object_type_matches(object_id, "Model", "Mesh")
-        ]
-        if len(mesh_model_ids) != 1:
+            ]
+        ))
+        # FBX permits multiple Mesh Models to instance the same Geometry.
+        # The Skin/Cluster facts belong to that shared Geometry and must be
+        # exposed to every connected Mesh Model; rejecting this graph drops
+        # the posed data for an otherwise valid duplicate-name Max node.
+        if not mesh_model_ids:
             continue
-        mesh_model = objects_by_id[mesh_model_ids[0]]
         bone_model = objects_by_id[bone_ids[0]]
-        if len(mesh_model.properties) < 2 or len(bone_model.properties) < 2:
+        if len(bone_model.properties) < 2:
             continue
-        mesh_name = _clean_binary_fbx_object_name(mesh_model.properties[1])
         bone_name = _clean_binary_fbx_object_name(bone_model.properties[1])
-        if mesh_name == "" or bone_name == "":
+        if bone_name == "":
+            continue
+        transform = _binary_fbx_matrix(
+            _binary_fbx_node_child_value(cluster, "Transform")
+        )
+        transform_link = _binary_fbx_matrix(
+            _binary_fbx_node_child_value(cluster, "TransformLink")
+        )
+        indexes = _binary_fbx_node_child_value(cluster, "Indexes")
+        weights = _binary_fbx_node_child_value(cluster, "Weights")
+        if (
+            transform is None
+            or transform_link is None
+            or not isinstance(indexes, list)
+            or not isinstance(weights, list)
+            or len(indexes) != len(weights)
+        ):
             continue
         try:
             parsed_indexes = [int(value) for value in indexes]
@@ -1628,20 +2383,42 @@ def _build_binary_fbx_skin_clusters(path: Path) -> tuple[dict[str, list[dict[str
             continue
         if not all(math.isfinite(value) and value >= 0.0 for value in parsed_weights):
             continue
-        result.setdefault(mesh_name, []).append(
-            {
-                "bone_name": bone_name,
-                "indexes": parsed_indexes,
-                "weights": parsed_weights,
-                "transform": transform,
-                "transform_link": transform_link,
-            }
-        )
+        for mesh_model_id in mesh_model_ids:
+            mesh_model = objects_by_id.get(mesh_model_id)
+            if mesh_model is None or len(mesh_model.properties) < 2:
+                continue
+            mesh_name = _clean_binary_fbx_object_name(mesh_model.properties[1])
+            if mesh_name == "":
+                continue
+            if (
+                normalized_target_mesh_names is not None
+                and normalize_match_name(mesh_name) not in normalized_target_mesh_names
+            ):
+                continue
+            result.setdefault(mesh_name, []).append(
+                {
+                    "bone_name": bone_name,
+                    "indexes": parsed_indexes,
+                    "weights": parsed_weights,
+                    "transform": transform,
+                    "transform_link": transform_link,
+                }
+            )
     return result, "ok"
 
 
-def _build_binary_fbx_skin_evaluation_context(path: Path, scene: Any) -> dict[str, Any]:
-    clusters_by_mesh, graph_status = _build_binary_fbx_skin_clusters(path)
+def _build_binary_fbx_skin_evaluation_context(
+    path: Path,
+    scene: Any,
+    *,
+    binary_document: _BinaryFbxDocument | None = None,
+    target_mesh_names: set[str] | None = None,
+) -> dict[str, Any]:
+    clusters_by_mesh, graph_status = _build_binary_fbx_skin_clusters(
+        path,
+        binary_document=binary_document,
+        target_mesh_names=target_mesh_names,
+    )
     context: dict[str, Any] = {
         "schema": FBX_BINARY_SKIN_EVALUATION_SCHEMA,
         "status": graph_status,
@@ -1760,6 +2537,789 @@ def _build_binary_fbx_skin_evaluation_context(path: Path, scene: Any) -> dict[st
             "weighted_vertex_count": weighted_vertex_count,
         }
     return context
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python UFBX substitute
+# ---------------------------------------------------------------------------
+#
+# The normal Probe pipeline intentionally consumes a small, duck-typed subset
+# of the pyufbx Scene/Node/Mesh API.  Keeping the substitute objects limited
+# to that subset is important: the native UFBX lane remains untouched, while
+# a missing/broken extension can still expose the exact same raw Geometry
+# arrays to the existing identity, normal, UV and Skin code below.
+
+
+@dataclass(slots=True)
+class _BinaryFbxAxesAdapter:
+    right: int = 0
+    up: int = 4
+    front: int = 3
+
+
+@dataclass(slots=True)
+class _BinaryFbxSettingsAdapter:
+    axes: _BinaryFbxAxesAdapter
+    unit_meters: float = 0.01
+    original_unit_meters: float = 0.01
+    original_axis_up: int = 4
+    default_camera: str = ""
+    frames_per_second: float = 30.0
+    time_mode: int = 0
+    time_protocol: int = 0
+    snap_mode: int = 0
+
+
+@dataclass(slots=True)
+class _BinaryFbxMaterialAdapter:
+    name: str
+    shading_model: str = ""
+    id: int = 0
+
+
+@dataclass(slots=True)
+class _BinaryFbxClusterAdapter:
+    bone_name: str
+    vertices: list[int]
+    weights: list[float]
+    transform: list[float] | None = None
+    transform_link: list[float] | None = None
+    name: str = ""
+
+
+@dataclass(slots=True)
+class _BinaryFbxSkinAdapter:
+    clusters: list[_BinaryFbxClusterAdapter]
+    name: str = ""
+
+
+@dataclass(slots=True)
+class _BinaryFbxMeshAdapter:
+    name: str
+    geometry_id: int
+    vertex_positions: list[list[float]]
+    indices: list[int]
+    faces: list[tuple[int, int]]
+    vertex_normals: list[list[float]]
+    vertex_uvs: list[list[float]]
+    uv_set_names: list[str]
+    uv_values_by_set: list[list[list[float]]]
+    uv_indices_by_set: list[list[int]]
+    materials: list[_BinaryFbxMaterialAdapter]
+    skin_deformers: list[_BinaryFbxSkinAdapter]
+    face_material: list[int]
+    num_uv_sets: int
+    num_vertices: int
+    num_indices: int
+    num_faces: int
+    num_triangles: int
+    vertex_bitangent: list[Any] | None = None
+    vertex_tangent: list[Any] | None = None
+    vertex_color: list[Any] | None = None
+    vertex_crease: list[Any] | None = None
+    edge_crease: list[Any] | None = None
+    blend_deformers: list[Any] | None = None
+
+    def get_vertex_uvs_for_set(self, set_index: int) -> list[list[float]]:
+        if set_index < 0 or set_index >= len(self.uv_values_by_set):
+            return []
+        return self.uv_values_by_set[set_index]
+
+    def get_vertex_uv_indices_for_set(self, set_index: int) -> list[int]:
+        if set_index < 0 or set_index >= len(self.uv_indices_by_set):
+            return []
+        return self.uv_indices_by_set[set_index]
+
+
+@dataclass(slots=True)
+class _BinaryFbxNodeAdapter:
+    name: str
+    attrib_type: str
+    mesh: _BinaryFbxMeshAdapter | None = None
+    parent: "_BinaryFbxNodeAdapter | None" = None
+    children: list["_BinaryFbxNodeAdapter"] | None = None
+    node_to_parent: list[float] | None = None
+    node_to_world: list[float] | None = None
+    geometry_to_parent: list[float] | None = None
+    geometry_to_world: list[float] | None = None
+    local_transform: list[float] | None = None
+    world_transform: list[float] | None = None
+    geometry_transform: list[float] | None = None
+    bone: Any | None = None
+    camera: Any | None = None
+    light: Any | None = None
+    visible: bool = True
+    is_root: bool = False
+    fbx_model_id: int = 0
+
+    def __post_init__(self) -> None:
+        if self.children is None:
+            self.children = []
+        if self.node_to_parent is None:
+            self.node_to_parent = _binary_fbx_identity_matrix()
+        if self.node_to_world is None:
+            self.node_to_world = _binary_fbx_identity_matrix()
+        if self.geometry_to_parent is None:
+            self.geometry_to_parent = list(self.node_to_parent)
+        if self.geometry_to_world is None:
+            self.geometry_to_world = list(self.node_to_world)
+        if self.local_transform is None:
+            self.local_transform = list(self.node_to_parent)
+        if self.world_transform is None:
+            self.world_transform = list(self.node_to_world)
+        if self.geometry_transform is None:
+            self.geometry_transform = _binary_fbx_identity_matrix()
+
+
+@dataclass(slots=True)
+class _BinaryFbxSceneAdapter:
+    nodes: list[_BinaryFbxNodeAdapter]
+    meshes: list[_BinaryFbxMeshAdapter]
+    bones: list[_BinaryFbxNodeAdapter]
+    materials: list[_BinaryFbxMaterialAdapter]
+    root_node: _BinaryFbxNodeAdapter
+    settings: _BinaryFbxSettingsAdapter
+    axes: _BinaryFbxAxesAdapter
+    metadata: dict[str, Any]
+    _codex_ufbx_runtime_mode: str = "ufbx_missed_substitute"
+
+    def close(self) -> None:
+        return None
+
+    def find_node(self, name: str) -> _BinaryFbxNodeAdapter | None:
+        for node in self.nodes:
+            if node.name == name:
+                return node
+        return None
+
+    def find_material(self, name: str) -> _BinaryFbxMaterialAdapter | None:
+        for material in self.materials:
+            if material.name == name:
+                return material
+        return None
+
+
+def _binary_fbx_identity_matrix() -> list[float]:
+    return [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+
+
+def _binary_fbx_properties70(node: _BinaryFbxNode) -> dict[str, list[Any]]:
+    properties: dict[str, list[Any]] = {}
+    for container in node.children:
+        if container.name not in {"Properties70", "Properties60"}:
+            continue
+        for property_node in container.children:
+            if property_node.name != "P" or not property_node.properties:
+                continue
+            property_name = str(property_node.properties[0] or "")
+            if property_name:
+                properties[property_name] = list(property_node.properties)
+    return properties
+
+
+def _binary_fbx_property_vector(
+    properties: dict[str, list[Any]],
+    name: str,
+    default: tuple[float, float, float],
+) -> list[float]:
+    values = properties.get(name)
+    if not isinstance(values, list) or len(values) < 7:
+        return [float(value) for value in default]
+    try:
+        result = [float(values[4]), float(values[5]), float(values[6])]
+    except (TypeError, ValueError, OverflowError):
+        return [float(value) for value in default]
+    if not all(math.isfinite(value) for value in result):
+        return [float(value) for value in default]
+    return result
+
+
+def _binary_fbx_property_scalar(
+    properties: dict[str, list[Any]],
+    name: str,
+    default: int | float,
+) -> int | float:
+    values = properties.get(name)
+    if not isinstance(values, list):
+        return default
+    for value in reversed(values[4:] if len(values) > 4 else values):
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return value
+    return default
+
+
+def _binary_fbx_translation_matrix(vector: list[float]) -> list[float]:
+    matrix = _binary_fbx_identity_matrix()
+    matrix[12], matrix[13], matrix[14] = vector[:3]
+    return matrix
+
+
+def _binary_fbx_scale_matrix(vector: list[float]) -> list[float]:
+    matrix = _binary_fbx_identity_matrix()
+    matrix[0], matrix[5], matrix[10] = vector[:3]
+    return matrix
+
+
+def _binary_fbx_axis_rotation_matrix(axis: str, radians: float) -> list[float]:
+    cosine = math.cos(radians)
+    sine = math.sin(radians)
+    matrix = _binary_fbx_identity_matrix()
+    # Row-vector convention: these are the transposes of the conventional
+    # column-vector elementary rotation matrices.
+    if axis == "X":
+        matrix[5], matrix[6], matrix[9], matrix[10] = cosine, sine, -sine, cosine
+    elif axis == "Y":
+        matrix[0], matrix[2], matrix[8], matrix[10] = cosine, -sine, sine, cosine
+    else:
+        matrix[0], matrix[1], matrix[4], matrix[5] = cosine, sine, -sine, cosine
+    return matrix
+
+
+def _binary_fbx_rotation_matrix(
+    degrees: list[float],
+    rotation_order: int,
+) -> list[float]:
+    orders = (
+        "XYZ",
+        "XZY",
+        "YZX",
+        "YXZ",
+        "ZXY",
+        "ZYX",
+    )
+    order = orders[rotation_order] if 0 <= rotation_order < len(orders) else "XYZ"
+    angle_by_axis = {
+        "X": math.radians(float(degrees[0])),
+        "Y": math.radians(float(degrees[1])),
+        "Z": math.radians(float(degrees[2])),
+    }
+    result = _binary_fbx_identity_matrix()
+    for axis in order:
+        result = _multiply_row_major_matrices(
+            result,
+            _binary_fbx_axis_rotation_matrix(axis, angle_by_axis[axis]),
+        )
+    return result
+
+
+def _binary_fbx_model_local_matrix(model: _BinaryFbxNode) -> list[float]:
+    """Build the ordinary FBX Model local matrix in row-vector form.
+
+    The replacement only needs the transform subset consumed by Probe.  It
+    preserves the exporter-authored Translation/Rotation/Scaling values and
+    common rotation/scale pivots; unsupported exotic FBX pivots simply retain
+    the same deterministic T/R/S result instead of inventing a position.
+    """
+    properties = _binary_fbx_properties70(model)
+    translation = _binary_fbx_property_vector(properties, "Lcl Translation", (0.0, 0.0, 0.0))
+    rotation = _binary_fbx_property_vector(properties, "Lcl Rotation", (0.0, 0.0, 0.0))
+    scaling = _binary_fbx_property_vector(properties, "Lcl Scaling", (1.0, 1.0, 1.0))
+    rotation_order = int(_binary_fbx_property_scalar(properties, "RotationOrder", 0) or 0)
+    rotation_matrix = _binary_fbx_rotation_matrix(rotation, rotation_order)
+    pre_rotation = _binary_fbx_rotation_matrix(
+        _binary_fbx_property_vector(properties, "PreRotation", (0.0, 0.0, 0.0)),
+        rotation_order,
+    )
+    post_rotation = _binary_fbx_rotation_matrix(
+        _binary_fbx_property_vector(properties, "PostRotation", (0.0, 0.0, 0.0)),
+        rotation_order,
+    )
+    inverse_post = _invert_row_major_matrix(post_rotation) or _binary_fbx_identity_matrix()
+    scale_matrix = _binary_fbx_scale_matrix(scaling)
+    # FBX's row-vector equivalent leaves translation in scene units rather
+    # than multiplying it by scale (S * R * T), matching pyufbx's matrices.
+    result = scale_matrix
+    result = _multiply_row_major_matrices(result, inverse_post)
+    result = _multiply_row_major_matrices(result, rotation_matrix)
+    result = _multiply_row_major_matrices(result, pre_rotation)
+
+    # Apply the two pivot pairs when authored.  This is deliberately bounded
+    # to the standard FBX pivot fields; geometric transforms remain separate
+    # in pyufbx and are not silently baked into node_to_world here.
+    rotation_pivot = _binary_fbx_property_vector(properties, "RotationPivot", (0.0, 0.0, 0.0))
+    scaling_pivot = _binary_fbx_property_vector(properties, "ScalingPivot", (0.0, 0.0, 0.0))
+    if any(abs(value) > 0.0 for value in scaling_pivot):
+        result = _multiply_row_major_matrices(result, _binary_fbx_translation_matrix([-value for value in scaling_pivot]))
+        result = _multiply_row_major_matrices(result, scale_matrix)
+        result = _multiply_row_major_matrices(result, _binary_fbx_translation_matrix(scaling_pivot))
+    if any(abs(value) > 0.0 for value in rotation_pivot):
+        result = _multiply_row_major_matrices(result, _binary_fbx_translation_matrix([-value for value in rotation_pivot]))
+        result = _multiply_row_major_matrices(result, rotation_matrix)
+        result = _multiply_row_major_matrices(result, _binary_fbx_translation_matrix(rotation_pivot))
+    result = _multiply_row_major_matrices(result, _binary_fbx_translation_matrix(translation))
+    return result
+
+
+def _binary_fbx_axis_value(axis: Any, sign: Any, default: int) -> int:
+    try:
+        axis_index = int(axis)
+        axis_sign = int(sign)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if axis_index not in {0, 1, 2}:
+        return default
+    return (axis_index * 2) if axis_sign >= 0 else (axis_index * 2 + 1)
+
+
+def _binary_fbx_scene_settings(global_settings: _BinaryFbxNode | None) -> tuple[_BinaryFbxAxesAdapter, _BinaryFbxSettingsAdapter]:
+    properties = _binary_fbx_properties70(global_settings) if global_settings is not None else {}
+    right = _binary_fbx_axis_value(
+        _binary_fbx_property_scalar(properties, "CoordAxis", 0),
+        _binary_fbx_property_scalar(properties, "CoordAxisSign", 1),
+        0,
+    )
+    up = _binary_fbx_axis_value(
+        _binary_fbx_property_scalar(properties, "UpAxis", 2),
+        _binary_fbx_property_scalar(properties, "UpAxisSign", 1),
+        4,
+    )
+    front = _binary_fbx_axis_value(
+        _binary_fbx_property_scalar(properties, "FrontAxis", 1),
+        _binary_fbx_property_scalar(properties, "FrontAxisSign", -1),
+        3,
+    )
+    axes = _BinaryFbxAxesAdapter(right=right, up=up, front=front)
+    try:
+        unit_scale = float(_binary_fbx_property_scalar(properties, "UnitScaleFactor", 1.0))
+    except (TypeError, ValueError, OverflowError):
+        unit_scale = 1.0
+    try:
+        original_scale = float(_binary_fbx_property_scalar(properties, "OriginalUnitScaleFactor", unit_scale))
+    except (TypeError, ValueError, OverflowError):
+        original_scale = unit_scale
+    if not math.isfinite(unit_scale) or unit_scale <= 0.0:
+        unit_scale = 1.0
+    if not math.isfinite(original_scale) or original_scale <= 0.0:
+        original_scale = unit_scale
+    settings = _BinaryFbxSettingsAdapter(
+        axes=axes,
+        unit_meters=unit_scale * 0.01,
+        original_unit_meters=original_scale * 0.01,
+        original_axis_up=int(_binary_fbx_property_scalar(properties, "OriginalUpAxis", up) or up),
+        default_camera=str(_binary_fbx_property_scalar(properties, "DefaultCamera", "") or ""),
+        frames_per_second=float(_binary_fbx_property_scalar(properties, "TimeMode", 30.0) or 30.0),
+        time_mode=int(_binary_fbx_property_scalar(properties, "TimeMode", 0) or 0),
+        time_protocol=int(_binary_fbx_property_scalar(properties, "TimeProtocol", 0) or 0),
+        snap_mode=int(_binary_fbx_property_scalar(properties, "SnapOnFrameMode", 0) or 0),
+    )
+    return axes, settings
+
+
+def _binary_fbx_model_property_text(model: _BinaryFbxNode, name: str) -> str:
+    values = _binary_fbx_properties70(model).get(name)
+    if not isinstance(values, list):
+        return ""
+    for value in reversed(values[4:] if len(values) > 4 else values):
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _binary_fbx_collect_connections(
+    connections_root: _BinaryFbxNode | None,
+) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
+    parents_by_child: dict[int, list[int]] = {}
+    children_by_parent: dict[int, list[int]] = {}
+    if connections_root is None:
+        return parents_by_child, children_by_parent
+    for connection in connections_root.children:
+        values = connection.properties
+        if connection.name != "C" or len(values) < 3 or values[0] != "OO":
+            continue
+        if not isinstance(values[1], int) or not isinstance(values[2], int):
+            continue
+        child_id, parent_id = int(values[1]), int(values[2])
+        parents_by_child.setdefault(child_id, []).append(parent_id)
+        children_by_parent.setdefault(parent_id, []).append(child_id)
+    return parents_by_child, children_by_parent
+
+
+def _binary_fbx_build_mesh_adapter(
+    geometry_node: _BinaryFbxNode,
+    *,
+    materials: list[_BinaryFbxMaterialAdapter] | None = None,
+    skin_deformers: list[_BinaryFbxSkinAdapter] | None = None,
+) -> _BinaryFbxMeshAdapter:
+    geometry_id = int(geometry_node.properties[0]) if geometry_node.properties and isinstance(geometry_node.properties[0], int) else 0
+    geometry_name = _clean_binary_fbx_object_name(geometry_node.properties[1]) if len(geometry_node.properties) > 1 else ""
+    raw_geometry: dict[str, Any] | None = None
+    try:
+        raw_geometry = _binary_fbx_read_corner_geometry(geometry_node)
+    except Exception:
+        raw_geometry = None
+    raw_positions = _binary_fbx_node_child_value(geometry_node, "Vertices")
+    raw_polygon_indices = _binary_fbx_node_child_value(geometry_node, "PolygonVertexIndex")
+    if not isinstance(raw_positions, list) or len(raw_positions) % 3 != 0:
+        raise ValueError(f"Geometry {geometry_id} has no valid Vertices array")
+    positions = [
+        [float(raw_positions[index]), float(raw_positions[index + 1]), float(raw_positions[index + 2])]
+        for index in range(0, len(raw_positions), 3)
+    ]
+    if raw_geometry is not None:
+        indices = [int(value) for value in raw_geometry.get("source_indices", [])]
+        faces = [tuple(map(int, face)) for face in raw_geometry.get("faces", [])]
+    else:
+        indices, faces, _corner_faces = _binary_fbx_polygon_vertex_stream(
+            raw_polygon_indices,
+            position_count=len(positions),
+        )
+
+    # UFBX exposes vertex_normals as a stream aligned with polygon corners for
+    # ByPolygonVertex layers.  Preserve that shape so the legacy compatibility
+    # extractor remains equivalent if strict raw matching is unavailable.
+    corner_normals: list[list[float]] = []
+    if isinstance(raw_geometry, dict) and isinstance(raw_geometry.get("normal"), dict):
+        normal = raw_geometry["normal"]
+        values = normal.get("values")
+        corner_indices = normal.get("corner_indices")
+        if isinstance(values, list) and isinstance(corner_indices, list):
+            for direct_index in corner_indices:
+                try:
+                    corner_normals.append([float(value) for value in values[int(direct_index)][:3]])
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    corner_normals = []
+                    break
+
+    uv_values_by_set: list[list[list[float]]] = []
+    uv_indices_by_set: list[list[int]] = []
+    uv_set_names: list[str] = []
+    if isinstance(raw_geometry, dict):
+        for index, channel in enumerate(raw_geometry.get("uv_channels", [])):
+            if not isinstance(channel, dict):
+                continue
+            values = channel.get("values")
+            corner_indices = channel.get("corner_indices")
+            if not isinstance(values, list) or not isinstance(corner_indices, list):
+                continue
+            try:
+                uv_values_by_set.append(
+                    [[float(value[0]), float(value[1])] for value in values]
+                )
+                uv_indices_by_set.append([int(value) for value in corner_indices])
+            except (TypeError, ValueError, IndexError, OverflowError):
+                continue
+            uv_set_names.append(str(channel.get("name", "") or f"map{index + 1}"))
+
+    # UFBX's vertex_uvs is the direct value table (not a corner-expanded
+    # stream); this is also what the summary and normal-fallback code expect.
+    primary_uv_values = [list(value) for value in uv_values_by_set[0]] if uv_values_by_set else []
+    face_material: list[int] = []
+    material_layer = next(
+        (child for child in geometry_node.children if child.name == "LayerElementMaterial"),
+        None,
+    )
+    if material_layer is not None:
+        raw_materials = _binary_fbx_node_child_value(material_layer, "Materials")
+        if isinstance(raw_materials, list):
+            try:
+                face_material = [int(value) for value in raw_materials]
+            except (TypeError, ValueError, OverflowError):
+                face_material = []
+    return _BinaryFbxMeshAdapter(
+        name=geometry_name,
+        geometry_id=geometry_id,
+        vertex_positions=positions,
+        indices=indices,
+        faces=faces,
+        vertex_normals=corner_normals,
+        vertex_uvs=primary_uv_values,
+        uv_set_names=uv_set_names,
+        uv_values_by_set=uv_values_by_set,
+        uv_indices_by_set=uv_indices_by_set,
+        materials=list(materials or []),
+        skin_deformers=list(skin_deformers or []),
+        face_material=face_material,
+        num_uv_sets=len(uv_values_by_set),
+        num_vertices=len(positions),
+        num_indices=len(indices),
+        num_faces=len(faces),
+        num_triangles=sum(max(0, int(size) - 2) for _begin, size in faces),
+    )
+
+
+def _binary_fbx_build_skin_rows(
+    objects_by_id: dict[int, _BinaryFbxNode],
+    parents_by_child: dict[int, list[int]],
+    children_by_parent: dict[int, list[int]],
+) -> tuple[dict[int, list[_BinaryFbxClusterAdapter]], set[int]]:
+    clusters_by_geometry: dict[int, list[_BinaryFbxClusterAdapter]] = {}
+    geometries_with_skin: set[int] = set()
+    for cluster_id, cluster in objects_by_id.items():
+        if cluster.name != "Deformer" or len(cluster.properties) < 3 or str(cluster.properties[2]) != "Cluster":
+            continue
+        skin_ids = [
+            parent_id
+            for parent_id in parents_by_child.get(cluster_id, [])
+            if objects_by_id.get(parent_id) is not None
+            and objects_by_id[parent_id].name == "Deformer"
+            and len(objects_by_id[parent_id].properties) >= 3
+            and str(objects_by_id[parent_id].properties[2]) == "Skin"
+        ]
+        if len(skin_ids) != 1:
+            continue
+        geometry_ids = [
+            parent_id
+            for parent_id in parents_by_child.get(skin_ids[0], [])
+            if objects_by_id.get(parent_id) is not None and objects_by_id[parent_id].name == "Geometry"
+        ]
+        if len(geometry_ids) != 1:
+            continue
+        geometry_id = int(geometry_ids[0])
+        geometries_with_skin.add(geometry_id)
+        bone_ids = [
+            child_id
+            for child_id in children_by_parent.get(cluster_id, [])
+            if objects_by_id.get(child_id) is not None
+            and objects_by_id[child_id].name == "Model"
+            and len(objects_by_id[child_id].properties) >= 3
+            and str(objects_by_id[child_id].properties[2]) == "LimbNode"
+        ]
+        bone_name = ""
+        if bone_ids and len(objects_by_id[bone_ids[0]].properties) > 1:
+            bone_name = _clean_binary_fbx_object_name(objects_by_id[bone_ids[0]].properties[1])
+        indexes = _binary_fbx_node_child_value(cluster, "Indexes")
+        weights = _binary_fbx_node_child_value(cluster, "Weights")
+        # UFBX keeps a valid zero-influence Cluster whose Indexes/Weights
+        # properties are omitted.  Preserve that empty row so the substitute
+        # has the same bone-name/cluster contract; it contributes no weights.
+        if indexes is None and weights is None:
+            parsed_indexes: list[int] = []
+            parsed_weights: list[float] = []
+        else:
+            if not isinstance(indexes, list) or not isinstance(weights, list) or len(indexes) != len(weights):
+                continue
+            try:
+                parsed_indexes = [int(value) for value in indexes]
+                parsed_weights = [float(value) for value in weights]
+            except (TypeError, ValueError, OverflowError):
+                continue
+        if not bone_name or not all(math.isfinite(value) and value >= 0.0 for value in parsed_weights):
+            continue
+        transform = _binary_fbx_matrix(_binary_fbx_node_child_value(cluster, "Transform"))
+        transform_link = _binary_fbx_matrix(_binary_fbx_node_child_value(cluster, "TransformLink"))
+        clusters_by_geometry.setdefault(geometry_id, []).append(
+            _BinaryFbxClusterAdapter(
+                bone_name=bone_name,
+                name=bone_name,
+                vertices=parsed_indexes,
+                weights=parsed_weights,
+                transform=transform,
+                transform_link=transform_link,
+            )
+        )
+    return clusters_by_geometry, geometries_with_skin
+
+
+def ufbx_missed_substitute(
+    path: str | Path,
+    *,
+    binary_document: _BinaryFbxDocument | None = None,
+) -> _BinaryFbxSceneAdapter:
+    """Load a binary FBX through the local parser when UFBX is unavailable.
+
+    This is intentionally a loader substitute, not a second export pipeline:
+    all normal/UV/topology and route decisions remain in the existing Probe
+    functions.  Unsupported (ASCII/corrupt) input raises a data error rather
+    than fabricating a default normal or silently exporting an empty scene.
+    """
+    fbx_path = Path(path)
+    document = binary_document or _build_binary_fbx_document(fbx_path)
+    if document.path.resolve() != fbx_path.resolve():
+        raise ValueError("Binary FBX document belongs to a different path")
+    roots = document.roots
+    objects_root = next((node for node in roots if node.name == "Objects"), None)
+    if objects_root is None:
+        raise ValueError("Binary FBX Objects node is missing")
+    connections_root = next((node for node in roots if node.name == "Connections"), None)
+    parents_by_child, children_by_parent = _binary_fbx_collect_connections(connections_root)
+    objects_by_id: dict[int, _BinaryFbxNode] = {
+        int(node.properties[0]): node
+        for node in objects_root.children
+        if node.properties and isinstance(node.properties[0], int)
+    }
+    geometry_nodes = {
+        object_id: node
+        for object_id, node in objects_by_id.items()
+        if node.name == "Geometry"
+        and len(node.properties) >= 3
+        and str(node.properties[2]) == "Mesh"
+    }
+    model_nodes = [
+        node
+        for node in objects_root.children
+        if node.name == "Model" and len(node.properties) >= 3 and isinstance(node.properties[0], int)
+    ]
+    material_adapters: dict[int, _BinaryFbxMaterialAdapter] = {}
+    for object_id, node in objects_by_id.items():
+        if node.name != "Material" or len(node.properties) < 2:
+            continue
+        material_adapters[object_id] = _BinaryFbxMaterialAdapter(
+            name=_clean_binary_fbx_object_name(node.properties[1]),
+            id=object_id,
+        )
+    clusters_by_geometry, geometries_with_skin = _binary_fbx_build_skin_rows(
+        objects_by_id,
+        parents_by_child,
+        children_by_parent,
+    )
+
+    mesh_adapters: dict[int, _BinaryFbxMeshAdapter] = {}
+    for geometry_id, geometry_node in geometry_nodes.items():
+        connected_material_ids: list[int] = []
+        for model_id, model_node in objects_by_id.items():
+            if model_node.name != "Model":
+                continue
+            if geometry_id not in parents_by_child:
+                continue
+            if model_id not in parents_by_child.get(geometry_id, []):
+                continue
+            connected_material_ids.extend(
+                child_id
+                for child_id in children_by_parent.get(model_id, [])
+                if child_id in material_adapters
+            )
+        materials = [material_adapters[mid] for mid in dict.fromkeys(connected_material_ids) if mid in material_adapters]
+        skin_rows = clusters_by_geometry.get(geometry_id, [])
+        skin_deformers = []
+        if geometry_id in geometries_with_skin:
+            skin_deformers = [_BinaryFbxSkinAdapter(clusters=list(skin_rows))]
+        try:
+            mesh_adapters[geometry_id] = _binary_fbx_build_mesh_adapter(
+                geometry_node,
+                materials=materials,
+                skin_deformers=skin_deformers,
+            )
+        except Exception:
+            # A malformed unconnected helper Geometry must not make a valid
+            # scene unusable; connected malformed Geometry is reported below.
+            if any(
+                geometry_id in children_by_parent.get(int(model.properties[0]), [])
+                for model in model_nodes
+            ):
+                raise
+
+    axes, settings = _binary_fbx_scene_settings(
+        next((node for node in roots if node.name == "GlobalSettings"), None)
+    )
+    root = _BinaryFbxNodeAdapter(
+        name="",
+        attrib_type="ROOT",
+        is_root=True,
+        fbx_model_id=0,
+    )
+    node_adapters: dict[int, _BinaryFbxNodeAdapter] = {}
+    for model in model_nodes:
+        model_id = int(model.properties[0])
+        model_name = _clean_binary_fbx_object_name(model.properties[1])
+        model_type = str(model.properties[2] or "")
+        geometry_ids = [
+            child_id
+            for child_id in children_by_parent.get(model_id, [])
+            if child_id in mesh_adapters
+        ]
+        node_adapters[model_id] = _BinaryFbxNodeAdapter(
+            name=model_name,
+            attrib_type=model_type,
+            mesh=mesh_adapters.get(geometry_ids[0]) if geometry_ids else None,
+            fbx_model_id=model_id,
+            visible=True,
+            node_to_parent=_binary_fbx_model_local_matrix(model),
+        )
+        if model_type.casefold() == "limbnode":
+            node_adapters[model_id].bone = node_adapters[model_id]
+    # Dataclass slots intentionally reject ad-hoc bookkeeping attributes; use
+    # a local map for hierarchy assembly instead.
+    parent_model_map: dict[int, int] = {}
+    for model in model_nodes:
+        model_id = int(model.properties[0])
+        parent_model_map[model_id] = next(
+            (
+                int(parent_id)
+                for parent_id in parents_by_child.get(model_id, [])
+                if objects_by_id.get(parent_id) is not None and objects_by_id[parent_id].name == "Model"
+            ),
+            0,
+        )
+    # Resolve parent/world matrices recursively instead of relying on FBX
+    # Objects order.  Exporters are allowed to serialize a child Model before
+    # its parent; a single insertion-order pass would then attach an incorrect
+    # world matrix to that child and to every dependent Skin calculation.
+    world_cache: dict[int, list[float]] = {}
+    resolving: set[int] = set()
+
+    def resolve_world(model_id: int) -> list[float]:
+        cached = world_cache.get(model_id)
+        if cached is not None:
+            return list(cached)
+        node = node_adapters[model_id]
+        local = list(node.node_to_parent or _binary_fbx_identity_matrix())
+        if model_id in resolving:
+            # Malformed cyclic Model links cannot be evaluated.  Preserve the
+            # local transform as a deterministic, non-recursive fallback.
+            world = local
+        else:
+            resolving.add(model_id)
+            parent_id = parent_model_map.get(model_id, 0)
+            if parent_id in node_adapters:
+                parent_world = resolve_world(parent_id)
+            else:
+                parent_world = _binary_fbx_identity_matrix()
+            resolving.discard(model_id)
+            world = _multiply_row_major_matrices(local, parent_world)
+        world_cache[model_id] = list(world)
+        return list(world)
+
+    for model_id, node in node_adapters.items():
+        parent_id = parent_model_map.get(model_id, 0)
+        parent = node_adapters.get(parent_id, root)
+        node.parent = parent
+        if parent.children is None:
+            parent.children = []
+        parent.children.append(node)
+        node.node_to_world = resolve_world(model_id)
+        node.geometry_to_parent = list(node.node_to_parent or _binary_fbx_identity_matrix())
+        node.geometry_to_world = list(node.node_to_world)
+        node.local_transform = list(node.node_to_parent or _binary_fbx_identity_matrix())
+        node.world_transform = list(node.node_to_world)
+
+    nodes = [root] + [node_adapters[int(model.properties[0])] for model in model_nodes]
+    bones = [node for node in nodes if node is not root and node.attrib_type.casefold() == "limbnode"]
+    meshes = list(mesh_adapters.values())
+    materials = list(material_adapters.values())
+    return _BinaryFbxSceneAdapter(
+        nodes=nodes,
+        meshes=meshes,
+        bones=bones,
+        materials=materials,
+        root_node=root,
+        settings=settings,
+        axes=axes,
+        metadata={
+            "source": "binary_fbx_python_reader",
+            "path": str(fbx_path),
+            "version": int(document.version),
+            "runtime_mode": "ufbx_missed_substitute",
+        },
+    )
 
 
 def _apply_binary_fbx_skin_pose_channels(
@@ -2652,6 +4212,19 @@ def _extract_mesh_geometry(
     vertex_map: dict[tuple[int, Any, tuple[int, int, int]], int] = {}
     node_to_world = getattr(instance_node, "node_to_world", None)
     prepared_transform = _prepare_row_major_transform(node_to_world)
+    # Keep the compatibility/fallback extractor on the exact same position
+    # chain as the strict corner reader. A Mesh node may carry the exporter
+    # axis basis (for example the imported Max-Z-up <-> FBX-Y-up helper) in
+    # addition to its real scale/translation. Applying only node_to_world
+    # leaves rows in FBX world axes; applying the inverse of the normalized
+    # node basis removes only that helper basis while retaining scale and
+    # placement in the Max/MOD lane.
+    node_world_matrix = _binary_fbx_matrix(_flatten_matrix4x4(node_to_world))
+    world_to_max_matrix = (
+        _world_to_max_axis_matrix(node_world_matrix)
+        if node_world_matrix is not None
+        else None
+    )
     default_uv_channel = uv_channels[0] if uv_channels else None
 
     for face_begin, face_size in faces:
@@ -2701,7 +4274,11 @@ def _extract_mesh_geometry(
                 if 0 <= position_index < positions_count:
                     local_pos = _vec3_to_list(positions_src[position_index])
                     world_pos = _transform_position_row_major(local_pos, prepared_transform)
-                    max_pos = _fbx_world_to_max_vec3(world_pos)
+                    max_pos = (
+                        _transform_position_row_major(world_pos, world_to_max_matrix)
+                        if world_to_max_matrix is not None
+                        else _fbx_world_to_max_vec3(world_pos)
+                    )
                     out_positions.append(local_pos)
                     out_world_positions.append(max_pos)
                     out_max_positions.append(max_pos)
@@ -2896,15 +4473,18 @@ def _extract_source_skin_rows(mesh: Any, source_vertex_count: int) -> tuple[list
     primary = mesh.skin_deformers[0]
     for cluster_index, cluster in enumerate(primary.clusters):
         bone_name = str(getattr(cluster, "bone_name", "") or getattr(cluster, "name", "") or "")
-        if bone_name != "":
-            bone_names.append(bone_name)
         game_bone = parse_bone_id_from_name(bone_name, default_value=None)
         if game_bone is None:
-            mesh_name = str(getattr(mesh, "name", "") or "<unnamed mesh>")
-            raise ValueError(
-                "FBX Skin cluster cannot be mapped to an RE6 bone ID: "
-                f"mesh={mesh_name}; cluster={cluster_index}; bone={bone_name or '<unnamed>'}"
-            )
+            # COMPATIBILITY CONTRACT -- DO NOT RESTORE THE OLD EXCEPTION:
+            # Max/FBX Skin data may contain renamed helpers, arbitrary link
+            # nodes, or stale clusters whose names are not ``b_<parent>_<id>``.
+            # Such a cluster has no deterministic RE6 bone ID, so discard the
+            # entire cluster and continue exporting every valid RE6 cluster.
+            # Raising here aborts an otherwise usable Mesh export. The policy
+            # is locked by _run_skin_cluster_name_policy_regression_guard().
+            continue
+        if bone_name != "":
+            bone_names.append(bone_name)
         vertices = _safe_list(getattr(cluster, "vertices", None))
         weights = _safe_list(getattr(cluster, "weights", None))
         row_count = min(len(vertices), len(weights))
@@ -3003,18 +4583,35 @@ def _extract_skin_summary(mesh: Any, *, source_vertex_indices: list[int] | None 
 
 
 def _require_scene(path: str | Path) -> tuple[Path, Any]:
-    if ufbx is None:
-        runtime_error = FbxProbeRuntimeUnavailableError(get_fbx_probe_runtime_status())
-        if UFBX_IMPORT_ERROR is not None:
-            raise runtime_error from UFBX_IMPORT_ERROR
-        raise runtime_error
     fbx_path = Path(path)
+    if ufbx is None:
+        # The raw binary reader is the supported substitute for a missing
+        # native extension.  It returns the same small Scene/Node/Mesh shape
+        # consumed by the existing Probe stages; it does not intercept or
+        # alter MOD export decisions.
+        try:
+            scene = ufbx_missed_substitute(fbx_path)
+        except Exception:
+            # Preserve a clear parse/data error from the substitute.  Do not
+            # fabricate an empty scene or turn an unsupported ASCII/corrupt
+            # FBX into a retryable native-runtime error.
+            raise
+        return fbx_path, scene
     try:
         scene = ufbx.load_file(str(fbx_path))
     except Exception as exc:
         details = classify_fbx_probe_exception(exc, stage="load_file")
         if bool(details["runtime_retryable"]):
-            raise FbxProbeRuntimeUnavailableError(details) from exc
+            try:
+                scene = ufbx_missed_substitute(fbx_path)
+            except Exception:
+                # Native loader failure plus an unparseable binary is still a
+                # real input/runtime failure; keep the native diagnostic as
+                # the cause while exposing the substitute parse exception.
+                raise
+            if isinstance(getattr(scene, "metadata", None), dict):
+                scene.metadata["native_ufbx_failure"] = details
+            return fbx_path, scene
         raise
     return fbx_path, scene
 
@@ -3030,7 +4627,8 @@ def _summarize_scene(
         node_name = str(instance_node.name) if instance_node is not None else ""
         mesh_name = str(mesh.name)
         binary_identity = _take_binary_fbx_mesh_model_identity(
-            binary_model_queues or {}, instance_node
+            binary_model_queues or {},
+            instance_node,
         )
         vertex_positions = mesh.vertex_positions if mesh.vertex_positions is not None else []
         vertex_uv = mesh.vertex_uvs if mesh.vertex_uvs is not None else []
@@ -3142,7 +4740,113 @@ def summarize_fbx(path: str | Path) -> dict[str, Any]:
         binary_model_queues=_binary_fbx_mesh_model_identity_queues(fbx_path),
     )
     summary["fbx_axes"] = _scene_axis_receipt(scene)
+    summary["fbx_units"] = _scene_unit_receipt(scene)
     return summary
+
+
+def _build_probe_contract_mesh_row(
+    *,
+    node_name: str,
+    mesh_name: str,
+    instance_node: Any | None,
+    material_names: list[str],
+    geometry: dict[str, Any],
+    normal_fidelity: dict[str, Any],
+    skin: dict[str, Any],
+    binary_identity: dict[str, Any] | None = None,
+    probe_route: str = "",
+    probe_route_authority: str = "",
+    probe_route_match_status: str = "",
+    probe_geometry_required: bool = False,
+    probe_geometry_skipped: bool = False,
+    probe_skip_reason: str = "",
+    probe_topology_scanned: bool = False,
+) -> dict[str, Any]:
+    """Build the single authoritative Mesh contract row for Probe consumers.
+
+    Both the public extraction adapter and the runtime handoff use this
+    builder.  Route metadata is opt-in so the legacy extraction API keeps its
+    established shape while the handoff retains Stage A/B facts.
+    """
+    geometry_normal_fidelity = geometry.get("normal_fidelity", normal_fidelity)
+    max_position_rows = geometry.get("max_positions")
+    # Position conversion does not depend on normal fidelity.  A fallback
+    # geometry extraction still has a valid node-transformed position lane;
+    # dropping it here forced the Bridge to rebuild the lane with a different
+    # axis path and could lose the FBX node basis.  Keep exact and fallback
+    # position rows alike; normal_fidelity remains the authority marker for
+    # authored normal data.
+    publish_max_positions = isinstance(max_position_rows, list) and bool(max_position_rows)
+    row: dict[str, Any] = {
+        "node_name": node_name,
+        "mesh_name": mesh_name,
+        "match_name": normalize_match_name(node_name or mesh_name),
+        "mesh_name_match": normalize_match_name(mesh_name),
+        "mesh_slot_hint": infer_mesh_slot_hint(node_name) or infer_mesh_slot_hint(mesh_name),
+        "lod_hint": infer_lod_hint(node_name) or infer_lod_hint(mesh_name),
+        "material_names": material_names,
+        "positions": geometry.get("positions", []),
+        **(
+            {"max_positions": max_position_rows}
+            if publish_max_positions
+            else {}
+        ),
+        "skinned_positions": geometry.get("skinned_positions", []),
+        "skinned_max_positions": geometry.get("skinned_max_positions", []),
+        "skinned_world_positions": geometry.get("skinned_world_positions", []),
+        "normals": geometry.get("normals", []),
+        "max_normals": geometry.get("max_normals", []),
+        "skinned_normals": geometry.get("skinned_normals", []),
+        "skinned_max_normals": geometry.get("skinned_max_normals", []),
+        "binary_skin_unreferenced_source_indices": geometry.get(
+            "binary_skin_unreferenced_source_indices", []
+        ),
+        "binary_skin_unreferenced_max_positions": geometry.get(
+            "binary_skin_unreferenced_max_positions", []
+        ),
+        "skinned_is_local": geometry.get("skinned_is_local", False),
+        "fbx_skin_pose_evaluation_status": geometry.get(
+            "fbx_skin_pose_evaluation_status", ""
+        ),
+        "fbx_skin_pose_evaluation_schema": geometry.get(
+            "fbx_skin_pose_evaluation_schema", ""
+        ),
+        "fbx_skin_pose_evaluation_mode": geometry.get(
+            "fbx_skin_pose_evaluation_mode", ""
+        ),
+        "uvs": geometry.get("uvs", []),
+        "face_indices": geometry.get("face_indices", []),
+        "source_vertex_indices": geometry.get("source_vertex_indices", []),
+        "fbx_export_corner_indices": geometry.get("fbx_export_corner_indices", []),
+        "fbx_geom_face_indices": geometry.get("fbx_geom_face_indices", []),
+        "fbx_export_face_indices": geometry.get("fbx_export_face_indices", []),
+        "fbx_uv_channels": geometry.get("fbx_uv_channels", []),
+        "normal_fidelity": geometry_normal_fidelity,
+        "vertex_count": geometry.get("vertex_count", 0),
+        "triangle_count": geometry.get("triangle_count", 0),
+    }
+    if isinstance(skin, dict):
+        row.update(skin)
+    if isinstance(binary_identity, dict) and binary_identity:
+        row.update(binary_identity)
+    if probe_route != "" or probe_route_authority != "":
+        row.update(
+            {
+                "fbx_probe_route": probe_route,
+                "fbx_probe_route_authority": probe_route_authority,
+                "fbx_probe_route_match_status": probe_route_match_status,
+                "fbx_probe_geometry_required": bool(probe_geometry_required),
+                "fbx_probe_geometry_skipped": bool(probe_geometry_skipped),
+                "fbx_probe_skip_reason": probe_skip_reason,
+                "fbx_probe_topology_scanned": bool(probe_topology_scanned),
+            }
+        )
+    node_to_world = _flatten_matrix4x4(
+        getattr(instance_node, "node_to_world", None)
+    )
+    if len(node_to_world) == 16:
+        row["fbx_node_to_world_matrix"] = node_to_world
+    return row
 
 
 def _extract_scene_mesh_contracts(
@@ -3151,6 +4855,7 @@ def _extract_scene_mesh_contracts(
     skin_context: dict[str, Any] | None = None,
     binary_model_queues: dict[tuple[str, str], list[dict[str, Any]]] | None = None,
     binary_corner_context: dict[str, Any] | None = None,
+    binary_document: _BinaryFbxDocument | None = None,
 ) -> list[dict[str, Any]]:
     contracts: list[dict[str, Any]] = []
     for mesh, instance_node in _mesh_node_pairs(scene):
@@ -3179,72 +4884,274 @@ def _extract_scene_mesh_contracts(
         )
         material_names = _mesh_material_names(mesh)
         skin_summary = _extract_skin_summary(mesh, source_vertex_indices=geometry["source_vertex_indices"])
-        node_to_world = _flatten_matrix4x4(getattr(instance_node, "node_to_world", None))
-        contract_mesh = {
-            "node_name": node_name,
-            "mesh_name": mesh_name,
-            "match_name": normalize_match_name(node_name or mesh_name),
-            "mesh_name_match": normalize_match_name(mesh_name),
-            "mesh_slot_hint": infer_mesh_slot_hint(node_name) or infer_mesh_slot_hint(mesh_name),
-            "lod_hint": infer_lod_hint(node_name) or infer_lod_hint(mesh_name),
-            "material_names": material_names,
-            "positions": geometry["positions"],
-            # Strict corner geometry has already restored the FBX node's
-            # Blender axis basis. This explicit Max-space table prevents the
-            # writer from serializing tiny FBX-local position rows. Legacy
-            # extraction deliberately retains its established position route.
-            **(
-                {"max_positions": geometry["max_positions"]}
-                if isinstance(geometry.get("normal_fidelity"), dict)
-                and str(geometry["normal_fidelity"].get("status", "") or "") == "exact"
-                else {}
-            ),
-            "skinned_positions": geometry["skinned_positions"],
-            "skinned_max_positions": geometry["skinned_max_positions"],
-            "skinned_world_positions": geometry["skinned_world_positions"],
-            "normals": geometry["normals"],
-            "max_normals": geometry["max_normals"],
-            "skinned_normals": geometry["skinned_normals"],
-            "skinned_max_normals": geometry["skinned_max_normals"],
-            "binary_skin_unreferenced_source_indices": geometry.get(
-                "binary_skin_unreferenced_source_indices", []
-            ),
-            "binary_skin_unreferenced_max_positions": geometry.get(
-                "binary_skin_unreferenced_max_positions", []
-            ),
-            "skinned_is_local": geometry["skinned_is_local"],
-            "fbx_skin_pose_evaluation_status": geometry.get("fbx_skin_pose_evaluation_status", ""),
-            "fbx_skin_pose_evaluation_schema": geometry.get("fbx_skin_pose_evaluation_schema", ""),
-            "fbx_skin_pose_evaluation_mode": geometry.get("fbx_skin_pose_evaluation_mode", ""),
-            "uvs": geometry["uvs"],
-            "face_indices": geometry["face_indices"],
-            "source_vertex_indices": geometry["source_vertex_indices"],
-            "fbx_export_corner_indices": geometry["fbx_export_corner_indices"],
-            "fbx_geom_face_indices": geometry["fbx_geom_face_indices"],
-            "fbx_export_face_indices": geometry["fbx_export_face_indices"],
-            "fbx_uv_channels": geometry["fbx_uv_channels"],
-            "normal_fidelity": geometry.get("normal_fidelity", normal_fidelity),
-            "vertex_count": geometry["vertex_count"],
-            "triangle_count": geometry["triangle_count"],
-            **skin_summary,
-        }
-        if binary_identity:
-            contract_mesh.update(binary_identity)
-        if len(node_to_world) == 16:
-            contract_mesh["fbx_node_to_world_matrix"] = node_to_world
+        contract_mesh = _build_probe_contract_mesh_row(
+            node_name=node_name,
+            mesh_name=mesh_name,
+            instance_node=instance_node,
+            material_names=material_names,
+            geometry=geometry,
+            normal_fidelity=normal_fidelity,
+            skin=skin_summary,
+            binary_identity=binary_identity,
+        )
         contracts.append(contract_mesh)
     return contracts
 
 
 def extract_fbx_mesh_contracts(path: str | Path) -> list[dict[str, Any]]:
     fbx_path, scene = _require_scene(path)
-    skin_context = _build_binary_fbx_skin_evaluation_context(fbx_path, scene)
+    binary_document = _build_binary_fbx_document(fbx_path)
+    skin_context = _build_binary_fbx_skin_evaluation_context(
+        fbx_path,
+        scene,
+        binary_document=binary_document,
+    )
     return _extract_scene_mesh_contracts(
         scene,
         skin_context=skin_context,
-        binary_model_queues=_binary_fbx_mesh_model_identity_queues(fbx_path),
-        binary_corner_context=_build_binary_fbx_corner_geometry_context(fbx_path),
+        binary_model_queues=_binary_fbx_mesh_model_identity_queues(
+            fbx_path,
+            binary_document=binary_document,
+        ),
+        binary_corner_context=_build_binary_fbx_corner_geometry_context(
+            fbx_path,
+            binary_document=binary_document,
+        ),
+        binary_document=binary_document,
     )
+
+
+def _build_probe_stage_a_plan(
+    scene: Any,
+    *,
+    binary_model_queues: dict[tuple[str, str], list[dict[str, Any]]] | None = None,
+    probe_mode: str = "full",
+    target_handles: set[int] | None = None,
+    target_names: set[str] | None = None,
+    target_slots: set[int] | None = None,
+    route_hints: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Classify every Mesh once before any exact Geometry array is consumed."""
+    normalized_target_handles = {
+        _int_or_default(value, 0)
+        for value in (target_handles or set())
+        if _int_or_default(value, 0) > 0
+    }
+    normalized_target_names = {
+        normalize_match_name(value)
+        for value in (target_names or set())
+        if normalize_match_name(value)
+    }
+    normalized_target_slots = {
+        _int_or_default(value, 0)
+        for value in (target_slots or set())
+        if _int_or_default(value, 0) > 0
+    }
+    normalized_route_hints = _normalize_probe_route_hints(route_hints)
+    unskinned_edit_policy = normalized_route_hints.get(
+        "unskinned_mesh_edit_export", {}
+    )
+    allow_unskinned_geometry = bool(
+        isinstance(unskinned_edit_policy, dict)
+        and unskinned_edit_policy.get("authorized") is True
+    )
+    probe_mode_key = str(probe_mode or "full").casefold()
+    route_hint_filter_active = (
+        normalized_route_hints.get("status") == "ok"
+        and bool(normalized_route_hints.get("rows"))
+        and (
+            probe_mode_key == "export_required"
+            or bool(normalized_route_hints.get("explicit_route_required", False))
+        )
+    )
+    filter_active = str(probe_mode or "full").casefold() == "export_required" and bool(
+        normalized_target_handles
+        or normalized_target_names
+        or normalized_target_slots
+        or route_hint_filter_active
+    )
+    entries: list[dict[str, Any]] = []
+    route_hint_match_count = 0
+    route_hint_ambiguous_count = 0
+    route_hint_unmatched_count = 0
+    identity_excluded_count = 0
+    exact_geometry_ids: set[int] = set()
+    exact_geometry_names: set[str] = set()
+    exact_mesh_names: set[str] = set()
+
+    for mesh, instance_node in _mesh_node_pairs(scene):
+        node_name = str(instance_node.name) if instance_node is not None else ""
+        mesh_name = str(mesh.name)
+        binary_identity = _take_binary_fbx_mesh_model_identity(
+            binary_model_queues or {},
+            instance_node,
+            preferred_route_handles=(
+                normalized_target_handles
+                if bool(normalized_route_hints.get("explicit_route_required", False))
+                else None
+            ),
+        )
+        target_mesh = _probe_stage_a_mesh_target(
+            mesh,
+            instance_node,
+            binary_identity,
+            target_handles=normalized_target_handles,
+            target_names=normalized_target_names,
+            target_slots=normalized_target_slots,
+            filter_active=filter_active,
+        )
+        route_hint, route_hint_match = (
+            _probe_route_hint_for_mesh(
+                mesh,
+                instance_node,
+                binary_identity,
+                normalized_route_hints,
+            )
+            if route_hint_filter_active
+            else (None, "disabled")
+        )
+        if route_hint is not None:
+            route_hint_match_count += 1
+        elif route_hint_match.startswith("ambiguous_"):
+            route_hint_ambiguous_count += 1
+        elif route_hint_filter_active and route_hint_match == "unmatched":
+            route_hint_unmatched_count += 1
+
+        hint_lane = (
+            str(route_hint.get("lane", "") or "").strip().lower()
+            if route_hint
+            else ""
+        )
+        identity_excluded = route_hint_match == "identity_excluded"
+        if identity_excluded:
+            # This is an unmarked/wrongly marked Max duplicate.  Keep it out
+            # of Stage B entirely; the correctly marked sibling owns the route.
+            identity_excluded_count += 1
+        launcher_route_only = hint_lane in {"header", "delete"}
+        if identity_excluded:
+            has_skin = False
+            triangle_count = 0
+            topology_scanned = False
+        elif launcher_route_only:
+            has_skin = False
+            triangle_count = 0
+            topology_scanned = False
+        else:
+            has_skin = _probe_mesh_has_skin(mesh)
+            triangle_count = _probe_mesh_triangle_count(mesh)
+            topology_scanned = True
+
+        if identity_excluded:
+            exact_payload_required = False
+            probe_route = ""
+            probe_route_authority = "fbx_probe_identity_filter"
+            probe_geometry_required = False
+            probe_skip_reason = "max_unmarked_or_mismatched_route_identity"
+        elif hint_lane == "header":
+            exact_payload_required = False
+            probe_route = "header_only"
+            probe_route_authority = "launcher_bucket_receipt"
+            probe_geometry_required = False
+            probe_skip_reason = "launcher_header_route"
+        elif hint_lane == "delete":
+            exact_payload_required = False
+            probe_route = "delete"
+            probe_route_authority = "launcher_bucket_receipt"
+            probe_geometry_required = False
+            probe_skip_reason = "launcher_delete_route"
+        elif hint_lane == "modify":
+            probe_route = _probe_topology_route(
+                has_skin,
+                triangle_count,
+                allow_unskinned_geometry=allow_unskinned_geometry,
+            )
+            probe_route_authority = "fbx_probe_topology"
+            probe_geometry_required = probe_route == "fbx_geometry"
+            exact_payload_required = probe_geometry_required
+            probe_skip_reason = (
+                "topology_route_source_geometry"
+                if not exact_payload_required
+                else ""
+            )
+        else:
+            probe_route = (
+                _probe_topology_route(
+                    has_skin,
+                    triangle_count,
+                    allow_unskinned_geometry=allow_unskinned_geometry,
+                )
+                if target_mesh
+                else ""
+            )
+            exact_payload_required = (
+                probe_route == "fbx_geometry"
+                if target_mesh
+                else not filter_active
+            )
+            probe_route_authority = "fbx_probe_topology" if probe_route else ""
+            probe_geometry_required = bool(exact_payload_required)
+            probe_skip_reason = (
+                "stage_a_route_discovery" if not exact_payload_required else ""
+            )
+
+        entry = {
+            "mesh": mesh,
+            "instance_node": instance_node,
+            "node_name": node_name,
+            "mesh_name": mesh_name,
+            "binary_identity": binary_identity,
+            "target_mesh": target_mesh,
+            "route_hint": route_hint,
+            "route_hint_match": route_hint_match,
+            "identity_excluded": bool(identity_excluded),
+            "hint_lane": hint_lane,
+            "has_skin": bool(has_skin),
+            "triangle_count": int(triangle_count),
+            "topology_scanned": bool(topology_scanned),
+            "exact_payload_required": bool(exact_payload_required),
+            "probe_route": probe_route,
+            "probe_route_authority": probe_route_authority,
+            "probe_geometry_required": bool(probe_geometry_required),
+            "probe_skip_reason": probe_skip_reason,
+            "unskinned_mesh_edit_export_authorized": allow_unskinned_geometry,
+        }
+        entries.append(entry)
+        if not exact_payload_required:
+            continue
+        geometry_id = _int_or_default(binary_identity.get("fbx_geometry_id"), 0)
+        if geometry_id > 0:
+            exact_geometry_ids.add(geometry_id)
+        for value in (
+            node_name,
+            mesh_name,
+            binary_identity.get("fbx_model_name", ""),
+        ):
+            name_key = normalize_match_name(value)
+            if name_key:
+                exact_geometry_names.add(name_key)
+                exact_mesh_names.add(name_key)
+
+    return {
+        "entries": entries,
+        "mode": str(probe_mode or "full"),
+        "filter_active": bool(filter_active),
+        "route_hint_filter_active": bool(route_hint_filter_active),
+        "route_hints": normalized_route_hints,
+        "unskinned_mesh_edit_export_authorized": allow_unskinned_geometry,
+        "route_hint_match_count": route_hint_match_count,
+        "route_hint_ambiguous_count": route_hint_ambiguous_count,
+        "route_hint_unmatched_count": route_hint_unmatched_count,
+        "identity_excluded_count": identity_excluded_count,
+        "stage_a_mesh_count": sum(
+            1 for entry in entries if not entry["exact_payload_required"]
+        ),
+        "stage_b_mesh_count": sum(
+            1 for entry in entries if entry["exact_payload_required"]
+        ),
+        "exact_geometry_ids": exact_geometry_ids,
+        "exact_geometry_names": exact_geometry_names,
+        "exact_mesh_names": exact_mesh_names,
+    }
 
 
 def _probe_scene_handoff(
@@ -3255,43 +5162,227 @@ def _probe_scene_handoff(
     skin_context: dict[str, Any] | None = None,
     binary_model_queues: dict[tuple[str, str], list[dict[str, Any]]] | None = None,
     binary_corner_context: dict[str, Any] | None = None,
+    probe_mode: str = "full",
+    target_handles: set[int] | None = None,
+    target_names: set[str] | None = None,
+    target_slots: set[int] | None = None,
+    route_hints: dict[str, Any] | None = None,
+    stage_a_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     mesh_summaries: list[dict[str, Any]] = []
     contract_meshes: list[dict[str, Any]] = []
-    for mesh, instance_node in _mesh_node_pairs(scene):
-        node_name = str(instance_node.name) if instance_node is not None else ""
-        mesh_name = str(mesh.name)
-        binary_identity = _take_binary_fbx_mesh_model_identity(
-            binary_model_queues or {}, instance_node
+    route_receipt_rows: list[dict[str, Any]] = []
+    active_stage_a_plan = (
+        stage_a_plan
+        if isinstance(stage_a_plan, dict)
+        and isinstance(stage_a_plan.get("entries"), list)
+        else _build_probe_stage_a_plan(
+            scene,
+            binary_model_queues=binary_model_queues,
+            probe_mode=probe_mode,
+            target_handles=target_handles,
+            target_names=target_names,
+            target_slots=target_slots,
+            route_hints=route_hints,
         )
-        vertex_positions = mesh.vertex_positions if mesh.vertex_positions is not None else []
-        vertex_uv = mesh.vertex_uvs if mesh.vertex_uvs is not None else []
-        normal_values = mesh.vertex_normals if mesh.vertex_normals is not None else []
-        has_positions = len(vertex_positions) > 0
-        has_uv = len(vertex_uv) > 0
-        has_normals = len(normal_values) > 0
-        binary_corner_geometry, normal_fidelity = _select_binary_fbx_corner_geometry(
-            mesh,
-            binary_corner_context,
-            binary_identity,
+    )
+    normalized_route_hints = active_stage_a_plan.get("route_hints", {})
+    # Stage A is the sole owner of the unskinned-geometry authorization fact.
+    # Reuse that decision while writing the receipt; do not recalculate or
+    # introduce a second policy gate in Stage B.
+    allow_unskinned_geometry = bool(
+        active_stage_a_plan.get("unskinned_mesh_edit_export_authorized", False)
+    )
+    route_hint_filter_active = bool(
+        active_stage_a_plan.get("route_hint_filter_active", False)
+    )
+    stage_a_filter_active = bool(active_stage_a_plan.get("filter_active", False))
+    route_hint_match_count = _int_or_default(
+        active_stage_a_plan.get("route_hint_match_count"), 0
+    )
+    route_hint_ambiguous_count = _int_or_default(
+        active_stage_a_plan.get("route_hint_ambiguous_count"), 0
+    )
+    route_hint_unmatched_count = _int_or_default(
+        active_stage_a_plan.get("route_hint_unmatched_count"), 0
+    )
+    stage_a_mesh_count = _int_or_default(
+        active_stage_a_plan.get("stage_a_mesh_count"), 0
+    )
+    stage_b_mesh_count = _int_or_default(
+        active_stage_a_plan.get("stage_b_mesh_count"), 0
+    )
+    for entry in active_stage_a_plan.get("entries", []):
+        if not isinstance(entry, dict):
+            continue
+        mesh = entry.get("mesh")
+        instance_node = entry.get("instance_node")
+        if mesh is None:
+            continue
+        node_name = str(entry.get("node_name", "") or "")
+        mesh_name = str(entry.get("mesh_name", "") or "")
+        binary_identity = (
+            dict(entry.get("binary_identity", {}))
+            if isinstance(entry.get("binary_identity"), dict)
+            else {}
         )
-        geometry = _extract_mesh_geometry(
-            mesh,
-            instance_node,
-            binary_corner_geometry=binary_corner_geometry,
-            normal_fidelity=normal_fidelity,
+        if bool(entry.get("identity_excluded", False)):
+            # Do not open UFBX Geometry/Skin arrays for a duplicate Max node
+            # whose FBX route marker is absent or does not match Launcher.
+            mesh_summaries.append(
+                {
+                    "node_name": node_name,
+                    "mesh_name": mesh_name,
+                    "match_name": normalize_match_name(node_name or mesh_name),
+                    "mesh_name_match": normalize_match_name(mesh_name),
+                    "mesh_slot_hint": infer_mesh_slot_hint(node_name) or infer_mesh_slot_hint(mesh_name),
+                    "lod_hint": infer_lod_hint(node_name) or infer_lod_hint(mesh_name),
+                    "vertex_count": int(getattr(mesh, "num_vertices", 0) or 0),
+                    "index_count": int(getattr(mesh, "num_indices", 0) or 0),
+                    "face_count": int(getattr(mesh, "num_faces", 0) or 0),
+                    "triangle_count": 0,
+                    "material_names": [],
+                    "material_slot_count": 0,
+                    "material_part_count": None,
+                    "bbox": BoundingBox().to_dict(),
+                    "position_preview": [],
+                    "uv_preview": [],
+                    "normal_preview": [],
+                    "face_preview": [],
+                    "fbx_probe_route": "",
+                    "fbx_probe_route_authority": "fbx_probe_identity_filter",
+                    "fbx_probe_route_match_status": "identity_excluded",
+                    "fbx_probe_geometry_required": False,
+                    "fbx_probe_geometry_skipped": True,
+                    "fbx_probe_skip_reason": str(
+                        entry.get("probe_skip_reason", "max_unmarked_or_mismatched_route_identity")
+                        or "max_unmarked_or_mismatched_route_identity"
+                    ),
+                    "fbx_probe_topology_scanned": False,
+                    "identity_excluded": True,
+                    **binary_identity,
+                }
+            )
+            continue
+        route_hint = (
+            entry.get("route_hint")
+            if isinstance(entry.get("route_hint"), dict)
+            else None
         )
-        geometry = _augment_geometry_with_skinned_pose_channels(geometry, mesh, instance_node)
-        geometry = _apply_binary_fbx_skin_pose_channels(
-            geometry,
-            mesh,
-            instance_node,
-            skin_context,
-        )
+        route_hint_match = str(entry.get("route_hint_match", "disabled") or "disabled")
+        hint_lane = str(entry.get("hint_lane", "") or "").strip().lower()
+        has_skin = bool(entry.get("has_skin", False))
+        triangle_count = _int_or_default(entry.get("triangle_count"), 0)
+        topology_scanned = bool(entry.get("topology_scanned", False))
+        exact_payload_required = bool(entry.get("exact_payload_required", False))
+        probe_route = str(entry.get("probe_route", "") or "")
+        probe_route_authority = str(entry.get("probe_route_authority", "") or "")
+        probe_geometry_required = bool(entry.get("probe_geometry_required", False))
+        probe_skip_reason = str(entry.get("probe_skip_reason", "") or "")
+        if exact_payload_required:
+            vertex_positions = _safe_list(getattr(mesh, "vertex_positions", None))
+            vertex_uv = _safe_list(getattr(mesh, "vertex_uvs", None))
+            normal_values = _safe_list(getattr(mesh, "vertex_normals", None))
+            has_positions = len(vertex_positions) > 0
+            has_uv = len(vertex_uv) > 0
+            has_normals = len(normal_values) > 0
+            binary_corner_geometry, normal_fidelity = _select_binary_fbx_corner_geometry(
+                mesh,
+                binary_corner_context,
+                binary_identity,
+            )
+            geometry = _extract_mesh_geometry(
+                mesh,
+                instance_node,
+                binary_corner_geometry=binary_corner_geometry,
+                normal_fidelity=normal_fidelity,
+            )
+            geometry = _augment_geometry_with_skinned_pose_channels(geometry, mesh, instance_node)
+            geometry = _apply_binary_fbx_skin_pose_channels(
+                geometry,
+                mesh,
+                instance_node,
+                skin_context,
+            )
+            summary_skin, contract_skin = _build_skin_summary_variants(
+                mesh,
+                export_source_vertex_indices=geometry.get("source_vertex_indices"),
+            )
+        else:
+            vertex_positions = []
+            vertex_uv = []
+            normal_values = []
+            has_positions = False
+            has_uv = False
+            has_normals = False
+            normal_fidelity = _binary_fbx_normal_fidelity_audit(
+                status="fallback",
+                reason="stage_a_route_discovery",
+            )
+            geometry = _build_lightweight_mesh_geometry(
+                mesh,
+                normal_fidelity=normal_fidelity,
+                vertex_count=int(getattr(mesh, "num_vertices", 0) or 0),
+                index_count=int(getattr(mesh, "num_indices", 0) or 0),
+                triangle_count=triangle_count,
+            )
+            summary_skin = _build_lightweight_skin_summary(mesh, has_skin=has_skin)
+            contract_skin = dict(summary_skin)
         material_names = _mesh_material_names(mesh)
-        summary_skin, contract_skin = _build_skin_summary_variants(
-            mesh,
-            export_source_vertex_indices=geometry.get("source_vertex_indices"),
+        vertex_count = int(
+            getattr(mesh, "num_vertices", 0)
+            or len(vertex_positions)
+        )
+        face_values = (
+            _safe_list(getattr(mesh, "faces", None))
+            if exact_payload_required
+            else []
+        )
+        face_count = int(
+            getattr(mesh, "num_faces", 0)
+            or len(face_values)
+        )
+        route_receipt_rows.append(
+            {
+                "scene_node": node_name,
+                "mesh_name": mesh_name,
+                "scene_node_handle": _int_or_default(
+                    (route_hint or {}).get("scene_node_handle"), 0
+                ),
+                "mesh_slot": _int_or_default(
+                    (route_hint or {}).get("mesh_slot"),
+                    _int_or_default(
+                        (infer_mesh_slot_hint(node_name) or infer_mesh_slot_hint(mesh_name) or {}).get("slot"),
+                        0,
+                    ),
+                ),
+                "fbx_route_handle": _int_or_default(binary_identity.get("fbx_route_handle"), 0),
+                "expected_fbx_route_handle": _int_or_default(
+                    (route_hint or {}).get("fbx_route_handle"),
+                    _int_or_default((route_hint or {}).get("scene_node_handle"), 0),
+                ),
+                "fbx_route_handle_match": (
+                    _int_or_default(binary_identity.get("fbx_route_handle"), 0)
+                    == _int_or_default(
+                        (route_hint or {}).get("fbx_route_handle"),
+                        _int_or_default((route_hint or {}).get("scene_node_handle"), 0),
+                    )
+                    if route_hint is not None
+                    else False
+                ),
+                "lane": hint_lane,
+                "route": probe_route,
+                "authority": probe_route_authority,
+                "match_status": "matched" if route_hint is not None else route_hint_match,
+                "geometry_required": bool(probe_geometry_required),
+                "geometry_skipped": not bool(exact_payload_required),
+                "skip_reason": probe_skip_reason,
+                "topology_scanned": topology_scanned,
+                "fbx_has_skin": bool(has_skin),
+                "fbx_vertex_count": vertex_count,
+                "fbx_face_count": int(triangle_count),
+                "unskinned_mesh_edit_export_authorized": allow_unskinned_geometry,
+            }
         )
 
         mesh_summaries.append(
@@ -3302,10 +5393,10 @@ def _probe_scene_handoff(
                 "mesh_name_match": normalize_match_name(mesh_name),
                 "mesh_slot_hint": infer_mesh_slot_hint(node_name) or infer_mesh_slot_hint(mesh_name),
                 "lod_hint": infer_lod_hint(node_name) or infer_lod_hint(mesh_name),
-                "vertex_count": int(getattr(mesh, "num_vertices", len(vertex_positions)) or len(vertex_positions)),
+                "vertex_count": vertex_count,
                 "index_count": int(getattr(mesh, "num_indices", 0) or 0),
-                "face_count": int(getattr(mesh, "num_faces", len(mesh.faces)) or len(mesh.faces)),
-                "triangle_count": int(getattr(mesh, "num_triangles", 0) or 0),
+                "face_count": face_count,
+                "triangle_count": triangle_count,
                 "material_names": material_names,
                 "material_slot_count": len(material_names),
                 "material_part_count": None,
@@ -3318,65 +5409,38 @@ def _probe_scene_handoff(
                         "index_begin": int(face[0]),
                         "num_indices": int(face[1]),
                     }
-                    for face in list(mesh.faces)[:5]
+                    for face in face_values[:5]
                 ],
+                "fbx_probe_route": probe_route,
+                "fbx_probe_route_authority": probe_route_authority,
+                "fbx_probe_route_match_status": "matched" if route_hint is not None else route_hint_match,
+                "fbx_probe_geometry_required": bool(probe_geometry_required),
+                "fbx_probe_geometry_skipped": not bool(exact_payload_required),
+                "fbx_probe_skip_reason": probe_skip_reason,
+                "fbx_probe_topology_scanned": topology_scanned,
                 "normal_fidelity": geometry.get("normal_fidelity", normal_fidelity),
                 **binary_identity,
                 **summary_skin,
             }
         )
 
-        node_to_world = _flatten_matrix4x4(getattr(instance_node, "node_to_world", None))
-        contract_mesh = {
-            "node_name": node_name,
-            "mesh_name": mesh_name,
-            "match_name": normalize_match_name(node_name or mesh_name),
-            "mesh_name_match": normalize_match_name(mesh_name),
-            "mesh_slot_hint": infer_mesh_slot_hint(node_name) or infer_mesh_slot_hint(mesh_name),
-            "lod_hint": infer_lod_hint(node_name) or infer_lod_hint(mesh_name),
-            "material_names": material_names,
-            "positions": geometry["positions"],
-            # probe_fbx_handoff() is the runtime bridge path. Keep this in
-            # lockstep with extract_fbx_mesh_contracts(): exact corner rows
-            # need the already axis-restored Max-space position table.
-            **(
-                {"max_positions": geometry["max_positions"]}
-                if isinstance(geometry.get("normal_fidelity"), dict)
-                and str(geometry["normal_fidelity"].get("status", "") or "") == "exact"
-                else {}
-            ),
-            "skinned_positions": geometry["skinned_positions"],
-            "skinned_max_positions": geometry["skinned_max_positions"],
-            "skinned_world_positions": geometry["skinned_world_positions"],
-            "normals": geometry["normals"],
-            "max_normals": geometry["max_normals"],
-            "skinned_normals": geometry["skinned_normals"],
-            "skinned_max_normals": geometry["skinned_max_normals"],
-            "binary_skin_unreferenced_source_indices": geometry.get(
-                "binary_skin_unreferenced_source_indices", []
-            ),
-            "binary_skin_unreferenced_max_positions": geometry.get(
-                "binary_skin_unreferenced_max_positions", []
-            ),
-            "skinned_is_local": geometry["skinned_is_local"],
-            "fbx_skin_pose_evaluation_status": geometry.get("fbx_skin_pose_evaluation_status", ""),
-            "fbx_skin_pose_evaluation_schema": geometry.get("fbx_skin_pose_evaluation_schema", ""),
-            "fbx_skin_pose_evaluation_mode": geometry.get("fbx_skin_pose_evaluation_mode", ""),
-            "uvs": geometry["uvs"],
-            "face_indices": geometry["face_indices"],
-            "source_vertex_indices": geometry["source_vertex_indices"],
-            "fbx_export_corner_indices": geometry["fbx_export_corner_indices"],
-            "fbx_export_face_indices": geometry["fbx_export_face_indices"],
-            "fbx_geom_face_indices": geometry["fbx_geom_face_indices"],
-            "fbx_uv_channels": geometry["fbx_uv_channels"],
-            "normal_fidelity": geometry.get("normal_fidelity", normal_fidelity),
-            "vertex_count": geometry["vertex_count"],
-            "triangle_count": geometry["triangle_count"],
-            **binary_identity,
-            **contract_skin,
-        }
-        if len(node_to_world) == 16:
-            contract_mesh["fbx_node_to_world_matrix"] = node_to_world
+        contract_mesh = _build_probe_contract_mesh_row(
+            node_name=node_name,
+            mesh_name=mesh_name,
+            instance_node=instance_node,
+            material_names=material_names,
+            geometry=geometry,
+            normal_fidelity=normal_fidelity,
+            skin=contract_skin,
+            binary_identity=binary_identity,
+            probe_route=probe_route,
+            probe_route_authority=probe_route_authority,
+            probe_route_match_status=("matched" if route_hint is not None else route_hint_match),
+            probe_geometry_required=probe_geometry_required,
+            probe_geometry_skipped=not exact_payload_required,
+            probe_skip_reason=probe_skip_reason,
+            probe_topology_scanned=topology_scanned,
+        )
         contract_meshes.append(contract_mesh)
 
     material_names_seen: dict[str, dict[str, Any]] = {}
@@ -3440,8 +5504,38 @@ def _probe_scene_handoff(
         "nodes": node_summaries,
     }
     payload: dict[str, Any] = {
+        "status": "ok",
+        "ufbx_runtime_mode": str(
+            getattr(scene, "_codex_ufbx_runtime_mode", "ufbx_native")
+            or "ufbx_native"
+        ),
         "summary": summary,
         "contract_meshes": contract_meshes,
+        "probe_stage": {
+            "mode": str(probe_mode or "full"),
+            "stage_a_mesh_count": int(stage_a_mesh_count),
+            "stage_b_mesh_count": int(stage_b_mesh_count),
+            "target_filter_active": bool(stage_a_filter_active),
+            "route_hint_status": (
+                str(normalized_route_hints.get("status", "absent") or "absent")
+                if route_hint_filter_active
+                else "disabled_for_full_mode"
+            ),
+            "route_hint_count": len(normalized_route_hints.get("rows", [])) if route_hint_filter_active else 0,
+            "route_hint_match_count": int(route_hint_match_count),
+            "route_hint_ambiguous_count": int(route_hint_ambiguous_count),
+            "route_hint_unmatched_count": int(route_hint_unmatched_count),
+            "identity_excluded_count": int(
+                active_stage_a_plan.get("identity_excluded_count", 0)
+            ),
+            "unskinned_mesh_edit_export_authorized": allow_unskinned_geometry,
+        },
+        "probe_route_receipt": {
+            "schema": FBX_PROBE_ROUTE_RECEIPT_SCHEMA,
+            "authority": "fbx_probe",
+            "policy": "fbx_probe_topology_v1",
+            "rows": route_receipt_rows,
+        },
         "normal_fidelity": [
             {
                 **mesh.get("normal_fidelity", {}),
@@ -3457,24 +5551,187 @@ def _probe_scene_handoff(
     return payload
 
 
-def probe_fbx_handoff(path: str | Path, *, max_snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+def probe_fbx_handoff(
+    path: str | Path,
+    *,
+    max_snapshot: dict[str, Any] | None = None,
+    target_handles: set[int] | None = None,
+    target_names: set[str] | None = None,
+    target_slots: set[int] | None = None,
+    probe_mode: str = "full",
+    route_hints: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     fbx_path, scene = _require_scene(path)
-    skin_context = _build_binary_fbx_skin_evaluation_context(fbx_path, scene)
+    # The export handoff starts with a structural tree only.  Large FBX arrays
+    # are decoded lazily when the Stage B target actually consumes them.
+    binary_document = _build_binary_fbx_document(
+        fbx_path,
+        decode_array_names=frozenset(),
+    )
+    normalized_target_handles = {
+        _int_or_default(value, 0)
+        for value in (target_handles or set())
+        if _int_or_default(value, 0) > 0
+    }
+    normalized_target_names = {
+        normalize_match_name(value)
+        for value in (target_names or set())
+        if normalize_match_name(value)
+    }
+    normalized_target_slots = {
+        _int_or_default(value, 0)
+        for value in (target_slots or set())
+        if _int_or_default(value, 0) > 0
+    }
+    normalized_route_hints = _normalize_probe_route_hints(route_hints)
+    stage_a_filter_active = (
+        str(probe_mode or "full").casefold() == "export_required"
+        and bool(
+            normalized_target_handles
+            or normalized_target_names
+            or normalized_target_slots
+            or normalized_route_hints.get("rows")
+        )
+    )
     binary_model_queues, route_model_observations = _binary_fbx_model_identity_context(
-        fbx_path
+        fbx_path,
+        binary_document=binary_document,
+        target_handles=normalized_target_handles,
+        target_names=normalized_target_names,
+        target_slots=normalized_target_slots,
+        target_filter_active=stage_a_filter_active,
+        explicit_route_required=bool(
+            normalized_route_hints.get("explicit_route_required", False)
+        ),
+    )
+    stage_a_plan = _build_probe_stage_a_plan(
+        scene,
+        binary_model_queues=binary_model_queues,
+        probe_mode=probe_mode,
+        target_handles=normalized_target_handles,
+        target_names=normalized_target_names,
+        target_slots=normalized_target_slots,
+        route_hints=route_hints,
+    )
+    # Stage A is the sole route authority.  Only its exact-geometry entries
+    # are allowed to open the expensive Skin and corner-attribute readers.
+    target_geometry_ids = {
+        _int_or_default(value, 0)
+        for value in stage_a_plan.get("exact_geometry_ids", set())
+        if _int_or_default(value, 0) > 0
+    }
+    target_geometry_names = {
+        normalize_match_name(value)
+        for value in stage_a_plan.get("exact_geometry_names", set())
+        if normalize_match_name(value)
+    }
+    target_mesh_names = {
+        normalize_match_name(value)
+        for value in stage_a_plan.get("exact_mesh_names", set())
+        if normalize_match_name(value)
+    }
+    exact_target_filter_active = (
+        str(probe_mode or "full").casefold() == "export_required"
+    )
+    skin_context = _build_binary_fbx_skin_evaluation_context(
+        fbx_path,
+        scene,
+        binary_document=binary_document,
+        target_mesh_names=target_mesh_names if exact_target_filter_active else None,
     )
     payload = _probe_scene_handoff(
         scene,
         fbx_path=str(fbx_path),
         max_snapshot=max_snapshot,
         skin_context=skin_context,
-        binary_model_queues=binary_model_queues,
-        binary_corner_context=_build_binary_fbx_corner_geometry_context(fbx_path),
+        binary_model_queues=_clone_binary_fbx_model_identity_queues(binary_model_queues),
+        binary_corner_context=_build_binary_fbx_corner_geometry_context(
+            fbx_path,
+            binary_document=binary_document,
+            target_geometry_ids=target_geometry_ids,
+            target_geometry_names=target_geometry_names,
+            target_filter_active=exact_target_filter_active,
+        ),
+        probe_mode=probe_mode,
+        target_handles=normalized_target_handles,
+        target_names=normalized_target_names,
+        target_slots=normalized_target_slots,
+        route_hints=route_hints,
+        stage_a_plan=stage_a_plan,
+    )
+    payload["binary_parse"] = binary_document.receipt()
+    payload["status"] = "ok"
+    payload["ufbx_runtime_mode"] = str(
+        getattr(scene, "_codex_ufbx_runtime_mode", "ufbx_native")
+        or "ufbx_native"
     )
     payload["route_models"] = route_model_observations
+    normalized_route_hints = _normalize_probe_route_hints(route_hints)
+    route_receipt = payload.get("probe_route_receipt")
+    if (
+        isinstance(route_receipt, dict)
+        and str(probe_mode or "full").casefold() == "export_required"
+        and normalized_route_hints.get("status") == "ok"
+    ):
+        represented_keys = {
+            (
+                _int_or_default(row.get("scene_node_handle"), 0),
+                _int_or_default(row.get("mesh_slot"), 0),
+                str(row.get("lane", "") or "").strip().lower(),
+            )
+            for row in route_receipt.get("rows", [])
+            if isinstance(row, dict)
+        }
+        # Header/Delete rows do not need a scene Mesh in the FBX.  Preserve
+        # their Launcher route as a hint-only pass-through row.
+        for hint in normalized_route_hints.get("rows", []):
+            if not isinstance(hint, dict):
+                continue
+            lane = str(hint.get("lane", "") or "").strip().lower()
+            if lane not in {"header", "delete"}:
+                continue
+            key = (
+                _int_or_default(hint.get("scene_node_handle"), 0),
+                _int_or_default(hint.get("mesh_slot"), 0),
+                lane,
+            )
+            if key in represented_keys:
+                continue
+            names = hint.get("names") if isinstance(hint.get("names"), list) else []
+            route_receipt.setdefault("rows", []).append(
+                {
+                    "scene_node": str(names[0] if names else ""),
+                    "mesh_name": str(names[0] if names else ""),
+                    "scene_node_handle": key[0],
+                    "mesh_slot": key[1],
+                    "fbx_route_handle": _int_or_default(
+                        hint.get("fbx_route_handle"),
+                        key[0],
+                    ),
+                    "lane": lane,
+                    "route": "header_only" if lane == "header" else "delete",
+                    "authority": "launcher_bucket_receipt",
+                    "match_status": "hint_only",
+                    "geometry_required": False,
+                    "geometry_skipped": True,
+                    "skip_reason": (
+                        "launcher_header_route"
+                        if lane == "header"
+                        else "launcher_delete_route"
+                    ),
+                    "topology_scanned": False,
+                    "fbx_has_skin": False,
+                    "fbx_vertex_count": 0,
+                    "fbx_face_count": 0,
+                }
+            )
+        payload["probe_route_receipt"] = route_receipt
     fbx_axes = _scene_axis_receipt(scene)
+    fbx_units = _scene_unit_receipt(scene)
     payload["fbx_axes"] = fbx_axes
+    payload["fbx_units"] = fbx_units
     payload["summary"]["fbx_axes"] = fbx_axes
+    payload["summary"]["fbx_units"] = fbx_units
     return payload
 
 
@@ -3717,32 +5974,70 @@ def load_max_snapshot(path: str | Path) -> dict[str, Any]:
     return data
 
 
+def _run_skin_cluster_name_policy_regression_guard() -> dict[str, Any]:
+    """Lock the non-RE6 Skin Cluster policy without affecting normal Probe runs."""
+
+    class _Cluster:
+        def __init__(self, bone_name: str, vertices: list[int], weights: list[float]) -> None:
+            self.bone_name = bone_name
+            self.name = bone_name
+            self.vertices = vertices
+            self.weights = weights
+
+    class _Skin:
+        clusters = [
+            _Cluster("hair_R_01", [0], [1.0]),
+            _Cluster("b_0_2", [1], [0.75]),
+        ]
+
+    class _Mesh:
+        name = "skin_cluster_policy_fixture"
+        skin_deformers = [_Skin()]
+
+    bone_names, bone_rows, weight_rows = _extract_source_skin_rows(_Mesh(), 2)
+    assert bone_names == ["b_0_2"]
+    assert bone_rows == [[], [1]]
+    assert weight_rows == [[], [0.75]]
+    return {
+        "status": "ok",
+        "policy": "discard_unmappable_skin_clusters",
+    }
+
+
 def run_fbx_probe_runtime_self_test() -> dict[str, Any]:
-    global ufbx, UFBX_IMPORT_ERROR, UFBX_IMPORT_FAILURE
+    global ufbx, UFBX_IMPORT_ERROR, UFBX_IMPORT_FAILURE, ufbx_missed_substitute
 
     original_ufbx = ufbx
     original_import_error = UFBX_IMPORT_ERROR
     original_import_failure = UFBX_IMPORT_FAILURE
-    checks: dict[str, Any] = {}
+    original_substitute = ufbx_missed_substitute
+    checks: dict[str, Any] = {
+        "skin_cluster_name_policy": _run_skin_cluster_name_policy_regression_guard(),
+    }
     try:
+        class _SubstituteSceneFixture:
+            _codex_ufbx_runtime_mode = "ufbx_missed_substitute"
+            metadata: dict[str, Any] = {}
+
+        substitute_scene = _SubstituteSceneFixture()
+
+        def substitute_fixture(_path: str | Path, **_kwargs: Any) -> _SubstituteSceneFixture:
+            return substitute_scene
+
         try:
             raise ModuleNotFoundError("No module named 'ufbx'")
         except ModuleNotFoundError as missing_error:
             ufbx = None
             UFBX_IMPORT_ERROR = missing_error
             UFBX_IMPORT_FAILURE = classify_fbx_probe_exception(missing_error, stage="import")
-        try:
-            _require_scene("missing-runtime.fbx")
-        except FbxProbeRuntimeUnavailableError as exc:
-            assert isinstance(exc, ImportError)
-            assert exc.status == FBX_PROBE_RUNTIME_UNAVAILABLE_STATUS
-            assert exc.bridge_status == FBX_PROBE_BRIDGE_RETRY_STATUS
-            assert exc.runtime_retryable is True
-            assert exc.to_status_dict()["exception_type"].endswith("ModuleNotFoundError")
-            assert exc.traceback_summary
-            checks["missing_module"] = exc.to_status_dict()
-        else:
-            raise AssertionError("missing ufbx did not raise a runtime-unavailable error")
+        ufbx_missed_substitute = substitute_fixture
+        missing_path, missing_scene = _require_scene("missing-runtime.fbx")
+        assert missing_path.name == "missing-runtime.fbx"
+        assert missing_scene is substitute_scene
+        missing_status = get_fbx_probe_runtime_status()
+        assert missing_status["status"] == "ok"
+        assert missing_status["mode"] == "ufbx_missed_substitute"
+        checks["missing_module"] = missing_status
 
         class _BadAbiUfbx:
             @staticmethod
@@ -3752,18 +6047,12 @@ def run_fbx_probe_runtime_self_test() -> dict[str, Any]:
         ufbx = _BadAbiUfbx()
         UFBX_IMPORT_ERROR = None
         UFBX_IMPORT_FAILURE = None
-        try:
-            _require_scene("bad-abi.fbx")
-        except FbxProbeRuntimeUnavailableError as exc:
-            status = exc.to_status_dict()
-            assert status["classification"] == "runtime_failure"
-            assert status["runtime_retryable"] is True
-            assert status["bridge_status"] == FBX_PROBE_BRIDGE_RETRY_STATUS
-            assert status["exception_type"].endswith("OSError")
-            assert "load_file" in status["traceback_summary"]
-            checks["bad_abi"] = status
-        else:
-            raise AssertionError("bad ufbx ABI did not raise a runtime-unavailable error")
+        ufbx_missed_substitute = substitute_fixture
+        bad_abi_path, bad_abi_scene = _require_scene("bad-abi.fbx")
+        assert bad_abi_path.name == "bad-abi.fbx"
+        assert bad_abi_scene is substitute_scene
+        assert substitute_scene.metadata["native_ufbx_failure"]["classification"] == "runtime_failure"
+        checks["bad_abi"] = substitute_scene.metadata["native_ufbx_failure"]
 
         class _FbxDataError(Exception):
             pass
@@ -3790,6 +6079,7 @@ def run_fbx_probe_runtime_self_test() -> dict[str, Any]:
         ufbx = original_ufbx
         UFBX_IMPORT_ERROR = original_import_error
         UFBX_IMPORT_FAILURE = original_import_failure
+        ufbx_missed_substitute = original_substitute
 
     if original_ufbx is not None:
         try:

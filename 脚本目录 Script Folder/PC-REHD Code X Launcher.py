@@ -7084,6 +7084,9 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
         "dark_mode_enabled": bool(
             source.get("dark_mode_enabled", _windows_prefers_dark_mode())
         ),
+        "simplified_export_success_dialog": bool(
+            source.get("simplified_export_success_dialog", False)
+        ),
         "scene_auto_colors_enabled": bool(source.get("scene_auto_colors_enabled", False)),
         "scene_auto_colors_mode": scene_auto_colors_mode,
         "scene_auto_colors_seed": scene_auto_colors_seed,
@@ -8453,15 +8456,15 @@ IMPORT_EXPORT_PERFORMANCE_REVIEW_REQUIRED_FIELDS = (
     "reviewed_baseline_sha256",
 )
 IMPORT_EXPORT_PERFORMANCE_REVIEW = {
-    "review_id": "auxiliary-runtime-cleanup-87D0E1A121A1",
+    "review_id": "simplified-export-success-dialog-F82EEA16F4EF",
     "does_this_change_slow_import_export": "NO",
     "affected_phase": (
-        "Dependency dispatch and auxiliary route validation only. Main MOD Importer/Writer execution and Blender/Max request transport are unchanged; legacy auxiliary export now exits before Max runtime access."
+        "Post-export success receipt UI only, after Writer completion and export receipt/health reporting. Import, FBX export, Writer/Verify, and transport phases are unchanged."
     ),
     "timing_evidence": (
-        "LauncherApp._import_mod_active and LauncherApp._export_mod_active retain their reviewed AST fingerprints. The focused architecture test proves legacy auxiliary export rejects before _max_runtime, and removal of the dead loader entry adds no foreground IPC, hashing, retry, or file work."
+        "Control-flow review places the new branch after export completion. On CPython 3.14, 1,000,000 equivalent state lookups took 0.034792 seconds (0.035 microseconds each), and this lookup runs once per completed export. Focused state persistence and AST checks pass."
     ),
-    "reviewed_baseline_sha256": "87D0E1A121A1601D05FEB754D64789005635AA6F1911585AB585341A552B8D31",
+    "reviewed_baseline_sha256": "F82EEA16F4EFBF8A5677FDA07BE96948967C726BC7B4C8255B7ACAA594DD5BE4",
 }
 IMPORT_EXPORT_PERFORMANCE_PROTECTED_FUNCTIONS = (
     "_call_with_windows_thread_priority",
@@ -8591,8 +8594,8 @@ IMPORT_EXPORT_PERFORMANCE_FINGERPRINTS = {
     "LauncherApp._start_pending_scene_auto_colors": "7B8FB75C11B6E74B9419498417A741E16737A9BD36B69002288262F3B5EBF10A",
     "LauncherApp._schedule_scene_auto_colors_after_import": "D15402F999A7ABA29F38553ED656C242852320912CA33A99D21ACCAEB9CEAEA6",
     "LauncherApp._poll_max_windows": "7C0DC41B01B212564320E70C7DA455A3C47EC63E08B82D56A95DB4119FE9F5B0",
-    "LauncherApp._import_mod_active": "A4D13A49A676120C2BE9616BBE9F691B1B0E0560614D1C9B6A65653E80138F22",
-    "LauncherApp._export_mod_active": "6F11750BE82C7018A6660D811B7208A2B29F47B4B5C8728EFBB5B127C4284833",
+    "LauncherApp._import_mod_active": "2E3FB55BD869AACF42206FA7573BBFD59D7F4B35FC228311C4A14C3DFC6DBD4A",
+    "LauncherApp._export_mod_active": "6E7922BAE0360B1248A6444F406426F69C57039B3C076D12EC80F1A685C5E91A",
     "LauncherApp._on_close": "43E353E9F78D09B76D2E833804AFC045E240F12FA7CF25C33A24A522F895BE3D",
     "_main_impl": "43D765CE2DD12E3111A0F0B4AAAFFE304E446955B6E72F081CA8AA18288F7682",
     "_run_import_export_performance_policy_guard": "025C8A6547AAFFC452AEA36C7B1AEF82ADE22B8C8150B5190511D6DE5851ECD5",
@@ -8603,11 +8606,11 @@ IMPORT_EXPORT_PERFORMANCE_FINGERPRINTS = {
 # It tells a maintainer that Importer/Writer changed without a recorded review.
 # User operations must never use these values as runtime trust or readiness.
 AI_MAINTENANCE_ONLY_MODULE_SHA256 = {
-    "codex_python_runtime_bootstrap.py": "89A3A06DA87D4F28E8E105DFD858AC79DC2C2FD3DE8EC449BD1B8EC9C574002C",
+    "codex_python_runtime_bootstrap.py": "E6F69D64DFFEEE6CB44F636201A7F8EB5ACE3649718B7C196662987163A904BA",
     "codex_re6_mod_import_fbx.py": "F94AC8B0D9D7E60B14A42E88DCCF893371E99B9F85F6DDD628EEE8A55C75DA53",
-    "codex_python_export_bridge.py": "F8F973F2108CC4FCB2B73DD6110601552D0B0710A13248629AB1F724AAB3BB02",
+    "codex_python_export_bridge.py": "CA3466094B3FAF4B53A54CCA25F18DFDEA99DFC540BE75BD313926A81129A8F4",
     "codex_re6_scene_compatibility.py": "0F387A805643A060C90B0FB3C32A5A884F925E9C1D872A117DFB3681BB5E16CC",
-    "codex_fbx_probe.py": "0F0BE261D64FAEE8C762838DA439C8AC1E962498B75DA6F74B682BDF7A17840A",
+    "codex_fbx_probe.py": "FAFA17773AE62752940BEDF3B0DEA9B3D4FB0A022F85C08717ED758138D67E9C",
     "codex_re6_tex_decode.py": "2C3D689B5CC7CFF59BEF3479CB0DF979B932DB6ED1204D9BF1AC6E04D603CD56",
 }
 RESCUE_AGENT_MAINTENANCE_PROTECTED_FUNCTIONS = (
@@ -16692,6 +16695,7 @@ def run_protocol_smoke_test() -> dict[str, Any]:
                     "blender_mode_enabled": True,
                     "blender_advanced_options_visible": True,
                     "blender_mode_restore_advanced_visible": True,
+                    "simplified_export_success_dialog": True,
                     "toolbox_visible": True,
                     "toolbox_geometry": "612x344-1280+96",
                     "scene_normals_visible": True,
@@ -16770,6 +16774,10 @@ def run_protocol_smoke_test() -> dict[str, Any]:
             persisted_state = _load_launcher_state(Path(state_root))
         if persisted_state != expected_persisted_state:
             raise AssertionError("Launcher long-term state did not persist")
+        if persisted_state.get("simplified_export_success_dialog") is not True:
+            raise AssertionError(
+                "Simplified export-success dialog preference did not persist"
+            )
         rescue_agent = _run_rescue_agent_protocol_smoke()
         legacy_auxiliary_128 = _run_legacy_auxiliary_128_contract_smoke()
         memory_scene_signature_handoff = _run_memory_scene_signature_handoff_smoke()
@@ -24860,6 +24868,11 @@ def _bucket_identity_digest(max_process_id: int, rows: list[dict[str, Any]]) -> 
             "scene_node_handle": int(
                 row.get("source_scene_node_handle", row.get("scene_node_handle", 0)) or 0
             ),
+            # MAX identity is carried into the FBX route explicitly.  It is
+            # never inferred from a duplicate Mesh name or slot.
+            "fbx_route_handle": int(
+                row.get("fbx_route_handle", row.get("scene_node_handle", 0)) or 0
+            ),
             "scene_node": str(row.get("scene_node", "") or ""),
             "same_name_ordinal": int(row.get("same_name_ordinal", 0) or 0),
             "same_name_count": int(row.get("same_name_count", 1) or 1),
@@ -25002,6 +25015,9 @@ def _max_bucket_identity_receipt(
                 "scene_node": live_name,
                 "source_scene_node_handle": handle,
                 "scene_node_handle": handle,
+                # The live Max Anim Handle is the sole route identity written
+                # to the FBX marker; do not copy a stale planned value.
+                "fbx_route_handle": handle,
                 "same_name_ordinal": same_name_ordinal,
                 "same_name_count": same_name_count,
                 "mesh_slot": mesh_slot,
@@ -25313,6 +25329,8 @@ def _max_export_fbx(
                 "key": "CodexRe6FbxRouteHandle",
                 "fbx_property": "Model/Properties70/UDP3DSMAX",
                 "route_node_handles": list(requested_route_handles),
+                "fbx_route_handles": list(requested_route_handles),
+                "identity_policy": "max_explicit_handle_only",
                 "restored": False,
             },
             "fbx_axes": {
@@ -31751,10 +31769,7 @@ _SCENE_TRANSFER_CHUNK_BYTES = 4 * 1024 * 1024
 _SCENE_TRANSFER_MAX_COMPRESSED_BYTES = 96 * 1024 * 1024
 _SCENE_TRANSFER_MAX_RAW_BYTES = 192 * 1024 * 1024
 BLENDER_SCENE_MATERIALS_UNDO_LABEL = "PC-REHD Scene Texture Material Repair"
-_LOD_GROUP_IDS = frozenset((0, 1, 2, 3, 4, 5, 6, 249, 252, 254, 255))
 _LOD_NAME_RE = re.compile(r"(?i)_lodx(-?\d+)(?:_|$)")
-_IMPORT_SUFFIX_RE = re.compile(r"(?i)(?:_import_?\d+)?(?:\.\d{3})?$")
-_IMPORT_ORDINAL_RE = re.compile(r"(?i)_import_?(\d+)(?:\.\d{3})?$")
 _MESH_SLOT_RE = re.compile(r"(?i)^mesh_(\d+)(?:_|$)")
 _FVF_NAME_RE = re.compile(r"(?i)^mesh_\d+_x?([0-9a-f]{8})(?:_|$)")
 _COMPACT_RE6_MESH_NAME_RE = re.compile(
@@ -31789,8 +31804,13 @@ _FULL_RE6_MESH_HEADER_NAME_RE = re.compile(
     r"display(?:mode)?[:=_](?P<display_mode>-?\d+)_"
     r"type[:=_](?P<mesh_type>-?\d+)"
     r"(?P<import_suffix>_Import_?(?:[2-9]|[1-9]\d+)(?:_[1-9]\d*)?)?"
-    r"(?P<blender_suffix>\.\d{3})?$"
+    r"(?P<blender_suffix>\.\d{3,})?$"
 )
+# Some FBX writers append a __CIX_<pointer> marker to duplicate Model names
+# before Blender sees them. It is an import-time collision marker, not part of
+# the user's Mesh/Object name; keep it recognizable so the first occurrence
+# can reclaim the base name and later occurrences receive Blender suffixes.
+_FBX_HIERARCHY_CIX_SUFFIX_RE = re.compile(r"(?i)__CIX_\d+$")
 _FBX_HIERARCHY_CONTRACT_SCHEMA = "pc-rehd-blender-fbx-hierarchy-v1"
 _FBX_HIERARCHY_CONTRACT_REVISION = 1
 _FBX_HIERARCHY_CONTRACT_ID_PROPERTY = "PC_REHD_FBX_HIERARCHY_CONTRACT_ID"
@@ -31869,6 +31889,13 @@ def _fbx_hierarchy_file_sha256(path):
 def _fbx_hierarchy_identity_number(value):
     text = str(value or "").strip().strip('"').strip("'")
     return text if re.fullmatch(r"[1-9]\d*", text) else ""
+
+
+def _fbx_hierarchy_cix_identity_number(value):
+    """Read the import-time __CIX_<ModelID> marker without using collection order."""
+    text = str(value or "").strip()
+    match = re.search(r"(?i)__CIX_([1-9]\d*)(?:\.\d{3,})?$", text)
+    return _fbx_hierarchy_identity_number(match.group(1)) if match else ""
 
 
 def _fbx_hierarchy_operator_filepath(operator, params=None):
@@ -32425,20 +32452,81 @@ def _fbx_hierarchy_validate_contract(raw_contract, source_path):
         )
 
 
+def _fbx_hierarchy_strip_cix_suffix(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    stripped = _FBX_HIERARCHY_CIX_SUFFIX_RE.sub("", text)
+    # Never turn a malformed stand-alone marker into an empty Object name.
+    return stripped if stripped else text
+
+
+def _fbx_hierarchy_canonical_import_name(value):
+    """Return the visible Object name represented by one FBX Model name."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    # A writer and Blender may append their collision suffixes in either order.
+    # This is name normalization only; it never chooses a parent or uses
+    # Blender collection order as an identity source.
+    for _index in range(4):
+        previous = text
+        text = _FBX_HIERARCHY_CIX_SUFFIX_RE.sub("", text)
+        text = re.sub(r"\.\d{3,}$", "", text)
+        if text == previous:
+            break
+    return _fbx_hierarchy_strip_cix_suffix(text)
+
+
+def _fbx_hierarchy_name_collision_ordinal(value):
+    """Return Blender's visible duplicate ordinal (base=0, .001=1)."""
+    text = _fbx_hierarchy_strip_cix_suffix(str(value or "").strip())
+    match = re.search(r"\.(\d{3,})$", text)
+    if match is None:
+        return 0
+    try:
+        return max(0, int(match.group(1)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _fbx_hierarchy_name_candidates(node):
     candidates = []
     value = str(getattr(node, "name", "") or "").strip()
     if not value:
         return candidates
-    candidates.append(value)
-    duplicate = re.sub(r"\.\d{3}$", "", value)
-    if duplicate and duplicate not in candidates:
-        candidates.append(duplicate)
+
+    def add(candidate):
+        candidate = str(candidate or "").strip()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    # Preserve exact names for identity matching, then offer the CIX and
+    # Blender numeric-suffix forms used by the import normalizer.
+    add(value)
+    add(_fbx_hierarchy_strip_cix_suffix(value))
+    duplicate = re.sub(r"\.\d{3,}$", "", value)
+    add(duplicate)
+    add(_fbx_hierarchy_strip_cix_suffix(duplicate))
+    add(_fbx_hierarchy_canonical_import_name(value))
     return candidates
 
 
 def _fbx_hierarchy_source_identity_candidates(row):
     candidates = []
+    # A source variant may omit the visible __CIX marker while retaining its
+    # numeric Model ID.  The importer variant carries that same number in the
+    # marker, so keep it as a deterministic cross-export identity.
+    source_id = _fbx_hierarchy_identity_number(row.get("source_model_id", ""))
+    if source_id:
+        candidates.append(("cix_model_id", source_id))
+    source_name_cix = _fbx_hierarchy_cix_identity_number(
+        row.get("source_model_name", "")
+    )
+    if source_name_cix:
+        candidate = ("cix_model_id", source_name_cix)
+        if candidate not in candidates:
+            candidates.append(candidate)
     for field, identity_name in (
         (_FBX_HIERARCHY_SOURCE_MAX_HANDLE_FIELD, "max_handle"),
         (_FBX_HIERARCHY_SOURCE_ROUTE_HANDLE_FIELD, "route_handle"),
@@ -32469,7 +32557,272 @@ def _fbx_hierarchy_node_identity_candidates(node):
                 candidate = (identity_name, value)
                 if candidate not in candidates:
                     candidates.append(candidate)
+        for source_name in (
+            getattr(owner, "name", ""),
+            getter(_FBX_HIERARCHY_SOURCE_MODEL_NAME_PROPERTY, ""),
+        ):
+            cix = _fbx_hierarchy_cix_identity_number(source_name)
+            if cix:
+                candidate = ("cix_model_id", cix)
+                if candidate not in candidates:
+                    candidates.append(candidate)
     return candidates
+
+
+def _fbx_hierarchy_node_preserved_source_id(node, preserved_source_ids=None):
+    """Return the source Model ID captured before an import name changes."""
+    try:
+        value = node.get(_FBX_HIERARCHY_SOURCE_MODEL_ID_PROPERTY, "")
+    except Exception:
+        value = ""
+    value = _fbx_hierarchy_identity_number(value)
+    if value:
+        return value
+    if not isinstance(preserved_source_ids, dict):
+        return ""
+    handle = _pointer(node)
+    for key in (handle, str(handle)):
+        try:
+            value = _fbx_hierarchy_identity_number(preserved_source_ids.get(key, ""))
+        except Exception:
+            value = ""
+        if value:
+            return value
+    return ""
+
+
+def _fbx_hierarchy_allocate_import_object_names(base_names, occupied_names):
+    """Allocate Blender-style suffixes while preserving the earliest name."""
+    occupied = {str(value or "") for value in occupied_names}
+    allocated = []
+    for raw_base in base_names:
+        base = str(raw_base or "")
+        candidate = base
+        if candidate in occupied:
+            suffix = 1
+            while True:
+                candidate = "%s.%03d" % (base, suffix)
+                if candidate not in occupied:
+                    break
+                suffix += 1
+        occupied.add(candidate)
+        allocated.append(candidate)
+    return allocated
+
+
+def _fbx_hierarchy_source_identity_order(source_row, node):
+    if isinstance(source_row, dict):
+        source_id = str(source_row.get("source_model_id", "") or "").strip()
+        if re.fullmatch(r"-?\d+", source_id):
+            return (0, int(source_id), _pointer(node))
+    return (1, 0, _pointer(node))
+
+
+def _fbx_hierarchy_normalize_import_object_names(scene, contract, imported_nodes):
+    """Allocate duplicate names in original source Model identity order."""
+    imported_by_handle = {}
+    for node in imported_nodes or ():
+        if node is None:
+            continue
+        imported_by_handle[_pointer(node)] = node
+    # Keep explicitly captured Objects even when their Collection is not
+    # linked to the active Scene; Blender can still parent and rename them.
+    nodes = list(imported_by_handle.values())
+    if not nodes:
+        return {
+            "status": "NO_IMPORTED_OBJECTS",
+            "renamed_object_count": 0,
+            "renamed": [],
+            "issues": [],
+        }
+
+    raw_models = contract.get("models", ()) if isinstance(contract, dict) else ()
+    models = [row for row in (raw_models or ()) if isinstance(row, dict)]
+    source_by_id = {}
+    source_by_identity = {}
+    source_by_name = {}
+    source_names = set()
+    source_canonical_names = set()
+    scene_names = {
+        str(getattr(node, "name", "") or "")
+        for node in _fbx_hierarchy_live_objects(scene, include_data=True)
+    }
+    for row in models:
+        source_name = str(row.get("source_model_name", "") or "")
+        if not source_name:
+            continue
+        source_id = str(row.get("source_model_id", "") or "").strip()
+        if re.fullmatch(r"-?\d+", source_id):
+            source_by_id[source_id] = row
+        source_by_name.setdefault(source_name, []).append(row)
+        source_names.add(source_name)
+        canonical_name = _fbx_hierarchy_canonical_import_name(source_name)
+        if canonical_name:
+            source_canonical_names.add(canonical_name)
+        for identity in _fbx_hierarchy_source_identity_candidates(row):
+            source_by_identity.setdefault(identity, []).append(row)
+
+    def source_row_for_node(node):
+        # The hierarchy pass stamps the exact source Model ID before this
+        # naming pass. That ID, including an ID preserved through __CIX_, is
+        # authoritative; Blender collection order must never decide which
+        # duplicate keeps the unsuffixed source name.
+        preserved_source_id = _fbx_hierarchy_node_preserved_source_id(node)
+        if preserved_source_id:
+            preserved_row = source_by_id.get(preserved_source_id)
+            if preserved_row is not None:
+                return preserved_row
+        identity_matches = []
+        for identity in _fbx_hierarchy_node_identity_candidates(node):
+            rows = source_by_identity.get(identity, ())
+            if len(rows) == 1 and rows[0] not in identity_matches:
+                identity_matches.append(rows[0])
+        if len(identity_matches) == 1:
+            return identity_matches[0]
+        for candidate in _fbx_hierarchy_name_candidates(node):
+            rows = source_by_name.get(candidate, ())
+            if len(rows) == 1:
+                return rows[0]
+        return None
+
+    ordered_nodes = []
+    for node in nodes:
+        source_row = source_row_for_node(node)
+        # Unproven objects follow every proven source Model. The pointer in
+        # the helper is only a last-resort total-order key; it can never
+        # outrank a Model identity from the source FBX contract.
+        order_key = _fbx_hierarchy_source_identity_order(source_row, node)
+        ordered_nodes.append((order_key, node, source_row))
+    ordered_nodes.sort(key=lambda entry: entry[0])
+    nodes = [entry[1] for entry in ordered_nodes]
+
+    base_names = []
+    source_model_ids = {}
+    for _order_key, node, source_row in ordered_nodes:
+        current_name = str(getattr(node, "name", "") or "")
+        source_name = (
+            str(source_row.get("source_model_name", "") or "")
+            if source_row is not None
+            else ""
+        )
+        if source_row is not None:
+            source_id = _fbx_hierarchy_identity_number(
+                source_row.get("source_model_id", "")
+            )
+            if source_id:
+                source_model_ids[str(_pointer(node))] = source_id
+        canonical_name = _fbx_hierarchy_canonical_import_name(
+            source_name or current_name
+        )
+        if canonical_name in source_canonical_names:
+            # The source contract confirms that CIX is a writer collision
+            # marker. Use the canonical base for allocation; exact source
+            # names remain available above for deterministic Model matching.
+            base_names.append(canonical_name)
+            continue
+        if not source_name:
+            duplicate_base = re.sub(r"\.\d{3,}$", "", current_name)
+            # Without a readable source contract, only treat a numeric
+            # suffix as Blender's duplicate marker when its unsuffixed
+            # name is actually present in this scene. A lone legitimate
+            # name such as prop.001 must remain untouched.
+            if duplicate_base in source_names or (
+                bool(duplicate_base) and duplicate_base != current_name
+                and duplicate_base in scene_names
+            ):
+                source_name = duplicate_base
+        base_names.append(source_name or current_name)
+
+    imported_handles = set(imported_by_handle)
+    occupied_names = [
+        str(getattr(node, "name", "") or "")
+        for node in _fbx_hierarchy_live_objects(scene, include_data=True)
+        if _pointer(node) not in imported_handles
+    ]
+    target_names = _fbx_hierarchy_allocate_import_object_names(
+        base_names, occupied_names
+    )
+    plans = [
+        {
+            "node": node,
+            "original_name": str(getattr(node, "name", "") or ""),
+            "target_name": target_name,
+        }
+        for node, target_name in zip(nodes, target_names)
+        if str(getattr(node, "name", "") or "") != target_name
+    ]
+    if not plans:
+        return {
+            "status": "UNCHANGED",
+            "renamed_object_count": 0,
+            "renamed": [],
+            "source_model_ids": source_model_ids,
+            "issues": [],
+        }
+
+    reserved_names = set(occupied_names) | set(target_names) | {
+        str(getattr(node, "name", "") or "") for node in nodes
+    }
+
+    def reserve_temporary_name():
+        while True:
+            candidate = "__PCREHD_FBX_%s" % uuid.uuid4().hex
+            if candidate not in reserved_names:
+                reserved_names.add(candidate)
+                return candidate
+
+    for plan in plans:
+        plan["temporary_name"] = reserve_temporary_name()
+    try:
+        # Moving every changed Object aside first prevents old names from
+        # influencing Blender while the deterministic final names are applied.
+        for plan in plans:
+            plan["node"].name = plan["temporary_name"]
+            if str(plan["node"].name) != plan["temporary_name"]:
+                raise RuntimeError("Blender rejected a temporary Object name")
+        for plan in plans:
+            plan["node"].name = plan["target_name"]
+            if str(plan["node"].name) != plan["target_name"]:
+                raise RuntimeError("Blender changed an allocated Object name")
+    except Exception as exc:
+        rollback_issues = []
+        for plan in plans:
+            try:
+                rollback_name = reserve_temporary_name()
+                plan["node"].name = rollback_name
+            except Exception as rollback_exc:
+                rollback_issues.append(
+                    "%s: %s" % (type(rollback_exc).__name__, rollback_exc)
+                )
+        for plan in plans:
+            try:
+                plan["node"].name = plan["original_name"]
+            except Exception as rollback_exc:
+                rollback_issues.append(
+                    "%s: %s" % (type(rollback_exc).__name__, rollback_exc)
+                )
+        issues = ["%s: %s" % (type(exc).__name__, exc)]
+        issues.extend(rollback_issues[:8])
+        return {
+            "status": "FAILED",
+            "renamed_object_count": 0,
+            "renamed": [],
+            "source_model_ids": source_model_ids,
+            "issues": issues,
+        }
+    return {
+        "status": "RENAMED",
+        "renamed_object_count": len(plans),
+        "renamed": [
+            {
+                "old_name": plan["original_name"],
+                "new_name": plan["target_name"],
+            }
+            for plan in plans[:128]
+        ],
+        "source_model_ids": source_model_ids,
+        "issues": [],
+    }
 
 
 def _fbx_hierarchy_scene_registry(scene, contract, status, detail=""):
@@ -32550,6 +32903,7 @@ def _fbx_hierarchy_capture_repair_undo(scene, plans, reason):
                     "parent": node.parent,
                     "matrix_world": node.matrix_world.copy(),
                     "matrix_parent_inverse": node.matrix_parent_inverse.copy(),
+                    "collections": tuple(_fbx_hierarchy_object_collections(node)),
                     "properties": _fbx_hierarchy_capture_custom_properties(
                         node, _FBX_HIERARCHY_REPAIR_METADATA_KEYS
                     ),
@@ -32586,7 +32940,7 @@ def _fbx_hierarchy_store_repair_undo(scene, snapshot, routed_nodes):
 
 
 def _fbx_hierarchy_undo_last_repair():
-    """Restore the exact parent and world matrix captured before the last repair."""
+    """Restore the exact parent, transform, metadata, and Collection links."""
     scene = bpy.context.scene
     scene_handle = _pointer(scene)
     stack = _FBX_HIERARCHY_REPAIR_UNDO_STACK.get(scene_handle, [])
@@ -32617,10 +32971,17 @@ def _fbx_hierarchy_undo_last_repair():
             "restored_model_count": 0,
             "issues": issues or ["repair snapshot has no live objects"],
         }
+    collection_issues = []
     for node, parent, entry in prepared:
         node.parent = parent
         node.matrix_parent_inverse = entry["matrix_parent_inverse"]
         node.matrix_world = entry["matrix_world"]
+        if "collections" in entry:
+            collection_issues.extend(
+                _fbx_hierarchy_restore_object_collections(
+                    node, entry.get("collections", ())
+                )
+            )
         _fbx_hierarchy_restore_custom_properties(node, entry.get("properties", {}))
     _fbx_hierarchy_restore_custom_properties(
         scene, snapshot.get("scene_properties", {})
@@ -32631,11 +32992,11 @@ def _fbx_hierarchy_undo_last_repair():
     return _record_blender_scene_undo(
         {
             "action": "scene.undo_fbx_hierarchy_repair",
-            "status": "UNDONE",
+            "status": "UNDONE" if not collection_issues else "PARTIAL",
             "repair_id": str(snapshot.get("repair_id", "") or ""),
             "reason": str(snapshot.get("reason", "") or ""),
             "restored_model_count": len(prepared),
-            "issues": [],
+            "issues": collection_issues[:64],
         },
         "PC-REHD Undo FBX Hierarchy Repair",
         changed=True,
@@ -32649,6 +33010,7 @@ def _fbx_hierarchy_apply_import_contract(
     strict,
     full_source_hierarchy=False,
     record_evidence=True,
+    preserved_source_ids=None,
 ):
     """Attach source Model IDs to newly imported objects, then restore every proven parent."""
     scene = bpy.context.scene
@@ -32676,6 +33038,8 @@ def _fbx_hierarchy_apply_import_contract(
             "mapped_model_count": 0,
             "tracked_model_count": 0,
             "routed_model_count": 0,
+            "collection_moved_model_count": 0,
+            "changed_model_count": 0,
             "unchanged_model_count": 0,
             "unmatched_imported_names": unresolved[:64],
             "unresolved_node_names": unresolved[:64],
@@ -32706,16 +33070,25 @@ def _fbx_hierarchy_apply_import_contract(
             unmatched_relevant.append(str(node.name))
             continue
         matches = []
+        preserved_source_id = _fbx_hierarchy_node_preserved_source_id(
+            node, preserved_source_ids
+        )
+        if preserved_source_id:
+            preserved_row = source_by_id.get(preserved_source_id)
+            if preserved_row is not None:
+                matches = [preserved_row]
         identity_matches = []
         identity_conflict = False
-        for identity in _fbx_hierarchy_node_identity_candidates(node):
+        for identity in (() if matches else _fbx_hierarchy_node_identity_candidates(node)):
             rows = source_by_identity.get(identity, [])
             if len(rows) > 1:
                 identity_conflict = True
                 break
             if len(rows) == 1 and rows[0] not in identity_matches:
                 identity_matches.append(rows[0])
-        if identity_conflict or len(identity_matches) > 1:
+        if matches:
+            pass
+        elif identity_conflict or len(identity_matches) > 1:
             ambiguous.append(str(node.name))
         elif len(identity_matches) == 1:
             matches = identity_matches
@@ -32821,25 +33194,46 @@ def _fbx_hierarchy_apply_import_contract(
         )
         if str(getattr(node, "type", "") or "") == "MESH":
             node["PC_REHD_PARENT_NAME"] = str(row.get("source_parent_name", "") or "")
-    routed = []
-    routed_nodes = []
-    unchanged = 0
-    for node, _row, target in plans:
-        if node.parent is target:
-            unchanged += 1
+    ordered_plans = _fbx_hierarchy_collection_plan_order(plans)
+    parent_changed_by_handle = {}
+    for node, _row, target in ordered_plans:
+        parent_changed = node.parent is not target
+        parent_changed_by_handle[_pointer(node)] = bool(parent_changed)
+        if not parent_changed:
             continue
         world_matrix = node.matrix_world.copy()
         node.parent = target
         if target is not None:
             node.matrix_parent_inverse = target.matrix_world.inverted_safe()
         node.matrix_world = world_matrix
+    routed = []
+    collection_moved = []
+    changed = []
+    routed_nodes = []
+    unchanged = 0
+    for node, _row, target in ordered_plans:
+        parent_changed = bool(parent_changed_by_handle.get(_pointer(node), False))
+        collection_result = _fbx_hierarchy_move_to_parent_collection(node, target)
+        collection_issues = list(collection_result.get("issues", []))
+        if collection_issues:
+            issues.extend(collection_issues)
+        collection_changed = bool(collection_result.get("changed", False))
+        if not parent_changed and not collection_changed:
+            unchanged += 1
+            continue
         routed_nodes.append(node)
-        routed.append(
-            {
-                "node_name": str(node.name),
-                "parent_name": str(target.name) if target is not None else "",
-            }
-        )
+        detail = {
+            "node_name": str(node.name),
+            "parent_name": str(target.name) if target is not None else "",
+            "parent_changed": parent_changed,
+            "collection_changed": collection_changed,
+            "target_collections": list(collection_result.get("target_collections", [])),
+        }
+        changed.append(detail)
+        if parent_changed:
+            routed.append(detail)
+        if collection_changed:
+            collection_moved.append(detail)
     undo_repair_id = _fbx_hierarchy_store_repair_undo(
         scene, undo_snapshot, routed_nodes
     )
@@ -32856,6 +33250,8 @@ def _fbx_hierarchy_apply_import_contract(
         "mapped_model_count": len(mapping),
         "tracked_model_count": len(plans),
         "routed_model_count": len(routed),
+        "collection_moved_model_count": len(collection_moved),
+        "changed_model_count": len(changed),
         "unchanged_model_count": int(unchanged),
         "undo_repair_id": undo_repair_id,
         "unmatched_imported_names": sorted(set(unmatched_relevant))[:64],
@@ -32866,13 +33262,19 @@ def _fbx_hierarchy_apply_import_contract(
         "missing_required_source_model_ids": missing_required_ids[:64],
         "issues": issues[:64],
         "routed": routed[:128],
+        "collection_moved": collection_moved[:128],
+        "changed": changed[:128],
     }
 
 
 def _fbx_hierarchy_restore_scene_contract(nodes=None, *, strict):
     """Restore proven parents only; evidence gaps are advisory to every export path."""
     scene = bpy.context.scene
-    requested = list(nodes) if nodes is not None else list(scene.objects)
+    requested = (
+        list(nodes)
+        if nodes is not None
+        else _fbx_hierarchy_live_objects(scene, include_data=True)
+    )
     failed_evidence = [
         node for node in requested
         if _property_text(node, _FBX_HIERARCHY_EVIDENCE_PROPERTY)
@@ -32899,13 +33301,16 @@ def _fbx_hierarchy_restore_scene_contract(nodes=None, *, strict):
             "contract_count": 0,
             "tracked_model_count": 0,
             "routed_model_count": 0,
+            "collection_moved_model_count": 0,
+            "changed_model_count": 0,
             "unchanged_model_count": 0,
             "issues": issues[:64],
             "unresolved_node_names": sorted(unresolved_names, key=str.casefold)[:64],
             "routed": [],
         }
     tracked = [
-        node for node in scene.objects
+        node
+        for node in _fbx_hierarchy_live_objects(scene, include_data=True)
         if _property_text(node, _FBX_HIERARCHY_CONTRACT_ID_PROPERTY) in contract_ids
     ]
     by_contract_model = {}
@@ -32956,25 +33361,46 @@ def _fbx_hierarchy_restore_scene_contract(nodes=None, *, strict):
     undo_snapshot = _fbx_hierarchy_capture_repair_undo(
         scene, plans, "scene_contract"
     )
-    routed = []
-    routed_nodes = []
-    unchanged = 0
-    for node, target in plans:
-        if node.parent is target:
-            unchanged += 1
+    ordered_plans = _fbx_hierarchy_collection_plan_order(plans)
+    parent_changed_by_handle = {}
+    for node, target in ordered_plans:
+        parent_changed = node.parent is not target
+        parent_changed_by_handle[_pointer(node)] = bool(parent_changed)
+        if not parent_changed:
             continue
         world_matrix = node.matrix_world.copy()
         node.parent = target
         if target is not None:
             node.matrix_parent_inverse = target.matrix_world.inverted_safe()
         node.matrix_world = world_matrix
+    routed = []
+    collection_moved = []
+    changed = []
+    routed_nodes = []
+    unchanged = 0
+    for node, target in ordered_plans:
+        parent_changed = bool(parent_changed_by_handle.get(_pointer(node), False))
+        collection_result = _fbx_hierarchy_move_to_parent_collection(node, target)
+        collection_issues = list(collection_result.get("issues", []))
+        if collection_issues:
+            issues.extend(collection_issues)
+        collection_changed = bool(collection_result.get("changed", False))
+        if not parent_changed and not collection_changed:
+            unchanged += 1
+            continue
         routed_nodes.append(node)
-        routed.append(
-            {
-                "node_name": str(node.name),
-                "parent_name": str(target.name) if target is not None else "",
-            }
-        )
+        detail = {
+            "node_name": str(node.name),
+            "parent_name": str(target.name) if target is not None else "",
+            "parent_changed": parent_changed,
+            "collection_changed": collection_changed,
+            "target_collections": list(collection_result.get("target_collections", [])),
+        }
+        changed.append(detail)
+        if parent_changed:
+            routed.append(detail)
+        if collection_changed:
+            collection_moved.append(detail)
     undo_repair_id = _fbx_hierarchy_store_repair_undo(
         scene, undo_snapshot, routed_nodes
     )
@@ -32986,11 +33412,42 @@ def _fbx_hierarchy_restore_scene_contract(nodes=None, *, strict):
         "contract_count": len(contract_ids),
         "tracked_model_count": len(tracked),
         "routed_model_count": len(routed),
+        "collection_moved_model_count": len(collection_moved),
+        "changed_model_count": len(changed),
         "unchanged_model_count": int(unchanged),
         "undo_repair_id": undo_repair_id,
         "issues": issues[:64],
         "unresolved_node_names": sorted(unresolved_names, key=str.casefold)[:64],
         "routed": routed[:128],
+        "collection_moved": collection_moved[:128],
+        "changed": changed[:128],
+    }
+
+
+def _fbx_hierarchy_no_name_guess_receipt(nodes=(), *, status="SOURCE_CONTRACT_REQUIRED"):
+    """Keep non-FBX tools reporting hierarchy fields without guessing parents.
+
+    Parentage is changed only by a verified source-FBX contract.  Rename and
+    node-map utilities still return the historical receipt shape, but they no
+    longer infer a LodGroup/OtherMesh parent from a Mesh name.
+    """
+    values = [node for node in (nodes or ()) if node is not None]
+    mesh_count = sum(
+        1
+        for node in values
+        if str(getattr(node, "type", "") or "") == "MESH"
+        and not _is_re6_bound_sphere(node)
+    )
+    return {
+        "status": str(status),
+        "candidate_mesh_count": int(mesh_count),
+        "routed_mesh_count": 0,
+        "unchanged_mesh_count": 0,
+        "missing_helper_count": 0,
+        "missing_helpers": [],
+        "route_counts": {},
+        "routed": [],
+        "issues": [],
     }
 
 
@@ -33284,15 +33741,6 @@ def _property_text(node, key):
         return ""
 
 
-def _canonical_helper_name(name):
-    return _IMPORT_SUFFIX_RE.sub("", str(name or "").strip()).casefold()
-
-
-def _import_name_ordinal(name):
-    match = _IMPORT_ORDINAL_RE.search(str(name or "").strip())
-    return int(match.group(1)) if match else None
-
-
 def _mesh_lod_level(node):
     name = _re6_mesh_live_object_name(node)
     compact_lod = _mesh_name_facts(name).get("lod_level")
@@ -33300,32 +33748,6 @@ def _mesh_lod_level(node):
         return int(compact_lod)
     match = _LOD_NAME_RE.search(name)
     return int(match.group(1)) if match else None
-
-
-def _hierarchy_mesh_lod_level(node):
-    name = str(getattr(node, "name", "") or "").strip()
-    facts = _mesh_name_facts(name)
-    lod_level = facts.get("lod_level")
-    if lod_level is not None:
-        return int(lod_level)
-    match = _LOD_NAME_RE.search(name)
-    return int(match.group(1)) if match else None
-
-
-def _mesh_has_armature(node):
-    return any(
-        modifier.type == "ARMATURE" and modifier.object is not None
-        for modifier in getattr(node, "modifiers", ())
-    )
-
-
-def _expected_mesh_helper(node):
-    lod_level = _hierarchy_mesh_lod_level(node)
-    if lod_level == 0:
-        return "LodGroup_0"
-    if lod_level in _LOD_GROUP_IDS and _mesh_has_armature(node):
-        return "LodGroup_%s" % lod_level
-    return "OtherMesh"
 
 
 def _is_complete_re6_hierarchy_name(node):
@@ -33350,113 +33772,211 @@ def _is_complete_re6_hierarchy_name(node):
     return True
 
 
-def _find_import_helper(mesh, helper_name, helper_scope=None):
-    expected_raw = str(helper_name or "").strip().casefold()
-    expected = _canonical_helper_name(helper_name)
-    contract_id = _property_text(mesh, "CodexRe6ImportContractId")
-    mesh_import_ordinal = _import_name_ordinal(getattr(mesh, "name", ""))
-    contract_matches = []
-    declared_name_matches = []
-    ordinal_matches = []
-    fallback = []
-    candidates = (
-        list(helper_scope)
-        if helper_scope is not None
-        else list(bpy.context.scene.objects)
-    )
-    for node in candidates:
-        if node.type != "EMPTY":
-            continue
-        if _canonical_helper_name(node.name) != expected:
-            continue
-        fallback.append(node)
-        if str(node.name or "").strip().casefold() == expected_raw:
-            declared_name_matches.append(node)
-        if (
-            mesh_import_ordinal is not None
-            and _import_name_ordinal(node.name) == mesh_import_ordinal
-        ):
-            ordinal_matches.append(node)
-        if contract_id and _property_text(
-            node, "CodexRe6ImportContractId"
-        ) == contract_id:
-            contract_matches.append(node)
-    if contract_matches:
-        candidates = contract_matches
-    elif _import_name_ordinal(helper_name) is not None and declared_name_matches:
-        candidates = declared_name_matches
-    elif ordinal_matches:
-        candidates = ordinal_matches
-    elif declared_name_matches:
-        candidates = declared_name_matches
-    else:
-        candidates = fallback
-    return candidates[0] if candidates else None
-
-
-def _rebuild_lod_hierarchy(meshes=None, helper_scope=None):
-    candidates = list(meshes) if meshes is not None else [
-        node
-        for node in bpy.context.scene.objects
-        if node.type == "MESH"
-        and not _is_re6_bound_sphere(node)
-        and _is_complete_re6_hierarchy_name(node)
-    ]
-    routed = []
-    unchanged = 0
-    missing_helpers = []
-    route_counts = {}
-    for mesh in candidates:
-        if mesh is None or mesh.type != "MESH":
-            continue
-        if not _is_complete_re6_hierarchy_name(mesh):
-            missing_helpers.append(
-                {
-                    "mesh_name": str(getattr(mesh, "name", "") or ""),
-                    "helper_name": "",
-                    "reason": "current Mesh name is not a complete RE6 Header",
-                }
-            )
-            continue
-        helper_name = _expected_mesh_helper(mesh)
-        target = _find_import_helper(mesh, helper_name, helper_scope=helper_scope)
-        if target is None:
-            missing_helpers.append(
-                {"mesh_name": str(mesh.name), "helper_name": helper_name}
-            )
-            continue
-        route_counts[helper_name] = int(route_counts.get(helper_name, 0)) + 1
-        if mesh.parent is target:
-            unchanged += 1
-            continue
-        world_matrix = mesh.matrix_world.copy()
-        mesh.parent = target
-        mesh.matrix_parent_inverse = target.matrix_world.inverted_safe()
-        mesh.matrix_world = world_matrix
-        routed.append(
-            {
-                "mesh_name": str(mesh.name),
-                "helper_name": str(target.name),
-                "lod_level": _mesh_lod_level(mesh),
-                "armature": bool(_mesh_has_armature(mesh)),
-            }
-        )
-    return {
-        "candidate_mesh_count": len(candidates),
-        "routed_mesh_count": len(routed),
-        "unchanged_mesh_count": int(unchanged),
-        "missing_helper_count": len(missing_helpers),
-        "missing_helpers": missing_helpers,
-        "route_counts": route_counts,
-        "routed": routed,
-    }
-
-
 def _pointer(value):
     try:
         return int(value.as_pointer())
     except Exception:
         return int(id(value))
+
+
+def _fbx_hierarchy_object_collections(node):
+    """Return the direct Collections currently linking one Blender Object."""
+    try:
+        return list(getattr(node, "users_collection", ()) or ())
+    except Exception:
+        return []
+
+
+def _fbx_hierarchy_move_to_parent_collection(node, target):
+    """Make an Object's Collection membership match its restored parent."""
+    result = {"changed": False, "issues": [], "target_collections": []}
+    if node is None or target is None:
+        return result
+    current = _fbx_hierarchy_object_collections(node)
+    parent_collections = _fbx_hierarchy_object_collections(target)
+    result["target_collections"] = [
+        str(getattr(collection, "name", "") or "")
+        for collection in parent_collections
+    ]
+    if not parent_collections:
+        # An unlinked parent has no authoritative Collection to inherit.  Keep
+        # the child where it is and report the evidence gap without orphaning.
+        if current:
+            result["issues"].append(
+                "parent has no Collection: " + str(getattr(target, "name", "") or "")
+            )
+        return result
+    target_handles = {_pointer(collection) for collection in parent_collections}
+    current_handles = {_pointer(collection) for collection in current}
+    if current_handles == target_handles:
+        return result
+    for collection in parent_collections:
+        if _pointer(collection) in current_handles:
+            continue
+        try:
+            collection.objects.link(node)
+        except Exception as exc:
+            result["issues"].append(
+                "could not link %s to %s: %s"
+                % (
+                    str(getattr(node, "name", "") or ""),
+                    str(getattr(collection, "name", "") or ""),
+                    exc,
+                )
+            )
+    for collection in list(_fbx_hierarchy_object_collections(node)):
+        if _pointer(collection) in target_handles:
+            continue
+        try:
+            collection.objects.unlink(node)
+        except Exception as exc:
+            result["issues"].append(
+                "could not unlink %s from %s: %s"
+                % (
+                    str(getattr(node, "name", "") or ""),
+                    str(getattr(collection, "name", "") or ""),
+                    exc,
+                )
+            )
+    final_handles = {
+        _pointer(collection)
+        for collection in _fbx_hierarchy_object_collections(node)
+    }
+    result["changed"] = final_handles != current_handles
+    if final_handles != target_handles:
+        result["issues"].append(
+            "Collection membership did not match parent for "
+            + str(getattr(node, "name", "") or "")
+        )
+    return result
+
+
+def _fbx_hierarchy_restore_object_collections(node, collections):
+    """Restore the exact direct Collection links captured before a repair."""
+    wanted = [collection for collection in (collections or ()) if collection is not None]
+    wanted_handles = {_pointer(collection) for collection in wanted}
+    issues = []
+    current = _fbx_hierarchy_object_collections(node)
+    current_handles = {_pointer(collection) for collection in current}
+    for collection in wanted:
+        if _pointer(collection) in current_handles:
+            continue
+        try:
+            collection.objects.link(node)
+        except Exception as exc:
+            issues.append(
+                "could not restore %s in %s: %s"
+                % (
+                    str(getattr(node, "name", "") or ""),
+                    str(getattr(collection, "name", "") or ""),
+                    exc,
+                )
+            )
+    for collection in list(_fbx_hierarchy_object_collections(node)):
+        if _pointer(collection) in wanted_handles:
+            continue
+        try:
+            collection.objects.unlink(node)
+        except Exception as exc:
+            issues.append(
+                "could not remove %s from %s: %s"
+                % (
+                    str(getattr(node, "name", "") or ""),
+                    str(getattr(collection, "name", "") or ""),
+                    exc,
+                )
+            )
+    final_handles = {
+        _pointer(collection)
+        for collection in _fbx_hierarchy_object_collections(node)
+    }
+    if final_handles != wanted_handles:
+        issues.append(
+            "Collection undo membership mismatch for "
+            + str(getattr(node, "name", "") or "")
+        )
+    return issues
+
+
+def _fbx_hierarchy_collection_plan_order(plans):
+    """Order hierarchy plans from Collection ancestors to descendants."""
+    plan_by_node = {}
+    for plan in plans or ():
+        if not plan:
+            continue
+        try:
+            plan_by_node[_pointer(plan[0])] = plan
+        except Exception:
+            continue
+    depth_cache = {}
+
+    def depth(node, trail=()):
+        handle = _pointer(node)
+        cached = depth_cache.get(handle)
+        if cached is not None:
+            return cached
+        if handle in trail:
+            return 0
+        plan = plan_by_node.get(handle)
+        if plan is None or len(plan) < 2:
+            depth_cache[handle] = 0
+            return 0
+        target = plan[-1]
+        if target is None:
+            value = 0
+        else:
+            value = depth(target, trail + (handle,)) + 1
+        depth_cache[handle] = value
+        return value
+
+    return sorted(
+        list(plans or ()),
+        key=lambda plan: (depth(plan[0]), _pointer(plan[0])),
+    )
+
+
+def _fbx_hierarchy_live_objects(scene=None, *, include_data=False, extras=()):
+    """Return unique live Objects for FBX hierarchy work.
+
+    Scene.objects omits Objects whose Collection is not linked to that Scene.
+    Blender still permits child.parent = parent across those Collection
+    boundaries, so a strict source-FBX repair must not lose such Objects
+    merely because of Collection membership.  Keep the active Scene as the
+    normal scope and add all datablocks only for explicit hierarchy/import
+    paths that need to see an unlinked Collection.
+    """
+    if scene is None:
+        scene = getattr(getattr(bpy, "context", None), "scene", None)
+    values = []
+    seen = set()
+
+    def append(node):
+        if node is None:
+            return
+        try:
+            handle = _pointer(node)
+        except Exception:
+            return
+        if handle in seen:
+            return
+        seen.add(handle)
+        values.append(node)
+
+    if scene is not None:
+        try:
+            for node in scene.objects:
+                append(node)
+        except Exception:
+            pass
+    if include_data:
+        try:
+            for node in bpy.data.objects:
+                append(node)
+        except Exception:
+            pass
+    for node in extras or ():
+        append(node)
+    return values
 
 
 def _blender_rna_same(left, right):
@@ -33852,7 +34372,9 @@ def _is_re6_hierarchy_repair_mesh(node):
 
 def _fbx_hierarchy_unresolved_mesh_names():
     unresolved = []
-    for node in bpy.context.scene.objects:
+    for node in _fbx_hierarchy_live_objects(
+        getattr(bpy.context, "scene", None), include_data=True
+    ):
         if (
             str(getattr(node, "type", "") or "") != "MESH"
             or _is_re6_bound_sphere(node)
@@ -33882,13 +34404,253 @@ def _fbx_hierarchy_unresolved_mesh_names():
             or re.fullmatch(r"-?\d+", source_id) is None
             or re.fullmatch(r"-?\d+", parent_id) is None
         ):
-            if _is_complete_re6_hierarchy_name(node):
-                helper_name = _expected_mesh_helper(node)
-                helper = _find_import_helper(node, helper_name)
-                if helper is not None:
-                    continue
             unresolved.append(str(node.name))
     return sorted(set(unresolved), key=lambda value: value.casefold())
+
+
+def _fbx_hierarchy_strict_source_mapping(contract):
+    """Map only exact source-FBX names; never infer a parent from a Mesh name."""
+    if not isinstance(contract, dict) or not bool(contract.get("contract_available", True)):
+        detail = str(
+            contract.get("analysis_detail", "hierarchy evidence unavailable")
+            if isinstance(contract, dict)
+            else "hierarchy evidence unavailable"
+        )
+        raise RuntimeError(
+            "The selected source FBX hierarchy contract is unavailable: " + detail
+        )
+    raw_models = contract.get("models", [])
+    if not isinstance(raw_models, list) or not raw_models:
+        raise RuntimeError("The selected source FBX has no Model records")
+    models_by_id = {}
+    for raw_row in raw_models:
+        if not isinstance(raw_row, dict):
+            raise RuntimeError("The selected source FBX has an invalid Model record")
+        source_id = str(raw_row.get("source_model_id", "") or "").strip()
+        name = str(raw_row.get("source_model_name", "") or "")
+        parent_id = str(raw_row.get("source_parent_model_id", "") or "").strip()
+        if (
+            re.fullmatch(r"-?\d+", source_id) is None
+            or re.fullmatch(r"-?\d+", parent_id) is None
+            or not name
+            or source_id in models_by_id
+        ):
+            raise RuntimeError("The selected source FBX has an invalid Model identity")
+        models_by_id[source_id] = raw_row
+    required_ids = {
+        source_id
+        for source_id, row in models_by_id.items()
+        if str(row.get("source_model_type", "") or "").casefold() == "mesh"
+    }
+    if not required_ids:
+        raise RuntimeError("The selected source FBX has no Mesh Models")
+    pending = list(required_ids)
+    while pending:
+        source_id = pending.pop()
+        parent_id = str(models_by_id[source_id].get("source_parent_model_id", "0") or "0")
+        if parent_id == "0" or parent_id in required_ids:
+            continue
+        if parent_id not in models_by_id:
+            raise RuntimeError(
+                "The selected source FBX references a missing parent Model: " + parent_id
+            )
+        required_ids.add(parent_id)
+        pending.append(parent_id)
+    required_rows = sorted(
+        (models_by_id[source_id] for source_id in required_ids),
+        key=lambda row: int(row["source_model_id"]),
+    )
+    source_groups = {}
+    source_group_ordinals = {}
+    for row in required_rows:
+        source_name = str(row.get("source_model_name", "") or "")
+        canonical_name = _fbx_hierarchy_canonical_import_name(source_name)
+        if not canonical_name:
+            raise RuntimeError("The selected source FBX has an empty Model name")
+        group_key = canonical_name.casefold()
+        source_groups.setdefault(group_key, []).append(row)
+    for group_rows in source_groups.values():
+        group_rows.sort(key=lambda row: int(row["source_model_id"]))
+        for ordinal, row in enumerate(group_rows):
+            source_group_ordinals[str(row["source_model_id"])] = int(ordinal)
+    source_names = {
+        str(row.get("source_model_name", "") or "") for row in required_rows
+    }
+    scene = getattr(bpy.context, "scene", None)
+    source_sha256 = str(contract.get("source_sha256", "") or "").strip().upper()
+
+    def node_metadata_matches_source(node):
+        # A scene can legitimately be repaired from a source-export variant
+        # whose visible names/Model graph are the same but whose file hash and
+        # pointer IDs differ.  Old contract properties are hints only in that
+        # case; the selected source FBX remains authoritative.
+        node_sha256 = _property_text(node, _FBX_HIERARCHY_SOURCE_SHA256_PROPERTY)
+        node_sha256 = str(node_sha256 or "").strip().upper()
+        return not node_sha256 or not source_sha256 or node_sha256 == source_sha256
+
+    # A Collection can be unlinked from the active Scene while its Objects
+    # remain valid Blender datablocks.  Exact source names/identities still
+    # decide the mapping; Collection membership must not hide a candidate.
+    scene_nodes = _fbx_hierarchy_live_objects(scene, include_data=True)
+    nodes_by_name = {}
+    for node in scene_nodes:
+        name = str(getattr(node, "name", "") or "")
+        if name:
+            canonical_name = _fbx_hierarchy_canonical_import_name(name)
+            if canonical_name:
+                nodes_by_name.setdefault(canonical_name.casefold(), []).append(node)
+
+    def node_identity_set(node):
+        identities = set(_fbx_hierarchy_node_identity_candidates(node))
+        if not node_metadata_matches_source(node):
+            # Preserve only the intrinsic __CIX marker when switching between
+            # source-export variants; MaxHandle/route properties may be stale.
+            identities = {
+                identity for identity in identities if identity[0] == "cix_model_id"
+            }
+        return identities
+
+    def row_identity_set(row):
+        return set(_fbx_hierarchy_source_identity_candidates(row))
+
+    mapping = {}
+    used_handles = set()
+    issues = []
+    for row in required_rows:
+        source_id = str(row["source_model_id"])
+        source_name = str(row["source_model_name"])
+        group_key = _fbx_hierarchy_canonical_import_name(source_name).casefold()
+        candidates = [
+            node
+            for node in nodes_by_name.get(group_key, [])
+            if _pointer(node) not in used_handles
+        ]
+        row_identities = row_identity_set(row)
+        selected = None
+        preserved_matches = [
+            node
+            for node in candidates
+            if node_metadata_matches_source(node)
+            if _fbx_hierarchy_identity_number(
+                _property_text(node, _FBX_HIERARCHY_SOURCE_MODEL_ID_PROPERTY)
+            )
+            == source_id
+        ]
+        if len(preserved_matches) == 1:
+            selected = preserved_matches[0]
+        elif len(preserved_matches) > 1:
+            issues.append("source Model identity is duplicated: " + source_name)
+        if selected is None and row_identities:
+            identity_matches = [
+                node
+                for node in candidates
+                if row_identities.intersection(node_identity_set(node))
+            ]
+            if len(identity_matches) == 1:
+                selected = identity_matches[0]
+            elif len(identity_matches) > 1:
+                issues.append("source Model identity is ambiguous: " + source_name)
+        if selected is None:
+            exact_matches = [
+                node
+                for node in candidates
+                if str(getattr(node, "name", "") or "").casefold()
+                == source_name.casefold()
+            ]
+            if len(exact_matches) == 1:
+                selected = exact_matches[0]
+        if selected is None:
+            ordinal = int(source_group_ordinals.get(source_id, 0))
+            ordinal_matches = [
+                node
+                for node in candidates
+                if _fbx_hierarchy_name_collision_ordinal(
+                    getattr(node, "name", "")
+                )
+                == ordinal
+            ]
+            if len(ordinal_matches) == 1:
+                selected = ordinal_matches[0]
+        if selected is None and len(candidates) == 1:
+            selected = candidates[0]
+        if selected is None:
+            if not candidates:
+                issues.append("scene name missing from source FBX: " + source_name)
+            else:
+                issues.append(
+                    "duplicate source name has no deterministic scene match: "
+                    + source_name
+                )
+        if selected is None:
+            continue
+        node_identities = node_identity_set(selected)
+        if row_identities and node_identities and not row_identities.intersection(
+            node_identities
+        ):
+            issues.append("source identity conflicts with scene name: " + source_name)
+        existing_source_id = (
+            _fbx_hierarchy_identity_number(
+                _property_text(selected, _FBX_HIERARCHY_SOURCE_MODEL_ID_PROPERTY)
+            )
+            if node_metadata_matches_source(selected)
+            else ""
+        )
+        if existing_source_id and existing_source_id != source_id:
+            issues.append("scene Model identity conflicts with source FBX: " + source_name)
+            continue
+        handle = _pointer(selected)
+        if handle in used_handles:
+            issues.append("scene object is mapped more than once: " + source_name)
+            continue
+        used_handles.add(handle)
+        mapping[source_id] = selected
+
+    for group_key, group_rows in source_groups.items():
+        nodes = nodes_by_name.get(group_key, [])
+        if len(nodes) != len(group_rows):
+            issues.append(
+                "scene/source name count differs for %s (%d/%d)"
+                % (
+                    str(group_rows[0].get("source_model_name", "") or ""),
+                    len(nodes),
+                    len(group_rows),
+                )
+            )
+    for node in scene_nodes:
+        name = str(getattr(node, "name", "") or "")
+        canonical_name = _fbx_hierarchy_canonical_import_name(name)
+        if (
+            canonical_name
+            and canonical_name.casefold() in source_groups
+            and name not in source_names
+        ):
+            # CIX and Blender numeric suffixes are expected import spellings;
+            # the next pass converts them to the source-derived final name.
+            pass
+        if _pointer(node) in used_handles:
+            continue
+        if any(
+            _property_text(node, key)
+            for key in (
+                _FBX_HIERARCHY_CONTRACT_ID_PROPERTY,
+                _FBX_HIERARCHY_SOURCE_MODEL_ID_PROPERTY,
+                _FBX_HIERARCHY_SOURCE_MODEL_NAME_PROPERTY,
+                _FBX_HIERARCHY_EVIDENCE_PROPERTY,
+            )
+        ):
+            issues.append("tracked scene object is not an exact source Model: " + name)
+    if len(mapping) != len(required_rows):
+        issues.append(
+            "source Model count is not fully matched (%d/%d)"
+            % (len(mapping), len(required_rows))
+        )
+    if issues:
+        detail = " | ".join(sorted(set(issues), key=str.casefold)[:16])
+        raise RuntimeError(
+            "Scene names must exactly match the selected source FBX; hierarchy was not changed: "
+            + detail
+        )
+    return mapping
 
 
 def _fbx_hierarchy_recover_scene_from_source(payload):
@@ -33900,29 +34662,124 @@ def _fbx_hierarchy_recover_scene_from_source(payload):
     contract = _fbx_hierarchy_validate_contract(
         payload.get("fbx_hierarchy_contract"), source_path
     )
-    source_names = {
-        str(row.get("source_model_name", "") or "").casefold()
-        for row in contract.get("models", [])
-        if isinstance(row, dict)
+    mapping = _fbx_hierarchy_strict_source_mapping(contract)
+    preserved_source_ids = {
+        _pointer(node): str(source_id)
+        for source_id, node in mapping.items()
     }
-    candidates = [
-        node
-        for node in bpy.context.scene.objects
-        if any(
-            candidate.casefold() in source_names
-            for candidate in _fbx_hierarchy_name_candidates(node)
-        )
-    ]
-    # A source FBX can repair its proven subset even when the current Blender
-    # scene also contains user-created, renamed, or duplicate-name objects.
-    # Those objects must remain untouched rather than aborting the whole pass.
     result = _fbx_hierarchy_apply_import_contract(
         contract,
-        candidates,
-        strict=False,
+        list(mapping.values()),
+        strict=True,
         full_source_hierarchy=True,
+        preserved_source_ids=preserved_source_ids,
     )
-    result["skipped_unresolved_nodes"] = _fbx_hierarchy_unresolved_mesh_names()
+    # The source contract is the complete expectation table.  Restore the
+    # graph first, then allocate the visible duplicate names from that table;
+    # never let Blender's current Object order decide which node is .001.
+    name_normalization = _fbx_hierarchy_normalize_import_object_names(
+        bpy.context.scene, contract, list(mapping.values())
+    )
+
+    def verify_source_expectation():
+        rows = [
+            row
+            for row in contract.get("models", [])
+            if isinstance(row, dict)
+            and str(row.get("source_model_id", "") or "") in mapping
+        ]
+        groups = {}
+        for row in rows:
+            key = _fbx_hierarchy_canonical_import_name(
+                row.get("source_model_name", "")
+            ).casefold()
+            groups.setdefault(key, []).append(row)
+        ordinals = {}
+        for group_rows in groups.values():
+            for ordinal, row in enumerate(
+                sorted(group_rows, key=lambda value: int(value["source_model_id"]))
+            ):
+                ordinals[str(row["source_model_id"])] = int(ordinal)
+        issues = []
+        for row in rows:
+            source_id = str(row["source_model_id"])
+            node = mapping.get(source_id)
+            if node is None:
+                issues.append("missing mapped Model " + source_id)
+                continue
+            base_name = _fbx_hierarchy_canonical_import_name(
+                row.get("source_model_name", "")
+            )
+            ordinal = int(ordinals.get(source_id, 0))
+            expected_name = (
+                base_name if ordinal == 0 else "%s.%03d" % (base_name, ordinal)
+            )
+            if str(getattr(node, "name", "") or "") != expected_name:
+                issues.append(
+                    "name mismatch for %s (expected %s, got %s)"
+                    % (source_id, expected_name, str(getattr(node, "name", "") or ""))
+                )
+            if _property_text(node, _FBX_HIERARCHY_SOURCE_MODEL_ID_PROPERTY) != source_id:
+                issues.append("source identity mismatch for " + source_id)
+            parent_id = str(row.get("source_parent_model_id", "0") or "0")
+            expected_parent = None if parent_id == "0" else mapping.get(parent_id)
+            if parent_id != "0" and expected_parent is None:
+                issues.append("missing expected parent %s for %s" % (parent_id, source_id))
+            elif not _blender_rna_same(getattr(node, "parent", None), expected_parent):
+                issues.append("parent mismatch for " + source_id)
+        return issues
+
+    verification_issues = verify_source_expectation()
+    verification_retry = False
+    if verification_issues:
+        # One bounded retry re-reads same-name scene Objects after Blender has
+        # applied its own suffixes, then reapplies the already computed table.
+        verification_retry = True
+        mapping = _fbx_hierarchy_strict_source_mapping(contract)
+        preserved_source_ids = {
+            _pointer(node): str(source_id)
+            for source_id, node in mapping.items()
+        }
+        result = _fbx_hierarchy_apply_import_contract(
+            contract,
+            list(mapping.values()),
+            strict=True,
+            full_source_hierarchy=True,
+            preserved_source_ids=preserved_source_ids,
+        )
+        name_normalization = _fbx_hierarchy_normalize_import_object_names(
+            bpy.context.scene, contract, list(mapping.values())
+        )
+        verification_issues = verify_source_expectation()
+    if verification_issues:
+        raise RuntimeError(
+            "Blender scene did not match the source FBX expectation after repair: "
+            + " | ".join(verification_issues[:16])
+        )
+    result["name_normalization"] = name_normalization
+    expectation_group_counts = {}
+    for row in contract.get("models", []):
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("source_model_id", "") or "") not in mapping:
+            continue
+        key = _fbx_hierarchy_canonical_import_name(
+            row.get("source_model_name", "")
+        ).casefold()
+        expectation_group_counts[key] = int(expectation_group_counts.get(key, 0)) + 1
+    result["source_expectation"] = {
+        "model_count": len(mapping),
+        "duplicate_name_groups": sum(
+            1 for count in expectation_group_counts.values() if count > 1
+        ),
+    }
+    result["verification"] = {
+        "status": "PASS",
+        "retry": bool(verification_retry),
+        "checked_model_count": len(mapping),
+    }
+    result["skipped_unresolved_nodes"] = []
+    result["strict_name_match"] = True
     result["recovery_source_path"] = source_path
     result["recovery_source_sha256"] = str(contract.get("source_sha256", "") or "")
     result["recovery_attempted"] = True
@@ -33931,40 +34788,25 @@ def _fbx_hierarchy_recover_scene_from_source(payload):
 
 def _repair_re6_fbx_hierarchy(payload=None):
     request = dict(payload) if isinstance(payload, dict) else {}
-    source_recovery_requested = bool(str(request.get("source_path", "") or "").strip())
-    if source_recovery_requested:
-        result = _fbx_hierarchy_recover_scene_from_source(request)
-    else:
-        result = _fbx_hierarchy_restore_scene_contract(strict=False)
-        result["recovery_attempted"] = False
-    named_repair = _rebuild_lod_hierarchy(
-        [
-            node
-            for node in bpy.context.scene.objects
-            if _is_complete_re6_hierarchy_name(node)
-        ]
+    source_path = str(request.get("source_path", "") or "").strip()
+    if not source_path:
+        raise ValueError(
+            "Manual FBX hierarchy repair requires selecting the original source FBX"
+        )
+    result = _fbx_hierarchy_recover_scene_from_source(request)
+    result["re6_name_rule_repair"] = _fbx_hierarchy_no_name_guess_receipt(
+        (), status="DISABLED"
     )
-    result["re6_name_rule_repair"] = named_repair
-    result["candidate_mesh_count"] = max(
-        int(result.get("candidate_mesh_count", 0) or 0),
-        int(named_repair.get("candidate_mesh_count", 0) or 0),
-    )
-    result["routed_model_count"] = int(
-        result.get("routed_model_count", 0) or 0
-    ) + int(named_repair.get("routed_mesh_count", 0) or 0)
-    result["unchanged_model_count"] = int(
-        result.get("unchanged_model_count", 0) or 0
-    ) + int(named_repair.get("unchanged_mesh_count", 0) or 0)
-    unresolved = _fbx_hierarchy_unresolved_mesh_names()
-    result["unresolved_nodes"] = unresolved
-    result["unresolved_node_count"] = len(unresolved)
-    result["requires_source_fbx"] = bool(unresolved) and not source_recovery_requested
-    if unresolved and not source_recovery_requested:
-        result["status"] = "SOURCE_FBX_REQUIRED"
+    result.setdefault("candidate_mesh_count", 0)
+    result["unresolved_nodes"] = []
+    result["unresolved_node_count"] = 0
+    result["requires_source_fbx"] = False
     result["scope"] = "persisted_source_fbx_model_contract"
     result["recognized_mesh_count"] = sum(
         1
-        for node in bpy.context.scene.objects
+        for node in _fbx_hierarchy_live_objects(
+            bpy.context.scene, include_data=True
+        )
         if str(getattr(node, "type", "") or "") == "MESH"
         and not _is_re6_bound_sphere(node)
         and _property_text(node, _FBX_HIERARCHY_CONTRACT_ID_PROPERTY)
@@ -33973,7 +34815,7 @@ def _repair_re6_fbx_hierarchy(payload=None):
     return _record_blender_scene_undo(
         result,
         "PC-REHD Restore Source FBX Hierarchy",
-        changed=bool(result.get("routed_model_count", 0)),
+        changed=bool(result.get("changed_model_count", result.get("routed_model_count", 0))),
     )
 
 
@@ -34558,16 +35400,8 @@ def _bone_contract(armature, bone, selected_handles):
 
 def _scene_contract(selected_handles=None):
     objects = list(bpy.context.scene.objects)
-    # Manual Outliner renames are scene edits. Route their current LOD names
-    # before taking one live contract; no prior Worker result is consulted.
-    _rebuild_lod_hierarchy(
-        [
-            node
-            for node in objects
-            if node.type == "MESH" and _is_complete_re6_hierarchy_name(node)
-        ],
-        helper_scope=objects,
-    )
+    # Inspection is read-only. Source FBX hierarchy repair happens at import
+    # time and must not be replaced later by the legacy RE6 LOD-name rule.
     if selected_handles is None:
         selected_handles = set()
         for node in objects:
@@ -34888,7 +35722,9 @@ def _node_map_apply(payload):
         node["PC_REHD_MESH_TYPE"] = int(header["meshtype"])
         if not _property_text(node, "CodexRe6ImportSourceSha256"):
             node["CodexRe6ImportSourceSha256"] = source_sha256
-    hierarchy = _rebuild_lod_hierarchy([row[0] for row in prepared])
+    hierarchy = _fbx_hierarchy_no_name_guess_receipt(
+        [row[0] for row in prepared], status="NODE_MAP_RENAME_ONLY"
+    )
     result = {
         "schema": "pc-rehd-blender-node-map-apply-v1",
         "node_map_id": node_map_id,
@@ -35046,7 +35882,9 @@ def _scene_node_map_rename(payload):
         node["PC_REHD_SOURCE_FVF"] = "0x%08X" % int(header["fvf_info"])
         node["CodexRe6SourceFVF"] = "0x%08X" % int(header["fvf_info"])
         node["PC_REHD_MESH_TYPE"] = int(header["meshtype"])
-    hierarchy = _rebuild_lod_hierarchy([row[0] for row in changed_nodes])
+    hierarchy = _fbx_hierarchy_no_name_guess_receipt(
+        [row[0] for row in changed_nodes], status="RENAME_ONLY"
+    )
     selection_receipt = _scene_select(
         {
             "node_handles": [_pointer(row[0]) for row in changed_nodes],
@@ -35127,7 +35965,9 @@ def _scene_rename(payload):
     for node, new_name in zip(selected, final_names):
         node.name = new_name
         renamed.append({"handle": _pointer(node), "name": str(node.name)})
-    hierarchy = _rebuild_lod_hierarchy(selected)
+    hierarchy = _fbx_hierarchy_no_name_guess_receipt(
+        selected, status="RENAME_ONLY"
+    )
     selection_receipt = _scene_select(
         {
             "node_handles": [_pointer(node) for node in selected],
@@ -36623,7 +37463,7 @@ def _native_fbx_import(path, *, use_custom_normals):
         "import_subdivision": False,
         "ignore_leaf_bones": False,
         "validate_meshes": True,
-        "use_anim": False,
+        "use_anim": True,
         "anim_offset": 1.0,
     }
     outcome = operator(**_operator_kwargs(operator, options))
@@ -36863,7 +37703,9 @@ def _fbx_hierarchy_record_import_baseline(watch, handles):
 def _fbx_hierarchy_monitor_native_import(operations):
     scene = bpy.context.scene
     scene_handle = _pointer(scene)
-    current_handles = {_pointer(node) for node in scene.objects}
+    current_handles = {
+        _pointer(node) for node in _fbx_hierarchy_live_objects(scene, include_data=True)
+    }
     scene_watches = _FBX_HIERARCHY_IMPORT_WATCHES.get(scene_handle, [])
     if isinstance(scene_watches, dict):
         scene_watches = [scene_watches]
@@ -37068,7 +37910,8 @@ def _fbx_hierarchy_monitor_native_import(operations):
         return
     if not scene_watches:
         _FBX_HIERARCHY_IDLE_OBJECT_HANDLES[scene_handle] = {
-            _pointer(node) for node in scene.objects
+            _pointer(node)
+            for node in _fbx_hierarchy_live_objects(scene, include_data=True)
         }
         return
     now = time.monotonic()
@@ -37087,7 +37930,7 @@ def _fbx_hierarchy_monitor_native_import(operations):
         if captured_handles is None:
             imported = [
                 node
-                for node in scene.objects
+                for node in _fbx_hierarchy_live_objects(scene, include_data=True)
                 if _pointer(node) not in before_handles
             ]
             if imported:
@@ -37097,7 +37940,7 @@ def _fbx_hierarchy_monitor_native_import(operations):
             captured_handles = _handles(captured_handles)
             imported = [
                 node
-                for node in scene.objects
+                for node in _fbx_hierarchy_live_objects(scene, include_data=True)
                 if _pointer(node) in captured_handles
             ]
         if not imported:
@@ -37151,10 +37994,22 @@ def _fbx_hierarchy_monitor_native_import(operations):
                 full_source_hierarchy=True,
                 record_evidence=False,
             )
-            if int(receipt.get("routed_model_count", 0) or 0) > 0:
+            # Preserve exact source Model names until every parent is restored.
+            # Only then remove __CIX collision markers and allocate .001/.002.
+            name_normalization = _fbx_hierarchy_normalize_import_object_names(
+                scene, contract, imported
+            )
+            if int(receipt.get("changed_model_count", receipt.get("routed_model_count", 0)) or 0) > 0:
                 try:
                     bpy.ops.ed.undo_push(
                         message="PC-REHD Restore Source FBX Hierarchy"
+                    )
+                except Exception:
+                    pass
+            if int(name_normalization.get("renamed_object_count", 0) or 0) > 0:
+                try:
+                    bpy.ops.ed.undo_push(
+                        message="PC-REHD Normalize Imported FBX Object Names"
                     )
                 except Exception:
                     pass
@@ -37169,7 +38024,8 @@ def _fbx_hierarchy_monitor_native_import(operations):
     else:
         _FBX_HIERARCHY_IMPORT_WATCHES.pop(scene_handle, None)
         _FBX_HIERARCHY_IDLE_OBJECT_HANDLES[scene_handle] = {
-            _pointer(node) for node in scene.objects
+            _pointer(node)
+            for node in _fbx_hierarchy_live_objects(scene, include_data=True)
         }
 
 
@@ -37190,7 +38046,7 @@ def _fbx_hierarchy_monitor_native_export(operations):
     _FBX_HIERARCHY_EXPORT_WATCHES[scene_handle] = key
     try:
         receipt = _fbx_hierarchy_restore_scene_contract(strict=False)
-        if int(receipt.get("routed_model_count", 0) or 0) > 0:
+        if int(receipt.get("changed_model_count", receipt.get("routed_model_count", 0)) or 0) > 0:
             try:
                 bpy.ops.ed.undo_push(message="PC-REHD Verify Source FBX Hierarchy")
             except Exception:
@@ -37201,7 +38057,8 @@ def _fbx_hierarchy_monitor_native_export(operations):
     except Exception as exc:
         detail = "%s: %s" % (type(exc).__name__, exc)
         tracked = [
-            node for node in scene.objects
+            node
+            for node in _fbx_hierarchy_live_objects(scene, include_data=True)
             if _property_text(node, _FBX_HIERARCHY_CONTRACT_ID_PROPERTY)
             or _property_text(node, _FBX_HIERARCHY_EVIDENCE_PROPERTY)
         ]
@@ -37479,7 +38336,12 @@ def _import_fbx(payload):
         payload.get("fbx_hierarchy_contract"), path
     )
     _FBX_HIERARCHY_MANUAL_IMPORT_ARMS.pop(_pointer(bpy.context.scene), None)
-    before = {_pointer(node) for node in bpy.context.scene.objects}
+    before = {
+        _pointer(node)
+        for node in _fbx_hierarchy_live_objects(
+            bpy.context.scene, include_data=True
+        )
+    }
     preexisting_material_handles = {_pointer(material) for material in bpy.data.materials}
     preexisting_image_handles = {_pointer(image) for image in bpy.data.images}
     outcome = _native_fbx_import(
@@ -37487,7 +38349,11 @@ def _import_fbx(payload):
         use_custom_normals=consume_custom_normals,
     )
     imported = [
-        node for node in bpy.context.scene.objects if _pointer(node) not in before
+        node
+        for node in _fbx_hierarchy_live_objects(
+            bpy.context.scene, include_data=True
+        )
+        if _pointer(node) not in before
     ]
     hidden_bound_spheres = []
     for node in imported:
@@ -37741,13 +38607,22 @@ def _import_3ds_max_exported_fbx(payload):
         payload.get("fbx_hierarchy_contract"), path
     )
     _FBX_HIERARCHY_MANUAL_IMPORT_ARMS.pop(_pointer(bpy.context.scene), None)
-    before = {_pointer(node) for node in bpy.context.scene.objects}
+    before = {
+        _pointer(node)
+        for node in _fbx_hierarchy_live_objects(
+            bpy.context.scene, include_data=True
+        )
+    }
     outcome = _native_fbx_import(
         path,
         use_custom_normals=bool(payload.get("include_normals", True)),
     )
     imported = [
-        node for node in bpy.context.scene.objects if _pointer(node) not in before
+        node
+        for node in _fbx_hierarchy_live_objects(
+            bpy.context.scene, include_data=True
+        )
+        if _pointer(node) not in before
     ]
     hidden_bound_spheres = []
     for node in imported:
@@ -37791,6 +38666,21 @@ def _import_3ds_max_exported_fbx(payload):
         strict=True,
         full_source_hierarchy=True,
     )
+    try:
+        # Restore the source graph while __CIX still uniquely identifies every
+        # Model; collision cleanup is deliberately the final import step.
+        name_normalization = _fbx_hierarchy_normalize_import_object_names(
+            bpy.context.scene, source_hierarchy_contract, imported
+        )
+    except Exception as exc:
+        # Naming is advisory; a Blender RNA/API variation must never cancel
+        # an otherwise successful native FBX import.
+        name_normalization = {
+            "status": "FAILED",
+            "renamed_object_count": 0,
+            "renamed": [],
+            "issues": ["%s: %s" % (type(exc).__name__, exc)],
+        }
     hierarchy["origin"] = "launcher_3dsmax_fbx_import"
     hierarchy["scheduled"] = False
     hierarchy["delay_seconds"] = 0.0
@@ -37809,6 +38699,7 @@ def _import_3ds_max_exported_fbx(payload):
     hierarchy["unrecognized_mesh_names"] = list(
         re6_mesh_recognition["unrecognized_mesh_names"]
     )
+    hierarchy["name_normalization"] = name_normalization
     try:
         bpy.ops.object.select_all(action="DESELECT")
     except Exception:
@@ -38624,7 +39515,9 @@ def _scene_data_build_scene(data, reset_scene=False, include_normals=True):
         imported.append(obj)
         imported_slots.append(slot)
     bpy.context.view_layer.update()
-    hierarchy = _rebuild_lod_hierarchy(imported)
+    hierarchy = _fbx_hierarchy_no_name_guess_receipt(
+        imported, status="DIRECT_PARENT_CONTRACT"
+    )
     material_normalization = _blender_normalize_scene_materials()
     return {
         "imported": True,
@@ -38991,7 +39884,6 @@ def _blender_worker_capabilities():
         "scene.inspect_selection",
         "scene.selection",
         "scene.rename.prepare",
-        "scene.rebuild_lod_hierarchy",
         "scene.repair_re6_fbx_hierarchy",
         "scene.undo_fbx_hierarchy_repair",
         "scene.configure_fbx_hierarchy_auto_repair",
@@ -39266,8 +40158,6 @@ class _BlenderWorker:
                 ),
                 "selected": len(list(bpy.context.selected_objects)),
             }
-        if command == "scene.rebuild_lod_hierarchy":
-            return _fbx_hierarchy_restore_scene_contract(strict=False)
         if command == "scene.repair_re6_fbx_hierarchy":
             return _repair_re6_fbx_hierarchy(payload)
         if command == "scene.undo_fbx_hierarchy_repair":
@@ -47926,6 +48816,12 @@ def _run_blender_worker_live_scene_regression_guard() -> dict[str, Any]:
         "_mesh_contract",
         "_scene_contract",
         "_scene_snapshot_mesh",
+        "_fbx_hierarchy_source_identity_order",
+        "_fbx_hierarchy_normalize_import_object_names",
+        "_fbx_hierarchy_unresolved_mesh_names",
+        "_fbx_hierarchy_strict_source_mapping",
+        "_fbx_hierarchy_recover_scene_from_source",
+        "_repair_re6_fbx_hierarchy",
     }
     missing = sorted(required - set(definitions))
     if missing:
@@ -48063,13 +48959,127 @@ def _run_blender_worker_live_scene_regression_guard() -> dict[str, Any]:
         and isinstance(node.func, ast.Name)
         and node.func.id == "_mesh_contract"
     ]
-    if (
-        not rebuild_lines
-        or not mesh_contract_lines
-        or min(rebuild_lines) >= min(mesh_contract_lines)
-    ):
+    if rebuild_lines or not mesh_contract_lines:
         raise AssertionError(
-            "Blender Worker did not synchronize live LOD parents before inspection"
+            "Blender Worker inspection must not mutate source FBX hierarchy"
+        )
+
+    normalizer_calls = {
+        node.func.id
+        for node in ast.walk(
+            definitions["_fbx_hierarchy_normalize_import_object_names"]
+        )
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    if not {
+        "_fbx_hierarchy_node_preserved_source_id",
+        "_fbx_hierarchy_source_identity_order",
+    }.issubset(normalizer_calls):
+        raise AssertionError(
+            "Blender FBX duplicate naming no longer follows preserved source Model identity"
+        )
+    obsolete_worker_names = {
+        "_rebuild_lod_hierarchy",
+        "_expected_mesh_helper",
+        "_find_import_helper",
+        "_hierarchy_mesh_lod_level",
+    }
+    obsolete_present = sorted(
+        name for name in obsolete_worker_names if name in definitions or name in worker_source
+    )
+    if obsolete_present:
+        raise AssertionError(
+            "Blender Worker still contains legacy name-inferred hierarchy code: "
+            + ", ".join(obsolete_present)
+        )
+    repair_calls = {
+        node.func.id
+        for node in ast.walk(definitions["_repair_re6_fbx_hierarchy"])
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    if "_fbx_hierarchy_recover_scene_from_source" not in repair_calls:
+        raise AssertionError(
+            "Explicit Blender hierarchy repair must use the source FBX contract"
+        )
+    if "_rebuild_lod_hierarchy" in repair_calls:
+        raise AssertionError(
+            "Explicit Blender hierarchy repair still calls the removed name-inferred route"
+        )
+    strict_mapping_source = ast.get_source_segment(
+        worker_source, definitions["_fbx_hierarchy_strict_source_mapping"]
+    ) or ""
+    if "_fbx_hierarchy_name_candidates" in strict_mapping_source:
+        raise AssertionError(
+            "Strict Blender FBX hierarchy repair must not use fuzzy name candidates"
+        )
+    recover_source = ast.get_source_segment(
+        worker_source, definitions.get("_fbx_hierarchy_recover_scene_from_source")
+    ) or ""
+    if "strict=True" not in recover_source or "preserved_source_ids" not in recover_source:
+        raise AssertionError(
+            "Source FBX hierarchy recovery lost strict identity mapping"
+        )
+    # Every FBX import path must use the source Model contract and must not
+    # call a legacy name-inferred hierarchy route.
+    fbx_import_functions = {
+        "_fbx_hierarchy_monitor_native_import",
+        "_import_fbx",
+        "_import_3ds_max_exported_fbx",
+    }
+    for function_name in fbx_import_functions:
+        function_node = definitions.get(function_name)
+        if function_node is None:
+            raise AssertionError(
+                "Blender FBX import function is missing: " + function_name
+            )
+        import_calls = {
+            node.func.id
+            for node in ast.walk(function_node)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        if "_rebuild_lod_hierarchy" in import_calls:
+            raise AssertionError(
+                "Blender FBX import reintroduced name-inferred hierarchy routing in "
+                + function_name
+            )
+
+    identity_probe_body = [
+        node
+        for node in worker_tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {
+            "_pointer",
+            "_fbx_hierarchy_source_identity_order",
+        }
+    ]
+    identity_namespace: dict[str, Any] = {"re": re}
+    exec(
+        compile(
+            ast.Module(body=identity_probe_body, type_ignores=[]),
+            "<blender-worker-fbx-identity-order-probe>",
+            "exec",
+        ),
+        identity_namespace,
+    )
+
+    class IdentityProbeNode:
+        def __init__(self, pointer: int):
+            self.pointer = int(pointer)
+
+        def as_pointer(self) -> int:
+            return self.pointer
+
+    identity_order = identity_namespace["_fbx_hierarchy_source_identity_order"]
+    lod1_order = identity_order(
+        {"source_model_id": "2243034514800"}, IdentityProbeNode(999)
+    )
+    renamed_duplicate_order = identity_order(
+        {"source_model_id": "2243155054560"}, IdentityProbeNode(1)
+    )
+    unproven_order = identity_order(None, IdentityProbeNode(0))
+    if not lod1_order < renamed_duplicate_order < unproven_order:
+        raise AssertionError(
+            "Blender FBX source Model identity order does not outrank Blender Object order"
         )
 
     worker_class = next(
@@ -48113,7 +49123,10 @@ def _run_blender_worker_live_scene_regression_guard() -> dict[str, Any]:
         "stored_header_fallback": False,
         "stored_parent_fallback": False,
         "stored_type_override": False,
-        "live_lod_hierarchy_sync": True,
+        "live_lod_hierarchy_sync": False,
+        "source_fbx_hierarchy_preserved_during_inspection": True,
+        "source_fbx_duplicate_name_identity_order": True,
+        "obsolete_fbx_name_hierarchy_fallback": False,
         "persistent_scene_result_cache": False,
     }
 
@@ -48497,6 +49510,10 @@ def _build_bucket_rows(workspace: MaxWorkspaceState) -> list[dict[str, Any]]:
                     "lane": lane,
                     "scene_node": str(mesh.get("scene_node", "")),
                     "scene_node_handle": int(handle),
+                    # MAX FBX routing is always explicit because same-name
+                    # scene nodes are legal.  This equals the marker written
+                    # by _max_prepare_fbx_route_markers before export.
+                    "fbx_route_handle": int(handle),
                     "same_name_ordinal": int(duplicate_identity["same_name_ordinal"]),
                     "same_name_count": int(duplicate_identity["same_name_count"]),
                     "mesh_slot": int(mesh.get("mesh_slot", 0) or 0),
@@ -52383,6 +53400,11 @@ class ChoiceDialog:
         choices: list[tuple[str, str]],
         non_closing_actions: dict[str, Callable[[], None]] | None = None,
         center_on_screen: bool = True,
+        position_y_offset: int = 0,
+        anchor_widget: Any | None = None,
+        anchor_below: bool = False,
+        anchor_x_offset: int = 0,
+        anchor_gap: int = 8,
         callout: str = "",
         emphasis_message: str = "",
         detail_message: str = "",
@@ -52425,6 +53447,27 @@ class ChoiceDialog:
         self._cancel_auto_close_on_other_click = bool(
             cancel_auto_close_on_other_click
         )
+        # Optional, per-dialog vertical nudge used when another managed popup
+        # occupies the Launcher center.  Keep the default unchanged for every
+        # existing ChoiceDialog caller.
+        try:
+            self._position_y_offset = int(position_y_offset)
+        except (TypeError, ValueError, OverflowError):
+            self._position_y_offset = 0
+        # Optional widget anchor for a feature-specific notice.  The default
+        # remains None so every existing ChoiceDialog keeps its prior layout.
+        self._anchor_widget = anchor_widget
+        # A feature may request a deterministic below-anchor notice.  The
+        # default keeps the historical centered-above-anchor behavior.
+        self._anchor_below = bool(anchor_below)
+        try:
+            self._anchor_x_offset = int(anchor_x_offset)
+        except (TypeError, ValueError, OverflowError):
+            self._anchor_x_offset = 0
+        try:
+            self._anchor_gap = max(0, int(anchor_gap))
+        except (TypeError, ValueError, OverflowError):
+            self._anchor_gap = 8
         self._auto_close_deadline = 0.0
         self._auto_close_after: Any = None
         self._auto_close_cancelled = False
@@ -53014,13 +54057,63 @@ class ChoiceDialog:
         requested_width = max(body.winfo_reqwidth(), self.window.winfo_reqwidth(), content_width + 44)
         width = min(maximum_width, max(min(404, maximum_width), requested_width))
         height = min(screen_height - 80, self.window.winfo_reqheight())
-        if center_on_screen:
+        anchor = self._anchor_widget
+        anchor_positioned = False
+        if anchor is not None and not center_on_screen:
+            try:
+                anchor.update_idletasks()
+                anchor_x = int(anchor.winfo_rootx())
+                anchor_y = int(anchor.winfo_rooty())
+                anchor_width = max(1, int(anchor.winfo_width()))
+                anchor_height = max(1, int(anchor.winfo_height()))
+                if self._anchor_below:
+                    # The FBX recovery notice belongs inside the Launcher,
+                    # immediately below its repair button (the screenshot
+                    # reference position).  Do not move it above the main
+                    # window merely because the monitor has room there.
+                    x = anchor_x + self._anchor_x_offset
+                    y = anchor_y + anchor_height + self._anchor_gap
+                else:
+                    x = anchor_x + (anchor_width - width) // 2
+                    y = anchor_y - height - 8
+                # Keep the notice on the same monitor and out of the taskbar
+                # edge.  If there is no room above the button, place it just
+                # below rather than letting Tk clip it off-screen.
+                try:
+                    desktop_x = int(anchor.winfo_vrootx())
+                    desktop_y = int(anchor.winfo_vrooty())
+                    desktop_width = max(1, int(anchor.winfo_vrootwidth()))
+                    desktop_height = max(1, int(anchor.winfo_vrootheight()))
+                except Exception:
+                    desktop_x = 0
+                    desktop_y = 0
+                    desktop_width = screen_width
+                    desktop_height = screen_height
+                if y < desktop_y + 8:
+                    y = anchor_y + anchor_height + 8
+                x = min(
+                    max(desktop_x + 8, x),
+                    max(desktop_x + 8, desktop_x + desktop_width - width - 8),
+                )
+                y = min(
+                    max(desktop_y + 8, y),
+                    max(desktop_y + 8, desktop_y + desktop_height - height - 8),
+                )
+                anchor_positioned = True
+            except Exception:
+                anchor_positioned = False
+        if not anchor_positioned and center_on_screen:
             x, y = _centered_window_position(
                 width, height, screen_width, screen_height
             )
-        else:
+            y = min(
+                max(0, y + self._position_y_offset),
+                max(0, screen_height - height),
+            )
+        elif not anchor_positioned:
             x = parent.winfo_rootx() + max(0, (parent.winfo_width() - width) // 2)
             y = parent.winfo_rooty() + max(0, (parent.winfo_height() - height) // 2)
+            y += self._position_y_offset
             x = min(max(0, x), max(0, screen_width - width))
             y = min(max(0, y), max(0, screen_height - height))
         self.window.minsize(width, height)
@@ -55959,6 +57052,18 @@ class LauncherApp:
     ) -> None:
         normalized_phase = str(phase or "").strip().casefold()
         merged_extra = dict(extra) if isinstance(extra, dict) else {}
+        if normalized_phase in {"pause", "resume"}:
+            # The pause signal is deliberately synchronous: the supervisor must
+            # stop before a file picker or confirmation dialog can yield.
+            self._report_bootstrap_health_operation_sync(
+                action,
+                normalized_phase,
+                max_process_id=max_process_id,
+                request_id=request_id,
+                detail=detail,
+                extra=merged_extra or None,
+            )
+            return
         action_key = str(action or "unknown").strip().casefold()
         try:
             canonical_action = _canonical_operation_name(action_key)
@@ -61534,6 +62639,9 @@ class LauncherApp:
         self.blender_max_fbx_name_repair_tooltip = None
         self.blender_max_fbx_name_repair_window = None
         self.blender_fbx_hierarchy_recovery_window = None
+        # Native source-FBX picker remembers one directory for this Launcher
+        # run only.  Do not persist the selected file or this directory.
+        self._blender_fbx_hierarchy_last_source_directory: Path | None = None
         self.blender_node_map_button = None
         self.blender_hierarchy_message_button = None
         self.blender_hierarchy_message_window = None
@@ -66817,9 +67925,24 @@ class LauncherApp:
     def _request_mod_export(self) -> None:
         session = self._active_model_session()
         workspace = self._active_workspace()
+        request_token = uuid.uuid4().hex
+        self._report_bootstrap_health_operation(
+            "export_mod",
+            "pause",
+            max_process_id=session.pid if session is not None else 0,
+            request_id=request_token,
+            detail="Export button pressed; beginning export preflight.",
+        )
         if session is None or workspace is None:
             self._show_error(
                 RuntimeError(self._tr("当前没有活动的建模程序。", "No active modeling session."))
+            )
+            self._report_bootstrap_health_operation(
+                "export_mod",
+                "resume",
+                max_process_id=session.pid if session is not None else 0,
+                request_id=request_token,
+                detail="Export button flow ended without an active modeling session.",
             )
             return
         self._capture_view_into_workspace()
@@ -66828,15 +67951,40 @@ class LauncherApp:
             self._sync_legacy_export_control(workspace)
             self._show_export_sets()
             self._apply_quick_select_to_modify_before_export_sets()
+            self._report_bootstrap_health_operation(
+                "export_mod",
+                "resume",
+                max_process_id=session.pid,
+                request_id=request_token,
+                detail="Export settings opened; no export operation was started.",
+            )
             return
         if not workspace.legacy_export:
             self._show_export_sets()
             self._apply_quick_select_to_modify_before_export_sets()
+            self._report_bootstrap_health_operation(
+                "export_mod",
+                "resume",
+                max_process_id=session.pid,
+                request_id=request_token,
+                detail="Export settings opened; no export operation was started.",
+            )
             return
 
         bone_mode = "bones_plus_mesh" if workspace.experimental_bone_edit else "disabled"
         if self.export_transactions.snapshot_for_pid(session.pid) is not None:
-            self._export_mod(bone_mode=bone_mode)
+            accepted = self._export_mod(
+                bone_mode=bone_mode,
+                health_request_id=request_token,
+            )
+            if not accepted:
+                self._report_bootstrap_health_operation(
+                    "export_mod",
+                    "resume",
+                    max_process_id=session.pid,
+                    request_id=request_token,
+                    detail="Export was cancelled before background work started.",
+                )
             return
         if session.pid in self._legacy_export_preflight_pids:
             self._set_status(
@@ -66845,6 +67993,13 @@ class LauncherApp:
                     f"Legacy Export is reading the current Max selection | PID {session.pid}",
                 ),
                 progress=1,
+            )
+            self._report_bootstrap_health_operation(
+                "export_mod",
+                "resume",
+                max_process_id=session.pid,
+                request_id=request_token,
+                detail="A concurrent export already owns this PID.",
             )
             return
 
@@ -66871,10 +68026,19 @@ class LauncherApp:
                 choices=[(self._tr("确定", "OK"), "ok")],
                 center_on_screen=True,
             ).show()
+            self._report_bootstrap_health_operation(
+                "export_mod",
+                "resume",
+                max_process_id=session.pid,
+                request_id=request_token,
+                detail="Legacy export preflight was rejected by another Launcher instance.",
+            )
             return
 
         legacy_preflight_state: dict[str, Any] = {
             "lease": legacy_preflight_lease,
+            "health_request_id": request_token,
+            "pause_handed_off": False,
         }
 
         def release_legacy_export_preflight() -> None:
@@ -66986,16 +68150,28 @@ class LauncherApp:
 
                 self._apply_export_target_to_view(session.workspace)
                 self._set_status(session.workspace.last_status, progress=2)
-                self._export_mod(
+                export_handed_off = self._export_mod(
                     bone_mode=bone_mode,
                     legacy_bucket_plan=legacy_bucket_plan,
+                    health_request_id=str(
+                        legacy_preflight_state.get("health_request_id", request_token)
+                    ),
                 )
-                legacy_plan_handed_off = True
+                legacy_plan_handed_off = bool(export_handed_off)
             except Exception as exc:
                 self._session_error(session, action, generation, exc)
             finally:
                 if not legacy_plan_handed_off:
                     self._release_legacy_export_bucket_plan(legacy_bucket_plan)
+                    self._report_bootstrap_health_operation(
+                        "export_mod",
+                        "resume",
+                        max_process_id=session.pid,
+                        request_id=str(
+                            legacy_preflight_state.get("health_request_id", request_token)
+                        ),
+                        detail="Legacy export preflight ended before the export worker was accepted.",
+                    )
                 self._legacy_export_preflight_pids.discard(session.pid)
                 release_legacy_export_preflight()
 
@@ -67004,6 +68180,15 @@ class LauncherApp:
             try:
                 self._session_error(session, action, generation, exc)
             finally:
+                self._report_bootstrap_health_operation(
+                    "export_mod",
+                    "resume",
+                    max_process_id=session.pid,
+                    request_id=str(
+                        legacy_preflight_state.get("health_request_id", request_token)
+                    ),
+                    detail="Legacy export preflight failed before the export worker was accepted.",
+                )
                 release_legacy_export_preflight()
 
         try:
@@ -67015,9 +68200,17 @@ class LauncherApp:
                 quiet=True,
                 performance_critical=True,
             )
+            legacy_preflight_state["pause_handed_off"] = True
         except Exception:
             self._legacy_export_preflight_pids.discard(session.pid)
             release_legacy_export_preflight()
+            self._report_bootstrap_health_operation(
+                "export_mod",
+                "resume",
+                max_process_id=session.pid,
+                request_id=request_token,
+                detail="Legacy export preflight could not be scheduled.",
+            )
             raise
 
     def _show_export_sets(self) -> None:
@@ -69613,11 +70806,183 @@ class LauncherApp:
             self.blender_fbx_hierarchy_recovery_window = None
         _managed_window_scheduler(self.root).dispose(window)
 
+    def _open_blender_fbx_hierarchy_source_picker(
+        self, session: ManagedBlenderSession
+    ) -> None:
+        """Choose the source FBX with Windows' native file chooser and recover it.
+
+        The old path-entry Toplevel is intentionally not part of the live button
+        flow.  Only one in-memory directory is retained so reopening the chooser
+        is convenient; no selected path or directory is written to Launcher state.
+        """
+        if self._blender_fbx_hierarchy_recovery_inflight:
+            return
+
+        initial_directory: Path | None = None
+        remembered_directory = getattr(
+            self, "_blender_fbx_hierarchy_last_source_directory", None
+        )
+        if remembered_directory:
+            try:
+                candidate = Path(str(remembered_directory)).expanduser()
+            except (OSError, TypeError, ValueError):
+                candidate = None
+            if candidate is not None and candidate.is_dir():
+                initial_directory = candidate
+        if initial_directory is None:
+            source_mod = Path(str(session.workspace.source_mod or "")).expanduser()
+            log_directory = Path(
+                str(session.workspace.log_dir or DEFAULT_LOG_DIR)
+            ).expanduser()
+            initial_directory = (
+                source_mod.parent
+                if source_mod.is_file()
+                else log_directory
+                if log_directory.is_dir()
+                else Path.home()
+            )
+        try:
+            initial_directory = initial_directory.resolve(strict=False)
+        except OSError:
+            pass
+
+        try:
+            # tkinter's askopenfilename is the Windows common file dialog; the
+            # managed wrapper only supplies ownership/Z-order protection.
+            selected = _managed_file_dialog(
+                self.root,
+                "askopenfilename",
+                title=self._tr("选择源 FBX", "Choose Source FBX"),
+                initialdir=str(initial_directory),
+                filetypes=[
+                    ("FBX", "*.fbx"),
+                    (self._tr("所有文件", "All files"), "*.*"),
+                ],
+            )
+        except Exception as exc:
+            self._show_error(exc)
+            return
+        if not selected:
+            return
+
+        try:
+            source_path = Path(str(selected)).expanduser().resolve(strict=False)
+        except (OSError, TypeError, ValueError) as exc:
+            self._show_error(exc)
+            return
+        if not source_path.is_file() or source_path.suffix.casefold() != ".fbx":
+            self._show_error(
+                ValueError(
+                    self._tr(
+                        "请选择有效且可读取的源 FBX。",
+                        "Choose a readable source FBX.",
+                    )
+                )
+            )
+            return
+
+        # This is deliberately an ephemeral MRU of one directory, not a cache.
+        self._blender_fbx_hierarchy_last_source_directory = source_path.parent
+        recovery_session = self._active_blender_session()
+        if recovery_session is not session:
+            self._show_error(
+                RuntimeError(
+                    self._tr(
+                        "活动 Blender 进程已经切换，请重新点击修复。",
+                        "The active Blender process changed; click repair again.",
+                    )
+                )
+            )
+            return
+
+        action = "blender_recover_3dsmax_fbx_hierarchy"
+        generation = self._begin_session_operation(recovery_session, action)
+        self._blender_fbx_hierarchy_recovery_inflight = True
+        recovery_session.workspace.last_status = self._tr(
+            "正在解析源 FBX 并恢复可验证节点…",
+            "Parsing the source FBX and restoring proven nodes…",
+        )
+        self._refresh_toolbox_action_states()
+
+        def operation() -> tuple[dict[str, Any], dict[str, Any]]:
+            source_contract = _fbx_source_model_hierarchy_contract(source_path)
+            hierarchy = recovery_session.request(
+                "scene.repair_re6_fbx_hierarchy",
+                {
+                    "source_path": str(source_path),
+                    "fbx_hierarchy_contract": source_contract,
+                },
+            )
+            if not isinstance(hierarchy, Mapping):
+                raise ProtocolError(
+                    "Blender hierarchy recovery returned an invalid receipt"
+                )
+            if bool(hierarchy.get("requires_source_fbx", False)):
+                raise RuntimeError(
+                    "Source FBX did not resolve every scene Mesh"
+                )
+            if hierarchy.get("strict_name_match") is not True:
+                raise RuntimeError(
+                    "Scene names must exactly match the selected source FBX"
+                )
+            return dict(hierarchy), self._inspect_blender_scene(recovery_session)
+
+        def success(value: tuple[dict[str, Any], dict[str, Any]]) -> None:
+            self._blender_fbx_hierarchy_recovery_inflight = False
+            self._refresh_toolbox_action_states()
+            if not self._owns_session_operation(
+                recovery_session, action, generation
+            ):
+                return
+            hierarchy, scene_contract = value
+            _reconcile_workspace_scene(recovery_session.workspace, scene_contract)
+            routed = int(hierarchy.get("routed_model_count", 0) or 0)
+            unchanged = int(hierarchy.get("unchanged_model_count", 0) or 0)
+            recovery_session.workspace.last_status = self._tr(
+                f"FBX 层级关系恢复完成 | 重挂 {routed} | 原本正确 {unchanged}",
+                f"FBX hierarchy restored | Reparented {routed} | Already correct {unchanged}",
+            )
+            if self._session_is_visible(recovery_session):
+                self._apply_workspace_to_view(recovery_session.workspace)
+                self._set_status(
+                    recovery_session.workspace.last_status, progress=100
+                )
+
+        def failure(exc: Exception) -> None:
+            self._blender_fbx_hierarchy_recovery_inflight = False
+            self._refresh_toolbox_action_states()
+            if not self._owns_session_operation(
+                recovery_session, action, generation
+            ):
+                return
+            recovery_session.workspace.last_status = self._tr(
+                f"FBX 层级关系恢复未完成：{exc}",
+                f"FBX hierarchy recovery did not complete: {exc}",
+            )
+            if self._session_is_visible(recovery_session):
+                self._set_status(
+                    recovery_session.workspace.last_status, progress=0
+                )
+
+        self._run_background(
+            operation,
+            success,
+            label=self._tr(
+                "正在恢复 Blender FBX 层级关系",
+                "Restoring Blender FBX Hierarchy",
+            ),
+            on_error=failure,
+        )
+
     def _show_blender_fbx_hierarchy_recovery_dialog(
         self,
         session: ManagedBlenderSession,
         unresolved_nodes: Iterable[str],
     ) -> None:
+        # Compatibility entry point for older callers.  The live button uses
+        # the native picker above; never expose the former path-entry window.
+        self._open_blender_fbx_hierarchy_source_picker(session)
+        return
         names = sorted(
             {str(value or "").strip() for value in unresolved_nodes if str(value or "").strip()},
             key=lambda value: value.casefold(),
@@ -69662,20 +71027,20 @@ class LauncherApp:
         self.ttk.Label(
             body,
             text=self._tr(
-                "以下节点无法解析",
-                "The Following Nodes Cannot Be Resolved",
+                "使用原始 FBX 严格恢复层级",
+                "Restore Hierarchy Strictly From the Source FBX",
             ),
             style="DialogTitle.TLabel",
         ).grid(row=0, column=0, sticky="w", pady=(0, 8))
         self.tk.Label(
             body,
             text=self._tr(
-                "如果源 FBX文件里面有以下节点，可将Blender场景的层级关系恢复成源FBX中的层级关系；\n只要二者节点名字能唯一对应，且所需父级节点也存在即可。",
-                "If the source FBX contains the nodes below, Blender scene hierarchy can be restored from the source FBX when node names map uniquely and their required parent nodes also exist.",
+                "场景名必须和FBX中的一样才可恢复，不一致则会导致失败。\n恢复只接受与源 FBX 名称严格一致的节点，不会按 LOD 或父级名字猜测。",
+                "Scene names must exactly match the FBX names for recovery; any mismatch causes failure.\nOnly nodes with exact source-FBX names are accepted; no LOD or parent-name guessing is used.",
             ),
             background=self.colors["panel"],
             foreground=self.colors["warn"],
-            font=("Microsoft YaHei UI", 11, "bold"),
+            font=("Microsoft YaHei", 11, "bold"),
             anchor="w",
             justify="left",
             wraplength=760,
@@ -69683,8 +71048,8 @@ class LauncherApp:
         self.ttk.Label(
             body,
             text=self._tr(
-                f"无法解析节点：{len(names)}",
-                f"Unresolved nodes: {len(names)}",
+                f"待核对节点：{len(names) if names else '全部源 FBX 节点'}",
+                f"Nodes to verify: {len(names) if names else 'all source-FBX nodes'}",
             ),
             style="Muted.TLabel",
         ).grid(row=2, column=0, sticky="w", pady=(0, 5))
@@ -69720,7 +71085,15 @@ class LauncherApp:
             yscrollcommand=node_scroll_y.set,
             xscrollcommand=node_scroll_x.set,
         )
-        node_text.insert("1.0", "\n".join(names))
+        node_text.insert(
+            "1.0",
+            "\n".join(names)
+            if names
+            else self._tr(
+                "确认时将核对源 FBX 中所有 Mesh 及其父级节点。",
+                "Confirmation will verify every source-FBX Mesh and its parent nodes.",
+            ),
+        )
         node_text.configure(state="disabled")
 
         path_row = self.ttk.Frame(body, style="Panel.TFrame")
@@ -69784,8 +71157,8 @@ class LauncherApp:
         status_var = self.tk.StringVar(
             master=window,
             value=self._tr(
-                "等待选择包含上述节点的源 FBX。",
-                "Waiting for a source FBX containing the nodes above.",
+                "等待选择原始 FBX；场景名称必须与它严格一致。",
+                "Choose the original FBX; scene names must match it exactly.",
             ),
         )
         result_label = self.tk.Label(
@@ -69793,7 +71166,7 @@ class LauncherApp:
             textvariable=status_var,
             background=self.colors["panel"],
             foreground=self.colors["warn"],
-            font=("Microsoft YaHei UI", 11, "bold"),
+            font=("Microsoft YaHei", 11, "bold"),
             anchor="center",
             justify="center",
             wraplength=760,
@@ -69862,6 +71235,10 @@ class LauncherApp:
                     raise RuntimeError(
                         "Source FBX did not resolve every scene Mesh"
                     )
+                if hierarchy.get("strict_name_match") is not True:
+                    raise RuntimeError(
+                        "Scene names must exactly match the selected source FBX"
+                    )
                 return dict(hierarchy), self._inspect_blender_scene(recovery_session)
 
             def finish_controls() -> None:
@@ -69890,13 +71267,13 @@ class LauncherApp:
                     if str(item or "").strip()
                 ]
                 recovery_session.workspace.last_status = self._tr(
-                    f"FBX 层级关系恢复完成 | 重挂 {routed} | 原本正确 {unchanged} | 跳过 {len(skipped)}",
-                    f"FBX hierarchy restored | Reparented {routed} | Already correct {unchanged} | Skipped {len(skipped)}",
+                    f"FBX 层级关系恢复完成 | 重挂 {routed} | 原本正确 {unchanged}",
+                    f"FBX hierarchy restored | Reparented {routed} | Already correct {unchanged}",
                 )
                 status_var.set(
                     self._tr(
-                        f"恢复完成：重挂 {routed} 个节点，{unchanged} 个节点原本正确；跳过 {len(skipped)} 个无法从源 FBX 验证的节点，已保持原位。",
-                        f"Recovery completed: {routed} nodes reparented; {unchanged} were already correct; {len(skipped)} unverified nodes were left unchanged.",
+                        f"恢复完成：重挂 {routed} 个节点，{unchanged} 个节点原本正确；所有参与恢复的名称均与源 FBX 严格一致。",
+                        f"Recovery completed: {routed} nodes reparented; {unchanged} were already correct; every recovered name exactly matched the source FBX.",
                     )
                 )
                 if self._session_is_visible(recovery_session):
@@ -69975,7 +71352,7 @@ class LauncherApp:
             pass
 
     def _repair_blender_fbx_hierarchy(self) -> None:
-        """Restore RE6 Mesh parent helpers after a direct 3ds Max FBX import."""
+        """Open the strict source-FBX hierarchy recovery flow."""
         session = self._active_blender_session()
         if not self.blender_mode_enabled or session is None:
             self._show_error(
@@ -69989,89 +71366,35 @@ class LauncherApp:
             return
         if self._blender_fbx_hierarchy_recovery_inflight:
             return
-
-        action = "blender_repair_3dsmax_fbx_hierarchy"
-        generation = self._begin_session_operation(session, action)
-        self._blender_fbx_hierarchy_recovery_inflight = True
-        self._refresh_toolbox_action_states()
-        session.workspace.last_status = self._tr(
-            "正在修复 3ds MAX FBX 的 RE6 Mesh 层级…",
-            "Repairing RE6 Mesh hierarchy from the 3ds Max FBX…",
-        )
-        if self._session_is_visible(session):
-            self._set_status(session.workspace.last_status, progress=12)
-
-        def operation() -> tuple[str, dict[str, Any], dict[str, Any]]:
-            request_id = uuid.uuid4().hex
-            hierarchy = session.request("scene.repair_re6_fbx_hierarchy")
-            if not isinstance(hierarchy, Mapping):
-                raise ProtocolError("Blender hierarchy repair returned an invalid receipt")
-            return request_id, dict(hierarchy), self._inspect_blender_scene(session)
-
-        def success(value: tuple[str, dict[str, Any], dict[str, Any]]) -> None:
-            self._blender_fbx_hierarchy_recovery_inflight = False
-            self._refresh_toolbox_action_states()
-            if not self._owns_session_operation(session, action, generation):
-                return
-            request_id, hierarchy, contract = value
-            _reconcile_workspace_scene(session.workspace, contract)
-            unresolved_nodes = [
-                str(value or "").strip()
-                for value in hierarchy.get("unresolved_nodes", [])
-                if str(value or "").strip()
-            ]
-            if unresolved_nodes:
-                session.workspace.last_status = self._tr(
-                    f"检测到 {len(unresolved_nodes)} 个无法解析的节点，需要源 FBX。",
-                    f"Detected {len(unresolved_nodes)} unresolved nodes; a source FBX is required.",
-                )
-                if self._session_is_visible(session):
-                    self._set_status(session.workspace.last_status, progress=0)
-                    self._show_blender_fbx_hierarchy_recovery_dialog(
-                        session, unresolved_nodes
-                    )
-                return
-            recognized = int(
-                hierarchy.get(
-                    "recognized_mesh_count",
-                    hierarchy.get("candidate_mesh_count", 0),
-                )
-                or 0
-            )
-            routed = int(hierarchy.get("routed_model_count", 0) or 0)
-            unchanged = int(hierarchy.get("unchanged_model_count", 0) or 0)
-            missing = len(list(hierarchy.get("issues", []) or []))
-            session.workspace.last_status = self._tr(
-                f"3ds MAX FBX 层级已修复 | RE6 Mesh {recognized} | 重挂 {routed} | 原本正确 {unchanged} | 缺少父级 {missing}",
-                f"3ds Max FBX hierarchy repaired | RE6 Meshes {recognized} | Reparented {routed} | Already correct {unchanged} | Missing parents {missing}",
-            )
-            if self._session_is_visible(session):
-                self._apply_workspace_to_view(session.workspace)
-                self._set_status(
-                    f"{session.workspace.last_status} | Request {request_id[:12]}",
-                    progress=100,
-                )
-
-        def failure(exc: Exception) -> None:
-            self._blender_fbx_hierarchy_recovery_inflight = False
-            self._refresh_toolbox_action_states()
-            self._session_error(
-                session,
-                action,
-                generation,
-                exc,
-                report_health=False,
-            )
-
-        self._run_background(
-            operation,
-            success,
-            label=self._tr(
-                "修复 3ds MAX FBX 层级",
-                "Repairing 3ds Max FBX Hierarchy",
+        notice = ChoiceDialog(
+            self.root,
+            title=self._tr("恢复 FBX 层级前提示", "FBX Hierarchy Recovery Notice"),
+            message=self._tr(
+                "场景名必须和FBX中的一样才可恢复，不一致则会导致失败",
+                "Scene names must exactly match the FBX names for recovery; any mismatch causes failure.",
             ),
-            on_error=failure,
+            choices=[
+                (self._tr("选择原始 FBX", "Choose Source FBX"), "continue"),
+                (self._tr("取消", "Cancel"), "cancel"),
+            ],
+            center_on_screen=False,
+            anchor_widget=getattr(self, "blender_fbx_hierarchy_repair_button", None),
+            anchor_below=True,
+            anchor_x_offset=-13,
+            anchor_gap=1,
         )
+
+        def apply_notice_font() -> None:
+            try:
+                notice._message_widget.configure(
+                    font=("Microsoft YaHei", 12, "bold")
+                )
+            except Exception:
+                pass
+
+        if notice.show(on_shown=apply_notice_font) != "continue":
+            return
+        self._open_blender_fbx_hierarchy_source_picker(session)
 
     def _uninstall_blender_fbx_hierarchy_auto_repair(self) -> None:
         """Stop auto hierarchy repair for this Launcher run without changing the scene."""
@@ -86044,6 +87367,15 @@ class LauncherApp:
 
     def _choose_and_import_mod(self) -> None:
         session = self._active_model_session()
+        request_token = uuid.uuid4().hex
+        operation_handed_off = False
+        self._report_bootstrap_health_operation(
+            "import_mod",
+            "pause",
+            max_process_id=session.pid if session is not None else 0,
+            request_id=request_token,
+            detail="Import button pressed; waiting for source selection.",
+        )
         try:
             if session is None:
                 self._show_import_receipt_error(RuntimeError(self._tr("当前没有活动的建模程序 PID。", "No active modeling-process PID.")))
@@ -86071,18 +87403,35 @@ class LauncherApp:
                 workspace = self._active_workspace()
                 if workspace is not None:
                     self._set_workspace_source_mod(workspace, source_mod)
-                self._import_mod(texture_config=texture_config)
+                operation_handed_off = bool(
+                    self._import_mod(
+                        texture_config=texture_config,
+                        health_request_id=request_token,
+                    )
+                )
                 return
             if self._browse_source_mod():
-                self._import_mod()
+                operation_handed_off = bool(
+                    self._import_mod(health_request_id=request_token)
+                )
         except Exception as exc:
             self._report_bootstrap_health_operation(
                 "import_mod",
                 "failed",
                 max_process_id=session.pid if session is not None else 0,
+                request_id=request_token,
                 detail=f"Launcher source selection failed: {type(exc).__name__}: {exc}",
             )
             self._show_import_receipt_error(exc)
+        finally:
+            if not operation_handed_off:
+                self._report_bootstrap_health_operation(
+                    "import_mod",
+                    "resume",
+                    max_process_id=session.pid if session is not None else 0,
+                    request_id=request_token,
+                    detail="Import button flow ended before an asynchronous operation was accepted.",
+                )
 
     @staticmethod
     def _is_re6_mod_scan_source(source: Path | str) -> bool:
@@ -91746,33 +93095,56 @@ class LauncherApp:
         self,
         *,
         texture_config: Mapping[str, Any] | None = None,
-    ) -> None:
+        health_request_id: str = "",
+    ) -> bool:
         """Keep preflight failures on the same Bootstrap diagnostic path as worker failures."""
         supplied_texture_config = (
             dict(texture_config) if isinstance(texture_config, Mapping) else None
         )
+        request_token = str(health_request_id or uuid.uuid4().hex)
+        session = self._active_model_session()
+        self._report_bootstrap_health_operation(
+            "import_mod",
+            "pause",
+            max_process_id=session.pid if session is not None else 0,
+            request_id=request_token,
+            detail="Import operation preflight started.",
+        )
         try:
-            self._dispatch_operation(
+            accepted = self._dispatch_operation(
                 "import_mod",
                 lambda: self._import_mod_active(
                     supplied_texture_config=supplied_texture_config,
+                    health_request_id=request_token,
                 ),
             )
+            accepted = bool(accepted)
+            if not accepted:
+                self._report_bootstrap_health_operation(
+                    "import_mod",
+                    "resume",
+                    max_process_id=session.pid if session is not None else 0,
+                    request_id=request_token,
+                    detail="Import preflight was cancelled before background work started.",
+                )
+            return accepted
         except Exception as exc:
-            session = self._active_model_session()
             self._report_bootstrap_health_operation(
                 "import_mod",
                 "failed",
                 max_process_id=session.pid if session is not None else 0,
+                request_id=request_token,
                 detail=f"Launcher import preflight failed: {type(exc).__name__}: {exc}",
             )
             self._show_import_receipt_error(exc)
+            return False
 
     def _import_mod_active(
         self,
         *,
         supplied_texture_config: Mapping[str, Any] | None = None,
-    ) -> None:
+        health_request_id: str = "",
+    ) -> bool:
         session = self._active_model_session()
         workspace = self._active_workspace()
         if session is None or workspace is None:
@@ -91872,7 +93244,7 @@ class LauncherApp:
                 return
         # Register the operation only after the source dialog succeeds. This
         # keeps a cancelled import from owning the next callback generation.
-        request_token = uuid.uuid4().hex
+        request_token = str(health_request_id or uuid.uuid4().hex)
         log_directory = self._switch_bootstrap_health_log_directory(workspace.log_dir)
         workspace.log_dir = str(log_directory)
         self.log_dir_var.set(str(log_directory))
@@ -92993,6 +94365,8 @@ class LauncherApp:
             )
         except Exception as exc:
             failure(exc)
+            return False
+        return True
 
     def _show_nonstandard_re6_export_mesh_dialog(self, rows: list[dict[str, Any]]) -> None:
         names = [str(row.get("scene_node", "") or "").strip() for row in rows if isinstance(row, dict)]
@@ -93852,8 +95226,17 @@ class LauncherApp:
         *,
         bone_mode: str | None = None,
         legacy_bucket_plan: LegacyExportBucketPlan | None = None,
-    ) -> None:
+        health_request_id: str = "",
+    ) -> bool:
+        request_token = str(health_request_id or uuid.uuid4().hex)
         session = self._active_model_session()
+        self._report_bootstrap_health_operation(
+            "export_mod",
+            "pause",
+            max_process_id=session.pid if session is not None else 0,
+            request_id=request_token,
+            detail="Export operation preflight started.",
+        )
         if session is not None:
             active_export = self.export_transactions.snapshot_for_pid(session.pid)
             if active_export is None:
@@ -93869,30 +95252,43 @@ class LauncherApp:
                 except self.tk.TclError:
                     pass
         try:
-            self._dispatch_operation(
+            accepted = self._dispatch_operation(
                 "export_mod",
                 lambda: self._export_mod_active(
                     bone_mode=bone_mode,
                     legacy_bucket_plan=legacy_bucket_plan,
+                    health_request_id=request_token,
                 ),
             )
+            accepted = bool(accepted)
+            if not accepted:
+                self._report_bootstrap_health_operation(
+                    "export_mod",
+                    "resume",
+                    max_process_id=session.pid if session is not None else 0,
+                    request_id=request_token,
+                    detail="Export preflight was cancelled before background work started.",
+                )
+            return accepted
         except Exception as exc:
             self._release_legacy_export_bucket_plan(legacy_bucket_plan)
-            session = self._active_model_session()
             self._report_bootstrap_health_operation(
                 "export_mod",
                 "failed",
                 max_process_id=session.pid if session is not None else 0,
+                request_id=request_token,
                 detail=f"Launcher export preflight failed: {type(exc).__name__}: {exc}",
             )
             self._show_error(exc)
+            return False
 
     def _export_mod_active(
         self,
         *,
         bone_mode: str | None = None,
         legacy_bucket_plan: LegacyExportBucketPlan | None = None,
-    ) -> None:
+        health_request_id: str = "",
+    ) -> bool:
         # operation() records the Agent receipt; finish_writer() consumes it later.
         uv2_agent_fallback = False
 
@@ -94053,7 +95449,7 @@ class LauncherApp:
             for lane in ("header", "delete", "modify")
         }
         source_scene_reference = copy.deepcopy(workspace.scene_contract)
-        request_token = uuid.uuid4().hex
+        request_token = str(health_request_id or uuid.uuid4().hex)
         log_directory = self._switch_bootstrap_health_log_directory(workspace.log_dir)
         log_dir = str(log_directory)
         workspace.log_dir = log_dir
@@ -95645,7 +97041,64 @@ class LauncherApp:
                         uv_risk=uv_risk,
                     )
 
+                if bool(
+                    self.launcher_state.get(
+                        "simplified_export_success_dialog", False
+                    )
+                ):
+                    simplified_receipt_message = self._tr(
+                        "导出成功", "Export Successful"
+                    )
+                    simplified_dialog = ChoiceDialog(
+                        self.root,
+                        title=simplified_receipt_message,
+                        message=simplified_receipt_message,
+                        choices=[
+                            (
+                                self._tr(
+                                    "返回标准弹窗",
+                                    "Return to Standard Dialog",
+                                ),
+                                "return_standard_dialog",
+                            )
+                        ],
+                    )
+
+                    def arm_simplified_receipt_auto_close() -> None:
+                        try:
+                            simplified_dialog.window.after(
+                                2000, simplified_dialog._cancel
+                            )
+                        except Exception:
+                            simplified_dialog._cancel()
+
+                    simplified_choice = simplified_dialog.show(
+                        on_shown=arm_simplified_receipt_auto_close
+                    )
+                    if simplified_choice != "return_standard_dialog":
+                        try:
+                            if deferred_uv_context is not None:
+                                begin_deferred_reservation()
+                                try:
+                                    self._start_deferred_uv_risk_dialog_update(
+                                        simplified_dialog,
+                                        deferred_uv_context,
+                                        lambda _uv_lines: simplified_receipt_message,
+                                        on_finished=finish_deferred_reservation,
+                                    )
+                                except Exception:
+                                    finish_deferred_reservation()
+                                    raise
+                        finally:
+                            finish_export_reservation_pipeline()
+                        return
+                    self.launcher_state[
+                        "simplified_export_success_dialog"
+                    ] = False
+                    self._queue_launcher_state_write()
+
                 receipt_dialog: ChoiceDialog
+                receipt_choice: str | None
 
                 def open_output_folder() -> None:
                     try:
@@ -95668,6 +97121,13 @@ class LauncherApp:
                     choices=[
                         (receipt_button, "ok"),
                         (receipt_open_folder_button, "open_output_folder"),
+                        (
+                            self._tr(
+                                "简化弹窗：下次生效 + 2秒钟后关闭",
+                                "Simplified Dialog: Apply Next Time + Close After 2 Seconds",
+                            ),
+                            "simplify_next",
+                        ),
                     ],
                     non_closing_actions={"open_output_folder": open_output_folder},
                     inline_warning_message=(
@@ -95762,7 +97222,7 @@ class LauncherApp:
                     if deferred_uv_context is not None:
                         begin_deferred_reservation()
                     try:
-                        receipt_dialog.show(on_shown=receipt_shown)
+                        receipt_choice = receipt_dialog.show(on_shown=receipt_shown)
                     finally:
                         if (
                             deferred_uv_context is not None
@@ -95770,7 +97230,12 @@ class LauncherApp:
                         ):
                             finish_deferred_reservation()
                 else:
-                    receipt_dialog.show()
+                    receipt_choice = receipt_dialog.show()
+                if receipt_choice == "simplify_next":
+                    self.launcher_state[
+                        "simplified_export_success_dialog"
+                    ] = True
+                    self._queue_launcher_state_write()
             finish_export_reservation_pipeline()
 
         def success(value: tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]) -> None:
@@ -95806,6 +97271,7 @@ class LauncherApp:
                 quiet=True,
                 performance_critical=True,
             )
+            return True
         except Exception:
             restore_renamed_source_after_failure()
             try:

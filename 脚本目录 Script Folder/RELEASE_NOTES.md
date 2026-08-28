@@ -12,3 +12,5 @@
 - FVF B0983013/14, 0CB68015/16, A8FAB018/19, and D877801B bone-index padding exports as 00 Mesh Teeth vanished issue fixed
 - Corrected FVF CBF6C01A import/source-truth/export handling to one little-endian u16 bone-index field at offsets 6..7
 - Fixed MOD export normal fidelity: the exported normal representation, values, and count now remain consistent with the source FBX
+- Removed ufbx as a required dependency and made it optional to avoid the growing number of error cases
+- Non-conforming bone names no longer block export and are discarded

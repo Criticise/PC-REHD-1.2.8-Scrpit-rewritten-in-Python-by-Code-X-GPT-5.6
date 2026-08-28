@@ -1132,7 +1132,10 @@ OPERATION_RUNTIME_DOMAINS: dict[str, dict[str, object]] = {
     "export_mod": {
         "failure_domain": "mod_export",
         "modules": EXPORT_RUNTIME_MODULES,
-        "required_imports": ("ufbx",),
+        # UFBX is an optional accelerator.  codex_fbx_probe now routes to
+        # ufbx_missed_substitute when the native extension is unavailable, so
+        # its absence must not block the MOD export lane.
+        "required_imports": (),
         "optional_imports": (
             "orjson",
             "codex_fbx_probe_accel",
@@ -9613,6 +9616,7 @@ HEALTH_SUPERVISOR_DEFAULT_INTERVAL_SECONDS = 20.0
 HEALTH_SUPERVISOR_DEFAULT_DEEP_INTERVAL_SECONDS = 300.0
 HEALTH_SUPERVISOR_OPERATION_STALE_SECONDS = 30.0 * 60.0
 HEALTH_SUPERVISOR_REPAIR_COOLDOWN_SECONDS = 5.0 * 60.0
+HEALTH_SUPERVISOR_OPERATION_PAUSE_SECONDS = 60.0
 HEALTH_SUPERVISOR_WATCHED_SOURCES = {
     "bootstrap": "codex_python_runtime_bootstrap.py",
     "launcher": "PC-REHD Code X Launcher.py",
@@ -9924,6 +9928,9 @@ def _run_operation_domain_isolation_regression_guard() -> dict[str, object]:
 HEALTH_SUPERVISOR_LOG_FILE_NAME = "Bootstrap RE6 Script Health check 脚本健康度日志.txt"
 HEALTH_SUPERVISOR_LOG_RETENTION_SECONDS = 10.0 * 24.0 * 60.0 * 60.0
 _HEALTH_SUPERVISOR_EVENT_HANDLES: dict[tuple[int, str], int] = {}
+_HEALTH_SUPERVISOR_PAUSE_LOCK = threading.RLock()
+_HEALTH_SUPERVISOR_PAUSE_TIMERS: dict[int, tuple[int, threading.Timer]] = {}
+_HEALTH_SUPERVISOR_PAUSE_GENERATIONS: dict[int, int] = {}
 HEALTH_SUPERVISOR_FAILURE_RECEIPT_BYTES = 64 * 1024
 HEALTH_SUPERVISOR_OPERATION_RECEIPT_SCHEMA = "pc-rehd-code-x-health-operation-state-v2"
 HEALTH_SUPERVISOR_MAX_ACTIVE_RECEIPTS = 12
@@ -10147,6 +10154,84 @@ def _health_supervisor_named_event_is_set(parent_pid: int, kind: str) -> bool:
         return int(kernel32.WaitForSingleObject(handle, 0)) == 0x00000000
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _health_supervisor_pause_timer_fired(parent_pid: int, generation: int) -> None:
+    """Release a completed operation's supervisor pause only if it is current."""
+    pid = max(0, int(parent_pid or 0))
+    with _HEALTH_SUPERVISOR_PAUSE_LOCK:
+        current = _HEALTH_SUPERVISOR_PAUSE_TIMERS.get(pid)
+        if current is None or int(current[0]) != int(generation):
+            return
+        _HEALTH_SUPERVISOR_PAUSE_TIMERS.pop(pid, None)
+        _health_supervisor_set_named_event(
+            pid,
+            "pause",
+            active=False,
+            manual_reset=True,
+        )
+
+
+def _health_supervisor_set_pause_gate(
+    parent_pid: int,
+    *,
+    paused: bool,
+    cooldown_seconds: float = HEALTH_SUPERVISOR_OPERATION_PAUSE_SECONDS,
+) -> dict[str, object]:
+    """Pause all supervisor work, or release it after a bounded cooldown."""
+    pid = max(0, int(parent_pid or 0))
+    if pid <= 0:
+        return {"parent_pid": pid, "paused": False, "remaining_seconds": 0.0}
+    with _HEALTH_SUPERVISOR_PAUSE_LOCK:
+        previous = _HEALTH_SUPERVISOR_PAUSE_TIMERS.pop(pid, None)
+        if previous is not None:
+            try:
+                previous[1].cancel()
+            except Exception:
+                pass
+        generation = int(_HEALTH_SUPERVISOR_PAUSE_GENERATIONS.get(pid, 0)) + 1
+        _HEALTH_SUPERVISOR_PAUSE_GENERATIONS[pid] = generation
+        _health_supervisor_set_named_event(
+            pid,
+            "pause",
+            active=True,
+            manual_reset=True,
+        )
+        if paused:
+            return {
+                "parent_pid": pid,
+                "paused": True,
+                "remaining_seconds": None,
+                "generation": generation,
+            }
+        seconds = max(0.0, float(cooldown_seconds or 0.0))
+        if seconds <= 0.0:
+            _health_supervisor_set_named_event(
+                pid,
+                "pause",
+                active=False,
+                manual_reset=True,
+            )
+            return {
+                "parent_pid": pid,
+                "paused": False,
+                "remaining_seconds": 0.0,
+                "generation": generation,
+            }
+        timer = threading.Timer(
+            seconds,
+            _health_supervisor_pause_timer_fired,
+            args=(pid, generation),
+        )
+        timer.daemon = True
+        _HEALTH_SUPERVISOR_PAUSE_TIMERS[pid] = (generation, timer)
+        timer.start()
+        return {
+            "parent_pid": pid,
+            "paused": True,
+            "remaining_seconds": seconds,
+            "generation": generation,
+        }
 
 
 def _health_supervisor_operation_receipt_name(launcher_pid: int) -> str:
@@ -10561,9 +10646,38 @@ def report_health_supervisor_operation(
     }
     if extra:
         payload["extra"] = dict(extra)
+    if normalized_phase in {"pause", "resume"}:
+        cooldown_seconds = HEALTH_SUPERVISOR_OPERATION_PAUSE_SECONDS
+        if isinstance(extra, dict):
+            try:
+                cooldown_seconds = float(
+                    extra.get("cooldown_seconds", cooldown_seconds)
+                )
+            except (TypeError, ValueError, OverflowError):
+                cooldown_seconds = HEALTH_SUPERVISOR_OPERATION_PAUSE_SECONDS
+        active_receipts = (
+            _health_supervisor_read_operation_receipts(launcher_pid).get("active", [])
+            if normalized_phase == "resume"
+            else []
+        )
+        gate_state = _health_supervisor_set_pause_gate(
+            launcher_pid,
+            paused=(
+                normalized_phase == "pause"
+                or bool(active_receipts)
+            ),
+            cooldown_seconds=cooldown_seconds,
+        )
+        payload["health_supervisor_pause"] = gate_state
+        return payload
     if normalized_phase not in {"started", "completed", "failed", "cancelled"}:
         payload["health_handoff_ignored"] = "unsupported lifecycle phase"
         return payload
+
+    # Set the gate before touching the receipt queue so the supervisor cannot
+    # start a maintenance cycle in the small interval after a button report.
+    if normalized_phase == "started":
+        _health_supervisor_set_pause_gate(launcher_pid, paused=True)
 
     user_operation_error = (
         normalized_phase == "failed"
@@ -10580,6 +10694,13 @@ def report_health_supervisor_operation(
         active=bool(receipt_state.get("active")),
         manual_reset=True,
     )
+    if normalized_phase in {"completed", "failed", "cancelled"}:
+        # A second operation keeps the gate closed.  Once the queue is idle,
+        # leave the supervisor paused for one minute after the terminal report.
+        _health_supervisor_set_pause_gate(
+            launcher_pid,
+            paused=bool(receipt_state.get("active")),
+        )
 
     if user_operation_error:
         payload["health_log_suppressed"] = "expected user or scene validation error"
@@ -10695,6 +10816,30 @@ class BootstrapHealthSupervisor:
         failure_signalled: bool = False,
         parent_exited: bool = False,
     ) -> dict[str, object]:
+        if (
+            not parent_exited
+            and _health_supervisor_named_event_is_set(self.parent_pid, "pause")
+        ):
+            # Import/export owns the Python runtime while this event is set.
+            # Return without even loading the watched sources: the pause must
+            # cover lightweight checks, deep checks, repairs, and upgrades.
+            return {
+                "schema": HEALTH_SUPERVISOR_SCHEMA,
+                "status": "PASS",
+                "supervisor_pid": os.getpid(),
+                "parent_pid": self.parent_pid,
+                "operation_active": True,
+                "health_supervisor_paused": True,
+                "deep_check_deferred": True,
+                "operation_receipts": {
+                    "paused": True,
+                    "active_count": 0,
+                    "pending_failure_count": 0,
+                    "stalled_count": 0,
+                    "launcher_exited": False,
+                },
+                **_health_supervisor_timestamp(),
+            }
         receipt_state = _health_supervisor_read_operation_receipts(self.parent_pid)
         active_receipts = [
             dict(row) for row in receipt_state.get("active", []) if isinstance(row, dict)
@@ -10935,6 +11080,15 @@ class BootstrapHealthSupervisor:
                     while time.monotonic() < deadline:
                         if self._parent_is_alive() is not True:
                             break
+                        if _health_supervisor_named_event_is_set(
+                            self.parent_pid, "pause"
+                        ):
+                            # Do not wake the supervisor on a failure event while
+                            # the import/export pause is still in force.
+                            time.sleep(
+                                min(0.25, max(0.05, deadline - time.monotonic()))
+                            )
+                            continue
                         # Consume failures immediately instead of waiting for the
                         # normal heartbeat; receipts remain queued until diagnosed.
                         if _health_supervisor_named_event_is_set(self.parent_pid, "error"):
