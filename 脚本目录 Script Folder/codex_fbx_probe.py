@@ -34,8 +34,22 @@ FBX_PROBE_RUNTIME_UNAVAILABLE_STATUS = "runtime_unavailable"
 FBX_PROBE_DATA_ERROR_STATUS = "data_error"
 FBX_PROBE_BRIDGE_RETRY_STATUS = "RUNTIME_RETRY"
 BINARY_FBX_NORMAL_FIDELITY_SCHEMA = "pc-rehd-fbx-corner-normal-fidelity-v1"
+# Normal-space labels are deliberately explicit.  A Generic rebuild may bake
+# the source axis basis into only the skinned Geometry records; the Writer
+# must therefore not infer one normal transform for the whole FBX.
+FBX_NORMAL_AXIS_DOMAIN_CANONICAL = "canonical_xyz"
+# EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+# Legacy non-Generic normal-domain label.  Keep only for old receipts while
+# every supported DCC route migrates to the Generic canonical contract.
+FBX_NORMAL_AXIS_DOMAIN_LEGACY = "legacy_max"
 UFBX_BEHAVIOR_CONTRACT_SCHEMA = "pc-rehd-code-x-patched-ufbx-behavior-v1"
 UFBX_BEHAVIOR_FLOAT_DECIMALS = 8
+# MOD's position denominator is authored in the same numeric unit domain as
+# 3ds Max inches.  Blender FBX files normally report centimetres (0.01 m), so
+# Probe converts their already-evaluated world/Max position channels once at
+# the handoff boundary.  The Writer intentionally remains unit-factor-free.
+FBX_MAX_INCH_UNIT_METERS = 0.0254
+BLENDER_FBX_INCH_SCALE_SCHEMA = "pc-rehd-blender-fbx-inch-scale-v1"
 _NATIVE_LOADER_ERROR_CODES = frozenset({8, 126, 127, 182, 193, 1114})
 _NATIVE_LOADER_ERROR_MARKERS = (
     "dll load failed",
@@ -188,6 +202,19 @@ MAX_FBX_ROUTE_USER_PROPERTY_RE = re.compile(
 # A Max scene may contain duplicate Mesh names.  Its FBX route therefore
 # cannot use Blender's unmarked name/slot fallback.
 MAX_ALLOW_UNMARKED_ROUTE_FALLBACK = False
+# The embedded Generic FBX reconstruction is used by the two DCC export
+# lanes. Keep this as one exact predicate so an unknown route can never enter
+# the normalizer merely because a caller passed a truthy option.
+MAX_GENERIC_REBUILD_BACKEND = "max_fbx"
+GENERIC_REBUILD_BACKENDS = frozenset({"max_fbx", "blender_fbx"})
+
+
+def _is_max_generic_rebuild_backend(value: Any) -> bool:
+    return str(value or "").strip().casefold() == MAX_GENERIC_REBUILD_BACKEND
+
+
+def _uses_generic_rebuild_backend(value: Any) -> bool:
+    return str(value or "").strip().casefold() in GENERIC_REBUILD_BACKENDS
 
 
 @dataclass(slots=True)
@@ -290,7 +317,7 @@ def _normalize_probe_route_hints(route_hints: Any) -> dict[str, Any]:
     backend_kind = str(route_hints.get("backend_kind", "") or "").strip().lower()
     explicit_route_required = bool(
         route_hints.get("explicit_route_required") is True
-        or backend_kind == "max_fbx"
+        or _is_max_generic_rebuild_backend(backend_kind)
     ) and not MAX_ALLOW_UNMARKED_ROUTE_FALLBACK
     normalized_rows: list[dict[str, Any]] = []
     for raw_row in route_hints.get("rows", []):
@@ -360,7 +387,7 @@ def _normalize_probe_route_hints(route_hints: Any) -> dict[str, Any]:
         "authorized": bool(
             policy_requested
             and policy_enabled
-            and policy_backend == "max_fbx"
+            and _is_max_generic_rebuild_backend(policy_backend)
             and policy_reason in _UNSKINNED_MESH_EDIT_EXPORT_AUTHORIZED_REASONS
         ),
     }
@@ -769,12 +796,350 @@ def _scene_unit_receipt(scene: Any) -> dict[str, Any]:
     }
 
 
+def _scale_probe_position_rows_to_max_inches(
+    rows: Any,
+    factor: float,
+) -> list[list[float]] | None:
+    """Scale a Probe world/Max vec3 stream into the Max-inch numeric domain."""
+    if not isinstance(rows, list):
+        return None
+    try:
+        converted: list[list[float]] = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                return None
+            values = [float(row[index]) for index in range(3)]
+            if not all(math.isfinite(value) for value in values):
+                return None
+            converted.append([round(value * factor, 6) for value in values])
+        return converted
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _scale_blender_bone_matrices_to_max_inches(
+    payload: dict[str, Any],
+    factor: float,
+) -> dict[str, Any]:
+    """Convert Blender bone matrices to the Max-inch numeric domain once.
+
+    The Mesh and bone world rows are emitted by the same Blender FBX scene and
+    therefore must cross the unit boundary together.  We scale absolute world
+    matrices first, then derive each local row from its converted parent world;
+    applying the factor independently to every local row would multiply it at
+    each hierarchy level.
+    """
+    result: dict[str, Any] = {
+        "status": "no_bone_matrices",
+        "fields": [],
+        "world_matrix_count": 0,
+        "local_matrix_count": 0,
+        "applied_once": True,
+    }
+    summary = payload.get("summary")
+    bones = summary.get("bones") if isinstance(summary, dict) else None
+    try:
+        factor_value = float(factor)
+    except (TypeError, ValueError, OverflowError):
+        factor_value = 0.0
+    if not isinstance(bones, list) or not bones:
+        return result
+    if not math.isfinite(factor_value) or factor_value <= 0.0:
+        result["status"] = "invalid_factor"
+        return result
+    result["bone_count"] = len(bones)
+    result["unit_factor"] = factor_value
+    if abs(factor_value - 1.0) <= 1.0e-12:
+        result["status"] = "not_needed"
+        return result
+
+    # A handoff payload is normally fresh, but retain a marker so a diagnostic
+    # caller cannot apply the scene-unit conversion twice to the same bones.
+    existing = summary.get("blender_bone_matrix_scale_transform")
+    if isinstance(existing, dict) and existing.get("schema") == BLENDER_FBX_INCH_SCALE_SCHEMA:
+        result.update(existing)
+        result["status"] = "already_applied"
+        result["applied_once"] = True
+        return result
+
+    converted_world_by_index: dict[int, list[float]] = {}
+    converted_world_by_name: dict[str, list[float]] = {}
+    for index, bone in enumerate(bones):
+        if not isinstance(bone, dict):
+            continue
+        matrix = _flatten_matrix4x4(bone.get("world_matrix"))
+        if len(matrix) != 16:
+            continue
+        try:
+            converted = _scale_affine_matrix(
+                matrix,
+                factor_value,
+                label=f"Blender bone {index} world matrix",
+            )
+        except (TypeError, ValueError, OverflowError):
+            continue
+        bone["world_matrix"] = converted
+        converted_world_by_index[index] = converted
+        name_key = str(bone.get("name", "") or "").strip().casefold()
+        if name_key and name_key not in converted_world_by_name:
+            converted_world_by_name[name_key] = converted
+        result["world_matrix_count"] = int(result["world_matrix_count"]) + 1
+
+    for index, bone in enumerate(bones):
+        if not isinstance(bone, dict):
+            continue
+        world = converted_world_by_index.get(index)
+        if world is None:
+            # If no absolute world is available, preserve the old fallback and
+            # scale the local matrix once rather than dropping the bone row.
+            local = _flatten_matrix4x4(bone.get("local_matrix"))
+            if len(local) != 16:
+                continue
+            try:
+                bone["local_matrix"] = _scale_affine_matrix(
+                    local,
+                    factor_value,
+                    label=f"Blender bone {index} local matrix",
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            result["local_matrix_count"] = int(result["local_matrix_count"]) + 1
+            continue
+
+        parent_name = str(bone.get("parent_name", "") or "").strip().casefold()
+        parent_world = converted_world_by_name.get(parent_name) if parent_name else None
+        if parent_world is None:
+            # Root bones have no parent-relative cancellation; their local row
+            # is the converted absolute row.
+            bone["local_matrix"] = list(world)
+            result["local_matrix_count"] = int(result["local_matrix_count"]) + 1
+            continue
+        inverse_parent = _generic_invert_row_major_matrix(parent_world)
+        if inverse_parent is None:
+            continue
+        bone["local_matrix"] = _generic_multiply_row_major_matrices(
+            world,
+            inverse_parent,
+        )
+        result["local_matrix_count"] = int(result["local_matrix_count"]) + 1
+
+    if int(result["world_matrix_count"]) or int(result["local_matrix_count"]):
+        result["status"] = "applied"
+        result["fields"] = ["summary.bones.world_matrix", "summary.bones.local_matrix"]
+        summary["blender_bone_matrix_scale_transform"] = {
+            "schema": BLENDER_FBX_INCH_SCALE_SCHEMA,
+            "status": "applied",
+            "unit_factor": factor_value,
+            "applied_once": True,
+        }
+    return result
+
+
+def _apply_blender_probe_inch_scale(
+    payload: dict[str, Any],
+    *,
+    backend_kind: Any,
+    fbx_units: dict[str, Any],
+    generic_receipt: dict[str, Any] | None,
+    bone_edit: bool = False,
+) -> dict[str, Any]:
+    """Convert Blender Probe position channels once before Bridge consumers.
+
+    MOD computes its output scale as ``measured_mesh_scale / fbx_scale``.
+    Max exports use inch-valued FBX transforms, while Blender exports report
+    centimetres; the smaller Blender denominator therefore makes MOD output
+    too large.  Convert only the already-evaluated world/Max channels to the
+    Max-inch numeric domain here.  Raw local ``positions`` stay untouched so
+    a later local-to-world fallback cannot apply the unit conversion twice.
+    """
+    # MOD computes its output scale as measured Mesh Scale divided by the
+    # FBX-derived scale. MAX uses inch-valued units, so its larger denominator
+    # produces a smaller MOD scale. Blender uses centimetre-valued units, so
+    # its smaller denominator makes the MOD scale too large. This empirically
+    # confirmed rule converts Blender FBX model scale once into the MAX-inch
+    # numeric domain; the export bridge applies no additional conversion.
+    backend = str(backend_kind or "").strip().lower()
+    receipt: dict[str, Any] = {
+        "schema": BLENDER_FBX_INCH_SCALE_SCHEMA,
+        "status": "disabled",
+        "backend": backend,
+        "source": "probe_handoff_position_channels",
+        "target_unit_meters": FBX_MAX_INCH_UNIT_METERS,
+        "unit_factor": 1.0,
+        "applied_once": True,
+        "bone_edit": bool(bone_edit),
+        "bone_matrix_transform": {"status": "disabled", "applied_once": True},
+    }
+    if backend != "blender_fbx":
+        if isinstance(generic_receipt, dict):
+            generic_receipt["blender_model_scale_transform"] = dict(receipt)
+        return receipt
+
+    if not isinstance(fbx_units, dict):
+        fbx_units = {}
+    unit_status = str(fbx_units.get("status", "") or "").strip().lower()
+    try:
+        source_unit_meters = float(fbx_units.get("unit_meters"))
+    except (TypeError, ValueError, OverflowError):
+        source_unit_meters = 0.0
+    if (
+        unit_status != "reported"
+        or not math.isfinite(source_unit_meters)
+        or source_unit_meters <= 0.0
+    ):
+        receipt.update(
+            {
+                "status": "unavailable",
+                "reason": "missing_or_invalid_fbx_unit_metadata",
+            }
+        )
+        if isinstance(generic_receipt, dict):
+            generic_receipt["blender_model_scale_transform"] = dict(receipt)
+        return receipt
+
+    factor = source_unit_meters / FBX_MAX_INCH_UNIT_METERS
+    if not math.isfinite(factor) or factor <= 0.0:
+        receipt.update({"status": "unavailable", "reason": "invalid_unit_factor"})
+        if isinstance(generic_receipt, dict):
+            generic_receipt["blender_model_scale_transform"] = dict(receipt)
+        return receipt
+
+    receipt.update(
+        {
+            "status": "not_needed" if abs(factor - 1.0) <= 1.0e-12 else "applied",
+            "source_unit_meters": source_unit_meters,
+            "original_unit_meters": fbx_units.get("original_unit_meters"),
+            "unit_factor": factor,
+            "formula": "source_value * (unit_meters / 0.0254)",
+            "fields": [
+                "max_positions",
+                "world_positions",
+                "skinned_positions",
+                "skinned_max_positions",
+                "skinned_world_positions",
+                "binary_skin_unreferenced_max_positions",
+                "fbx_node_to_world_matrix",
+            ],
+        }
+    )
+    if abs(factor - 1.0) <= 1.0e-12:
+        if bone_edit:
+            receipt["bone_matrix_transform"] = {
+                "status": "not_needed",
+                "applied_once": True,
+            }
+        if isinstance(generic_receipt, dict):
+            generic_receipt["blender_model_scale_transform"] = dict(receipt)
+        return receipt
+
+    transformed_mesh_count = 0
+    transformed_fields: set[str] = set()
+    # Handoff contract rows are the single source consumed by both ordinary
+    # MAX-position export and the BONE+MESH skinned-position route.
+    containers: list[list[Any]] = []
+    contract_meshes = payload.get("contract_meshes")
+    if isinstance(contract_meshes, list):
+        containers.append(contract_meshes)
+    summary = payload.get("summary")
+    if isinstance(summary, dict) and isinstance(summary.get("meshes"), list):
+        containers.append(summary["meshes"])
+
+    for container in containers:
+        for mesh in container:
+            if not isinstance(mesh, dict):
+                continue
+            previous = mesh.get("blender_model_scale_transform")
+            if isinstance(previous, dict) and previous.get("schema") == BLENDER_FBX_INCH_SCALE_SCHEMA:
+                continue
+            mesh_changed = False
+            for field in (
+                "max_positions",
+                "world_positions",
+                "skinned_max_positions",
+                "skinned_world_positions",
+                "binary_skin_unreferenced_max_positions",
+            ):
+                rows = mesh.get(field)
+                if not isinstance(rows, list) or not rows:
+                    continue
+                converted = _scale_probe_position_rows_to_max_inches(rows, factor)
+                if converted is None:
+                    continue
+                mesh[field] = converted
+                transformed_fields.add(field)
+                mesh_changed = True
+
+            # ``skinned_positions`` is a world stream only when the Probe
+            # explicitly says it is not local. Local source rows remain in
+            # their authored unit because the node matrix is converted below.
+            if (
+                not _coerce_bool(mesh.get("skinned_is_local"), False)
+                and isinstance(mesh.get("skinned_positions"), list)
+                and mesh.get("skinned_positions")
+            ):
+                converted = _scale_probe_position_rows_to_max_inches(
+                    mesh["skinned_positions"],
+                    factor,
+                )
+                if converted is not None:
+                    mesh["skinned_positions"] = converted
+                    transformed_fields.add("skinned_positions")
+                    mesh_changed = True
+
+            matrix = mesh.get("fbx_node_to_world_matrix")
+            if isinstance(matrix, (list, tuple)) and len(matrix) >= 16:
+                try:
+                    converted_matrix = _scale_affine_matrix(
+                        _flatten_matrix4x4(matrix),
+                        factor,
+                        label="Blender FBX node-to-world matrix",
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    converted_matrix = None
+                if converted_matrix is not None:
+                    mesh["fbx_node_to_world_matrix"] = converted_matrix
+                    transformed_fields.add("fbx_node_to_world_matrix")
+                    mesh_changed = True
+
+            if mesh_changed:
+                transformed_mesh_count += 1
+                mesh["blender_model_scale_transform"] = {
+                    "schema": BLENDER_FBX_INCH_SCALE_SCHEMA,
+                    "status": "applied",
+                    "unit_factor": factor,
+                    "applied_once": True,
+                }
+
+    receipt["transformed_mesh_count"] = transformed_mesh_count
+    receipt["transformed_fields"] = sorted(transformed_fields)
+    if transformed_mesh_count == 0:
+        receipt["status"] = "no_position_channels"
+    if bone_edit:
+        # MOD computes its output scale as measured Mesh Scale divided by the
+        # FBX-derived scale. MAX uses inch-valued transforms, while Blender
+        # bone matrices are reported in centimetre-valued scene units. Leaving
+        # the smaller Blender bone basis unchanged gives the skeleton a
+        # different scale from MAX and makes skinned Mesh positions diverge.
+        # Convert Blender bone matrices once into the MAX-inch numeric domain;
+        # the Writer must not apply another unit conversion.
+        receipt["bone_matrix_transform"] = _scale_blender_bone_matrices_to_max_inches(
+            payload,
+            factor,
+        )
+    if isinstance(generic_receipt, dict):
+        generic_receipt["blender_model_scale_transform"] = dict(receipt)
+    return receipt
+
+
 def _restore_max_space_geometry(
     geometry: dict[str, Any],
     mesh: Any,
     instance_node: Any | None,
 ) -> dict[str, Any]:
     """Replace every legacy V4 Y-up derivative with the Max Z-up FBX value."""
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # Dead legacy V4 Y-up cleanup.  Generic reconstruction now owns the
+    # document-level axis normalization and this helper has no live callers.
     if not isinstance(geometry, dict):
         return geometry
     for stale_key in (
@@ -791,6 +1156,9 @@ def _restore_max_space_geometry(
 
 
 def _max_normal_to_re6_game_normal(vec: Any) -> list[float]:
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # Fixed Max-to-game axis swap used by the old direct/UFBX normal lane.
+    # Generic canonical normals must not enter this conversion.
     xyz = _normal_vec3_to_list(vec)
     return _normalize_normal_vec3([xyz[0], xyz[2], -xyz[1]])
 
@@ -809,11 +1177,17 @@ def _fbx_authored_corner_normal_to_max(normal: Any) -> list[float]:
 
 def _encode_re6_normal_key_from_fbx_corner(normal: Any) -> tuple[int, int, int]:
     """Return the writer RGB key for one authored FBX polygon-corner normal."""
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # Legacy fixed Max-to-game normal encoding; the Generic normal contract is
+    # the replacement and this helper currently has no live callers.
     game_normal = _max_normal_to_re6_game_normal(_fbx_authored_corner_normal_to_max(normal))
     return tuple(max(0, min(255, int((axis * 127.0) + 127.0))) for axis in game_normal)
 
 
 def _encode_re6_normal_key_from_fbx_local(normal: Any, node_to_world: Any) -> tuple[int, int, int]:
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # Legacy direct/UFBX fallback that applies a per-Mesh axis path.  The
+    # Generic corner-normal route is the replacement authority.
     """Return the legacy/UFBX writer key after applying the Mesh node transform.
 
     AI MAINTENANCE GATE: this compatibility API is consumed by the pure-Python
@@ -1210,13 +1584,14 @@ def _build_binary_fbx_document(
     path: Path,
     *,
     decode_array_names: frozenset[str] | None = None,
+    data: bytes | bytearray | memoryview | None = None,
 ) -> _BinaryFbxDocument:
     """Read and parse one binary FBX for all consumers in one Probe request."""
-    data = path.read_bytes()
-    if not data.startswith(_FBX_BINARY_SIGNATURE):
+    raw_data = bytes(data) if data is not None else Path(path).read_bytes()
+    if not raw_data.startswith(_FBX_BINARY_SIGNATURE):
         raise ValueError("FBX is not a supported binary FBX file")
-    _binary_fbx_require_range(data, len(_FBX_BINARY_SIGNATURE), 4, label="version")
-    version = struct.unpack_from("<I", data, len(_FBX_BINARY_SIGNATURE))[0]
+    _binary_fbx_require_range(raw_data, len(_FBX_BINARY_SIGNATURE), 4, label="version")
+    version = struct.unpack_from("<I", raw_data, len(_FBX_BINARY_SIGNATURE))[0]
     if version < 7000:
         raise ValueError(f"Binary FBX version {version} is not supported for skin evaluation")
     header_size = 25 if version >= 7500 else 13
@@ -1227,9 +1602,9 @@ def _build_binary_fbx_document(
     )
     roots: list[_BinaryFbxNode] = []
     offset = len(_FBX_BINARY_SIGNATURE) + 4
-    while offset < len(data) - header_size:
+    while offset < len(raw_data) - header_size:
         root, offset = _read_binary_fbx_node(
-            data,
+            raw_data,
             offset,
             version=version,
             decode_array_names=frozenset(decode_names),
@@ -1239,7 +1614,7 @@ def _build_binary_fbx_document(
         roots.append(root)
     return _BinaryFbxDocument(
         path=Path(path),
-        data=data,
+        data=raw_data,
         version=int(version),
         roots=roots,
         decode_array_names=frozenset(decode_names),
@@ -1254,6 +1629,3878 @@ def _binary_fbx_node_child_value(node: _BinaryFbxNode, child_name: str) -> Any:
                 return value.decode()
             return value
     return None
+
+
+# ====== BEGIN GENERIC FBX IN-MEMORY NORMALIZER (MAX + BLENDER) ======
+
+import hashlib
+import json
+import math
+import re
+import struct
+import zlib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable
+
+
+# ---------------------------------------------------------------------------
+# Binary FBX reader/writer
+#
+# This section is deliberately self-contained. It reads the tagged binary
+# FBX tree, decodes standard FBX property types, and writes the same tree
+# back. No DCC application or third-party FBX runtime is needed.
+
+FBX_MAGIC = b"Kaydara FBX Binary  \x00\x1a\x00"
+FBX_VERSION_DEFAULT = 7400
+FBX_NULL_RECORD_NARROW = b"\x00" * 13
+FBX_NULL_RECORD_WIDE = b"\x00" * 25
+FBX_FILE_ID = bytes.fromhex("28b32aebb624ccc2bfc8b02aa92bfcf1")
+FBX_FOOT_ID = bytes.fromhex("fabcab09d0c8d466b176fb831cf7267e")
+FBX_FOOT_MAGIC = bytes.fromhex("f85a8c6adef5d97eece90ce3758f290b")
+FBX_ARRAY_LAYOUTS = {
+    "b": ("B", 1),
+    "c": ("B", 1),
+    "i": ("i", 4),
+    "l": ("q", 8),
+    "f": ("f", 4),
+    "d": ("d", 8),
+}
+FBX_ALWAYS_BLOCK = {"AnimationStack", "AnimationLayer"}
+ROUTE_HANDLE_PROPERTY = "CodexRe6FbxRouteHandle"
+_ROUTE_HANDLE_RE = re.compile(
+    rf"(?im)^\s*{re.escape(ROUTE_HANDLE_PROPERTY)}\s*=\s*([1-9]\d*)\s*$"
+)
+
+
+@dataclass
+class FbxNode:
+    name: str
+    properties: list[Any] = field(default_factory=list)
+    property_types: list[str] = field(default_factory=list)
+    children: list["FbxNode"] = field(default_factory=list)
+
+    def add(self, name: str, *properties: tuple[str, Any]) -> "FbxNode":
+        child = FbxNode(
+            name=name,
+            properties=[value for _kind, value in properties],
+            property_types=[kind for kind, _value in properties],
+        )
+        self.children.append(child)
+        return child
+
+    def typed_properties(self) -> list[tuple[str, Any]]:
+        if len(self.property_types) != len(self.properties):
+            raise ValueError(f"FBX node {self.name!r} has an invalid property contract")
+        return list(zip(self.property_types, self.properties))
+
+
+def _require_range(data: bytes, offset: int, size: int, label: str) -> None:
+    if offset < 0 or size < 0 or offset > len(data) - size:
+        raise ValueError(f"Binary FBX {label} exceeds the file bounds")
+
+
+def _read_property(data: bytes, offset: int) -> tuple[Any, int, str]:
+    _require_range(data, offset, 1, "property type")
+    kind = chr(data[offset])
+    offset += 1
+    scalar = {"Y": ("h", 2), "I": ("i", 4), "F": ("f", 4), "D": ("d", 8), "L": ("q", 8)}
+    if kind in scalar:
+        fmt, size = scalar[kind]
+        _require_range(data, offset, size, f"{kind} property")
+        return struct.unpack_from("<" + fmt, data, offset)[0], offset + size, kind
+    if kind == "C":
+        _require_range(data, offset, 1, "C property")
+        return bool(data[offset]), offset + 1, kind
+    if kind in {"S", "R"}:
+        _require_range(data, offset, 4, f"{kind} property length")
+        size = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        _require_range(data, offset, size, f"{kind} property")
+        raw = data[offset : offset + size]
+        offset += size
+        if kind == "S":
+            return raw.decode("utf-8", errors="replace"), offset, kind
+        return bytes(raw), offset, kind
+    if kind not in FBX_ARRAY_LAYOUTS:
+        raise ValueError(f"Binary FBX has unsupported property type {kind!r}")
+    _require_range(data, offset, 12, f"{kind} array header")
+    count, encoding, stored_size = struct.unpack_from("<III", data, offset)
+    offset += 12
+    _require_range(data, offset, stored_size, f"{kind} array")
+    raw = data[offset : offset + stored_size]
+    offset += stored_size
+    if encoding == 1:
+        raw = zlib.decompress(raw)
+    elif encoding != 0:
+        raise ValueError(f"Binary FBX array has unsupported encoding {encoding}")
+    item_fmt, item_size = FBX_ARRAY_LAYOUTS[kind]
+    expected = int(count) * item_size
+    if len(raw) != expected:
+        raise ValueError("Binary FBX array byte count does not match its element count")
+    if not count:
+        return [], offset, kind
+    return list(struct.unpack("<" + item_fmt * int(count), raw)), offset, kind
+
+
+def _read_node(data: bytes, offset: int, *, version: int) -> tuple[FbxNode | None, int]:
+    wide = version >= 7500
+    header_format = "<QQQB" if wide else "<IIIB"
+    header_size = 25 if wide else 13
+    _require_range(data, offset, header_size, "node header")
+    end_offset, property_count, property_bytes, name_size = struct.unpack_from(header_format, data, offset)
+    if end_offset == 0:
+        return None, offset + header_size
+    if end_offset > len(data) or end_offset < offset + header_size:
+        raise ValueError("Binary FBX node end offset is invalid")
+    offset += header_size
+    _require_range(data, offset, name_size, "node name")
+    name = data[offset : offset + name_size].decode("utf-8", errors="replace")
+    offset += name_size
+    property_end = offset + int(property_bytes)
+    if property_end > end_offset:
+        raise ValueError("Binary FBX property data exceeds its node")
+    properties: list[Any] = []
+    property_types: list[str] = []
+    for _index in range(int(property_count)):
+        value, offset, kind = _read_property(data, offset)
+        properties.append(value)
+        property_types.append(kind)
+    if offset != property_end:
+        raise ValueError("Binary FBX property length does not match its node header")
+    children: list[FbxNode] = []
+    null_size = header_size
+    while offset < end_offset - null_size:
+        child, next_offset = _read_node(data, offset, version=version)
+        if next_offset <= offset:
+            raise ValueError("Binary FBX child parser made no progress")
+        offset = next_offset
+        if child is not None:
+            children.append(child)
+    if offset > end_offset:
+        raise ValueError("Binary FBX child node exceeds its parent")
+    return FbxNode(name, properties, property_types, children), int(end_offset)
+
+
+def read_fbx(
+    path: str | Path | bytes | bytearray | memoryview,
+    *,
+    include_footer_id: bool = False,
+) -> tuple[int, list[FbxNode]] | tuple[int, list[FbxNode], bytes | None]:
+    data = (
+        bytes(path)
+        if isinstance(path, (bytes, bytearray, memoryview))
+        else Path(path).resolve().read_bytes()
+    )
+    if not data.startswith(FBX_MAGIC):
+        raise ValueError("仅支持二进制 FBX 文件 / Binary FBX files are required")
+    _require_range(data, len(FBX_MAGIC), 4, "version")
+    version = struct.unpack_from("<I", data, len(FBX_MAGIC))[0]
+    if version < 7000:
+        raise ValueError(f"Binary FBX version {version} is not supported")
+    header_size = 25 if version >= 7500 else 13
+    roots: list[FbxNode] = []
+    footer_id: bytes | None = None
+    offset = len(FBX_MAGIC) + 4
+    while offset < len(data) - header_size:
+        node, next_offset = _read_node(data, offset, version=version)
+        if next_offset <= offset:
+            raise ValueError("Binary FBX root parser made no progress")
+        offset = next_offset
+        if node is None:
+            if (
+                offset + 16 <= len(data)
+                and data.endswith(FBX_FOOT_MAGIC)
+            ):
+                footer_id = bytes(data[offset : offset + 16])
+            break
+        roots.append(node)
+    if not roots:
+        raise ValueError("Binary FBX contains no root nodes")
+    if include_footer_id:
+        return version, roots, footer_id
+    return version, roots
+
+
+def _property_bytes(kind: str, value: Any) -> bytes:
+    scalar = {"Y": "h", "I": "i", "F": "f", "D": "d", "L": "q"}
+    if kind in scalar:
+        return struct.pack("<" + scalar[kind], value)
+    if kind == "C":
+        return bytes((1 if value else 0,))
+    if kind == "S":
+        return str(value).encode("utf-8")
+    if kind == "R":
+        return bytes(value)
+    if kind in FBX_ARRAY_LAYOUTS:
+        if not isinstance(value, list):
+            raise ValueError(f"FBX array {kind!r} was not decoded")
+        item_fmt, _item_size = FBX_ARRAY_LAYOUTS[kind]
+        if kind in {"b", "c"}:
+            return bytes(int(item) & 0xFF for item in value)
+        if not value:
+            return b""
+        return struct.pack("<" + item_fmt * len(value), *value)
+    raise ValueError(f"Unsupported FBX property type {kind!r}")
+
+
+def _encode_property(kind: str, value: Any) -> bytes:
+    if kind in FBX_ARRAY_LAYOUTS:
+        values = value if isinstance(value, list) else list(value)
+        raw = _property_bytes(kind, values)
+        encoding = 1 if len(raw) > 128 else 0
+        payload = zlib.compress(raw, 1) if encoding else raw
+        return kind.encode("ascii") + struct.pack("<III", len(values), encoding, len(payload)) + payload
+    payload = _property_bytes(kind, value)
+    if kind in {"S", "R"}:
+        return kind.encode("ascii") + struct.pack("<I", len(payload)) + payload
+    return kind.encode("ascii") + payload
+
+
+def _encode_node(node: FbxNode, start_offset: int, *, version: int, is_last: bool) -> bytes:
+    wide = version >= 7500
+    header_size = 25 if wide else 13
+    null_record = FBX_NULL_RECORD_WIDE if wide else FBX_NULL_RECORD_NARROW
+    name = node.name.encode("utf-8")
+    property_blob = b"".join(_encode_property(kind, value) for kind, value in node.typed_properties())
+    body_offset = start_offset + header_size + len(name) + len(property_blob)
+    child_blobs: list[bytes] = []
+    cursor = body_offset
+    for child_index, child in enumerate(node.children):
+        encoded = _encode_node(child, cursor, version=version, is_last=child_index == len(node.children) - 1)
+        child_blobs.append(encoded)
+        cursor += len(encoded)
+    if node.children or (not node.properties and not is_last) or node.name in FBX_ALWAYS_BLOCK:
+        child_blobs.append(null_record)
+        cursor += len(null_record)
+    if wide:
+        header = struct.pack("<QQQB", cursor, len(node.properties), len(property_blob), len(name))
+    else:
+        header = struct.pack("<IIIB", cursor, len(node.properties), len(property_blob), len(name))
+    return header + name + property_blob + b"".join(child_blobs)
+
+
+# ---------------------------------------------------------------------------
+# Generic conversion and verification
+
+def _walk(nodes: Iterable[FbxNode]) -> Iterable[FbxNode]:
+    for node in nodes:
+        yield node
+        yield from _walk(node.children)
+
+
+def _first_root(roots: Iterable[FbxNode], name: str) -> FbxNode | None:
+    return next((node for node in roots if node.name == name), None)
+
+
+def _node_type(node: FbxNode) -> str:
+    return str(node.properties[2] or "") if len(node.properties) >= 3 else ""
+
+
+def _property_name(node: FbxNode) -> str:
+    return str(node.properties[0] or "") if node.name == "P" and node.properties else ""
+
+
+def _route_handle_from_property(node: FbxNode) -> int:
+    """Read one Max route handle from a custom Properties70 record."""
+    property_name = _property_name(node)
+    values = node.properties
+    if property_name == ROUTE_HANDLE_PROPERTY:
+        candidates = values[4:] if len(values) > 4 else values[1:]
+        for value in reversed(candidates):
+            text = str(value or "").strip().strip('"')
+            if text.isdigit() and int(text) > 0:
+                return int(text)
+        return 0
+    if property_name != "UDP3DSMAX" or not values:
+        return 0
+    matches = {
+        int(match)
+        for match in _ROUTE_HANDLE_RE.findall(str(values[-1] or ""))
+        if match.isdigit() and int(match) > 0
+    }
+    return next(iter(matches)) if len(matches) == 1 else 0
+
+
+def _model_route_handle(node: FbxNode) -> int:
+    """Return the one route handle authored on a Model, if it is unambiguous.
+
+    The source may store the marker in Max's ``UDP3DSMAX`` string or as a
+    direct ``CodexRe6FbxRouteHandle`` property.  Both forms describe the same
+    Model identity; the rebuilt file always normalizes the value back to the
+    UDP3DSMAX form used by the Probe/Launcher contract.
+    """
+    properties = _child_node(node, "Properties70")
+    if properties is None:
+        return 0
+    handles: set[int] = set()
+    for property_node in properties.children:
+        if property_node.name != "P":
+            continue
+        handle = _route_handle_from_property(property_node)
+        if handle > 0:
+            handles.add(handle)
+    return next(iter(handles)) if len(handles) == 1 else 0
+
+
+def _canonical_route_handle_property(route_handle: int) -> FbxNode:
+    """Create the stable, Probe-readable route marker for a rebuilt Model."""
+    return FbxNode(
+        "P",
+        [
+            "UDP3DSMAX",
+            "KString",
+            "",
+            "U",
+            f"{ROUTE_HANDLE_PROPERTY} = {int(route_handle)}\r\n",
+        ],
+        ["S", "S", "S", "S", "S"],
+        [],
+    )
+
+
+def _node_digest(node: FbxNode) -> str:
+    digest = hashlib.sha256()
+    digest.update(node.name.encode("utf-8"))
+    for kind, value in node.typed_properties():
+        digest.update(kind.encode("ascii"))
+        payload = _property_bytes(kind, value)
+        digest.update(struct.pack("<Q", len(payload)))
+        digest.update(payload)
+    for child in node.children:
+        digest.update(bytes.fromhex(_node_digest(child)))
+    return digest.hexdigest()
+
+
+def _media_payload_digests(roots: Iterable[FbxNode]) -> list[str]:
+    result: list[str] = []
+    for node in _walk(roots):
+        if node.name != "Video":
+            continue
+        for child in node.children:
+            if child.name == "Content" and child.property_types == ["R"]:
+                content = bytes(child.properties[0])
+                if content:
+                    result.append(hashlib.sha256(content).hexdigest())
+    return sorted(result)
+
+
+def _axis_signature(roots: Iterable[FbxNode]) -> list[int] | None:
+    settings = _first_root(roots, "GlobalSettings")
+    if settings is None:
+        return None
+    values: dict[str, int] = {}
+    for node in _walk(settings.children):
+        name = _property_name(node)
+        if name not in {"CoordAxis", "CoordAxisSign", "UpAxis", "UpAxisSign", "FrontAxis", "FrontAxisSign"} or not node.properties:
+            continue
+        try:
+            values[name] = int(node.properties[-1])
+        except (TypeError, ValueError, OverflowError):
+            pass
+    required = ("CoordAxis", "CoordAxisSign", "UpAxis", "UpAxisSign", "FrontAxis", "FrontAxisSign")
+    if not all(key in values for key in required):
+        return None
+    return [
+        values["CoordAxis"] * 2 + (0 if values["CoordAxisSign"] >= 0 else 1),
+        values["UpAxis"] * 2 + (0 if values["UpAxisSign"] >= 0 else 1),
+        values["FrontAxis"] * 2 + (0 if values["FrontAxisSign"] >= 0 else 1),
+    ]
+
+
+def collect_stats(roots: list[FbxNode]) -> dict[str, Any]:
+    objects = _first_root(roots, "Objects")
+    connections = _first_root(roots, "Connections")
+    all_nodes = list(_walk(roots))
+    geometry_nodes = [node for node in all_nodes if node.name == "Geometry"]
+    model_nodes = [node for node in all_nodes if node.name == "Model"]
+    deformer_nodes = [node for node in all_nodes if node.name == "Deformer"]
+    skin_clusters = [node for node in deformer_nodes if _node_type(node).casefold() == "cluster"]
+    skin_deformers = [node for node in deformer_nodes if _node_type(node).casefold() == "skin"]
+    normal_layers = [node for node in all_nodes if node.name == "LayerElementNormal"]
+    uv_layers = [node for node in all_nodes if node.name == "LayerElementUV"]
+    max_metadata = [
+        node
+        for node in all_nodes
+        if node.name == "P"
+        and (
+            _property_name(node) == "MaxHandle"
+            or (
+                _property_name(node) == "UDP3DSMAX"
+                and _route_handle_from_property(node) <= 0
+            )
+        )
+    ]
+    arrays = [kind for node in all_nodes for kind in node.property_types if kind.islower()]
+    geometry_digests = sorted(_node_digest(node) for node in geometry_nodes)
+    skin_digests = sorted(_node_digest(node) for node in skin_clusters)
+    connection_digests = sorted(_node_digest(node) for node in (connections.children if connections else []))
+    return {
+        "node_count": len(all_nodes),
+        "model_count": len(model_nodes),
+        "geometry_count": len(geometry_nodes),
+        "normal_layer_count": len(normal_layers),
+        "uv_layer_count": len(uv_layers),
+        "skin_deformer_count": len(skin_deformers),
+        "skin_cluster_count": len(skin_clusters),
+        "material_count": sum(1 for node in all_nodes if node.name == "Material"),
+        "texture_count": sum(1 for node in all_nodes if node.name == "Texture"),
+        "video_count": sum(1 for node in all_nodes if node.name == "Video"),
+        "embedded_media_sha256": _media_payload_digests(roots),
+        "connection_count": len(connections.children) if connections else 0,
+        "animation_stack_count": sum(1 for node in all_nodes if node.name == "AnimationStack"),
+        "animation_layer_count": sum(1 for node in all_nodes if node.name == "AnimationLayer"),
+        "array_count": len(arrays),
+        "max_metadata_count": len(max_metadata),
+        "axis_signature": _axis_signature(roots),
+        "geometry_digests": geometry_digests,
+        "skin_cluster_digests": skin_digests,
+        "connection_digests": connection_digests,
+        "objects_child_count": len(objects.children) if objects else 0,
+    }
+
+
+def _set_creator(roots: list[FbxNode]) -> None:
+    creator = _first_root(roots, "Creator")
+    if creator is None:
+        roots.insert(min(3, len(roots)), FbxNode("Creator", ["Generic FBX Converter"], ["S"], []))
+        return
+    for index, kind in enumerate(creator.property_types):
+        if kind == "S":
+            creator.properties[index] = "Generic FBX Converter"
+            return
+    creator.properties.append("Generic FBX Converter")
+    creator.property_types.append("S")
+
+
+def _remove_max_metadata(roots: list[FbxNode]) -> int:
+    removed = 0
+    objects = _first_root(roots, "Objects")
+    if objects is None:
+        return removed
+    for model in objects.children:
+        if model.name != "Model":
+            continue
+        for container in model.children:
+            if container.name != "Properties70":
+                continue
+            kept: list[FbxNode] = []
+            for property_node in container.children:
+                property_name = _property_name(property_node)
+                if property_name == "MaxHandle":
+                    removed += 1
+                elif property_name == "UDP3DSMAX":
+                    route_handle = _route_handle_from_property(property_node)
+                    if route_handle > 0 and property_node.properties:
+                        retained = FbxNode(
+                            "P",
+                            list(property_node.properties),
+                            list(property_node.property_types),
+                            [],
+                        )
+                        retained.properties[-1] = (
+                            f"{ROUTE_HANDLE_PROPERTY} = {route_handle}\r\n"
+                        )
+                        kept.append(retained)
+                    else:
+                        removed += 1
+                else:
+                    kept.append(property_node)
+            container.children = kept
+    return removed
+
+
+def _child_node(node: FbxNode, name: str) -> FbxNode | None:
+    return next((child for child in node.children if child.name == name), None)
+
+
+def _child_value(node: FbxNode, name: str) -> Any:
+    child = _child_node(node, name)
+    return child.properties[0] if child is not None and child.properties else None
+
+
+def _set_child_array(node: FbxNode, name: str, kind: str, values: list[Any]) -> None:
+    child = _child_node(node, name)
+    if child is None:
+        node.children.append(FbxNode(name, [values], [kind], []))
+    else:
+        child.properties = [values]
+        child.property_types = [kind]
+
+
+def _set_layer_text(node: FbxNode, name: str, value: str) -> None:
+    child = _child_node(node, name)
+    if child is None:
+        node.children.append(FbxNode(name, [value], ["S"], []))
+    else:
+        child.properties = [value]
+        child.property_types = ["S"]
+
+
+def _remove_child(node: FbxNode, name: str) -> None:
+    node.children = [child for child in node.children if child.name != name]
+
+
+# ---------------------------------------------------------------------------
+# V5 canonical transform helpers
+#
+# FBX stores the affine transform as a row-major matrix in the binary tree.
+# These helpers intentionally stay local to the standalone converter so the
+# tool remains independent from the production Probe module.
+
+def _identity_matrix() -> list[float]:
+    return [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+
+
+def _finite_matrix(value: Any, label: str) -> list[float]:
+    if not isinstance(value, list) or len(value) != 16:
+        raise ValueError(f"{label} must contain 16 values")
+    result = [float(item) for item in value]
+    if not all(math.isfinite(item) for item in result):
+        raise ValueError(f"{label} contains non-finite values")
+    return result
+
+
+def _generic_multiply_row_major_matrices(left: list[float], right: list[float]) -> list[float]:
+    left = _finite_matrix(left, "left matrix")
+    right = _finite_matrix(right, "right matrix")
+    return [
+        sum(left[row * 4 + item] * right[item * 4 + column] for item in range(4))
+        for row in range(4)
+        for column in range(4)
+    ]
+
+
+def _generic_invert_row_major_matrix(matrix: list[float]) -> list[float] | None:
+    try:
+        values = _finite_matrix(matrix, "matrix")
+    except (TypeError, ValueError, OverflowError):
+        return None
+    work = [
+        [values[row * 4 + column] for column in range(4)]
+        + [1.0 if row == column else 0.0 for column in range(4)]
+        for row in range(4)
+    ]
+    for pivot_column in range(4):
+        pivot_row = max(
+            range(pivot_column, 4),
+            key=lambda row: abs(work[row][pivot_column]),
+        )
+        if abs(work[pivot_row][pivot_column]) <= 1.0e-12:
+            return None
+        work[pivot_column], work[pivot_row] = work[pivot_row], work[pivot_column]
+        pivot = work[pivot_column][pivot_column]
+        work[pivot_column] = [value / pivot for value in work[pivot_column]]
+        for row in range(4):
+            if row == pivot_column:
+                continue
+            factor = work[row][pivot_column]
+            if abs(factor) <= 1.0e-18:
+                continue
+            work[row] = [
+                value - factor * pivot_value
+                for value, pivot_value in zip(work[row], work[pivot_column])
+            ]
+    return [work[row][column] for row in range(4) for column in range(4, 8)]
+
+
+def _generic_transform_position_row_major(row: Any, matrix: list[float]) -> list[float]:
+    values = list(row)
+    if len(values) < 3:
+        raise ValueError("Position row must contain three values")
+    matrix = _finite_matrix(matrix, "position matrix")
+    x, y, z = (float(values[0]), float(values[1]), float(values[2]))
+    return [
+        (x * matrix[0]) + (y * matrix[4]) + (z * matrix[8]) + matrix[12],
+        (x * matrix[1]) + (y * matrix[5]) + (z * matrix[9]) + matrix[13],
+        (x * matrix[2]) + (y * matrix[6]) + (z * matrix[10]) + matrix[14],
+    ]
+
+
+def _generic_transform_normal_row_major(row: Any, matrix: list[float]) -> list[float]:
+    values = list(row)
+    if len(values) < 3:
+        raise ValueError("Normal row must contain three values")
+    matrix = _finite_matrix(matrix, "normal matrix")
+    a00, a01, a02 = matrix[0], matrix[1], matrix[2]
+    a10, a11, a12 = matrix[4], matrix[5], matrix[6]
+    a20, a21, a22 = matrix[8], matrix[9], matrix[10]
+    c00 = (a11 * a22) - (a12 * a21)
+    c01 = (a12 * a20) - (a10 * a22)
+    c02 = (a10 * a21) - (a11 * a20)
+    determinant = (a00 * c00) + (a01 * c01) + (a02 * c02)
+    x, y, z = (float(values[0]), float(values[1]), float(values[2]))
+    if abs(determinant) <= 1.0e-12:
+        transformed = [
+            (x * a00) + (y * a10) + (z * a20),
+            (x * a01) + (y * a11) + (z * a21),
+            (x * a02) + (y * a12) + (z * a22),
+        ]
+    else:
+        inverse_det = 1.0 / determinant
+        normal = (
+            c00 * inverse_det,
+            ((a02 * a21) - (a01 * a22)) * inverse_det,
+            ((a01 * a12) - (a02 * a11)) * inverse_det,
+            c01 * inverse_det,
+            ((a00 * a22) - (a02 * a20)) * inverse_det,
+            ((a02 * a10) - (a00 * a12)) * inverse_det,
+            c02 * inverse_det,
+            ((a01 * a20) - (a00 * a21)) * inverse_det,
+            ((a00 * a11) - (a01 * a10)) * inverse_det,
+        )
+        transformed = [
+            (normal[0] * x) + (normal[1] * y) + (normal[2] * z),
+            (normal[3] * x) + (normal[4] * y) + (normal[5] * z),
+            (normal[6] * x) + (normal[7] * y) + (normal[8] * z),
+        ]
+    length = math.sqrt(sum(value * value for value in transformed))
+    if length <= 1.0e-12:
+        return [0.0, 0.0, 1.0]
+    return [value / length for value in transformed]
+
+
+def _matrix_basis_mean_scale(matrix: Any, *, label: str) -> float:
+    return sum(_matrix_basis_scales(matrix, label=label)) / 3.0
+
+
+def _matrix_basis_scales(matrix: Any, *, label: str) -> list[float]:
+    """Return the three row-basis lengths of an affine row-major matrix."""
+    values = _finite_matrix(matrix, label)
+    lengths = [
+        math.sqrt(sum(values[offset + axis] ** 2 for axis in range(3)))
+        for offset in (0, 4, 8)
+    ]
+    if any(not math.isfinite(length) or length <= 1.0e-9 for length in lengths):
+        raise ValueError(f"{label} has a degenerate basis")
+    return lengths
+
+
+def _scale_affine_matrix(matrix: Any, scale: float, *, label: str) -> list[float]:
+    values = _finite_matrix(matrix, label)
+    factor = float(scale)
+    if not math.isfinite(factor) or factor <= 0.0:
+        raise ValueError(f"{label} has an invalid scale")
+    for index in (0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14):
+        values[index] *= factor
+    return values
+
+
+def _matrices_match(left: list[float], right: list[float]) -> bool:
+    if len(left) != 16 or len(right) != 16:
+        return False
+    magnitude = max(1.0, *(abs(float(value)) for value in left), *(abs(float(value)) for value in right))
+    return max(abs(float(left[index]) - float(right[index])) for index in range(16)) <= magnitude * 1.0e-4
+
+
+def _matrix_relative_error(left: list[float], right: list[float]) -> float:
+    left_values = _finite_matrix(left, "left matrix")
+    right_values = _finite_matrix(right, "right matrix")
+    magnitude = max(
+        1.0,
+        *(abs(value) for value in left_values),
+        *(abs(value) for value in right_values),
+    )
+    return max(
+        abs(left_values[index] - right_values[index])
+        for index in range(16)
+    ) / magnitude
+
+
+def _is_unit_rigid_axis_matrix(matrix: list[float]) -> bool:
+    """Return whether a bind only describes an already-baked axis basis."""
+    values = _finite_matrix(matrix, "bind matrix")
+    rows = [values[offset : offset + 3] for offset in (0, 4, 8)]
+    lengths = [math.sqrt(sum(component * component for component in row)) for row in rows]
+    if any(abs(length - 1.0) > 1.0e-3 for length in lengths):
+        return False
+    if math.sqrt(sum(values[index] ** 2 for index in (12, 13, 14))) > 1.0e-3:
+        return False
+    normalized = [
+        [component / length for component in row]
+        for row, length in zip(rows, lengths)
+    ]
+    for left_index in range(3):
+        for right_index in range(left_index + 1, 3):
+            dot = sum(
+                left_component * right_component
+                for left_component, right_component in zip(
+                    normalized[left_index], normalized[right_index]
+                )
+            )
+            if abs(dot) > 1.0e-3:
+                return False
+    determinant = (
+        normalized[0][0]
+        * (
+            normalized[1][1] * normalized[2][2]
+            - normalized[1][2] * normalized[2][1]
+        )
+        - normalized[0][1]
+        * (
+            normalized[1][0] * normalized[2][2]
+            - normalized[1][2] * normalized[2][0]
+        )
+        + normalized[0][2]
+        * (
+            normalized[1][0] * normalized[2][1]
+            - normalized[1][1] * normalized[2][0]
+        )
+    )
+    return abs(abs(determinant) - 1.0) <= 1.0e-3
+
+
+def _classify_skin_geometry_domain(
+    mesh_clusters: dict[int, list[dict[str, Any]]],
+) -> str:
+    """Classify the scene before any Max-specific Skin matrix is reapplied."""
+    votes: list[bool] = []
+    for clusters in mesh_clusters.values():
+        active = [
+            cluster
+            for cluster in clusters
+            if int(cluster.get("positive_weight_count", 0) or 0) > 0
+            and cluster.get("transform") is not None
+            and cluster.get("transform_link") is not None
+        ]
+        if not active:
+            continue
+        candidates = [
+            _generic_multiply_row_major_matrices(
+                cluster["transform"], cluster["transform_link"]
+            )
+            for cluster in active
+        ]
+        first = candidates[0]
+        if any(_matrix_relative_error(first, candidate) > 1.0e-4 for candidate in candidates[1:]):
+            return "MIXED"
+        votes.append(_is_unit_rigid_axis_matrix(first))
+    if votes and all(votes):
+        return "ALREADY_BAKED"
+    if votes and not any(votes):
+        return "LOCAL_BIND"
+    return "MIXED"
+
+
+_PRODUCER_TRANSFORM_PROPERTIES = {
+    "Lcl Translation",
+    "Lcl Rotation",
+    "Lcl Scaling",
+    "PreRotation",
+    "PostRotation",
+    "RotationActive",
+    "RotationOffset",
+    "RotationPivot",
+    "ScalingOffset",
+    "ScalingPivot",
+    "GeometricTranslation",
+    "GeometricRotation",
+    "GeometricScaling",
+    "ScalingMax",
+    "MaxHandle",
+    "RotationOrder",
+    "InheritType",
+}
+
+
+def _model_property_vector(
+    source: FbxNode, name: str, width: int, default: list[float]
+) -> list[float]:
+    properties = _child_node(source, "Properties70")
+    if properties is None:
+        return list(default)
+    for property_node in properties.children:
+        if property_node.name != "P" or _property_name(property_node) != name:
+            continue
+        if len(property_node.properties) < width + 4:
+            continue
+        try:
+            values = [float(value) for value in property_node.properties[-width:]]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if all(math.isfinite(value) for value in values):
+            return values
+    return list(default)
+
+
+def _model_property_scalar(source: FbxNode, name: str, default: int | float) -> int | float:
+    properties = _child_node(source, "Properties70")
+    if properties is None:
+        return default
+    for property_node in properties.children:
+        if property_node.name != "P" or _property_name(property_node) != name:
+            continue
+        for value in reversed(property_node.properties[4:]):
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                return value
+    return default
+
+
+def _translation_matrix(vector: list[float]) -> list[float]:
+    result = _identity_matrix()
+    result[12:15] = [float(value) for value in vector[:3]]
+    return result
+
+
+def _scaling_matrix(vector: list[float]) -> list[float]:
+    result = _identity_matrix()
+    result[0], result[5], result[10] = [float(value) for value in vector[:3]]
+    return result
+
+
+def _axis_rotation_matrix(axis: str, radians: float) -> list[float]:
+    cosine = math.cos(float(radians))
+    sine = math.sin(float(radians))
+    result = _identity_matrix()
+    if axis == "X":
+        result[5], result[6], result[9], result[10] = cosine, sine, -sine, cosine
+    elif axis == "Y":
+        result[0], result[2], result[8], result[10] = cosine, -sine, sine, cosine
+    elif axis == "Z":
+        result[0], result[1], result[4], result[5] = cosine, sine, -sine, cosine
+    else:
+        raise ValueError(f"Unsupported rotation axis: {axis}")
+    return result
+
+
+def _rotation_matrix(rotation: list[float], rotation_order: int = 0) -> list[float]:
+    orders = ("XYZ", "XZY", "YZX", "YXZ", "ZXY", "ZYX")
+    order = orders[rotation_order] if 0 <= int(rotation_order) < len(orders) else "XYZ"
+    angles = {
+        "X": math.radians(float(rotation[0])),
+        "Y": math.radians(float(rotation[1])),
+        "Z": math.radians(float(rotation[2])),
+    }
+    result = _identity_matrix()
+    for axis in order:
+        result = _generic_multiply_row_major_matrices(
+            result,
+            _axis_rotation_matrix(axis, angles[axis]),
+        )
+    return result
+
+
+def _local_trs_matrix(
+    translation: list[float], rotation: list[float], scale: list[float]
+) -> list[float]:
+    return _generic_multiply_row_major_matrices(
+        _generic_multiply_row_major_matrices(_scaling_matrix(scale), _rotation_matrix(rotation)),
+        _translation_matrix(translation),
+    )
+
+
+def _source_model_local_parts(source: FbxNode) -> dict[str, Any]:
+    """Evaluate the full ordinary FBX Model transform in row-vector form."""
+    translation = _model_property_vector(source, "Lcl Translation", 3, [0.0, 0.0, 0.0])
+    rotation = _model_property_vector(source, "Lcl Rotation", 3, [0.0, 0.0, 0.0])
+    scale = _model_property_vector(source, "Lcl Scaling", 3, [1.0, 1.0, 1.0])
+    pre_rotation = _model_property_vector(source, "PreRotation", 3, [0.0, 0.0, 0.0])
+    post_rotation = _model_property_vector(source, "PostRotation", 3, [0.0, 0.0, 0.0])
+    rotation_offset = _model_property_vector(source, "RotationOffset", 3, [0.0, 0.0, 0.0])
+    rotation_pivot = _model_property_vector(source, "RotationPivot", 3, [0.0, 0.0, 0.0])
+    scaling_offset = _model_property_vector(source, "ScalingOffset", 3, [0.0, 0.0, 0.0])
+    scaling_pivot = _model_property_vector(source, "ScalingPivot", 3, [0.0, 0.0, 0.0])
+    rotation_order = int(_model_property_scalar(source, "RotationOrder", 0) or 0)
+    inherit_type = int(_model_property_scalar(source, "InheritType", 1) or 0)
+    local_rotation = _rotation_matrix(rotation, rotation_order)
+    pre = _rotation_matrix(pre_rotation, 0)
+    post_inverse = _generic_invert_row_major_matrix(_rotation_matrix(post_rotation, 0))
+    if post_inverse is None:
+        raise ValueError("PostRotation is not invertible")
+    total_rotation = _generic_multiply_row_major_matrices(
+        _generic_multiply_row_major_matrices(post_inverse, local_rotation),
+        pre,
+    )
+    # FBX row-vector order is the reverse of the SDK's published column-vector
+    # formula. RotationActive is authoring metadata; it does not erase stored
+    # pre/post or pivot values during evaluation.
+    matrix = _identity_matrix()
+    for component in (
+        _translation_matrix([-value for value in scaling_pivot]),
+        _scaling_matrix(scale),
+        _translation_matrix(scaling_pivot),
+        _translation_matrix(scaling_offset),
+        _translation_matrix([-value for value in rotation_pivot]),
+        total_rotation,
+        _translation_matrix(rotation_pivot),
+        _translation_matrix(rotation_offset),
+        _translation_matrix(translation),
+    ):
+        matrix = _generic_multiply_row_major_matrices(matrix, component)
+    evaluated_translation = list(matrix[12:15])
+    unscaled = _generic_multiply_row_major_matrices(
+        total_rotation,
+        _translation_matrix(evaluated_translation),
+    )
+    return {
+        "matrix": matrix,
+        "unscaled_matrix": unscaled,
+        "translation": evaluated_translation,
+        "rotation_matrix": total_rotation,
+        "scale": [float(value) for value in scale],
+        "inherit_type": inherit_type if inherit_type in {0, 1, 2} else 1,
+    }
+
+
+def _source_model_local_matrix(source: FbxNode) -> list[float]:
+    return list(_source_model_local_parts(source)["matrix"])
+
+
+def _orthonormalize_rotation_rows(rows: list[list[float]]) -> list[list[float]]:
+    first = list(rows[0][:3])
+    first_length = math.sqrt(sum(value * value for value in first))
+    if first_length <= 1.0e-10:
+        raise ValueError("Model transform has a degenerate X axis")
+    x_axis = [value / first_length for value in first]
+    second = list(rows[1][:3])
+    projection = sum(value * axis for value, axis in zip(second, x_axis))
+    second = [value - projection * axis for value, axis in zip(second, x_axis)]
+    second_length = math.sqrt(sum(value * value for value in second))
+    if second_length <= 1.0e-10:
+        raise ValueError("Model transform has a degenerate Y axis")
+    y_axis = [value / second_length for value in second]
+    z_axis = [
+        x_axis[1] * y_axis[2] - x_axis[2] * y_axis[1],
+        x_axis[2] * y_axis[0] - x_axis[0] * y_axis[2],
+        x_axis[0] * y_axis[1] - x_axis[1] * y_axis[0],
+    ]
+    z_length = math.sqrt(sum(value * value for value in z_axis))
+    if z_length <= 1.0e-10:
+        raise ValueError("Model transform has a degenerate Z axis")
+    return [x_axis, y_axis, [value / z_length for value in z_axis]]
+
+
+def _matrix_to_trs(matrix: list[float], *, label: str) -> tuple[list[float], list[float], list[float]]:
+    values = _finite_matrix(matrix, label)
+    scales = [
+        math.sqrt(sum(values[offset + axis] ** 2 for axis in range(3)))
+        for offset in (0, 4, 8)
+    ]
+    if any(scale <= 1.0e-10 or not math.isfinite(scale) for scale in scales):
+        raise ValueError(f"{label} has a degenerate basis")
+    rows = [
+        [values[row * 4 + axis] / scales[row] for axis in range(3)]
+        for row in range(3)
+    ]
+    determinant = (
+        rows[0][0] * (rows[1][1] * rows[2][2] - rows[1][2] * rows[2][1])
+        - rows[0][1] * (rows[1][0] * rows[2][2] - rows[1][2] * rows[2][0])
+        + rows[0][2] * (rows[1][0] * rows[2][1] - rows[1][1] * rows[2][0])
+    )
+    if determinant < 0.0:
+        scales[0] = -scales[0]
+        rows[0] = [-value for value in rows[0]]
+    rotation = _orthonormalize_rotation_rows(rows)
+    r00, r01, r02 = rotation[0][0], rotation[1][0], rotation[2][0]
+    r10, r11, r12 = rotation[0][1], rotation[1][1], rotation[2][1]
+    r20, r21, r22 = rotation[0][2], rotation[1][2], rotation[2][2]
+    sy = max(-1.0, min(1.0, -r20))
+    y = math.asin(sy)
+    if abs(sy) < 0.999999:
+        x = math.atan2(r21, r22)
+        z = math.atan2(r10, r00)
+    else:
+        x = math.atan2(-r12, r11)
+        z = 0.0
+    return (
+        [values[12], values[13], values[14]],
+        [math.degrees(x), math.degrees(y), math.degrees(z)],
+        scales,
+    )
+
+
+def _source_model_world_matrices(
+    model_nodes: list[FbxNode], parent_ids: dict[int, int]
+) -> dict[int, list[float]]:
+    by_id = {_object_id(node): node for node in model_nodes}
+    local = {model_id: _source_model_local_parts(node) for model_id, node in by_id.items()}
+    worlds: dict[int, list[float]] = {}
+    unscaled_worlds: dict[int, list[float]] = {}
+    inherit_scales: dict[int, list[float]] = {}
+    inherit_scale_nodes: dict[int, int] = {}
+    visiting: set[int] = set()
+
+    def resolve(model_id: int) -> list[float]:
+        if model_id in worlds:
+            return worlds[model_id]
+        if model_id in visiting:
+            raise ValueError(f"Model hierarchy contains a cycle at {model_id}")
+        visiting.add(model_id)
+        parent_id = int(parent_ids.get(model_id, 0) or 0)
+        if parent_id in by_id:
+            parent_world = resolve(parent_id)
+            parent_parts = local[parent_id]
+            parts = local[model_id]
+            inherit_type = int(parts["inherit_type"])
+            if inherit_type == 1:
+                world = _generic_multiply_row_major_matrices(parts["matrix"], parent_world)
+                unscaled_world = _generic_multiply_row_major_matrices(
+                    parts["unscaled_matrix"], parent_world
+                )
+                inherit_scale = list(parts["scale"])
+                inherit_scale_node = 0
+            else:
+                inherit_scale_node = (
+                    parent_id if inherit_type == 0 else inherit_scale_nodes.get(parent_id, 0)
+                )
+                inherited_scale = inherit_scales.get(inherit_scale_node, [1.0, 1.0, 1.0])
+                adjusted_scale = [
+                    float(parts["scale"][axis]) * float(inherited_scale[axis])
+                    for axis in range(3)
+                ]
+                adjusted_translation = [
+                    float(parts["translation"][axis]) * float(inherit_scales[parent_id][axis])
+                    for axis in range(3)
+                ]
+                adjusted = _generic_multiply_row_major_matrices(
+                    _generic_multiply_row_major_matrices(
+                        _scaling_matrix(adjusted_scale), parts["rotation_matrix"]
+                    ),
+                    _translation_matrix(adjusted_translation),
+                )
+                adjusted_unscaled = _generic_multiply_row_major_matrices(
+                    parts["rotation_matrix"],
+                    _translation_matrix(adjusted_translation),
+                )
+                world = _generic_multiply_row_major_matrices(adjusted, unscaled_worlds[parent_id])
+                unscaled_world = _generic_multiply_row_major_matrices(
+                    adjusted_unscaled, unscaled_worlds[parent_id]
+                )
+                inherit_scale = adjusted_scale
+        else:
+            parts = local[model_id]
+            world = list(parts["matrix"])
+            unscaled_world = list(parts["unscaled_matrix"])
+            inherit_scale = list(parts["scale"])
+            inherit_scale_node = 0
+        visiting.remove(model_id)
+        worlds[model_id] = world
+        unscaled_worlds[model_id] = unscaled_world
+        inherit_scales[model_id] = inherit_scale
+        inherit_scale_nodes[model_id] = inherit_scale_node
+        return world
+
+    for model_id in sorted(by_id):
+        resolve(model_id)
+    return worlds
+
+
+def _global_unit_scale(roots: list[FbxNode]) -> float:
+    settings = _first_root(roots, "GlobalSettings")
+    if settings is None:
+        return 1.0
+    # UnitScaleFactor is the active scene unit. OriginalUnitScaleFactor is
+    # historical authoring metadata and may differ; traversal order is not a
+    # semantic priority because exporters are free to write Original first.
+    values: dict[str, float] = {}
+    for node in _walk(settings.children):
+        property_name = _property_name(node)
+        if node.name != "P" or property_name not in {"UnitScaleFactor", "OriginalUnitScaleFactor"}:
+            continue
+        try:
+            value = float(node.properties[-1])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value) and value > 0.0:
+            values[property_name] = value
+    if "UnitScaleFactor" in values:
+        return values["UnitScaleFactor"]
+    if "OriginalUnitScaleFactor" in values:
+        return values["OriginalUnitScaleFactor"]
+    return 1.0
+
+
+def _generic_axis_conversion_matrix(roots: list[FbxNode]) -> list[float]:
+    """Map source storage coordinates to the converter's X/Y/Z target axes."""
+    signature = _axis_signature(roots)
+    if not isinstance(signature, list) or len(signature) != 3:
+        return _identity_matrix()
+    decoded = [
+        (int(value) // 2, 1.0 if int(value) % 2 == 0 else -1.0)
+        for value in signature
+    ]
+    if sorted(axis for axis, _sign in decoded) != [0, 1, 2]:
+        return _identity_matrix()
+    conversion = [0.0] * 16
+    for logical_axis, (storage_axis, sign) in enumerate(decoded):
+        conversion[(storage_axis * 4) + logical_axis] = sign
+    conversion[15] = 1.0
+    return conversion
+
+
+def _generic_axis_signature_is_valid(roots: list[FbxNode]) -> bool:
+    signature = _axis_signature(roots)
+    if not isinstance(signature, list) or len(signature) != 3:
+        return False
+    decoded_axes = [int(value) // 2 for value in signature]
+    return sorted(decoded_axes) == [0, 1, 2]
+
+
+def _output_local_from_world(
+    model_id: int,
+    worlds: dict[int, list[float]],
+    parent_ids: dict[int, int],
+) -> list[float]:
+    world = _finite_matrix(worlds[model_id], f"output Model world {model_id}")
+    parent_id = int(parent_ids.get(model_id, 0) or 0)
+    if parent_id == 0:
+        return world
+    parent_world = worlds.get(parent_id)
+    if parent_world is None:
+        raise ValueError(f"Model {model_id} references missing parent {parent_id}")
+    inverse = _generic_invert_row_major_matrix(parent_world)
+    if inverse is None:
+        raise ValueError(f"Model parent {parent_id} is not invertible")
+    return _generic_multiply_row_major_matrices(world, inverse)
+
+
+def _v5_scene_context(
+    roots: list[FbxNode], source_graph: dict[str, Any], parents_by_child: dict[int, list[int]]
+) -> dict[str, Any]:
+    """Derive V5 bind/domain data from the source FBX graph alone."""
+    model_nodes = list(source_graph.get("models", []))
+    objects_by_id = dict(source_graph.get("objects_by_id", {}))
+    parent_ids = dict(source_graph.get("model_parent_ids", {}))
+    worlds = _source_model_world_matrices(model_nodes, parent_ids)
+    axis_conversion = _generic_axis_conversion_matrix(roots)
+    target_worlds = {
+        model_id: _generic_multiply_row_major_matrices(world, axis_conversion)
+        for model_id, world in worlds.items()
+    }
+    mesh_ids = set(int(value) for value in source_graph.get("mesh_model_ids", []))
+    geometry_by_id = {
+        _object_id(node): node
+        for node in source_graph.get("geometries", [])
+        if _object_id(node) > 0
+    }
+    model_geometry_ids = dict(source_graph.get("model_geometry_ids", {}))
+    unit_scale = _global_unit_scale(roots)
+    children_by_parent: dict[int, list[int]] = {}
+    for child_id, parent_ids_for_child in parents_by_child.items():
+        for parent_id in parent_ids_for_child:
+            children_by_parent.setdefault(int(parent_id), []).append(int(child_id))
+    mesh_clusters: dict[int, list[dict[str, Any]]] = {model_id: [] for model_id in mesh_ids}
+    cluster_by_id: dict[int, dict[str, Any]] = {}
+    for cluster in source_graph.get("deformers", []):
+        if _node_type(cluster).casefold() != "cluster":
+            continue
+        cluster_id = _object_id(cluster)
+        if cluster_id <= 0:
+            continue
+        bone_ids = [
+            parent_id
+            for parent_id in parents_by_child.get(cluster_id, [])
+            if objects_by_id.get(parent_id) is not None
+            and objects_by_id[parent_id].name == "Model"
+            and _node_type(objects_by_id[parent_id]).casefold() == "limbnode"
+        ]
+        if not bone_ids:
+            # A few exporters reverse the Cluster/Bone OO edge. Accept that
+            # equivalent representation while keeping the one-bone contract.
+            bone_ids = [
+                child_id
+                for child_id in children_by_parent.get(cluster_id, [])
+                if objects_by_id.get(child_id) is not None
+                and objects_by_id[child_id].name == "Model"
+                and _node_type(objects_by_id[child_id]).casefold() == "limbnode"
+            ]
+        bone_ids = sorted(set(int(value) for value in bone_ids))
+        skin_ids = [
+            parent_id
+            for parent_id in parents_by_child.get(cluster_id, [])
+            if objects_by_id.get(parent_id) is not None
+            and objects_by_id[parent_id].name == "Deformer"
+            and _node_type(objects_by_id[parent_id]).casefold() == "skin"
+        ]
+        geometry_ids: set[int] = set()
+        for skin_id in skin_ids:
+            geometry_ids.update(
+                int(parent_id)
+                for parent_id in parents_by_child.get(skin_id, [])
+                if parent_id in geometry_by_id
+            )
+        if not geometry_ids:
+            geometry_ids.update(
+                int(parent_id)
+                for parent_id in parents_by_child.get(cluster_id, [])
+                if parent_id in geometry_by_id
+            )
+        mesh_model_ids: set[int] = set()
+        for geometry_id in geometry_ids:
+            mesh_model_ids.update(
+                int(parent_id)
+                for parent_id in parents_by_child.get(geometry_id, [])
+                if parent_id in mesh_ids
+            )
+        if len(bone_ids) != 1 or not mesh_model_ids:
+            continue
+        raw_indexes = _child_value(cluster, "Indexes")
+        raw_weights = _child_value(cluster, "Weights")
+        raw_transform = _child_value(cluster, "Transform")
+        raw_link = _child_value(cluster, "TransformLink")
+        if raw_indexes is None and raw_weights is None:
+            # Some exporters leave connected, but weightless, placeholder
+            # Clusters in the scene. They have no skin influence to normalize.
+            continue
+        if (
+            not isinstance(raw_indexes, list)
+            or not isinstance(raw_weights, list)
+            or len(raw_indexes) != len(raw_weights)
+        ):
+            raise ValueError(f"Cluster {cluster_id} has mismatched Indexes/Weights")
+        positive_weight_count = sum(
+            isinstance(weight, (int, float))
+            and math.isfinite(float(weight))
+            and float(weight) > 0.0
+            for weight in raw_weights
+        )
+        link = _finite_matrix(raw_link, f"Cluster {cluster_id} TransformLink")
+        transform = (
+            _finite_matrix(raw_transform, f"Cluster {cluster_id} Transform")
+            if isinstance(raw_transform, list)
+            else None
+        )
+        row = {
+            "cluster_id": cluster_id,
+            "bone_model_id": int(bone_ids[0]),
+            "indexes": [int(value) for value in raw_indexes],
+            "weights": [float(value) for value in raw_weights],
+            "positive_weight_count": positive_weight_count,
+            "transform": transform,
+            "transform_link": link,
+        }
+        cluster_by_id[cluster_id] = row
+        for mesh_model_id in sorted(mesh_model_ids):
+            mesh_clusters.setdefault(mesh_model_id, []).append(row)
+
+    geometry_domain = _classify_skin_geometry_domain(mesh_clusters)
+    pose_matrices_by_model: dict[int, list[list[float]]] = {}
+    for pose in source_graph.get("poses", []):
+        for pose_node in (child for child in pose.children if child.name == "PoseNode"):
+            node = _child_node(pose_node, "Node")
+            matrix = _child_node(pose_node, "Matrix")
+            if node is None or matrix is None or not node.properties or not matrix.properties:
+                continue
+            try:
+                model_id = int(node.properties[0])
+                values = _finite_matrix(
+                    matrix.properties[0], label=f"Pose Model {model_id} matrix"
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            pose_matrices_by_model.setdefault(model_id, []).append(values)
+
+    # A Model world is the current pose.  It must stay separate from the
+    # binding pose stored by a Cluster's TransformLink; using the current Model
+    # world as the link turns every newly exported pose into a new rest pose.
+    canonical_bone_worlds: dict[int, list[float]] = {
+        bone_id: list(target_worlds[bone_id])
+        for bone_id in sorted(int(value) for value in source_graph.get("bone_model_ids", []))
+        if bone_id in target_worlds
+    }
+
+    domain_scales: dict[int, float] = {}
+    bind_mesh_matrices: dict[int, list[float]] = {}
+    canonical_cluster_matrices: dict[int, tuple[list[float], list[float]]] = {}
+    canonical_bind_by_model: dict[int, list[float]] = {}
+    cluster_domain_scales: dict[int, list[float]] = {}
+    for mesh_model_id in sorted(mesh_ids):
+        clusters = mesh_clusters.get(mesh_model_id, [])
+        if not clusters:
+            # Unskinned Meshes keep their source Model transform.  Baking that
+            # transform into Geometry as well would apply the world transform twice.
+            domain_scales[mesh_model_id] = 1.0
+            continue
+        active_clusters = [
+            cluster
+            for cluster in clusters
+            if int(cluster.get("positive_weight_count", 0) or 0) > 0
+        ]
+        if not active_clusters:
+            # A connected Cluster with no positive influence is only an
+            # exporter placeholder.  It must not turn the Mesh into a
+            # skinned route or cause its Model world to be zeroed/baked.
+            domain_scales[mesh_model_id] = 1.0
+            continue
+        if geometry_domain == "ALREADY_BAKED":
+            # The Geometry is already in the common scene domain. Keep the
+            # control points untouched; Cluster links are still preserved below
+            # as the fixed bind pose, while Model worlds remain the current pose.
+            domain_scales[mesh_model_id] = 1.0
+            bind_mesh_matrices[mesh_model_id] = _identity_matrix()
+            for cluster in active_clusters:
+                cluster_domain_scales.setdefault(int(cluster["cluster_id"]), []).append(1.0)
+            continue
+        ratios: list[float] = []
+        for cluster in active_clusters:
+            bone_world = worlds.get(int(cluster["bone_model_id"]))
+            if bone_world is None:
+                continue
+            link_scales = _matrix_basis_scales(
+                cluster["transform_link"],
+                label=f"Cluster {cluster['cluster_id']} TransformLink",
+            )
+            bone_scales = _matrix_basis_scales(
+                bone_world, label=f"Bone {cluster['bone_model_id']} world"
+            )
+            # A scene-unit conversion is isotropic. If the current bone and
+            # bind-link scales disagree by axis, that difference is authored
+            # pose scale (or shear), not a unit factor; do not bake it into
+            # the Mesh domain estimate.
+            axis_ratios = [
+                bone_scales[axis] / link_scales[axis]
+                for axis in range(3)
+                if link_scales[axis] > 1.0e-9
+            ]
+            if len(axis_ratios) != 3:
+                continue
+            ratio_min = min(axis_ratios)
+            ratio_max = max(axis_ratios)
+            if ratio_max - ratio_min > max(1.0e-3, abs(ratio_max) * 1.0e-3):
+                continue
+            ratio = sum(axis_ratios) / 3.0
+            if math.isfinite(ratio) and ratio > 0.0:
+                ratios.append(ratio)
+        if ratios:
+            ratios.sort()
+            middle = len(ratios) // 2
+            median = ratios[middle] if len(ratios) % 2 else (ratios[middle - 1] + ratios[middle]) / 2.0
+            nearest = min((1.0, unit_scale), key=lambda candidate: abs(median - candidate))
+            domain = nearest if abs(median - nearest) <= max(1.0e-3, abs(nearest) * 1.0e-3) else median
+        else:
+            domain = 1.0
+        domain_scales[mesh_model_id] = float(domain)
+        for cluster in active_clusters:
+            cluster_domain_scales.setdefault(int(cluster["cluster_id"]), []).append(float(domain))
+        candidates: list[list[float]] = []
+        for cluster in active_clusters:
+            transform = cluster.get("transform")
+            transform_link = cluster.get("transform_link")
+            if transform is None or transform_link is None:
+                continue
+            # FBX Cluster.Transform is mesh-side while TransformLink is
+            # bone-side. Their product is the common bind Mesh world matrix;
+            # Transform alone legitimately differs for every bone.
+            candidates.append(
+                _generic_multiply_row_major_matrices(transform, transform_link)
+            )
+        if not candidates and mesh_model_id in worlds:
+            candidates.append(list(worlds[mesh_model_id]))
+        if candidates:
+            first = candidates[0]
+            for candidate in candidates[1:]:
+                if not _matrices_match(first, candidate):
+                    raise ValueError(
+                        f"Mesh {mesh_model_id} bind matrix disagreement"
+                    )
+            bind_mesh_matrices[mesh_model_id] = _generic_multiply_row_major_matrices(
+                _scale_affine_matrix(
+                    first, domain, label=f"Mesh {mesh_model_id} bind matrix"
+                ),
+                axis_conversion,
+            )
+
+    bind_candidates_by_bone: dict[int, list[list[float]]] = {}
+    for cluster_id, cluster in cluster_by_id.items():
+        bone_id = int(cluster["bone_model_id"])
+        has_positive_influence = int(cluster.get("positive_weight_count", 0) or 0) > 0
+        # TransformLink is the source of truth for the bind pose.  Normalize it
+        # into the same axis/unit domain as the rebuilt geometry, but never
+        # replace it with the current bone Model world.
+        link = _generic_multiply_row_major_matrices(
+            cluster["transform_link"], axis_conversion
+        )
+        scales = cluster_domain_scales.get(cluster_id, [])
+        if scales:
+            scales = sorted(float(value) for value in scales if math.isfinite(float(value)) and float(value) > 0.0)
+        if scales:
+            middle = len(scales) // 2
+            bind_scale = (
+                scales[middle]
+                if len(scales) % 2
+                else (scales[middle - 1] + scales[middle]) / 2.0
+            )
+        elif not has_positive_influence:
+            # A weightless helper Cluster is not part of the bind contract.
+            # Keep its source scale untouched so it cannot contaminate the
+            # authored bind pose of the bone it happens to reference.
+            bind_scale = 1.0
+        else:
+            bind_scale = float(unit_scale) if math.isfinite(float(unit_scale)) and float(unit_scale) > 0.0 else 1.0
+        link = _scale_affine_matrix(
+            link,
+            bind_scale,
+            label=f"Bone {bone_id} canonical bind",
+        )
+        link = _finite_matrix(link, label=f"Bone {bone_id} canonical bind")
+        inverse = _generic_invert_row_major_matrix(link)
+        if inverse is None:
+            raise ValueError(f"Bone {bone_id} canonical bind is not invertible")
+        canonical_cluster_matrices[int(cluster_id)] = (inverse, link)
+        if has_positive_influence:
+            bind_candidates_by_bone.setdefault(bone_id, []).append(list(link))
+
+    # Pose records are bind-pose records too.  Prefer a normalized Cluster
+    # link for bones that have Skin data; use the authored Pose only for bones
+    # that have no usable Cluster row, and keep the current Model world as the
+    # final fallback for an incomplete source file.
+    for bone_id in sorted(int(value) for value in source_graph.get("bone_model_ids", [])):
+        candidates = bind_candidates_by_bone.get(bone_id, [])
+        if candidates:
+            canonical_bind_by_model[bone_id] = list(candidates[0])
+            continue
+        pose_candidates = pose_matrices_by_model.get(bone_id, [])
+        if pose_candidates:
+            pose = _generic_multiply_row_major_matrices(pose_candidates[0], axis_conversion)
+            # Unweighted/helper bones often already store Pose in the active
+            # scene unit.  Do not multiply every authored Pose by UnitScale;
+            # that turns an otherwise valid helper into a floating bone.  Only
+            # convert when its basis is demonstrably in the pre-scaled domain
+            # relative to the corresponding current Model world.
+            pose_scale = 1.0
+            try:
+                active_unit = float(unit_scale)
+                pose_scales = _matrix_basis_scales(
+                    pose, label=f"Bone {bone_id} authored bind"
+                )
+                current_scales = _matrix_basis_scales(
+                    canonical_bone_worlds[bone_id],
+                    label=f"Bone {bone_id} current world",
+                )
+                ratios = [
+                    current_scales[index] / pose_scales[index]
+                    for index in range(3)
+                    if pose_scales[index] > 1.0e-9
+                ]
+                if (
+                    math.isfinite(active_unit)
+                    and active_unit > 0.0
+                    and len(ratios) == 3
+                ):
+                    ratio_min = min(ratios)
+                    ratio_max = max(ratios)
+                    ratio = sum(ratios) / 3.0
+                    tolerance = max(1.0e-3, abs(active_unit) * 1.0e-3)
+                    if (
+                        ratio_max - ratio_min <= tolerance
+                        and abs(ratio - active_unit) <= tolerance
+                    ):
+                        pose_scale = active_unit
+            except (KeyError, TypeError, ValueError, OverflowError):
+                # Keep the authored Pose untouched when there is no reliable
+                # basis comparison; this is safer than an unconditional scale.
+                pose_scale = 1.0
+            canonical_bind_by_model[bone_id] = _scale_affine_matrix(
+                pose,
+                pose_scale,
+                label=f"Bone {bone_id} authored bind",
+            )
+        elif bone_id in canonical_bone_worlds:
+            canonical_bind_by_model[bone_id] = list(canonical_bone_worlds[bone_id])
+
+    # Only a Mesh with at least one positive-weight Cluster is skinned.
+    # Weightless helper/placeholder Clusters are intentionally excluded from
+    # the geometry-bake and Model-world reset contract.
+    skinned_mesh_ids = {
+        mesh_id
+        for mesh_id, rows in mesh_clusters.items()
+        if any(int(row.get("positive_weight_count", 0) or 0) > 0 for row in rows)
+    }
+    output_worlds = {
+        model_id: (
+            _identity_matrix() if model_id in skinned_mesh_ids else list(world)
+        )
+        for model_id, world in target_worlds.items()
+    }
+    return {
+        "source_worlds": worlds,
+        "output_worlds": output_worlds,
+        "domain_scales": domain_scales,
+        "bind_mesh_matrices": bind_mesh_matrices,
+        "mesh_clusters": mesh_clusters,
+        "cluster_matrices": canonical_cluster_matrices,
+        "canonical_bind_by_model": canonical_bind_by_model,
+        "skinned_mesh_ids": skinned_mesh_ids,
+        "unit_scale": unit_scale,
+        "geometry_domain": geometry_domain,
+        "axis_conversion": axis_conversion,
+    }
+
+
+def _decode_polygon_corners(
+    polygon_indices: Any,
+    *,
+    position_count: int,
+) -> tuple[list[int], list[tuple[int, int]], list[int]]:
+    if not isinstance(polygon_indices, list) or len(polygon_indices) < 3:
+        raise ValueError("PolygonVertexIndex is missing or too short")
+    source_indices: list[int] = []
+    faces: list[tuple[int, int]] = []
+    corner_faces: list[int] = []
+    face_begin = 0
+    face_index = 0
+    for corner_index, raw_value in enumerate(polygon_indices):
+        raw_index = int(raw_value)
+        is_face_end = raw_index < 0
+        position_index = ~raw_index if is_face_end else raw_index
+        if position_index < 0 or position_index >= position_count:
+            raise ValueError(
+                f"PolygonVertexIndex[{corner_index}] references position {position_index}"
+            )
+        source_indices.append(position_index)
+        corner_faces.append(face_index)
+        if is_face_end:
+            face_size = len(source_indices) - face_begin
+            if face_size < 3:
+                raise ValueError(f"Polygon {face_index} has fewer than three corners")
+            faces.append((face_begin, face_size))
+            face_begin = len(source_indices)
+            face_index += 1
+    if face_begin != len(source_indices):
+        raise ValueError("PolygonVertexIndex does not terminate its final polygon")
+    return source_indices, faces, corner_faces
+
+
+def _decode_corner_layer(
+    layer: FbxNode,
+    *,
+    value_child: str,
+    index_child: str,
+    tuple_size: int,
+    source_indices: list[int],
+    corner_faces: list[int],
+    face_count: int,
+    position_count: int,
+) -> list[tuple[float, ...]]:
+    raw_values = _child_value(layer, value_child)
+    if not isinstance(raw_values, list) or not raw_values or len(raw_values) % tuple_size:
+        raise ValueError(f"{value_child} is missing or malformed")
+    values = [
+        tuple(float(raw_values[offset + axis]) for axis in range(tuple_size))
+        for offset in range(0, len(raw_values), tuple_size)
+    ]
+    mapping = str(_child_value(layer, "MappingInformationType") or "").casefold()
+    if mapping == "bypolygonvertex":
+        mapped = list(range(len(source_indices)))
+        expected_count = len(source_indices)
+    elif mapping in {"byvertice", "byvertex"}:
+        mapped = list(source_indices)
+        expected_count = position_count
+    elif mapping == "bypolygon":
+        mapped = list(corner_faces)
+        expected_count = face_count
+    elif mapping == "allsame":
+        mapped = [0] * len(source_indices)
+        expected_count = 1
+    else:
+        raise ValueError(
+            f"unsupported MappingInformationType={mapping or '<missing>'}"
+        )
+
+    reference = str(_child_value(layer, "ReferenceInformationType") or "").casefold()
+    if reference == "direct":
+        direct = mapped
+    elif reference == "indextodirect":
+        raw_indices = _child_value(layer, index_child)
+        if isinstance(raw_indices, list):
+            if len(raw_indices) != expected_count:
+                raise ValueError(f"{index_child} has an unexpected row count")
+            direct = [int(raw_indices[index]) for index in mapped]
+        elif value_child == "Materials" and len(values) == expected_count:
+            # Blender and several FBX writers encode material slots as the
+            # per-polygon Materials array while retaining the IndexToDirect
+            # label; unlike UV/normal layers, no MaterialIndex child exists.
+            # In that form the polygon mapping selects the authored value
+            # directly.
+            direct = mapped
+        elif value_child == "Materials" and mapping == "allsame" and len(values) == 1:
+            # The AllSame material form similarly stores its one slot directly
+            # in Materials.
+            direct = [0] * len(source_indices)
+        else:
+            raise ValueError(f"{index_child} has an unexpected row count")
+    else:
+        raise ValueError(
+            f"unsupported ReferenceInformationType={reference or '<missing>'}"
+        )
+    if any(index < 0 or index >= len(values) for index in direct):
+        raise ValueError(f"{value_child} direct index is outside its value domain")
+    return [values[index] for index in direct]
+
+
+def _canonicalize_layer(
+    layer: FbxNode,
+    *,
+    value_child: str,
+    values: list[tuple[float, ...]],
+) -> None:
+    flat = [component for value in values for component in value]
+    _set_child_array(layer, value_child, "d", flat)
+    _set_layer_text(layer, "MappingInformationType", "ByPolygonVertex")
+    _set_layer_text(layer, "ReferenceInformationType", "Direct")
+    _remove_child(layer, "NormalsIndex")
+    _remove_child(layer, "UVIndex")
+
+
+def _rebuild_geometry_node(geometry: FbxNode) -> dict[str, Any]:
+    """Legacy in-place helper retained for compatibility; not used by conversion."""
+    raw_positions = _child_value(geometry, "Vertices")
+    raw_indices = _child_value(geometry, "PolygonVertexIndex")
+    if (
+        not isinstance(raw_positions, list)
+        or len(raw_positions) < 9
+        or len(raw_positions) % 3
+        or not isinstance(raw_indices, list)
+    ):
+        return {"status": "skipped", "reason": "geometry_without_triangle_data", "cp_to_output": {}}
+    try:
+        position_count = len(raw_positions) // 3
+        source_indices, faces, corner_faces = _decode_polygon_corners(
+            raw_indices,
+            position_count=position_count,
+        )
+        positions = [
+            tuple(float(raw_positions[offset + axis]) for axis in range(3))
+            for offset in range(0, len(raw_positions), 3)
+        ]
+    except (TypeError, ValueError, OverflowError) as exc:
+        return {"status": "skipped", "reason": f"invalid_geometry:{exc}", "cp_to_output": {}}
+
+    normal_nodes = [child for child in geometry.children if child.name == "LayerElementNormal"]
+    if len(normal_nodes) > 1:
+        return {"status": "skipped", "reason": "ambiguous_normal_layers", "cp_to_output": {}}
+    try:
+        normal_values = (
+            _decode_corner_layer(
+                normal_nodes[0],
+                value_child="Normals",
+                index_child="NormalsIndex",
+                tuple_size=3,
+                source_indices=source_indices,
+                corner_faces=corner_faces,
+                face_count=len(faces),
+                position_count=position_count,
+            )
+            if normal_nodes
+            else None
+        )
+        uv_nodes = [child for child in geometry.children if child.name == "LayerElementUV"]
+        uv_values = [
+            _decode_corner_layer(
+                layer,
+                value_child="UV",
+                index_child="UVIndex",
+                tuple_size=2,
+                source_indices=source_indices,
+                corner_faces=corner_faces,
+                face_count=len(faces),
+                position_count=position_count,
+            )
+            for layer in uv_nodes
+        ]
+    except (TypeError, ValueError, OverflowError) as exc:
+        return {"status": "skipped", "reason": f"invalid_corner_layer:{exc}", "cp_to_output": {}}
+
+    output_positions: list[tuple[float, float, float]] = []
+    corner_normals: list[tuple[float, float, float]] = []
+    corner_uvs: list[list[tuple[float, float]]] = [[] for _ in uv_values]
+    output_indices: list[int] = []
+    cp_to_output: dict[int, list[int]] = {index: [] for index in range(position_count)}
+    key_to_output: dict[tuple[Any, ...], int] = {}
+    corner_output: list[int] = []
+    for corner_index, source_index in enumerate(source_indices):
+        normal_key = normal_values[corner_index] if normal_values is not None else None
+        uv_key = tuple(channel[corner_index] for channel in uv_values)
+        key = (source_index, normal_key, uv_key)
+        output_index = key_to_output.get(key)
+        if output_index is None:
+            output_index = len(output_positions)
+            key_to_output[key] = output_index
+            output_positions.append(positions[source_index])
+            cp_to_output[source_index].append(output_index)
+        if normal_values is not None:
+            corner_normals.append(normal_values[corner_index])
+        for channel_index, channel in enumerate(uv_values):
+            corner_uvs[channel_index].append(channel[corner_index])
+        corner_output.append(output_index)
+    for face_begin, face_size in faces:
+        for local_index in range(face_size):
+            output_index = corner_output[face_begin + local_index]
+            output_indices.append(~output_index if local_index == face_size - 1 else output_index)
+
+    _set_child_array(
+        geometry,
+        "Vertices",
+        "d",
+        [component for position in output_positions for component in position],
+    )
+    _set_child_array(geometry, "PolygonVertexIndex", "i", output_indices)
+    if normal_nodes and normal_values is not None:
+        _canonicalize_layer(normal_nodes[0], value_child="Normals", values=corner_normals)
+    for layer, values in zip(
+        [child for child in geometry.children if child.name == "LayerElementUV"],
+        corner_uvs,
+    ):
+        _canonicalize_layer(layer, value_child="UV", values=values)
+    return {
+        "status": "rebuilt",
+        "reason": "corner_attributes_expanded",
+        "cp_to_output": cp_to_output,
+        "source_vertex_count": position_count,
+        "output_vertex_count": len(output_positions),
+        "normal_split": bool(normal_values is not None),
+        "uv_channel_count": len(uv_values),
+    }
+
+
+def _object_id(node: FbxNode) -> int:
+    if not node.properties or not isinstance(node.properties[0], int):
+        return 0
+    return int(node.properties[0])
+
+
+def _rebuild_skin_indices(
+    objects: FbxNode | None,
+    connections: FbxNode | None,
+    geometry_maps: dict[int, dict[int, list[int]]],
+) -> int:
+    if objects is None or connections is None or not geometry_maps:
+        return 0
+    objects_by_id = {
+        _object_id(node): node
+        for node in objects.children
+        if _object_id(node) > 0
+    }
+    parents_by_child: dict[int, list[int]] = {}
+    for connection in connections.children:
+        values = connection.properties
+        if connection.name != "C" or len(values) < 3 or values[0] != "OO":
+            continue
+        if not isinstance(values[1], int) or not isinstance(values[2], int):
+            continue
+        parents_by_child.setdefault(int(values[1]), []).append(int(values[2]))
+
+    changed = 0
+    for cluster_id, cluster in objects_by_id.items():
+        if cluster.name != "Deformer" or len(cluster.properties) < 3:
+            continue
+        if str(cluster.properties[2]).casefold() != "cluster":
+            continue
+        skin_ids = [
+            parent_id
+            for parent_id in parents_by_child.get(cluster_id, [])
+            if objects_by_id.get(parent_id) is not None
+            and objects_by_id[parent_id].name == "Deformer"
+            and len(objects_by_id[parent_id].properties) >= 3
+            and str(objects_by_id[parent_id].properties[2]).casefold() == "skin"
+        ]
+        geometry_ids = [
+            geometry_id
+            for skin_id in skin_ids
+            for geometry_id in parents_by_child.get(skin_id, [])
+            if geometry_id in geometry_maps
+        ]
+        geometry_ids = sorted(set(geometry_ids))
+        if len(geometry_ids) != 1:
+            continue
+        mapping = geometry_maps[geometry_ids[0]]
+        indexes_node = _child_node(cluster, "Indexes")
+        weights_node = _child_node(cluster, "Weights")
+        if (
+            indexes_node is None
+            or weights_node is None
+            or not indexes_node.properties
+            or not weights_node.properties
+            or not isinstance(indexes_node.properties[0], list)
+            or not isinstance(weights_node.properties[0], list)
+            or len(indexes_node.properties[0]) != len(weights_node.properties[0])
+        ):
+            continue
+        expanded: dict[int, float] = {}
+        order: list[int] = []
+        for raw_index, raw_weight in zip(indexes_node.properties[0], weights_node.properties[0]):
+            source_index = int(raw_index)
+            output_indices = mapping.get(source_index)
+            if not output_indices:
+                output_indices = [source_index]
+            for output_index in output_indices:
+                if output_index not in expanded:
+                    order.append(output_index)
+                    expanded[output_index] = 0.0
+                expanded[output_index] += float(raw_weight)
+        new_indexes = [int(index) for index in order]
+        new_weights = [float(expanded[index]) for index in order]
+        if new_indexes != indexes_node.properties[0] or new_weights != weights_node.properties[0]:
+            indexes_node.properties[0] = new_indexes
+            weights_node.properties[0] = new_weights
+            changed += 1
+    return changed
+
+
+def _safe_rebuild_semantic_geometry(roots: list[FbxNode]) -> dict[str, Any]:
+    objects = _first_root(roots, "Objects")
+    connections = _first_root(roots, "Connections")
+    if objects is None:
+        return {
+            "geometry_rebuilt_count": 0,
+            "geometry_skipped_count": 0,
+            "skin_clusters_remapped": 0,
+            "semantic_rebuild": "binary_semantic_safe_rebuilder",
+        }
+    geometry_maps: dict[int, dict[int, list[int]]] = {}
+    rebuilt = 0
+    skipped = 0
+    skipped_reasons: list[str] = []
+    for geometry in objects.children:
+        if geometry.name != "Geometry":
+            continue
+        geometry_id = _object_id(geometry)
+        result = _rebuild_geometry_node(geometry)
+        if result.get("status") == "rebuilt":
+            rebuilt += 1
+            if geometry_id > 0:
+                geometry_maps[geometry_id] = result["cp_to_output"]
+        else:
+            skipped += 1
+            reason = str(result.get("reason", "unknown"))
+            if reason not in skipped_reasons:
+                skipped_reasons.append(reason)
+    clusters_remapped = _rebuild_skin_indices(objects, connections, geometry_maps)
+    return {
+        "geometry_rebuilt_count": rebuilt,
+        "geometry_skipped_count": skipped,
+        "geometry_skip_reasons": skipped_reasons,
+        "skin_clusters_remapped": clusters_remapped,
+        "semantic_rebuild": "binary_semantic_safe_rebuilder",
+    }
+
+
+def normalize_generic_tree(roots: list[FbxNode]) -> dict[str, Any]:
+    """Apply document-level cleanup before the dedicated semantic rebuild."""
+    removed = _remove_max_metadata(roots)
+    _set_creator(roots)
+    return {
+        "removed_max_metadata": removed,
+        "axis_policy": "normalize_to_xyz_axes",
+        "scene_policy": "binary_semantic_safe_rebuilder",
+        "geometry_rebuilt_count": 0,
+        "geometry_skipped_count": 0,
+        "geometry_skip_reasons": [],
+        "skin_clusters_remapped": 0,
+        "semantic_rebuild": "binary_semantic_safe_rebuilder",
+    }
+
+
+def _clone_generic_node(
+    node: FbxNode,
+    *,
+    id_map: dict[int, int] | None = None,
+    strip_max_metadata: bool = True,
+    in_pose_node: bool = False,
+) -> FbxNode | None:
+    """Clone one FBX node while removing producer-only metadata and remapping IDs."""
+    values = list(node.properties)
+    types = list(node.property_types)
+    if strip_max_metadata and node.name == "P" and values:
+        if _property_name(node) in {"MaxHandle", "UDP3DSMAX"}:
+            return None
+    if id_map and values and isinstance(values[0], int):
+        values[0] = id_map.get(int(values[0]), int(values[0]))
+    if in_pose_node and node.name == "Node" and values and isinstance(values[0], int):
+        values[0] = id_map.get(int(values[0]), int(values[0])) if id_map else values[0]
+    children: list[FbxNode] = []
+    for child in node.children:
+        cloned = _clone_generic_node(
+            child,
+            id_map=id_map,
+            strip_max_metadata=strip_max_metadata,
+            in_pose_node=in_pose_node or node.name == "PoseNode",
+        )
+        if cloned is not None:
+            children.append(cloned)
+    return FbxNode(node.name, values, types, children)
+
+
+def _generic_global_settings(
+    source: FbxNode,
+    *,
+    canonicalize_axes: bool = True,
+) -> FbxNode:
+    """Clone GlobalSettings and declare the converter's canonical X/Y/Z axes."""
+    cloned = _clone_generic_node(source, strip_max_metadata=False)
+    if cloned is None:
+        cloned = FbxNode("GlobalSettings", [], [], [])
+    if not canonicalize_axes:
+        # Without a complete source axis signature, changing only the
+        # metadata would reinterpret every existing vertex and Model matrix.
+        # Preserve the producer's settings and let the caller use the
+        # original-coordinate fallback instead.
+        return cloned
+    properties = _child_node(cloned, "Properties70")
+    if properties is None:
+        properties = cloned.add("Properties70")
+    target = {
+        "CoordAxis": 0,
+        "CoordAxisSign": 1,
+        "UpAxis": 1,
+        "UpAxisSign": 1,
+        "FrontAxis": 2,
+        "FrontAxisSign": 1,
+    }
+    found: set[str] = set()
+    for property_node in properties.children:
+        name = _property_name(property_node)
+        if name not in target or not property_node.properties:
+            continue
+        property_node.properties[-1] = target[name]
+        if property_node.property_types:
+            property_node.property_types[-1] = "I"
+        found.add(name)
+    for name, value in target.items():
+        if name in found:
+            continue
+        properties.add(
+            "P",
+            ("S", name),
+            ("S", "int"),
+            ("S", "Integer"),
+            ("S", ""),
+            ("I", value),
+        )
+    return cloned
+
+
+def _generic_object_name(node: FbxNode, fallback: str) -> str:
+    if len(node.properties) > 1:
+        value = str(node.properties[1] or "")
+        value = value.split("\x00", 1)[0].strip()
+        if value:
+            return value
+    return fallback
+
+
+def _unique_model_names(models: Iterable[FbxNode]) -> dict[int, str]:
+    """Give every public Model name a stable source-ID-backed identity."""
+    rows = [
+        (_object_id(model), _generic_object_name(model, "Model"))
+        for model in models
+        if _object_id(model) > 0
+    ]
+    counts: dict[str, int] = {}
+    for _source_id, base in rows:
+        counts[base] = counts.get(base, 0) + 1
+    used: set[str] = set()
+    output: dict[int, str] = {}
+    for source_id, base in sorted(rows):
+        candidate = (
+            base
+            if counts.get(base, 0) == 1
+            else f"{base}__CIX_{source_id}"
+        )
+        if candidate in used:
+            candidate = f"{candidate}_{source_id}"
+        used.add(candidate)
+        output[source_id] = candidate
+    return output
+
+
+def _copy_semantic_properties(
+    source: FbxNode,
+    *,
+    excluded_names: set[str] | None = None,
+) -> FbxNode | None:
+    """Read authored non-transform Properties70 values into a fresh container."""
+    source_properties = _child_node(source, "Properties70")
+    if source_properties is None:
+        return None
+    properties = FbxNode("Properties70", [], [], [])
+    for property_node in source_properties.children:
+        if property_node.name != "P" or not property_node.properties:
+            continue
+        excluded = {"MaxHandle"} if excluded_names is None else excluded_names
+        if _property_name(property_node) in excluded:
+            continue
+        properties.children.append(
+            FbxNode(
+                "P",
+                list(property_node.properties),
+                list(property_node.property_types),
+                [],
+            )
+        )
+    return properties if properties.children else None
+
+
+def _safe_float_rows(values: Any, width: int) -> list[list[float]]:
+    if not isinstance(values, list) or len(values) % width:
+        return []
+    rows: list[list[float]] = []
+    for offset in range(0, len(values), width):
+        row = [float(values[offset + axis]) for axis in range(width)]
+        if not all(math.isfinite(value) for value in row):
+            return []
+        rows.append(row)
+    return rows
+
+
+def _extract_geometry_semantics(
+    source: FbxNode,
+    *,
+    position_matrix: list[float] | None = None,
+    normal_matrix: list[float] | None = None,
+) -> dict[str, Any]:
+    """Decode one source Geometry into an independent canonical payload."""
+    raw_positions = _child_value(source, "Vertices")
+    raw_indices = _child_value(source, "PolygonVertexIndex")
+    if not isinstance(raw_positions, list) or len(raw_positions) < 9 or len(raw_positions) % 3:
+        return {"status": "header_only", "reason": "geometry_without_positions", "cp_to_output": {}}
+    try:
+        positions = _safe_float_rows(raw_positions, 3)
+    except (TypeError, ValueError, OverflowError):
+        positions = []
+    if not positions:
+        return {"status": "header_only", "reason": "geometry_with_invalid_positions", "cp_to_output": {}}
+    try:
+        source_indices, source_faces, corner_faces = _decode_polygon_corners(
+            raw_indices,
+            position_count=len(positions),
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        return {"status": "header_only", "reason": f"geometry_without_faces:{exc}", "cp_to_output": {}}
+
+    raw_edges = _child_value(source, "Edges")
+    edges: list[int] | None = None
+    if isinstance(raw_edges, list):
+        try:
+            edges = [int(value) for value in raw_edges]
+        except (TypeError, ValueError, OverflowError):
+            edges = None
+
+    normal_values: list[tuple[float, ...]] | None = None
+    normal_nodes = [child for child in source.children if child.name == "LayerElementNormal"]
+    if len(normal_nodes) > 1:
+        return {
+            "status": "header_only",
+            "reason": "ambiguous_normal_layers",
+            "cp_to_output": {},
+        }
+    if len(normal_nodes) == 1:
+        try:
+            normal_values = _decode_corner_layer(
+                normal_nodes[0],
+                value_child="Normals",
+                index_child="NormalsIndex",
+                tuple_size=3,
+                source_indices=source_indices,
+                corner_faces=corner_faces,
+                face_count=len(source_faces),
+                position_count=len(positions),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            return {
+                "status": "header_only",
+                "reason": f"invalid_normal_layer:{exc}",
+                "cp_to_output": {},
+            }
+
+    uv_values: list[list[tuple[float, ...]]] = []
+    uv_names: list[str] = []
+    for uv_node in (child for child in source.children if child.name == "LayerElementUV"):
+        try:
+            values = _decode_corner_layer(
+                uv_node,
+                value_child="UV",
+                index_child="UVIndex",
+                tuple_size=2,
+                source_indices=source_indices,
+                corner_faces=corner_faces,
+                face_count=len(source_faces),
+                position_count=len(positions),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            return {
+                "status": "header_only",
+                "reason": f"invalid_uv_layer:{exc}",
+                "cp_to_output": {},
+            }
+        uv_values.append(values)
+        uv_names.append(str(_child_value(uv_node, "Name") or f"map{len(uv_values)}"))
+
+    color_values: list[list[tuple[float, ...]]] = []
+    for color_node in (child for child in source.children if child.name == "LayerElementColor"):
+        try:
+            values = _decode_corner_layer(
+                color_node,
+                value_child="Colors",
+                index_child="ColorIndex",
+                tuple_size=4,
+                source_indices=source_indices,
+                corner_faces=corner_faces,
+                face_count=len(source_faces),
+                position_count=len(positions),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            return {
+                "status": "header_only",
+                "reason": f"invalid_color_layer:{exc}",
+                "cp_to_output": {},
+            }
+        color_values.append(values)
+
+    material_face_values: list[list[int]] = []
+    for material_node in (child for child in source.children if child.name == "LayerElementMaterial"):
+        try:
+            values = _decode_corner_layer(
+                material_node,
+                value_child="Materials",
+                index_child="MaterialIndex",
+                tuple_size=1,
+                source_indices=source_indices,
+                corner_faces=corner_faces,
+                face_count=len(source_faces),
+                position_count=len(positions),
+            )
+            cursor = 0
+            face_values: list[int] = []
+            for _face_begin, face_size in source_faces:
+                if cursor >= len(values):
+                    raise ValueError("Material layer has no value for a polygon")
+                face_values.append(int(round(float(values[cursor][0]))))
+                cursor += face_size
+            material_face_values.append(face_values)
+        except (TypeError, ValueError, OverflowError) as exc:
+            return {
+                "status": "header_only",
+                "reason": f"invalid_material_layer:{exc}",
+                "cp_to_output": {},
+            }
+
+    output_positions: list[list[float]] = []
+    output_faces: list[list[int]] = []
+    corner_normals: list[list[float]] = []
+    corner_uvs: list[list[list[float]]] = [[] for _ in uv_values]
+    cp_to_output: dict[int, list[int]] = {index: [] for index in range(len(positions))}
+    corner_output: list[int] = []
+    key_to_output: dict[tuple[Any, ...], int] = {}
+    for corner_index, source_index in enumerate(source_indices):
+        face_index = corner_faces[corner_index]
+        normal_key: tuple[float, ...] | None = None
+        normal_row: tuple[float, ...] | None = None
+        if normal_values is not None:
+            normal_row = tuple(float(value) for value in normal_values[corner_index][:3])
+            normal_key = normal_row
+        uv_key = tuple(channel[corner_index] for channel in uv_values)
+        color_key = tuple(channel[corner_index] for channel in color_values)
+        key = (source_index, normal_key, uv_key, color_key)
+        output_index = key_to_output.get(key)
+        if output_index is None:
+            output_index = len(output_positions)
+            key_to_output[key] = output_index
+            position = list(positions[source_index])
+            if position_matrix is not None:
+                position = _generic_transform_position_row_major(position, position_matrix)
+            output_positions.append(position)
+            cp_to_output[source_index].append(output_index)
+        if normal_row is not None:
+            normal = list(normal_row)
+            if normal_matrix is not None:
+                normal = _generic_transform_normal_row_major(normal, normal_matrix)
+            corner_normals.append(normal)
+        for channel_index, channel in enumerate(uv_values):
+            corner_uvs[channel_index].append([float(value) for value in channel[corner_index][:2]])
+        corner_output.append(output_index)
+
+    cursor = 0
+    for _face_begin, face_size in source_faces:
+        output_faces.append(corner_output[cursor : cursor + face_size])
+        cursor += face_size
+
+    uv_channels = [
+        {
+            "channel": channel_index + 1,
+            "name": uv_names[channel_index],
+            "values": values,
+            "corner_indices": list(range(len(values))),
+        }
+        for channel_index, values in enumerate(corner_uvs)
+    ]
+    colors = [
+        {
+            "name": f"Color{channel_index + 1}",
+            "values": [list(value) for value in values],
+            "corner_indices": list(range(len(values))),
+        }
+        for channel_index, values in enumerate(
+            [
+                [
+                    tuple(float(component) for component in color_values[channel_index][corner_index])
+                    for corner_index in range(len(source_indices))
+                ]
+                for channel_index in range(len(color_values))
+            ]
+        )
+    ]
+    return {
+        "status": "rebuilt",
+        "reason": "semantic_geometry_decode",
+        "vertices": output_positions,
+        "faces": output_faces,
+        "loop_normals": corner_normals if normal_values is not None else [],
+        "uv_channels": uv_channels,
+        "colors": colors,
+        "edges": edges,
+        "materials": [
+            {
+                "values": values,
+                "indices": list(range(len(values))),
+            }
+            for values in material_face_values
+        ],
+        "cp_to_output": cp_to_output,
+        "source_vertex_count": len(positions),
+        "output_vertex_count": len(output_positions),
+        "normal_split": bool(normal_values is not None),
+        "uv_channel_count": len(uv_channels),
+    }
+
+
+def _polygon_indices_from_faces(faces: list[list[int]]) -> list[int]:
+    output: list[int] = []
+    for face in faces:
+        for index, vertex in enumerate(face):
+            output.append(~int(vertex) if index == len(face) - 1 else int(vertex))
+    return output
+
+
+def _safe_rebuilder_source_graph(roots: list[FbxNode]) -> dict[str, Any]:
+    """Read the source Model/Geometry/Skeleton graph before rebuilding it."""
+    objects = _first_root(roots, "Objects")
+    connections = _first_root(roots, "Connections")
+    if objects is None:
+        return {
+            "object_nodes": [],
+            "models": [],
+            "geometries": [],
+            "deformers": [],
+            "poses": [],
+            "model_parent_ids": {},
+            "model_geometry_ids": {},
+            "model_attribute_ids": {},
+            "mesh_model_ids": [],
+            "bone_model_ids": [],
+            "structural_model_ids": [],
+            "source_connection_count": 0,
+        }
+
+    object_nodes = [node for node in objects.children if _object_id(node) > 0]
+    objects_by_id: dict[int, FbxNode] = {}
+    duplicate_ids: list[int] = []
+    for node in object_nodes:
+        object_id = _object_id(node)
+        if object_id in objects_by_id:
+            duplicate_ids.append(object_id)
+        else:
+            objects_by_id[object_id] = node
+    if duplicate_ids:
+        raise ValueError(
+            "Safe Rebuilder source Objects contain duplicate IDs: "
+            + ", ".join(str(value) for value in sorted(set(duplicate_ids))[:8])
+        )
+
+    models = [node for node in object_nodes if node.name == "Model"]
+    geometries = [node for node in object_nodes if node.name == "Geometry"]
+    deformers = [node for node in object_nodes if node.name == "Deformer"]
+    poses = [node for node in object_nodes if node.name == "Pose"]
+    model_parent_candidates: dict[int, list[int]] = {}
+    model_geometry_ids: dict[int, list[int]] = {}
+    model_attribute_ids: dict[int, list[int]] = {}
+    source_connection_count = 0
+    if connections is not None:
+        for connection in connections.children:
+            if connection.name != "C" or len(connection.properties) < 3:
+                continue
+            if not isinstance(connection.properties[1], int) or not isinstance(
+                connection.properties[2], int
+            ):
+                continue
+            source_connection_count += 1
+            kind = str(connection.properties[0] or "")
+            if kind != "OO":
+                continue
+            child_id = int(connection.properties[1])
+            parent_id = int(connection.properties[2])
+            child_node = objects_by_id.get(child_id)
+            parent_node = objects_by_id.get(parent_id)
+            if child_node is None:
+                continue
+            if child_node.name == "Model" and (
+                parent_id == 0 or (parent_node is not None and parent_node.name == "Model")
+            ):
+                model_parent_candidates.setdefault(child_id, []).append(parent_id)
+            elif (
+                child_node.name == "Geometry"
+                and parent_node is not None
+                and parent_node.name == "Model"
+            ):
+                model_geometry_ids.setdefault(parent_id, []).append(child_id)
+            elif (
+                child_node.name == "NodeAttribute"
+                and parent_node is not None
+                and parent_node.name == "Model"
+            ):
+                model_attribute_ids.setdefault(parent_id, []).append(child_id)
+
+    normalized_parents: dict[int, int] = {}
+    for model in models:
+        model_id = _object_id(model)
+        candidates = list(dict.fromkeys(model_parent_candidates.get(model_id, [])))
+        non_root = [value for value in candidates if value != 0]
+        normalized_parents[model_id] = non_root[0] if non_root else 0
+        model_geometry_ids[model_id] = sorted(
+            set(model_geometry_ids.get(model_id, []))
+        )
+        model_attribute_ids[model_id] = sorted(
+            set(model_attribute_ids.get(model_id, []))
+        )
+
+    mesh_model_ids = [
+        _object_id(model)
+        for model in models
+        if model_geometry_ids.get(_object_id(model))
+    ]
+    bone_model_ids = [
+        _object_id(model)
+        for model in models
+        if _node_type(model).casefold() == "limbnode"
+    ]
+    mesh_set = set(mesh_model_ids)
+    bone_set = set(bone_model_ids)
+    structural_model_ids = [
+        _object_id(model)
+        for model in models
+        if _object_id(model) not in mesh_set and _object_id(model) not in bone_set
+    ]
+    return {
+        "object_nodes": object_nodes,
+        "objects_by_id": objects_by_id,
+        "models": models,
+        "geometries": geometries,
+        "deformers": deformers,
+        "poses": poses,
+        "model_parent_ids": normalized_parents,
+        "model_geometry_ids": model_geometry_ids,
+        "model_attribute_ids": model_attribute_ids,
+        "mesh_model_ids": mesh_model_ids,
+        "bone_model_ids": bone_model_ids,
+        "structural_model_ids": structural_model_ids,
+        "source_connection_count": source_connection_count,
+    }
+
+
+def _generic_model_node(
+    source: FbxNode,
+    object_id: int,
+    *,
+    model_type: str | None = None,
+    local_matrix: list[float] | None = None,
+    name_override: str | None = None,
+) -> FbxNode:
+    name = str(name_override) if name_override is not None else _generic_object_name(source, "Model")
+    # Model IDs and display names are regenerated below.  The route handle is
+    # the source node's stable identity, so capture it before any new ID/name
+    # is assigned and attach it to this exact rebuilt Model.
+    route_handle = _model_route_handle(source)
+    resolved_type = (
+        str(model_type)
+        if model_type is not None
+        else (str(source.properties[2] or "Null") if len(source.properties) > 2 else "Null")
+    )
+    model = FbxNode(
+        "Model",
+        [int(object_id), f"{name}\x00\x01Model", resolved_type],
+        ["L", "S", "S"],
+        [],
+    )
+    source_version = _child_value(source, "Version")
+    try:
+        version = int(source_version) if source_version is not None else 232
+    except (TypeError, ValueError, OverflowError):
+        version = 232
+    model.add("Version", ("I", version))
+    try:
+        transform = (
+            _finite_matrix(local_matrix, f"Model {name} local matrix")
+            if local_matrix is not None
+            else _source_model_local_matrix(source)
+        )
+        translation, rotation, scale = _matrix_to_trs(
+            transform, label=f"Model {name} local matrix"
+        )
+    except (TypeError, ValueError, OverflowError):
+        translation = _model_property_vector(source, "Lcl Translation", 3, [0.0, 0.0, 0.0])
+        rotation = _model_property_vector(source, "Lcl Rotation", 3, [0.0, 0.0, 0.0])
+        scale = _model_property_vector(source, "Lcl Scaling", 3, [1.0, 1.0, 1.0])
+    semantic_properties = _copy_semantic_properties(
+        source, excluded_names=_PRODUCER_TRANSFORM_PROPERTIES
+    )
+    if semantic_properties is None:
+        semantic_properties = FbxNode("Properties70", [], [], [])
+    if route_handle > 0:
+        # Replace any source spelling of the marker (direct property or
+        # UDP3DSMAX blob) with one canonical Probe-readable row.  This keeps
+        # the value paired with this Model even when its ID/name changes and
+        # avoids stale or duplicate route rows in the rebuilt node.
+        semantic_properties.children = [
+            property_node
+            for property_node in semantic_properties.children
+            if not (
+                property_node.name == "P"
+                and _route_handle_from_property(property_node) > 0
+            )
+        ]
+        semantic_properties.children.append(
+            _canonical_route_handle_property(route_handle)
+        )
+    semantic_properties.children.insert(
+        0,
+        FbxNode(
+            "P",
+            ["Lcl Translation", "Lcl Translation", "", "A", *translation],
+            ["S", "S", "S", "S", "D", "D", "D"],
+            [],
+        ),
+    )
+    semantic_properties.children.insert(
+        1,
+        FbxNode(
+            "P",
+            ["Lcl Rotation", "Lcl Rotation", "", "A", *rotation],
+            ["S", "S", "S", "S", "D", "D", "D"],
+            [],
+        ),
+    )
+    semantic_properties.children.insert(
+        2,
+        FbxNode(
+            "P",
+            ["Lcl Scaling", "Lcl Scaling", "", "A", *scale],
+            ["S", "S", "S", "S", "D", "D", "D"],
+            [],
+        ),
+    )
+    semantic_properties.children.insert(
+        3,
+        FbxNode(
+            "P",
+            ["RotationOrder", "enum", "", "", 0],
+            ["S", "S", "S", "S", "I"],
+            [],
+        ),
+    )
+    semantic_properties.children.insert(
+        4,
+        FbxNode(
+            "P",
+            ["InheritType", "enum", "", "", 1],
+            ["S", "S", "S", "S", "I"],
+            [],
+        ),
+    )
+    model.children.append(semantic_properties)
+    for child_name, kind in (
+        ("MultiLayer", "I"),
+        ("MultiTake", "I"),
+    ):
+        value = _child_value(source, child_name)
+        if value is not None:
+            try:
+                model.add(child_name, (kind, int(value)))
+            except (TypeError, ValueError, OverflowError):
+                pass
+    shading = _child_value(source, "Shading")
+    model.add("Shading", ("C", bool(shading) if shading is not None else True))
+    culling = _child_value(source, "Culling")
+    model.add("Culling", ("S", str(culling or "CullingOff")))
+    return model
+
+
+def _generic_structure_model_node(
+    source: FbxNode,
+    object_id: int,
+    *,
+    local_matrix: list[float] | None = None,
+    name_override: str | None = None,
+) -> FbxNode:
+    """Rebuild a non-bone, non-geometry structural Model."""
+    return _generic_model_node(
+        source,
+        object_id,
+        local_matrix=local_matrix,
+        name_override=name_override,
+    )
+
+
+def _generic_mesh_model_node(
+    source: FbxNode,
+    object_id: int,
+    *,
+    local_matrix: list[float] | None = None,
+    name_override: str | None = None,
+) -> FbxNode:
+    """Rebuild one Mesh Model from the source Model identity."""
+    model = _generic_model_node(
+        source,
+        object_id,
+        model_type="Mesh",
+        local_matrix=local_matrix,
+        name_override=name_override,
+    )
+    properties = _child_node(model, "Properties70")
+    if properties is None:
+        properties = FbxNode("Properties70", [], [], [])
+        model.children.insert(1, properties)
+    if not any(
+        _property_name(property_node) == "DefaultAttributeIndex"
+        for property_node in properties.children
+    ):
+        # MAX uses this Model property to classify even a zero-face Geometry as
+        # a Mesh. Without it, an otherwise valid empty Mesh imports as a Dummy.
+        properties.children.append(
+            FbxNode(
+                "P",
+                ["DefaultAttributeIndex", "int", "Integer", "", 0],
+                ["S", "S", "S", "S", "I"],
+                [],
+            )
+        )
+    return model
+
+
+def _generic_bone_model_node(
+    source: FbxNode,
+    object_id: int,
+    *,
+    local_matrix: list[float] | None = None,
+    name_override: str | None = None,
+) -> FbxNode:
+    """Rebuild one LimbNode Model from the source skeleton identity."""
+    return _generic_model_node(
+        source,
+        object_id,
+        model_type="LimbNode",
+        local_matrix=local_matrix,
+        name_override=name_override,
+    )
+
+
+def _generic_node_attribute(
+    object_id: int,
+    model_name: str,
+    model_type: str,
+    *,
+    bone: bool = False,
+) -> FbxNode:
+    attribute_type = "LimbNode" if bone or model_type.casefold() == "limbnode" else "Null"
+    attribute = FbxNode(
+        "NodeAttribute",
+        [int(object_id), f"{model_name}\x00\x01NodeAttribute", attribute_type],
+        ["L", "S", "S"],
+        [],
+    )
+    attribute.add(
+        "TypeFlags", ("S", "Skeleton" if attribute_type == "LimbNode" else "Null")
+    )
+    if attribute_type == "LimbNode":
+        properties = attribute.add("Properties70")
+        properties.add(
+            "P",
+            ("S", "Size"),
+            ("S", "double"),
+            ("S", "Number"),
+            ("S", ""),
+            ("D", 1.5),
+        )
+    return attribute
+
+
+def _generic_geometry_node(
+    source: FbxNode,
+    object_id: int,
+    *,
+    name_override: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> FbxNode:
+    """Write a fresh Geometry node from decoded topology and corner channels."""
+    name = (
+        str(name_override)
+        if name_override is not None
+        else _generic_object_name(source, "Geometry")
+    )
+    payload = payload if isinstance(payload, dict) else _extract_geometry_semantics(source)
+    geometry = FbxNode(
+        "Geometry",
+        [int(object_id), f"{name}\x00\x01Geometry", "Mesh"],
+        ["L", "S", "S"],
+        [],
+    )
+    source_geometry_id = _object_id(source)
+    if source_geometry_id > 0:
+        properties = geometry.add("Properties70")
+        properties.add(
+            "P",
+            ("S", "CodexSourceGeometryId"),
+            ("S", "KString"),
+            ("S", ""),
+            ("S", "U"),
+            ("S", str(source_geometry_id)),
+        )
+    geometry.add("GeometryVersion", ("I", 124))
+    generated_children = {
+        "Properties70",
+        "GeometryVersion",
+        "Vertices",
+        "PolygonVertexIndex",
+        "Edges",
+        "LayerElementSmoothing",
+        "LayerElementNormal",
+        "LayerElementUV",
+        "LayerElementColor",
+        "LayerElementMaterial",
+        "Layer",
+    }
+
+    def preserve_unknown_children() -> None:
+        for child in source.children:
+            if child.name in generated_children:
+                continue
+            cloned = _clone_generic_node(
+                child,
+                strip_max_metadata=True,
+            )
+            if cloned is not None:
+                geometry.children.append(cloned)
+
+    if payload.get("status") != "rebuilt":
+        preserve_unknown_children()
+        return geometry
+
+    vertices = payload.get("vertices", [])
+    faces = payload.get("faces", [])
+    normals = payload.get("loop_normals", [])
+    uv_channels = payload.get("uv_channels", [])
+    colors = payload.get("colors", [])
+    materials = payload.get("materials", [])
+    geometry.add(
+        "Vertices",
+        ("d", [float(component) for row in vertices for component in row[:3]]),
+    )
+    geometry.add("PolygonVertexIndex", ("i", _polygon_indices_from_faces(faces)))
+    edges = payload.get("edges")
+    if isinstance(edges, list):
+        geometry.add("Edges", ("i", [int(value) for value in edges]))
+    smoothing = geometry.add("LayerElementSmoothing", ("I", 0))
+    smoothing.add("Version", ("I", 102))
+    smoothing.add("Name", ("S", ""))
+    smoothing.add("MappingInformationType", ("S", "ByPolygon"))
+    smoothing.add("ReferenceInformationType", ("S", "Direct"))
+    smoothing.add("Smoothing", ("i", [1] * len(faces)))
+    if isinstance(normals, list) and len(normals) == sum(len(face) for face in faces):
+        normal_layer = geometry.add("LayerElementNormal", ("I", 0))
+        normal_layer.add("Version", ("I", 101))
+        normal_layer.add("Name", ("S", ""))
+        normal_layer.add("MappingInformationType", ("S", "ByPolygonVertex"))
+        normal_layer.add("ReferenceInformationType", ("S", "Direct"))
+        normal_layer.add(
+            "Normals",
+            ("d", [float(component) for row in normals for component in row[:3]]),
+        )
+    source_uv_nodes = [
+        child for child in source.children if child.name == "LayerElementUV"
+    ]
+    uv_nodes_by_index: dict[int, FbxNode] = {}
+    uv_node_order: list[tuple[int, FbxNode]] = []
+    for channel_index, channel in enumerate(uv_channels):
+        if not isinstance(channel, dict):
+            continue
+        values = channel.get("values", [])
+        indices = channel.get("corner_indices", [])
+        typed_index = channel_index
+        source_uv = None
+        if channel_index < len(source_uv_nodes):
+            source_uv = source_uv_nodes[channel_index]
+            if source_uv.properties and isinstance(source_uv.properties[0], int):
+                typed_index = int(source_uv.properties[0])
+        # Keep the producer's UV table/index contract intact.  The rebuilt
+        # polygon corners are unchanged, so duplicating UV values per corner
+        # is unnecessary and makes 3ds Max reinterpret the channel.  Only
+        # synthesize a channel when the source did not provide one.
+        source_mapping = (
+            str(_child_value(source_uv, "MappingInformationType") or "").casefold()
+            if source_uv is not None
+            else ""
+        )
+        if (
+            source_uv is not None
+            and source_mapping not in {"byvertice", "byvertex"}
+            and typed_index not in uv_nodes_by_index
+        ):
+            cloned_uv = _clone_generic_node(source_uv, strip_max_metadata=True)
+            if cloned_uv is not None:
+                geometry.children.append(cloned_uv)
+                uv_nodes_by_index[typed_index] = cloned_uv
+                uv_node_order.append((typed_index, cloned_uv))
+                continue
+        if typed_index in uv_nodes_by_index:
+            typed_index = channel_index
+        uv_layer = geometry.add("LayerElementUV", ("I", typed_index))
+        uv_layer.add("Version", ("I", 101))
+        uv_layer.add("Name", ("S", str(channel.get("name") or f"map{channel_index + 1}")))
+        uv_layer.add("MappingInformationType", ("S", "ByPolygonVertex"))
+        uv_layer.add("ReferenceInformationType", ("S", "IndexToDirect"))
+        uv_layer.add("UV", ("d", [float(component) for row in values for component in row[:2]]))
+        uv_layer.add("UVIndex", ("i", [int(value) for value in indices]))
+        uv_nodes_by_index[typed_index] = uv_layer
+        uv_node_order.append((typed_index, uv_layer))
+    for color_index, color in enumerate(colors):
+        if not isinstance(color, dict):
+            continue
+        values = color.get("values", [])
+        indices = color.get("corner_indices", [])
+        color_layer = geometry.add("LayerElementColor", ("I", color_index))
+        color_layer.add("Version", ("I", 101))
+        color_layer.add("Name", ("S", str(color.get("name") or f"Color{color_index + 1}")))
+        color_layer.add("MappingInformationType", ("S", "ByPolygonVertex"))
+        color_layer.add("ReferenceInformationType", ("S", "IndexToDirect"))
+        color_layer.add("Colors", ("d", [float(component) for row in values for component in row[:4]]))
+        color_layer.add("ColorIndex", ("i", [int(value) for value in indices]))
+    source_material_nodes = [
+        child for child in source.children if child.name == "LayerElementMaterial"
+    ]
+    for material_index, material in enumerate(materials):
+        if not isinstance(material, dict):
+            continue
+        # MAX-authored files use a non-standard but meaningful material
+        # contract: ByPolygon + IndexToDirect with the per-face slot values
+        # stored directly in Materials and no MaterialIndex child. Rebuild
+        # that LayerElement from the source so MAX does not reinterpret each
+        # face number as a different material slot.
+        if material_index < len(source_material_nodes):
+            cloned_material = _clone_generic_node(
+                source_material_nodes[material_index],
+                strip_max_metadata=True,
+            )
+            if cloned_material is not None:
+                geometry.children.append(cloned_material)
+                continue
+        values = [int(value) for value in material.get("values", [])]
+        material_layer = geometry.add("LayerElementMaterial", ("I", material_index))
+        material_layer.add("Version", ("I", 101))
+        material_layer.add("Name", ("S", ""))
+        material_layer.add("MappingInformationType", ("S", "ByPolygon"))
+        material_layer.add("ReferenceInformationType", ("S", "Direct"))
+        material_layer.add("Materials", ("i", values))
+    generated_layer_types = {
+        "LayerElementSmoothing",
+        "LayerElementNormal",
+        "LayerElementUV",
+        "LayerElementColor",
+        "LayerElementMaterial",
+    }
+    generated_bindings: dict[tuple[str, int], bool] = {
+        ("LayerElementSmoothing", 0): True,
+        ("LayerElementNormal", 0): isinstance(normals, list)
+        and len(normals) == sum(len(face) for face in faces),
+    }
+    generated_bindings.update(
+        {
+            ("LayerElementUV", typed_index): True
+            for typed_index, _node in uv_node_order
+        }
+    )
+    generated_bindings.update(
+        {
+            ("LayerElementColor", color_index): True
+            for color_index, _color in enumerate(colors)
+        }
+    )
+    generated_bindings.update(
+        {
+            ("LayerElementMaterial", material_index): True
+            for material_index, _material in enumerate(materials)
+        }
+    )
+
+    def layer_reference(layer_type: str, typed_index: int) -> FbxNode:
+        reference = FbxNode("LayerElement", [], [], [])
+        reference.add("Type", ("S", layer_type))
+        reference.add("TypedIndex", ("I", int(typed_index)))
+        return reference
+
+    source_layers = [child for child in source.children if child.name == "Layer"]
+    output_layers: list[FbxNode] = []
+    bound_keys: set[tuple[str, int]] = set()
+    for source_layer in source_layers:
+        layer = FbxNode(
+            "Layer",
+            list(source_layer.properties),
+            list(source_layer.property_types),
+            [],
+        )
+        for source_layer_element in source_layer.children:
+            if source_layer_element.name != "LayerElement":
+                cloned = _clone_generic_node(
+                    source_layer_element,
+                    strip_max_metadata=True,
+                )
+                if cloned is not None:
+                    layer.children.append(cloned)
+                continue
+            layer_type = str(_child_value(source_layer_element, "Type") or "")
+            if layer_type not in generated_layer_types:
+                cloned = _clone_generic_node(
+                    source_layer_element,
+                    strip_max_metadata=True,
+                )
+                if cloned is not None:
+                    layer.children.append(cloned)
+                continue
+            raw_typed_index = _child_value(source_layer_element, "TypedIndex")
+            try:
+                typed_index = int(raw_typed_index)
+            except (TypeError, ValueError, OverflowError):
+                typed_index = 0
+            key = (layer_type, typed_index)
+            if generated_bindings.get(key):
+                layer.children.append(layer_reference(layer_type, typed_index))
+                bound_keys.add(key)
+        output_layers.append(layer)
+
+    if not output_layers:
+        output_layers.append(FbxNode("Layer", [0], ["I"], []))
+        output_layers[0].add("Version", ("I", 100))
+
+    # A source Layer layout is authoritative for channel identity. Any
+    # generated element absent from that layout is attached to the first Layer
+    # as a compatibility fallback, while UV1/UV2 remain on their source Layers.
+    fallback_order: list[tuple[str, int]] = [
+        ("LayerElementSmoothing", 0),
+    ]
+    if generated_bindings.get(("LayerElementNormal", 0)):
+        fallback_order.append(("LayerElementNormal", 0))
+    fallback_order.extend(("LayerElementUV", typed_index) for typed_index, _node in uv_node_order)
+    fallback_order.extend(
+        ("LayerElementColor", color_index) for color_index, _color in enumerate(colors)
+    )
+    fallback_order.extend(
+        ("LayerElementMaterial", material_index)
+        for material_index, _material in enumerate(materials)
+    )
+    for key in fallback_order:
+        if generated_bindings.get(key) and key not in bound_keys:
+            output_layers[0].children.append(layer_reference(*key))
+            bound_keys.add(key)
+
+    def split_shared_uv_layers(layers: list[FbxNode]) -> list[FbxNode]:
+        """Keep every UV channel on its own Layer for MAX channel identity."""
+        used_layer_ids: set[int] = set()
+        for layer in layers:
+            if layer.properties and isinstance(layer.properties[0], int):
+                used_layer_ids.add(int(layer.properties[0]))
+        next_layer_id = max(used_layer_ids, default=-1) + 1
+
+        def allocate_layer_id(preferred: int) -> int:
+            nonlocal next_layer_id
+            if preferred not in used_layer_ids:
+                used_layer_ids.add(preferred)
+                return preferred
+            while next_layer_id in used_layer_ids:
+                next_layer_id += 1
+            allocated = next_layer_id
+            used_layer_ids.add(allocated)
+            next_layer_id += 1
+            return allocated
+
+        split_layers: list[FbxNode] = []
+        for layer in layers:
+            uv_elements = [
+                element
+                for element in layer.children
+                if element.name == "LayerElement"
+                and _child_value(element, "Type") == "LayerElementUV"
+            ]
+            if len(uv_elements) <= 1:
+                split_layers.append(layer)
+                continue
+
+            first_uv = uv_elements[0]
+            kept = FbxNode(
+                "Layer",
+                list(layer.properties),
+                list(layer.property_types),
+                [],
+            )
+            first_seen = False
+            for child in layer.children:
+                if child is not first_uv and child.name == "LayerElement" and _child_value(child, "Type") == "LayerElementUV":
+                    continue
+                kept.children.append(child)
+                if child is first_uv:
+                    first_seen = True
+            if not first_seen:
+                kept.children.append(first_uv)
+            split_layers.append(kept)
+
+            for extra_uv in uv_elements[1:]:
+                raw_index = _child_value(extra_uv, "TypedIndex")
+                try:
+                    preferred_id = int(raw_index)
+                except (TypeError, ValueError, OverflowError):
+                    preferred_id = next_layer_id
+                extra_layer = FbxNode(
+                    "Layer",
+                    [allocate_layer_id(preferred_id)],
+                    ["I"],
+                    [],
+                )
+                for child in layer.children:
+                    if child.name == "LayerElement":
+                        continue
+                    cloned = _clone_generic_node(child, strip_max_metadata=True)
+                    if cloned is not None:
+                        extra_layer.children.append(cloned)
+                cloned_uv = _clone_generic_node(extra_uv, strip_max_metadata=True)
+                if cloned_uv is not None:
+                    extra_layer.children.append(cloned_uv)
+                split_layers.append(extra_layer)
+        return split_layers
+
+    output_layers = split_shared_uv_layers(output_layers)
+    geometry.children.extend(output_layers)
+    preserve_unknown_children()
+    return geometry
+
+
+def _generic_empty_mesh_geometry(object_id: int, name: str) -> FbxNode:
+    """Build the empty Geometry used by the established OtherMesh contract."""
+    source = FbxNode(
+        "Geometry",
+        [0, f"{name}\x00\x01Geometry", "Mesh"],
+        ["L", "S", "S"],
+        [],
+    )
+    return _generic_geometry_node(
+        source,
+        object_id,
+        name_override=name,
+        payload={
+            "status": "rebuilt",
+            "vertices": [],
+            "faces": [],
+            "loop_normals": None,
+            "uv_channels": [],
+            "colors": [],
+            "materials": [],
+            "cp_to_output": {},
+        },
+    )
+
+
+def _generic_deformer_node(
+    source: FbxNode,
+    object_id: int,
+    *,
+    index_map: dict[int, list[int]] | None = None,
+    canonical_matrices: tuple[list[float], list[float]] | None = None,
+) -> FbxNode:
+    """Write a fresh Skin/Cluster node from its semantic arrays."""
+    deformer_type = _node_type(source) or "Deformer"
+    name = _generic_object_name(source, deformer_type)
+    node = FbxNode(
+        "Deformer",
+        [int(object_id), f"{name}\x00\x01Deformer", deformer_type],
+        ["L", "S", "S"],
+        [],
+    )
+    normalized_type = deformer_type.casefold()
+    if normalized_type not in {"skin", "cluster"}:
+        cloned = _clone_generic_node(source, strip_max_metadata=True)
+        if cloned is not None:
+            cloned.name = "Deformer"
+            if cloned.properties:
+                cloned.properties[0] = int(object_id)
+                cloned.property_types[0] = "L"
+            return cloned
+    if normalized_type == "skin":
+        version = _child_value(source, "Version")
+        try:
+            version = int(version) if version is not None else 101
+        except (TypeError, ValueError, OverflowError):
+            version = 101
+        node.add("Version", ("I", version))
+        accuracy = _child_value(source, "Link_DeformAcuracy")
+        try:
+            accuracy = float(accuracy) if accuracy is not None else 50.0
+        except (TypeError, ValueError, OverflowError):
+            accuracy = 50.0
+        node.add("Link_DeformAcuracy", ("D", accuracy))
+    elif normalized_type == "cluster":
+        version = _child_value(source, "Version")
+        try:
+            version = int(version) if version is not None else 100
+        except (TypeError, ValueError, OverflowError):
+            version = 100
+        node.add("Version", ("I", version))
+        user_data = _child_node(source, "UserData")
+        if user_data is not None and len(user_data.properties) >= 2:
+            node.add("UserData", ("S", str(user_data.properties[0] or "")), ("S", str(user_data.properties[1] or "")))
+        else:
+            node.add("UserData", ("S", ""), ("S", ""))
+        raw_indexes = _child_value(source, "Indexes")
+        raw_weights = _child_value(source, "Weights")
+        indexes: list[int] = []
+        weights: list[float] = []
+        if isinstance(raw_indexes, list) and isinstance(raw_weights, list):
+            expanded: dict[int, float] = {}
+            order: list[int] = []
+            for raw_index, raw_weight in zip(raw_indexes, raw_weights):
+                try:
+                    source_index = int(raw_index)
+                    weight = float(raw_weight)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                targets = (index_map or {}).get(source_index, [source_index])
+                for target in targets:
+                    target_index = int(target)
+                    if target_index not in expanded:
+                        order.append(target_index)
+                        expanded[target_index] = 0.0
+                    expanded[target_index] += weight
+            indexes = order
+            weights = [expanded[index] for index in order]
+        node.add("Indexes", ("i", indexes))
+        node.add("Weights", ("d", weights))
+        for child_name in ("Transform", "TransformLink"):
+            matrix = (
+                canonical_matrices[0 if child_name == "Transform" else 1]
+                if canonical_matrices is not None
+                else _child_value(source, child_name)
+            )
+            values = []
+            if isinstance(matrix, list):
+                try:
+                    values = [float(value) for value in matrix]
+                except (TypeError, ValueError, OverflowError):
+                    values = []
+            node.add(child_name, ("d", values))
+    else:
+        # Unknown deformer kinds are outside the Skin contract; keep only the
+        # authored Properties70 values so they remain identifiable without
+        # copying producer-only child records.
+        semantic_properties = _copy_semantic_properties(source)
+        if semantic_properties is not None:
+            node.children.append(semantic_properties)
+    semantic_properties = _copy_semantic_properties(source)
+    if semantic_properties is not None and normalized_type in {"skin", "cluster"}:
+        node.children.append(semantic_properties)
+    return node
+
+
+def _generic_pose_node(
+    source: FbxNode,
+    object_id: int,
+    id_map: dict[int, int],
+    *,
+    canonical_bind_matrices: dict[int, list[float]] | None = None,
+) -> FbxNode:
+    """Write a fresh Pose containing only valid model matrices."""
+    name = _generic_object_name(source, "BindPose")
+    pose_type = str(source.properties[2] or "BindPose") if len(source.properties) > 2 else "BindPose"
+    pose = FbxNode(
+        "Pose",
+        [int(object_id), f"{name}\x00\x01Pose", pose_type],
+        ["L", "S", "S"],
+        [],
+    )
+    source_type = _child_value(source, "Type")
+    pose.add("Type", ("S", str(source_type or pose_type)))
+    source_version = _child_value(source, "Version")
+    try:
+        version = int(source_version) if source_version is not None else 100
+    except (TypeError, ValueError, OverflowError):
+        version = 100
+    pose.add("Version", ("I", version))
+    valid_nodes: list[tuple[int, list[float]]] = []
+    for pose_node in (child for child in source.children if child.name == "PoseNode"):
+        source_node = _child_node(pose_node, "Node")
+        matrix_node = _child_node(pose_node, "Matrix")
+        if source_node is None or not source_node.properties or matrix_node is None:
+            continue
+        try:
+            source_model_id = int(source_node.properties[0])
+            matrix = [float(value) for value in (matrix_node.properties[0] if matrix_node.properties else [])]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        output_model_id = id_map.get(source_model_id)
+        if canonical_bind_matrices and source_model_id in canonical_bind_matrices:
+            matrix = list(canonical_bind_matrices[source_model_id])
+        if output_model_id is None or len(matrix) != 16 or not all(math.isfinite(value) for value in matrix):
+            continue
+        valid_nodes.append((output_model_id, matrix))
+    pose.add("NbPoseNodes", ("I", len(valid_nodes)))
+    for model_id, matrix in valid_nodes:
+        rebuilt_node = pose.add("PoseNode")
+        rebuilt_node.add("Node", ("L", int(model_id)))
+        rebuilt_node.add("Matrix", ("d", matrix))
+    return pose
+
+
+def _safe_rebuilder_validate_graph(
+    objects: FbxNode,
+    connections: FbxNode,
+) -> dict[str, Any]:
+    """Check the rebuilt object graph for duplicate IDs and dangling edges."""
+    object_ids: set[int] = set()
+    duplicate_ids = 0
+    for node in objects.children:
+        object_id = _object_id(node)
+        if object_id <= 0:
+            continue
+        if object_id in object_ids:
+            duplicate_ids += 1
+        object_ids.add(object_id)
+    dangling = 0
+    for connection in connections.children:
+        if connection.name != "C" or len(connection.properties) < 3:
+            continue
+        child_id, parent_id = connection.properties[1:3]
+        if not isinstance(child_id, int) or not isinstance(parent_id, int):
+            dangling += 1
+            continue
+        if child_id not in object_ids or (parent_id != 0 and parent_id not in object_ids):
+            dangling += 1
+    return {
+        "object_ids": len(object_ids),
+        "duplicate_ids": duplicate_ids,
+        "dangling_connections": dangling,
+    }
+
+
+def _generic_definitions(objects: FbxNode) -> FbxNode:
+    counts: dict[str, int] = {}
+    for child in objects.children:
+        counts[child.name] = counts.get(child.name, 0) + 1
+    definitions = FbxNode("Definitions", [], [], [])
+    definitions.add("Version", ("I", 100))
+    definitions.add("Count", ("I", sum(counts.values())))
+    for object_type, count in sorted(counts.items()):
+        definition = definitions.add("ObjectType", ("S", object_type))
+        definition.add("Count", ("I", count))
+    return definitions
+
+
+def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], dict[str, Any]]:
+    """Rebuild the source FBX graph through explicit structure, bone and Mesh passes."""
+    source_objects = _first_root(roots, "Objects")
+    source_connections = _first_root(roots, "Connections")
+    if source_objects is None:
+        return roots, {"safe_rebuilder_status": "passthrough_no_objects"}
+
+    source_graph = _safe_rebuilder_source_graph(roots)
+    object_nodes = list(source_graph["object_nodes"])
+    objects_by_id = dict(source_graph["objects_by_id"])
+    model_nodes = list(source_graph["models"])
+    geometry_nodes = list(source_graph["geometries"])
+    deformer_nodes = list(source_graph["deformers"])
+    pose_nodes = list(source_graph["poses"])
+    mesh_model_ids = set(source_graph["mesh_model_ids"])
+    bone_model_ids = set(source_graph["bone_model_ids"])
+    structural_model_ids = set(source_graph["structural_model_ids"])
+    model_parent_ids = dict(source_graph["model_parent_ids"])
+    model_geometry_ids = dict(source_graph["model_geometry_ids"])
+
+    parents_by_child: dict[int, list[int]] = {}
+    if source_connections is not None:
+        for connection in source_connections.children:
+            if connection.name != "C" or len(connection.properties) < 3:
+                continue
+            if connection.properties[0] != "OO":
+                continue
+            child_id, parent_id = connection.properties[1:3]
+            if isinstance(child_id, int) and isinstance(parent_id, int):
+                parents_by_child.setdefault(int(child_id), []).append(int(parent_id))
+
+    v5_context = _v5_scene_context(roots, source_graph, parents_by_child)
+    output_worlds = dict(v5_context["output_worlds"])
+    canonical_bind_by_model = dict(v5_context["canonical_bind_by_model"])
+    for mesh_model_id in v5_context["skinned_mesh_ids"]:
+        canonical_bind_by_model[int(mesh_model_id)] = _identity_matrix()
+
+    id_map: dict[int, int] = {}
+    next_id = 100000
+
+    def allocate(source_id: int) -> int:
+        nonlocal next_id
+        if source_id in id_map:
+            return id_map[source_id]
+        id_map[source_id] = next_id
+        next_id += 1
+        return id_map[source_id]
+
+    # Preserve the source FBX's numeric identity ordering. Object declaration
+    # position is not authoritative and may place larger IDs before smaller IDs.
+    source_id_order = sorted(
+        _object_id(source)
+        for source in object_nodes
+        if source.name != "NodeAttribute"
+    )
+    source_by_id = {
+        _object_id(source): source
+        for source in object_nodes
+        if source.name != "NodeAttribute"
+    }
+    # MAX resolves duplicate Video records by their first declaration.  When
+    # one duplicate carries embedded bytes and another is an empty shell, the
+    # embedded record must receive the earlier output ID so the sorted output
+    # still lets MAX materialize the high-resolution image first.
+    video_positions: dict[tuple[str, str, str], list[int]] = {}
+    for position, source_id in enumerate(source_id_order):
+        source = source_by_id.get(source_id)
+        if source is None or source.name != "Video":
+            continue
+        name = str(source.properties[1]) if len(source.properties) > 1 else ""
+        relative = str(_child_value(source, "RelativeFilename") or "")
+        file_name = str(_child_value(source, "FileName") or "")
+        video_positions.setdefault((name, relative, file_name), []).append(position)
+    for positions in video_positions.values():
+        if len(positions) < 2:
+            continue
+        group_ids = [source_id_order[position] for position in positions]
+        group_ids.sort(
+            key=lambda source_id: bool(
+                _child_value(source_by_id[source_id], "Content")
+            ),
+            reverse=True,
+        )
+        for position, source_id in zip(positions, group_ids):
+            source_id_order[position] = source_id
+    for source_id in source_id_order:
+        allocate(source_id)
+
+    model_by_id = {_object_id(node): node for node in model_nodes}
+    model_names = _unique_model_names(model_nodes)
+    # MAX needs an actual Mesh Model/Geometry edge for empty OtherMesh slots.
+    # The source exporter represents these slots as Null Models, but the
+    # established MOD importer emits an empty Geometry so MAX creates a Mesh
+    # object instead of a Dummy. Keep this scoped to direct Mesh_* children of
+    # OtherMesh (including the import-suffixed helper variant).
+    other_mesh_placeholder_ids: set[int] = set()
+    for source_id in structural_model_ids:
+        source = model_by_id[source_id]
+        model_name = model_names.get(source_id, _generic_object_name(source, ""))
+        if not model_name.casefold().startswith("mesh_"):
+            continue
+        parent_id = model_parent_ids.get(source_id, 0)
+        parent = model_by_id.get(parent_id)
+        parent_name = _generic_object_name(parent, "") if parent is not None else ""
+        parent_folded = parent_name.casefold()
+        if parent_folded == "othermesh" or parent_folded.startswith("othermesh_import"):
+            other_mesh_placeholder_ids.add(source_id)
+
+    output_attribute_ids: dict[int, int] = {}
+    for source_id in sorted(
+        (structural_model_ids | bone_model_ids) - other_mesh_placeholder_ids
+    ):
+        output_attribute_ids[source_id] = next_id
+        next_id += 1
+
+    generic_objects = FbxNode("Objects", [], [], [])
+    emitted_object_ids: set[int] = set()
+    other_mesh_geometry_ids: dict[int, int] = {}
+
+    # Materials, animation nodes and other non-scene objects are retained as
+    # cloned source objects so this pass remains focused on scene semantics.
+    for source in object_nodes:
+        if source.name in {"Model", "Geometry", "NodeAttribute", "Deformer", "Pose"}:
+            continue
+        cloned = _clone_generic_node(source, id_map=id_map, strip_max_metadata=True)
+        if cloned is not None:
+            generic_objects.children.append(cloned)
+            emitted_object_ids.add(_object_id(source))
+
+    # Structural Models are rebuilt first so parent links are available to the
+    # later bone and Mesh passes. Empty OtherMesh slots are the one intentional
+    # exception: they are promoted to Mesh and receive an empty Geometry.
+    for source_id in sorted(structural_model_ids):
+        source = model_by_id[source_id]
+        if source_id in other_mesh_placeholder_ids:
+            model_name = model_names.get(source_id, "Mesh")
+            geometry_id = next_id
+            next_id += 1
+            other_mesh_geometry_ids[source_id] = geometry_id
+            generic_objects.children.append(
+                _generic_empty_mesh_geometry(geometry_id, model_name)
+            )
+            generic_objects.children.append(
+                _generic_mesh_model_node(
+                    source,
+                    id_map[source_id],
+                    local_matrix=_output_local_from_world(
+                        source_id, output_worlds, source_graph["model_parent_ids"]
+                    ),
+                    name_override=model_name,
+                )
+            )
+            emitted_object_ids.add(source_id)
+            continue
+        generic_objects.children.append(
+            _generic_structure_model_node(
+                source,
+                id_map[source_id],
+                local_matrix=_output_local_from_world(
+                    source_id, output_worlds, source_graph["model_parent_ids"]
+                ),
+                name_override=model_names.get(source_id),
+            )
+        )
+        generic_objects.children.append(
+            _generic_node_attribute(
+                output_attribute_ids[source_id],
+                model_names.get(source_id, "Model"),
+                _node_type(source),
+            )
+        )
+        emitted_object_ids.add(source_id)
+
+    # Bones are read from the source LimbNode Models and rebuilt independently
+    # from Mesh Models, including a fresh skeleton NodeAttribute.
+    for source_id in sorted(bone_model_ids):
+        source = model_by_id[source_id]
+        generic_objects.children.append(
+            _generic_bone_model_node(
+                source,
+                id_map[source_id],
+                local_matrix=_output_local_from_world(
+                    source_id, output_worlds, source_graph["model_parent_ids"]
+                ),
+                name_override=model_names.get(source_id),
+            )
+        )
+        generic_objects.children.append(
+            _generic_node_attribute(
+                output_attribute_ids[source_id],
+                model_names.get(source_id, "Bone"),
+                "LimbNode",
+                bone=True,
+            )
+        )
+        emitted_object_ids.add(source_id)
+
+    geometry_by_id = {
+        _object_id(node): node for node in geometry_nodes if _object_id(node) > 0
+    }
+    geometry_output_ids = {
+        geometry_id: id_map[geometry_id] for geometry_id in geometry_by_id
+    }
+    # Generic_to_mod_transform_code consumes these IDs later in the Writer.
+    # Record the actual domain of each emitted Geometry instead of relying on
+    # the scene-wide Skin classification (a file can contain both skinned and
+    # unskinned/placeholder Meshes).
+    axis_conversion = v5_context.get("axis_conversion")
+    source_axes_are_canonical = (
+        isinstance(axis_conversion, list)
+        and _matrices_match(axis_conversion, _identity_matrix())
+    )
+    canonical_normal_geometry_ids: set[int] = set()
+    legacy_normal_geometry_ids: set[int] = set()
+    normal_axis_domain_by_geometry_id: dict[str, str] = {}
+
+    def record_normal_axis_domain(
+        source_geometry_id: int,
+        *,
+        applied_matrix: list[float] | None,
+    ) -> None:
+        output_geometry_id = _int_or_default(
+            geometry_output_ids.get(int(source_geometry_id)),
+            0,
+        )
+        if output_geometry_id <= 0:
+            return
+        # An identity source basis is already canonical.  Otherwise only a
+        # Geometry that went through the explicit bind/axis bake is canonical;
+        # untouched Geometry remains in the legacy Max basis.
+        baked = (
+            isinstance(applied_matrix, list)
+            and not _matrices_match(applied_matrix, _identity_matrix())
+        )
+        domain = (
+            FBX_NORMAL_AXIS_DOMAIN_CANONICAL
+            if source_axes_are_canonical or baked
+            else FBX_NORMAL_AXIS_DOMAIN_LEGACY
+        )
+        normal_axis_domain_by_geometry_id[str(output_geometry_id)] = domain
+        if domain == FBX_NORMAL_AXIS_DOMAIN_CANONICAL:
+            canonical_normal_geometry_ids.add(output_geometry_id)
+        else:
+            legacy_normal_geometry_ids.add(output_geometry_id)
+
+    emitted_geometry_ids: set[int] = set()
+    geometry_cp_maps: dict[int, dict[int, list[int]]] = {}
+    geometry_rebuilt_count = 0
+    geometry_header_only_count = 0
+    geometry_skip_reasons: list[str] = []
+    skin_clusters_remapped = 0
+    for source_id in sorted(mesh_model_ids):
+        source_model = model_by_id[source_id]
+        model_name = model_names.get(source_id, "Mesh")
+        for geometry_id in model_geometry_ids.get(source_id, []):
+            source_geometry = geometry_by_id.get(geometry_id)
+            if source_geometry is None or geometry_id in emitted_geometry_ids:
+                continue
+            bind_matrix = (
+                v5_context["bind_mesh_matrices"].get(source_id)
+                if source_id in v5_context["skinned_mesh_ids"]
+                else None
+            )
+            geometry_payload = _extract_geometry_semantics(
+                source_geometry,
+                position_matrix=bind_matrix,
+                normal_matrix=bind_matrix,
+            )
+            record_normal_axis_domain(
+                geometry_id,
+                applied_matrix=bind_matrix,
+            )
+            generic_objects.children.append(
+                _generic_geometry_node(
+                    source_geometry,
+                    geometry_output_ids[geometry_id],
+                    name_override=model_name,
+                    payload=geometry_payload,
+                )
+            )
+            geometry_cp_maps[geometry_id] = dict(geometry_payload.get("cp_to_output", {}))
+            if geometry_payload.get("status") == "rebuilt":
+                geometry_rebuilt_count += 1
+            else:
+                geometry_header_only_count += 1
+                reason = str(geometry_payload.get("reason", "geometry_header_only"))
+                if reason not in geometry_skip_reasons:
+                    geometry_skip_reasons.append(reason)
+            emitted_geometry_ids.add(geometry_id)
+        generic_objects.children.append(
+            _generic_mesh_model_node(
+                source_model,
+                id_map[source_id],
+                local_matrix=_output_local_from_world(
+                    source_id, output_worlds, source_graph["model_parent_ids"]
+                ),
+                name_override=model_name,
+            )
+        )
+        emitted_object_ids.add(source_id)
+
+    # Preserve valid unlinked Geometry objects as standalone Geometry records.
+    for geometry_id, source_geometry in geometry_by_id.items():
+        if geometry_id in emitted_geometry_ids:
+            continue
+        geometry_payload = _extract_geometry_semantics(source_geometry)
+        record_normal_axis_domain(geometry_id, applied_matrix=None)
+        generic_objects.children.append(
+            _generic_geometry_node(
+                source_geometry,
+                geometry_output_ids[geometry_id],
+                payload=geometry_payload,
+            )
+        )
+        geometry_cp_maps[geometry_id] = dict(geometry_payload.get("cp_to_output", {}))
+        if geometry_payload.get("status") == "rebuilt":
+            geometry_rebuilt_count += 1
+        else:
+            geometry_header_only_count += 1
+            reason = str(geometry_payload.get("reason", "geometry_header_only"))
+            if reason not in geometry_skip_reasons:
+                geometry_skip_reasons.append(reason)
+        emitted_geometry_ids.add(geometry_id)
+
+    for source in deformer_nodes:
+        source_id = _object_id(source)
+        index_map: dict[int, list[int]] | None = None
+        if _node_type(source).casefold() == "cluster":
+            geometry_ids = [
+                parent_id
+                for parent_id in parents_by_child.get(source_id, [])
+                if parent_id in geometry_cp_maps
+            ]
+            if not geometry_ids:
+                for skin_id in parents_by_child.get(source_id, []):
+                    skin_node = objects_by_id.get(skin_id)
+                    if skin_node is None or _node_type(skin_node).casefold() != "skin":
+                        continue
+                    geometry_ids.extend(
+                        parent_id
+                        for parent_id in parents_by_child.get(skin_id, [])
+                        if parent_id in geometry_cp_maps
+                    )
+            if geometry_ids:
+                index_map = geometry_cp_maps.get(sorted(set(geometry_ids))[0])
+                if index_map:
+                    raw_indexes = _child_value(source, "Indexes")
+                    if isinstance(raw_indexes, list):
+                        expanded_indexes = [
+                            target
+                            for raw_index in raw_indexes
+                            for target in index_map.get(int(raw_index), [int(raw_index)])
+                        ]
+                        if expanded_indexes != [int(value) for value in raw_indexes]:
+                            skin_clusters_remapped += 1
+        canonical_matrices = (
+            v5_context["cluster_matrices"].get(source_id)
+            if _node_type(source).casefold() == "cluster"
+            else None
+        )
+        generic_objects.children.append(
+            _generic_deformer_node(
+                source,
+                id_map[source_id],
+                index_map=index_map,
+                canonical_matrices=canonical_matrices,
+            )
+        )
+        emitted_object_ids.add(source_id)
+    for source in pose_nodes:
+        source_id = _object_id(source)
+        generic_objects.children.append(
+            _generic_pose_node(
+                source,
+                id_map[source_id],
+                id_map,
+                canonical_bind_matrices=canonical_bind_by_model,
+            )
+        )
+        emitted_object_ids.add(source_id)
+
+    # Every source object handled by a dedicated scene pass is already emitted.
+    # Do not feed those records through the generic fallback: doing so would
+    # duplicate Geometry/Model/Deformer/Pose nodes and reuse their remapped IDs.
+    # Keep the fallback for newly introduced FBX object kinds so they cannot
+    # vanish silently from the rebuilt scene.
+    for source in object_nodes:
+        source_id = _object_id(source)
+        if source.name in {"Model", "Geometry", "NodeAttribute", "Deformer", "Pose"} or source_id in emitted_object_ids:
+            continue
+        cloned = _clone_generic_node(source, id_map=id_map, strip_max_metadata=True)
+        if cloned is not None:
+            generic_objects.children.append(cloned)
+            emitted_object_ids.add(source_id)
+
+    # Emit in the same ascending identity order used by the source FBX.
+    generic_objects.children.sort(key=_object_id)
+
+    generic_connections = FbxNode("Connections", [], [], [])
+    existing_edges: set[tuple[Any, ...]] = set()
+    existing_model_parent: set[int] = set()
+    existing_geometry_links: set[tuple[int, int]] = set()
+    dropped_connections = 0
+    if source_connections is not None:
+        for source_connection in source_connections.children:
+            if source_connection.name != "C" or len(source_connection.properties) < 3:
+                cloned = _clone_generic_node(source_connection, id_map=id_map)
+                if cloned is not None:
+                    generic_connections.children.append(cloned)
+                continue
+            values = list(source_connection.properties)
+            child_source, parent_source = values[1], values[2]
+            if not isinstance(child_source, int) or not isinstance(parent_source, int):
+                dropped_connections += 1
+                continue
+            child_source = int(child_source)
+            parent_source = int(parent_source)
+            child_node = objects_by_id.get(child_source)
+            parent_node = objects_by_id.get(parent_source)
+            # NodeAttributes are deliberately regenerated per Model; retaining
+            # their old edges would recreate dangling or duplicate attributes.
+            if (child_node is not None and child_node.name == "NodeAttribute") or (
+                parent_node is not None and parent_node.name == "NodeAttribute"
+            ):
+                dropped_connections += 1
+                continue
+            child = id_map.get(child_source)
+            parent = 0 if parent_source == 0 else id_map.get(parent_source)
+            if child is None or parent is None:
+                dropped_connections += 1
+                continue
+            values[1] = child
+            values[2] = parent
+            edge_key = tuple(values)
+            if edge_key in existing_edges:
+                continue
+            existing_edges.add(edge_key)
+            generic_connections.children.append(
+                FbxNode("C", values, list(source_connection.property_types), [])
+            )
+            kind = str(values[0] or "")
+            if kind == "OO" and child_node is not None:
+                if child_node.name == "Model" and (
+                    parent_source == 0
+                    or (parent_node is not None and parent_node.name == "Model")
+                ):
+                    existing_model_parent.add(child_source)
+                if child_node.name == "Geometry" and parent_node is not None and parent_node.name == "Model":
+                    existing_geometry_links.add((parent_source, child_source))
+
+    def add_connection(kind: str, child: int, parent: int) -> None:
+        key = (kind, child, parent)
+        if key in existing_edges:
+            return
+        existing_edges.add(key)
+        generic_connections.add(
+            "C", ("S", kind), ("L", int(child)), ("L", int(parent))
+        )
+
+    # Add exactly one generated attribute link per structural/bone Model.
+    for source_id, attribute_id in sorted(output_attribute_ids.items()):
+        add_connection("OO", attribute_id, id_map[source_id])
+
+    # Empty OtherMesh slots were promoted to Mesh above. Their generated
+    # Geometry edges are absent from the source graph, so add them explicitly.
+    for source_id, geometry_id in sorted(other_mesh_geometry_ids.items()):
+        add_connection("OO", geometry_id, id_map[source_id])
+
+    # Close the scene hierarchy even when the source exporter omitted a root
+    # connection. Cluster->Bone edges are retained above but do not count as a
+    # Model hierarchy parent.
+    for source in model_nodes:
+        source_id = _object_id(source)
+        if source_id not in existing_model_parent:
+            parent_source = model_parent_ids.get(source_id, 0)
+            parent_output = id_map.get(parent_source, 0) if parent_source else 0
+            add_connection("OO", id_map[source_id], parent_output)
+
+    # The source Model->Geometry edge is the Mesh identity authority. If a
+    # malformed source omitted it, rebuild it from the graph we just read.
+    for source_id in sorted(mesh_model_ids):
+        for geometry_id in model_geometry_ids.get(source_id, []):
+            if (source_id, geometry_id) not in existing_geometry_links:
+                add_connection(
+                    "OO", geometry_output_ids[geometry_id], id_map[source_id]
+                )
+
+    graph_check = _safe_rebuilder_validate_graph(generic_objects, generic_connections)
+    if graph_check["duplicate_ids"] or graph_check["dangling_connections"]:
+        # Never publish a rebuilt FBX whose object graph is internally
+        # inconsistent. The embedded Probe caller can safely fall back to
+        # the original bytes, while the standalone converter reports the
+        # precise validation failure instead of emitting a corrupt scene.
+        raise ValueError(
+            "Safe Rebuilder graph validation failed: "
+            f"duplicate_ids={graph_check['duplicate_ids']}, "
+            f"dangling_connections={graph_check['dangling_connections']}"
+        )
+
+    # Replace producer-specific roots while retaining unrelated document metadata.
+    root_by_name = {node.name: node for node in roots}
+    generic_roots: list[FbxNode] = []
+    preferred_order = [
+        "FBXHeaderExtension", "FileId", "CreationTime", "GlobalSettings",
+        "Documents", "Definitions", "Objects", "Connections", "Takes",
+    ]
+    header = _clone_generic_node(root_by_name.get("FBXHeaderExtension", FbxNode("FBXHeaderExtension")))
+    if header is None:
+        header = FbxNode("FBXHeaderExtension", [], [], [])
+    header_creator = _child_node(header, "Creator")
+    if header_creator is None:
+        header.add("Creator", ("S", "Generic FBX Converter"))
+    elif header_creator.properties:
+        header_creator.properties[0] = "Generic FBX Converter"
+        header_creator.property_types = ["S"]
+    root_replacements = {
+        "FBXHeaderExtension": header,
+        "GlobalSettings": _generic_global_settings(
+            root_by_name.get("GlobalSettings", FbxNode("GlobalSettings")),
+            canonicalize_axes=_generic_axis_signature_is_valid(roots),
+        ),
+        "Definitions": _generic_definitions(generic_objects),
+        "Objects": generic_objects,
+        "Connections": generic_connections,
+    }
+    for name in preferred_order:
+        if name in root_replacements:
+            generic_roots.append(root_replacements[name])
+        elif name in root_by_name:
+            cloned = _clone_generic_node(root_by_name[name])
+            if cloned is not None:
+                generic_roots.append(cloned)
+    for source_root in roots:
+        if source_root.name in preferred_order or source_root.name == "Creator":
+            continue
+        cloned = _clone_generic_node(source_root)
+        if cloned is not None:
+            generic_roots.append(cloned)
+    creator = next((node for node in generic_roots if node.name == "Creator"), None)
+    if creator is None:
+        generic_roots.append(FbxNode("Creator", ["Generic FBX Converter"], ["S"], []))
+    elif creator.properties:
+        creator.properties[0] = "Generic FBX Converter"
+    return generic_roots, {
+        "safe_rebuilder_status": "rebuilt",
+        "safe_rebuilder_object_count": len(generic_objects.children),
+        "safe_rebuilder_model_count": len(model_nodes),
+        "safe_rebuilder_mesh_count": len(mesh_model_ids) + len(other_mesh_placeholder_ids),
+        "safe_rebuilder_bone_count": len(bone_model_ids),
+        "safe_rebuilder_geometry_count": len(emitted_geometry_ids) + len(other_mesh_geometry_ids),
+        "other_mesh_empty_geometry_count": len(other_mesh_geometry_ids),
+        "geometry_rebuilt_count": geometry_rebuilt_count,
+        "geometry_skipped_count": geometry_header_only_count,
+        "geometry_skip_reasons": geometry_skip_reasons,
+        "skin_geometry_domain": v5_context["geometry_domain"],
+        "canonical_normal_geometry_ids": sorted(canonical_normal_geometry_ids),
+        "legacy_normal_geometry_ids": sorted(legacy_normal_geometry_ids),
+        "normal_axis_domain_by_geometry_id": dict(normal_axis_domain_by_geometry_id),
+        "skin_clusters_remapped": skin_clusters_remapped,
+        "safe_rebuilder_deformer_count": len(deformer_nodes),
+        "safe_rebuilder_pose_count": len(pose_nodes),
+        "safe_rebuilder_source_connection_count": int(
+            source_graph["source_connection_count"]
+        ),
+        "safe_rebuilder_dropped_connections": dropped_connections,
+        "safe_rebuilder_dangling_connections": int(
+            graph_check["dangling_connections"]
+        ),
+        "safe_rebuilder_id_base": 100000,
+        # Keep the source->canonical basis used by the rebuilt Model rows.  The
+        # Writer must apply its inverse to bone matrices before entering the
+        # historical MOD/Max matrix domain; storing it here avoids assuming
+        # every Max FBX used the same axis signature.
+        "source_axis_signature": _axis_signature(roots) or [],
+        "axis_conversion_matrix": list(axis_conversion),
+        "canonical_to_source_axis_matrix": (
+            _generic_invert_row_major_matrix(axis_conversion)
+            or _identity_matrix()
+        ),
+    }
+
+def _generic_encode_fbx_bytes(
+    version: int,
+    roots: Iterable[FbxNode],
+    *,
+    footer_id: bytes | None = None,
+) -> bytes:
+    """Encode a Generic FBX tree directly to bytes; no temporary file is used."""
+    roots_list = list(roots)
+    if not roots_list:
+        raise ValueError("Cannot encode an FBX without root nodes")
+    output_version = int(version) if int(version) >= 7000 else FBX_VERSION_DEFAULT
+    selected_footer_id = FBX_FOOT_ID if footer_id is None else bytes(footer_id)
+    if len(selected_footer_id) != 16:
+        raise ValueError("FBX footer identity must contain exactly 16 bytes")
+    body_parts: list[bytes] = []
+    cursor = len(FBX_MAGIC) + 4
+    for index, root in enumerate(roots_list):
+        encoded = _encode_node(
+            root,
+            cursor,
+            version=output_version,
+            is_last=index == len(roots_list) - 1,
+        )
+        body_parts.append(encoded)
+        cursor += len(encoded)
+    null_record = (
+        FBX_NULL_RECORD_WIDE
+        if output_version >= 7500
+        else FBX_NULL_RECORD_NARROW
+    )
+    body = b"".join(body_parts) + null_record
+    before_footer_version = (
+        len(FBX_MAGIC) + 4 + len(body) + len(selected_footer_id) + 4
+    )
+    padding = (-before_footer_version) % 16
+    if padding == 0:
+        padding = 16
+    footer = (
+        selected_footer_id
+        + b"\x00" * 4
+        + b"\x00" * padding
+        + struct.pack("<I", output_version)
+        + b"\x00" * 120
+        + FBX_FOOT_MAGIC
+    )
+    return FBX_MAGIC + struct.pack("<I", output_version) + body + footer
+# The converter is embedded in Probe.  This request-scoped bridge keeps the
+# normalized FBX in memory and never creates a Generic FBX intermediate file.
+_GENERIC_FBX_MEMORY_CACHE: dict[str, tuple[int, int, _BinaryFbxDocument, dict[str, Any]]] = {}
+
+def _generic_prepare_fbx_bytes(source: Path) -> tuple[bytes, dict[str, Any]]:
+    raw_bytes = source.read_bytes()
+    try:
+        version, roots, footer_id = read_fbx(raw_bytes, include_footer_id=True)
+        normalization = normalize_generic_tree(roots)
+        rebuilt_roots, rebuild_receipt = _safe_rebuild_generic_scene(roots)
+        normalization.update(rebuild_receipt)
+        normalized_bytes = _generic_encode_fbx_bytes(
+            version,
+            rebuilt_roots,
+            footer_id=footer_id,
+        )
+        # Parse the generated bytes before exposing them to UFBX/Probe.
+        read_fbx(normalized_bytes)
+        return normalized_bytes, {
+            "status": "normalized",
+            "source_size": len(raw_bytes),
+            "output_size": len(normalized_bytes),
+            # Generic output is a single canonical Y-up scene.  The source
+            # axis basis is applied once while rebuilding the scene; the MOD
+            # writer must consume these canonical rows without a per-Mesh
+            # second rotation.
+            "fbx_axis_output_policy": "max_xyz",
+            "axis_transform_contract": "scene_global_once",
+            "normalization": normalization,
+        }
+    except Exception as exc:
+        # Generic normalization is an enhancement lane.  Preserve the source
+        # bytes for unsupported/corrupt input so the existing Probe error path
+        # remains authoritative instead of inventing an empty FBX.
+        return raw_bytes, {
+            "status": "fallback",
+            "source_size": len(raw_bytes),
+            "output_size": len(raw_bytes),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _generic_memory_document_for_path(
+    path: str | Path,
+) -> tuple[_BinaryFbxDocument, dict[str, Any]]:
+    source = Path(path).resolve()
+    stat = source.stat()
+    key = str(source)
+    cached = _GENERIC_FBX_MEMORY_CACHE.get(key)
+    if cached is not None:
+        cached_size, cached_mtime, document, receipt = cached
+        if cached_size == int(stat.st_size) and cached_mtime == int(stat.st_mtime_ns):
+            return document, dict(receipt)
+    normalized_bytes, receipt = _generic_prepare_fbx_bytes(source)
+    # Keep large geometry arrays lazy; the generic pass already completed its
+    # own read, and Probe decodes only arrays consumed by the selected stage.
+    document = _build_binary_fbx_document(
+        source,
+        data=normalized_bytes,
+        decode_array_names=frozenset(),
+    )
+    _GENERIC_FBX_MEMORY_CACHE[key] = (
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        document,
+        dict(receipt),
+    )
+    return document, dict(receipt)
+# ====== END GENERIC FBX IN-MEMORY NORMALIZER (MAX + BLENDER) ======
 
 
 def _clean_binary_fbx_object_name(value: Any) -> str:
@@ -2229,6 +6476,9 @@ def _row_major_matrices_match(left: list[float], right: list[float]) -> bool:
 
 
 def _world_to_max_axis_matrix(mesh_world: list[float]) -> list[float] | None:
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # This per-Mesh FBX-helper inverse belongs to the old direct/UFBX fallback.
+    # Generic requests use one file-level canonical axis transform instead.
     """Extract only the FBX axis basis from a Mesh bind matrix.
 
     Importer-generated FBX stores Max Z-up to FBX Y-up on the Mesh helper,
@@ -2318,7 +6568,38 @@ def _build_binary_fbx_skin_clusters(
             if normalize_match_name(value)
         }
     )
+    # Keep each connected Mesh Model separate. Display names are not unique
+    # in exported scenes, and merging two Models under one name mixes their
+    # Cluster matrices before the bind-convention check.
     result: dict[str, list[dict[str, Any]]] = {}
+    mesh_name_counts: dict[str, int] = {}
+    for node in objects_root.children:
+        if (
+            node.name == "Model"
+            and len(node.properties) >= 3
+            and str(node.properties[2]) == "Mesh"
+        ):
+            model_name = _clean_binary_fbx_object_name(node.properties[1])
+            if model_name:
+                name_key = model_name.casefold()
+                mesh_name_counts[name_key] = mesh_name_counts.get(name_key, 0) + 1
+    geometry_fingerprint_cache: dict[int, str] = {}
+
+    def geometry_fingerprint(geometry_id: int) -> str:
+        cached = geometry_fingerprint_cache.get(geometry_id)
+        if cached is not None:
+            return cached
+        geometry_node = objects_by_id.get(geometry_id)
+        fingerprint = (
+            _binary_fbx_geometry_fingerprint(
+                _binary_fbx_node_child_value(geometry_node, "Vertices"),
+                _binary_fbx_node_child_value(geometry_node, "PolygonVertexIndex"),
+            )
+            if geometry_node is not None
+            else ""
+        )
+        geometry_fingerprint_cache[geometry_id] = fingerprint
+        return fingerprint
     for cluster_id, cluster in objects_by_id.items():
         if not object_type_matches(cluster_id, "Deformer", "Cluster"):
             continue
@@ -2395,13 +6676,23 @@ def _build_binary_fbx_skin_clusters(
                 and normalize_match_name(mesh_name) not in normalized_target_mesh_names
             ):
                 continue
-            result.setdefault(mesh_name, []).append(
+            geometry_fingerprint_value = (
+                geometry_fingerprint(geometry_ids[0])
+                if mesh_name_counts.get(mesh_name.casefold(), 0) > 1
+                else ""
+            )
+            mesh_key = f"{mesh_name}\x00{int(mesh_model_id)}"
+            result.setdefault(mesh_key, []).append(
                 {
                     "bone_name": bone_name,
                     "indexes": parsed_indexes,
                     "weights": parsed_weights,
                     "transform": transform,
                     "transform_link": transform_link,
+                    "mesh_model_id": int(mesh_model_id),
+                    "geometry_id": int(geometry_ids[0]),
+                    "geometry_fingerprint": geometry_fingerprint_value,
+                    "mesh_name": mesh_name,
                 }
             )
     return result, "ok"
@@ -2413,6 +6704,7 @@ def _build_binary_fbx_skin_evaluation_context(
     *,
     binary_document: _BinaryFbxDocument | None = None,
     target_mesh_names: set[str] | None = None,
+    use_global_axis_domain: bool = False,
 ) -> dict[str, Any]:
     clusters_by_mesh, graph_status = _build_binary_fbx_skin_clusters(
         path,
@@ -2432,18 +6724,87 @@ def _build_binary_fbx_skin_evaluation_context(
         for node in _safe_list(getattr(scene, "nodes", None))
         if str(getattr(node, "name", "") or "") != ""
     }
-    for mesh_name, clusters in clusters_by_mesh.items():
-        mesh_node = nodes_by_name.get(mesh_name)
+    mesh_nodes_by_name: dict[str, list[Any]] = {}
+    for node in _safe_list(getattr(scene, "nodes", None)):
+        node_name = str(getattr(node, "name", "") or "")
+        if getattr(node, "mesh", None) is not None and node_name != "":
+            mesh_nodes_by_name.setdefault(node_name, []).append(node)
+    for mesh_key, clusters in clusters_by_mesh.items():
+        # The binary graph keeps Mesh Models separate as ``name\\0model_id``.
+        # Native UFBX does not expose that Model ID, so resolve the scene node
+        # by the name prefix first and use Geometry ID when duplicate names
+        # are present.  A plain-name lookup here would lose the entire Skin
+        # context after duplicate-name isolation was enabled.
+        mesh_name, _separator, model_id_text = str(mesh_key).partition("\x00")
+        mesh_candidates = mesh_nodes_by_name.get(mesh_name, [])
+        mesh_node = mesh_candidates[0] if len(mesh_candidates) == 1 else None
+        if mesh_node is None and mesh_candidates:
+            geometry_id = _int_or_default(
+                clusters[0].get("geometry_id") if clusters else 0,
+                0,
+            )
+            geometry_matches = [
+                candidate
+                for candidate in mesh_candidates
+                if _int_or_default(
+                    getattr(getattr(candidate, "mesh", None), "geometry_id", 0),
+                    0,
+                )
+                == geometry_id
+            ]
+            if len(geometry_matches) == 1:
+                mesh_node = geometry_matches[0]
+            else:
+                geometry_fingerprint = str(
+                    (clusters[0].get("geometry_fingerprint") if clusters else "")
+                    or ""
+                )
+                if geometry_fingerprint:
+                    fingerprint_matches = [
+                        candidate
+                        for candidate in mesh_candidates
+                        if _ufbx_mesh_geometry_fingerprint(
+                            getattr(candidate, "mesh", None)
+                        )
+                        == geometry_fingerprint
+                    ]
+                    if len(fingerprint_matches) == 1:
+                        mesh_node = fingerprint_matches[0]
         mesh = getattr(mesh_node, "mesh", None) if mesh_node is not None else None
         source_positions = _safe_list(getattr(mesh, "vertex_positions", None))
         mesh_world = _binary_fbx_matrix(_flatten_matrix4x4(getattr(mesh_node, "node_to_world", None)))
-        mesh_world_to_max = _world_to_max_axis_matrix(mesh_world) if mesh_world is not None else None
+        # A Generic rebuild has already put the complete scene in one file-level
+        # XYZ/Y-up domain.  Never infer an axis helper from this Mesh's own
+        # rotation/scale: that would turn authored transforms into per-Mesh
+        # axis conversions and rotate Skin with each object.
+        mesh_world_to_max = (
+            _identity_matrix()
+            if use_global_axis_domain and mesh_world is not None
+            # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+            # Non-Generic per-Mesh axis fallback; Generic always takes the
+            # identity branch above after its scene-wide normalization.
+            else (_world_to_max_axis_matrix(mesh_world) if mesh_world is not None else None)
+        )
         if mesh_node is None or mesh is None or mesh_world is None or mesh_world_to_max is None or not source_positions:
-            context["meshes"][mesh_name] = {"status": "missing_mesh_node_or_geometry"}
+            context["meshes"][mesh_key] = {
+                "status": "missing_mesh_node_or_geometry",
+                "mesh_name": mesh_name,
+                "mesh_model_id": _int_or_default(model_id_text, 0),
+            }
             continue
 
         bindings: list[dict[str, Any]] = []
         for cluster in clusters:
+            # A Cluster with no positive influence cannot affect any vertex.
+            # Do not let its unrelated bind matrices veto the convention used
+            # by the active Clusters (for example Mesh 062's b_47_68 helper).
+            if not any(
+                isinstance(weight, (int, float))
+                and math.isfinite(float(weight))
+                and float(weight) > 0.0
+                for weight in _safe_list(cluster.get("weights"))
+            ):
+                continue
             bone_node = nodes_by_name.get(str(cluster["bone_name"]))
             bone_world = _binary_fbx_matrix(
                 _flatten_matrix4x4(getattr(bone_node, "node_to_world", None))
@@ -2461,7 +6822,11 @@ def _build_binary_fbx_skin_evaluation_context(
                 }
             )
         if not bindings:
-            context["meshes"][mesh_name] = {"status": "missing_bone_world_matrix"}
+            context["meshes"][mesh_key] = {
+                "status": "missing_bone_world_matrix",
+                "mesh_name": mesh_name,
+                "mesh_model_id": _int_or_default(model_id_text, 0),
+            }
             continue
 
         world_to_max = mesh_world_to_max
@@ -2487,11 +6852,20 @@ def _build_binary_fbx_skin_evaluation_context(
                     )
                 )
             if not deformation_matrices:
-                context["meshes"][mesh_name] = {"status": "non_invertible_cluster_link"}
+                context["meshes"][mesh_key] = {
+                    "status": "non_invertible_cluster_link",
+                    "mesh_name": mesh_name,
+                    "mesh_model_id": _int_or_default(model_id_text, 0),
+                }
                 continue
         elif (
             (armature_bind := _shared_cluster_prebind(bindings)) is not None
-            and (armature_world_to_max := _world_to_max_axis_matrix(armature_bind)) is not None
+            and (
+                use_global_axis_domain
+                # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+                # Legacy direct/UFBX Armature-basis fallback.
+                or (armature_world_to_max := _world_to_max_axis_matrix(armature_bind)) is not None
+            )
         ):
             # Blender writes the common Armature bind basis to Transform x
             # TransformLink while its Mesh node remains in export space.  At
@@ -2502,11 +6876,47 @@ def _build_binary_fbx_skin_evaluation_context(
                 _multiply_row_major_matrices(binding["transform"], binding["bone_world"])
                 for binding in bindings
             ]
-            world_to_max = armature_world_to_max
+            world_to_max = (
+                _identity_matrix()
+                if use_global_axis_domain
+                else armature_world_to_max
+            )
             unweighted_source_matrix = armature_bind
         else:
-            context["meshes"][mesh_name] = {"status": "unrecognized_cluster_bind_convention"}
-            continue
+            # Receipt Meshes must remain writable even when one valid Cluster
+            # uses a mixed bind convention.  Resolve each Cluster using the
+            # exact convention when it matches; otherwise preserve the FBX
+            # TransformLink relation (standard bind) and fall back to the Max
+            # prebind relation only when that link cannot be inverted.  This
+            # is a calculable FBX result, never a source-MOD copy decision.
+            mode = "mixed_cluster_bind_fallback"
+            deformation_matrices = []
+            fallback_binding_count = 0
+            for binding in bindings:
+                if _row_major_matrices_match(binding["max_prebind"], mesh_world):
+                    deformation_matrices.append(
+                        _multiply_row_major_matrices(
+                            binding["transform"], binding["bone_world"]
+                        )
+                    )
+                    continue
+                inverse_link = _invert_row_major_matrix(binding["transform_link"])
+                if inverse_link is not None:
+                    deformation_matrices.append(
+                        _multiply_row_major_matrices(
+                            _multiply_row_major_matrices(
+                                binding["transform"], inverse_link
+                            ),
+                            binding["bone_world"],
+                        )
+                    )
+                else:
+                    fallback_binding_count += 1
+                    deformation_matrices.append(
+                        _multiply_row_major_matrices(
+                            binding["transform"], binding["bone_world"]
+                        )
+                    )
 
         source_count = len(source_positions)
         accumulated = [[0.0] * 16 for _ in range(source_count)]
@@ -2529,12 +6939,27 @@ def _build_binary_fbx_skin_evaluation_context(
             source_matrices.append(
                 [value / weight_sum for value in accumulated[source_index]]
             )
-        context["meshes"][mesh_name] = {
+        context["meshes"][mesh_key] = {
             "status": "binary_cluster_evaluated",
             "mode": mode,
             "source_matrices": source_matrices,
             "world_to_max_matrix": world_to_max,
             "weighted_vertex_count": weighted_vertex_count,
+            "mesh_name": mesh_name,
+            "mesh_model_id": _int_or_default(model_id_text, 0),
+            "geometry_id": _int_or_default(
+                clusters[0].get("geometry_id") if clusters else 0,
+                0,
+            ),
+            "geometry_fingerprint": str(
+                clusters[0].get("geometry_fingerprint", "") if clusters else ""
+                or ""
+            ),
+            **(
+                {"fallback_binding_count": fallback_binding_count}
+                if mode == "mixed_cluster_bind_fallback"
+                else {}
+            ),
         }
     return context
 
@@ -2824,10 +7249,10 @@ def _binary_fbx_rotation_matrix(
 def _binary_fbx_model_local_matrix(model: _BinaryFbxNode) -> list[float]:
     """Build the ordinary FBX Model local matrix in row-vector form.
 
-    The replacement only needs the transform subset consumed by Probe.  It
-    preserves the exporter-authored Translation/Rotation/Scaling values and
-    common rotation/scale pivots; unsupported exotic FBX pivots simply retain
-    the same deterministic T/R/S result instead of inventing a position.
+    Keep this fallback mathematically aligned with the standalone Generic
+    rebuild path.  Pre/Post rotations are evaluated in XYZ authoring order
+    (FBX does not apply ``RotationOrder`` to those fields), and each pivot is
+    applied exactly once around its corresponding operation.
     """
     properties = _binary_fbx_properties70(model)
     translation = _binary_fbx_property_vector(properties, "Lcl Translation", (0.0, 0.0, 0.0))
@@ -2837,35 +7262,36 @@ def _binary_fbx_model_local_matrix(model: _BinaryFbxNode) -> list[float]:
     rotation_matrix = _binary_fbx_rotation_matrix(rotation, rotation_order)
     pre_rotation = _binary_fbx_rotation_matrix(
         _binary_fbx_property_vector(properties, "PreRotation", (0.0, 0.0, 0.0)),
-        rotation_order,
+        0,
     )
     post_rotation = _binary_fbx_rotation_matrix(
         _binary_fbx_property_vector(properties, "PostRotation", (0.0, 0.0, 0.0)),
-        rotation_order,
+        0,
     )
     inverse_post = _invert_row_major_matrix(post_rotation) or _binary_fbx_identity_matrix()
+    total_rotation = _multiply_row_major_matrices(
+        _multiply_row_major_matrices(inverse_post, rotation_matrix),
+        pre_rotation,
+    )
     scale_matrix = _binary_fbx_scale_matrix(scaling)
-    # FBX's row-vector equivalent leaves translation in scene units rather
-    # than multiplying it by scale (S * R * T), matching pyufbx's matrices.
-    result = scale_matrix
-    result = _multiply_row_major_matrices(result, inverse_post)
-    result = _multiply_row_major_matrices(result, rotation_matrix)
-    result = _multiply_row_major_matrices(result, pre_rotation)
-
-    # Apply the two pivot pairs when authored.  This is deliberately bounded
-    # to the standard FBX pivot fields; geometric transforms remain separate
-    # in pyufbx and are not silently baked into node_to_world here.
+    rotation_offset = _binary_fbx_property_vector(properties, "RotationOffset", (0.0, 0.0, 0.0))
     rotation_pivot = _binary_fbx_property_vector(properties, "RotationPivot", (0.0, 0.0, 0.0))
+    scaling_offset = _binary_fbx_property_vector(properties, "ScalingOffset", (0.0, 0.0, 0.0))
     scaling_pivot = _binary_fbx_property_vector(properties, "ScalingPivot", (0.0, 0.0, 0.0))
-    if any(abs(value) > 0.0 for value in scaling_pivot):
-        result = _multiply_row_major_matrices(result, _binary_fbx_translation_matrix([-value for value in scaling_pivot]))
-        result = _multiply_row_major_matrices(result, scale_matrix)
-        result = _multiply_row_major_matrices(result, _binary_fbx_translation_matrix(scaling_pivot))
-    if any(abs(value) > 0.0 for value in rotation_pivot):
-        result = _multiply_row_major_matrices(result, _binary_fbx_translation_matrix([-value for value in rotation_pivot]))
-        result = _multiply_row_major_matrices(result, rotation_matrix)
-        result = _multiply_row_major_matrices(result, _binary_fbx_translation_matrix(rotation_pivot))
-    result = _multiply_row_major_matrices(result, _binary_fbx_translation_matrix(translation))
+    # Row-vector FBX order, matching _source_model_local_parts().
+    result = _binary_fbx_identity_matrix()
+    for component in (
+        _binary_fbx_translation_matrix([-value for value in scaling_pivot]),
+        scale_matrix,
+        _binary_fbx_translation_matrix(scaling_pivot),
+        _binary_fbx_translation_matrix(scaling_offset),
+        _binary_fbx_translation_matrix([-value for value in rotation_pivot]),
+        total_rotation,
+        _binary_fbx_translation_matrix(rotation_pivot),
+        _binary_fbx_translation_matrix(rotation_offset),
+        _binary_fbx_translation_matrix(translation),
+    ):
+        result = _multiply_row_major_matrices(result, component)
     return result
 
 
@@ -2968,13 +7394,21 @@ def _binary_fbx_build_mesh_adapter(
         raw_geometry = None
     raw_positions = _binary_fbx_node_child_value(geometry_node, "Vertices")
     raw_polygon_indices = _binary_fbx_node_child_value(geometry_node, "PolygonVertexIndex")
+    if raw_positions is None and raw_polygon_indices is None:
+        raw_positions = []
     if not isinstance(raw_positions, list) or len(raw_positions) % 3 != 0:
         raise ValueError(f"Geometry {geometry_id} has no valid Vertices array")
     positions = [
         [float(raw_positions[index]), float(raw_positions[index + 1]), float(raw_positions[index + 2])]
         for index in range(0, len(raw_positions), 3)
     ]
-    if raw_geometry is not None:
+    # Generic MAX reconstruction intentionally keeps zero-vertex placeholder
+    # Meshes.  They are valid scene records and must not enter the polygon
+    # decoder, which correctly rejects missing topology for non-empty Meshes.
+    if not positions:
+        indices = []
+        faces = []
+    elif raw_geometry is not None:
         indices = [int(value) for value in raw_geometry.get("source_indices", [])]
         faces = [tuple(map(int, face)) for face in raw_geometry.get("faces", [])]
     else:
@@ -3337,11 +7771,46 @@ def _apply_binary_fbx_skin_pose_channels(
         geometry["fbx_skin_pose_evaluation_status"] = "ufbx_runtime_evaluated"
         return geometry
     node_name = str(getattr(instance_node, "name", "") or "")
-    mesh_pose = (
-        skin_context.get("meshes", {}).get(node_name)
-        if isinstance(skin_context, dict)
-        else None
-    )
+    mesh_pose = None
+    if isinstance(skin_context, dict):
+        mesh_context = skin_context.get("meshes", {})
+        if isinstance(mesh_context, dict):
+            direct_pose = mesh_context.get(node_name)
+            if isinstance(direct_pose, dict):
+                mesh_pose = direct_pose
+            else:
+                model_id = _int_or_default(
+                    getattr(instance_node, "fbx_model_id", 0),
+                    0,
+                )
+                if model_id > 0:
+                    keyed_pose = mesh_context.get(
+                        f"{node_name}\x00{model_id}"
+                    )
+                    if isinstance(keyed_pose, dict):
+                        mesh_pose = keyed_pose
+                if mesh_pose is None and node_name:
+                    candidates: list[dict[str, Any]] = []
+                    for key, value in mesh_context.items():
+                        if not isinstance(value, dict):
+                            continue
+                        key_name = str(value.get("mesh_name", "") or "")
+                        if key_name == "":
+                            key_name = str(key).partition("\x00")[0]
+                        if key_name == node_name:
+                            candidates.append(value)
+                    if len(candidates) == 1:
+                        mesh_pose = candidates[0]
+                    elif len(candidates) > 1:
+                        mesh_fingerprint = _ufbx_mesh_geometry_fingerprint(mesh)
+                        fingerprint_matches = [
+                            value
+                            for value in candidates
+                            if str(value.get("geometry_fingerprint", "") or "")
+                            == mesh_fingerprint
+                        ]
+                        if len(fingerprint_matches) == 1:
+                            mesh_pose = fingerprint_matches[0]
     if not isinstance(mesh_pose, dict) or mesh_pose.get("status") != "binary_cluster_evaluated":
         status = mesh_pose.get("status") if isinstance(mesh_pose, dict) else "binary_cluster_evaluation_unavailable"
         geometry["fbx_skin_pose_evaluation_status"] = str(status)
@@ -3876,6 +8345,8 @@ def _extract_mesh_geometry_from_binary_corner_layers(
     instance_node: Any | None,
     raw_geometry: dict[str, Any],
     normal_fidelity: dict[str, Any],
+    *,
+    use_global_axis_domain: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Build MOD rows from FBX-authored polygon-corner normal and UV streams."""
     try:
@@ -3944,9 +8415,15 @@ def _extract_mesh_geometry_from_binary_corner_layers(
         prepared_transform = _prepare_row_major_transform(node_to_world)
         node_world_matrix = _binary_fbx_matrix(_flatten_matrix4x4(node_to_world))
         world_to_max_matrix = (
-            _world_to_max_axis_matrix(node_world_matrix)
-            if node_world_matrix is not None
-            else None
+            _identity_matrix()
+            if use_global_axis_domain and node_world_matrix is not None
+            # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+            # Legacy per-Mesh axis removal for direct/non-Generic extraction.
+            else (
+                _world_to_max_axis_matrix(node_world_matrix)
+                if node_world_matrix is not None
+                else None
+            )
         )
 
         first_corner_by_position = [-1 for _ in range(len(positions_src))]
@@ -4006,7 +8483,11 @@ def _extract_mesh_geometry_from_binary_corner_layers(
             out_world_positions.append(max_position)
             out_max_positions.append(max_position)
             out_normals.append(corner_normal)
-            out_max_normals.append(_fbx_authored_corner_normal_to_max(corner_normal))
+            out_max_normals.append(
+                _transform_normal_row_major(corner_normal, prepared_transform)
+                if use_global_axis_domain
+                else _fbx_authored_corner_normal_to_max(corner_normal)
+            )
 
             skinned_position = local_position
             skinned_position_index = _resolve_vertex_attr_index(
@@ -4064,6 +8545,8 @@ def _extract_mesh_geometry_from_binary_corner_layers(
                 "output_triangle_count": len(out_face_indices) // 3,
                 "normal_split_vertex_count": 0,
                 "normal_space": "fbx_authored_corner_no_mesh_node_transform",
+                # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+                # Diagnostic label for the non-Generic per-Mesh axis route.
                 "position_mode": "binary_fbx_node_axis_to_max",
             }
         )
@@ -4109,6 +8592,7 @@ def _extract_mesh_geometry(
     *,
     binary_corner_geometry: dict[str, Any] | None = None,
     normal_fidelity: dict[str, Any] | None = None,
+    use_global_axis_domain: bool = False,
 ) -> dict[str, Any]:
     fallback_audit = (
         dict(normal_fidelity)
@@ -4121,6 +8605,7 @@ def _extract_mesh_geometry(
             instance_node,
             binary_corner_geometry,
             fallback_audit,
+            use_global_axis_domain=use_global_axis_domain,
         )
         if isinstance(strict_geometry, dict):
             return strict_geometry
@@ -4221,9 +8706,15 @@ def _extract_mesh_geometry(
     # placement in the Max/MOD lane.
     node_world_matrix = _binary_fbx_matrix(_flatten_matrix4x4(node_to_world))
     world_to_max_matrix = (
-        _world_to_max_axis_matrix(node_world_matrix)
-        if node_world_matrix is not None
-        else None
+        _identity_matrix()
+        if use_global_axis_domain and node_world_matrix is not None
+        # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+        # Legacy per-Mesh axis removal for direct/non-Generic extraction.
+        else (
+            _world_to_max_axis_matrix(node_world_matrix)
+            if node_world_matrix is not None
+            else None
+        )
     )
     default_uv_channel = uv_channels[0] if uv_channels else None
 
@@ -4582,37 +9073,110 @@ def _extract_skin_summary(mesh: Any, *, source_vertex_indices: list[int] | None 
     return summary_skin
 
 
-def _require_scene(path: str | Path) -> tuple[Path, Any]:
-    fbx_path = Path(path)
-    if ufbx is None:
-        # The raw binary reader is the supported substitute for a missing
-        # native extension.  It returns the same small Scene/Node/Mesh shape
-        # consumed by the existing Probe stages; it does not intercept or
-        # alter MOD export decisions.
+def _require_scene(
+    path: str | Path,
+    *,
+    use_generic_normalizer: bool = False,
+    backend_kind: Any = "",
+) -> tuple[Path, Any]:
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # False is retained for diagnostics and unsupported legacy callers; the
+    # supported DCC export handoff enables Generic explicitly.
+    fbx_path = Path(path).resolve()
+    # Keep the safety gate at the loader boundary too. The flag is an
+    # internal optimization hint; it is never sufficient to select the
+    # Generic lane without an explicit supported DCC backend identity.
+    use_generic_normalizer = bool(
+        use_generic_normalizer and _uses_generic_rebuild_backend(backend_kind)
+    )
+    # Runtime self-tests and diagnostics intentionally use synthetic paths.
+    # Keep their old loader behavior; real FBX requests are handled below.
+    if not fbx_path.is_file():
+        if ufbx is None:
+            return fbx_path, ufbx_missed_substitute(fbx_path)
         try:
+            return fbx_path, ufbx.load_file(str(fbx_path))
+        except Exception as exc:
+            details = classify_fbx_probe_exception(exc, stage="load_file")
+            if not bool(details["runtime_retryable"]):
+                raise
             scene = ufbx_missed_substitute(fbx_path)
+            if isinstance(getattr(scene, "metadata", None), dict):
+                scene.metadata["native_ufbx_failure"] = details
+            return fbx_path, scene
+
+    if use_generic_normalizer:
+        try:
+            document, generic_receipt = _generic_memory_document_for_path(fbx_path)
         except Exception:
-            # Preserve a clear parse/data error from the substitute.  Do not
-            # fabricate an empty scene or turn an unsupported ASCII/corrupt
-            # FBX into a retryable native-runtime error.
-            raise
+            # The Generic lane is an optional DCC enhancement. If its
+            # binary preparation/parser cannot produce an in-memory document,
+            # return to the existing direct loader so UFBX keeps its normal
+            # data-error/runtime-failure classification instead of leaking a
+            # Generic parser exception.
+            # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+            # This direct-loader fallback is retained only for old/diagnostic
+            # callers and is a deletion candidate after Generic is mandatory.
+            return _require_scene(
+                fbx_path,
+                use_generic_normalizer=False,
+                backend_kind=backend_kind,
+            )
+        normalized_bytes = document.data
+        if ufbx is not None:
+            load_memory = getattr(ufbx, "load_memory", None)
+            if callable(load_memory):
+                try:
+                    scene = load_memory(normalized_bytes)
+                except Exception as exc:
+                    # A Generic rebuild can be structurally valid for our
+                    # binary reader but still be rejected by a particular
+                    # native UFBX build. Keep the normalized binary document
+                    # in the substitute path; re-reading the original here
+                    # would silently bypass the MAX Generic lane and restore
+                    # the producer's unnormalized transforms.
+                    details = classify_fbx_probe_exception(exc, stage="load_memory")
+                    scene = ufbx_missed_substitute(
+                        fbx_path,
+                        binary_document=document,
+                    )
+                    generic_receipt = dict(generic_receipt)
+                    generic_receipt.update(
+                        {
+                            # The bytes are still the normalized document;
+                            # keep the established status so downstream
+                            # normal/axis receipt consumers do not discard it.
+                            "status": "normalized",
+                            "reason": "native_memory_parse_failed_preserved_normalized_document",
+                            "native_memory_failure": details,
+                        }
+                    )
+            else:
+                scene = ufbx_missed_substitute(
+                    fbx_path,
+                    binary_document=document,
+                )
+        else:
+            scene = ufbx_missed_substitute(
+                fbx_path,
+                binary_document=document,
+            )
+        if isinstance(getattr(scene, "metadata", None), dict):
+            scene.metadata["generic_fbx_normalization"] = generic_receipt
         return fbx_path, scene
+
+    if ufbx is None:
+        return fbx_path, ufbx_missed_substitute(fbx_path)
     try:
         scene = ufbx.load_file(str(fbx_path))
     except Exception as exc:
         details = classify_fbx_probe_exception(exc, stage="load_file")
-        if bool(details["runtime_retryable"]):
-            try:
-                scene = ufbx_missed_substitute(fbx_path)
-            except Exception:
-                # Native loader failure plus an unparseable binary is still a
-                # real input/runtime failure; keep the native diagnostic as
-                # the cause while exposing the substitute parse exception.
-                raise
-            if isinstance(getattr(scene, "metadata", None), dict):
-                scene.metadata["native_ufbx_failure"] = details
-            return fbx_path, scene
-        raise
+        if not bool(details["runtime_retryable"]):
+            raise
+        scene = ufbx_missed_substitute(fbx_path)
+        if isinstance(getattr(scene, "metadata", None), dict):
+            scene.metadata["native_ufbx_failure"] = details
+        return fbx_path, scene
     return fbx_path, scene
 
 
@@ -4733,6 +9297,9 @@ def _summarize_scene(
 
 
 def summarize_fbx(path: str | Path) -> dict[str, Any]:
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # Public legacy/diagnostic API: it intentionally invokes the direct loader
+    # and is not the export handoff used by supported DCC routes.
     fbx_path, scene = _require_scene(path)
     summary = _summarize_scene(
         scene,
@@ -4742,6 +9309,57 @@ def summarize_fbx(path: str | Path) -> dict[str, Any]:
     summary["fbx_axes"] = _scene_axis_receipt(scene)
     summary["fbx_units"] = _scene_unit_receipt(scene)
     return summary
+
+
+def _generic_normal_axis_domain_for_geometry(
+    generic_normalization: Any,
+    binary_identity: dict[str, Any] | None,
+) -> str:
+    """Resolve the normal basis for one emitted Generic Geometry ID.
+
+    The receipt is deliberately the only cross-stage authority.  If an old
+    caller has no per-Geometry entry, return an empty value so the Bridge can
+    retain its established policy instead of guessing from FBX axes alone.
+    """
+    if not isinstance(generic_normalization, dict):
+        return ""
+    if str(generic_normalization.get("status", "") or "").strip().lower() != "normalized":
+        return ""
+    normalization = generic_normalization.get("normalization")
+    if not isinstance(normalization, dict):
+        normalization = generic_normalization
+    geometry_id = _int_or_default(
+        (binary_identity or {}).get("fbx_geometry_id"),
+        0,
+    )
+    if geometry_id <= 0:
+        return ""
+    by_geometry = normalization.get("normal_axis_domain_by_geometry_id")
+    if isinstance(by_geometry, dict):
+        domain = str(
+            by_geometry.get(str(geometry_id), by_geometry.get(geometry_id, ""))
+            or ""
+        ).strip().lower()
+        if domain in {
+            FBX_NORMAL_AXIS_DOMAIN_CANONICAL,
+            FBX_NORMAL_AXIS_DOMAIN_LEGACY,
+        }:
+            return domain
+    canonical_ids = {
+        _int_or_default(value, 0)
+        for value in normalization.get("canonical_normal_geometry_ids", [])
+        if _int_or_default(value, 0) > 0
+    }
+    if geometry_id in canonical_ids:
+        return FBX_NORMAL_AXIS_DOMAIN_CANONICAL
+    legacy_ids = {
+        _int_or_default(value, 0)
+        for value in normalization.get("legacy_normal_geometry_ids", [])
+        if _int_or_default(value, 0) > 0
+    }
+    if geometry_id in legacy_ids:
+        return FBX_NORMAL_AXIS_DOMAIN_LEGACY
+    return ""
 
 
 def _build_probe_contract_mesh_row(
@@ -4761,6 +9379,7 @@ def _build_probe_contract_mesh_row(
     probe_geometry_skipped: bool = False,
     probe_skip_reason: str = "",
     probe_topology_scanned: bool = False,
+    generic_normalization: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the single authoritative Mesh contract row for Probe consumers.
 
@@ -4769,6 +9388,17 @@ def _build_probe_contract_mesh_row(
     established shape while the handoff retains Stage A/B facts.
     """
     geometry_normal_fidelity = geometry.get("normal_fidelity", normal_fidelity)
+    normal_axis_domain = _generic_normal_axis_domain_for_geometry(
+        generic_normalization,
+        binary_identity,
+    )
+    if normal_axis_domain:
+        geometry_normal_fidelity = dict(
+            geometry_normal_fidelity
+            if isinstance(geometry_normal_fidelity, dict)
+            else {}
+        )
+        geometry_normal_fidelity["normal_axis_domain"] = normal_axis_domain
     max_position_rows = geometry.get("max_positions")
     # Position conversion does not depend on normal fidelity.  A fallback
     # geometry extraction still has a valid node-transformed position lane;
@@ -4825,6 +9455,8 @@ def _build_probe_contract_mesh_row(
         "vertex_count": geometry.get("vertex_count", 0),
         "triangle_count": geometry.get("triangle_count", 0),
     }
+    if normal_axis_domain:
+        row["fbx_normal_axis_domain"] = normal_axis_domain
     if isinstance(skin, dict):
         row.update(skin)
     if isinstance(binary_identity, dict) and binary_identity:
@@ -4899,6 +9531,9 @@ def _extract_scene_mesh_contracts(
 
 
 def extract_fbx_mesh_contracts(path: str | Path) -> list[dict[str, Any]]:
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # Legacy public contract API: it calls the direct loader/extractor and is
+    # not the Generic-backed export handoff used by supported DCC routes.
     fbx_path, scene = _require_scene(path)
     binary_document = _build_binary_fbx_document(fbx_path)
     skin_context = _build_binary_fbx_skin_evaluation_context(
@@ -5168,7 +9803,15 @@ def _probe_scene_handoff(
     target_slots: set[int] | None = None,
     route_hints: dict[str, Any] | None = None,
     stage_a_plan: dict[str, Any] | None = None,
+    generic_normalization: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # The embedded Generic rebuild emits one canonical Y-up scene. This flag
+    # is request-scoped; direct non-export callers keep their existing path.
+    use_global_axis_domain = (
+        isinstance(generic_normalization, dict)
+        and str(generic_normalization.get("status", "") or "").strip().lower()
+        == "normalized"
+    )
     mesh_summaries: list[dict[str, Any]] = []
     contract_meshes: list[dict[str, Any]] = []
     route_receipt_rows: list[dict[str, Any]] = []
@@ -5296,6 +9939,7 @@ def _probe_scene_handoff(
                 instance_node,
                 binary_corner_geometry=binary_corner_geometry,
                 normal_fidelity=normal_fidelity,
+                use_global_axis_domain=use_global_axis_domain,
             )
             geometry = _augment_geometry_with_skinned_pose_channels(geometry, mesh, instance_node)
             geometry = _apply_binary_fbx_skin_pose_channels(
@@ -5440,6 +10084,7 @@ def _probe_scene_handoff(
             probe_geometry_skipped=not exact_payload_required,
             probe_skip_reason=probe_skip_reason,
             probe_topology_scanned=topology_scanned,
+            generic_normalization=generic_normalization,
         )
         contract_meshes.append(contract_mesh)
 
@@ -5561,13 +10206,28 @@ def probe_fbx_handoff(
     probe_mode: str = "full",
     route_hints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    fbx_path, scene = _require_scene(path)
+    normalized_route_hints = _normalize_probe_route_hints(route_hints)
+    # Both supported DCC routes use the same in-memory Generic reconstruction
+    # before Probe consumes the scene. Unknown/direct callers retain the old
+    # reader path.
+    use_generic_normalizer = _uses_generic_rebuild_backend(
+        normalized_route_hints.get("backend_kind")
+    )
+    fbx_path, scene = _require_scene(
+        path,
+        use_generic_normalizer=use_generic_normalizer,
+        backend_kind=normalized_route_hints.get("backend_kind"),
+    )
     # The export handoff starts with a structural tree only.  Large FBX arrays
     # are decoded lazily when the Stage B target actually consumes them.
-    binary_document = _build_binary_fbx_document(
-        fbx_path,
-        decode_array_names=frozenset(),
-    )
+    if use_generic_normalizer:
+        binary_document, generic_receipt = _generic_memory_document_for_path(fbx_path)
+    else:
+        binary_document = _build_binary_fbx_document(
+            fbx_path,
+            decode_array_names=frozenset(),
+        )
+        generic_receipt = {"status": "disabled", "reason": "non_generic_backend"}
     normalized_target_handles = {
         _int_or_default(value, 0)
         for value in (target_handles or set())
@@ -5583,7 +10243,6 @@ def probe_fbx_handoff(
         for value in (target_slots or set())
         if _int_or_default(value, 0) > 0
     }
-    normalized_route_hints = _normalize_probe_route_hints(route_hints)
     stage_a_filter_active = (
         str(probe_mode or "full").casefold() == "export_required"
         and bool(
@@ -5638,6 +10297,12 @@ def probe_fbx_handoff(
         scene,
         binary_document=binary_document,
         target_mesh_names=target_mesh_names if exact_target_filter_active else None,
+        use_global_axis_domain=(
+            use_generic_normalizer
+            and isinstance(generic_receipt, dict)
+            and str(generic_receipt.get("status", "") or "").strip().lower()
+            == "normalized"
+        ),
     )
     payload = _probe_scene_handoff(
         scene,
@@ -5658,6 +10323,7 @@ def probe_fbx_handoff(
         target_slots=normalized_target_slots,
         route_hints=route_hints,
         stage_a_plan=stage_a_plan,
+        generic_normalization=generic_receipt,
     )
     payload["binary_parse"] = binary_document.receipt()
     payload["status"] = "ok"
@@ -5728,10 +10394,56 @@ def probe_fbx_handoff(
         payload["probe_route_receipt"] = route_receipt
     fbx_axes = _scene_axis_receipt(scene)
     fbx_units = _scene_unit_receipt(scene)
+    # All downstream Writer branches receive the same already-converted
+    # position contract.  Keep this one scene-level unit boundary here so
+    # ordinary MAX positions and BONE+MESH Skin positions cannot diverge.
+    fbx_model_scale_transform = _apply_blender_probe_inch_scale(
+        payload,
+        backend_kind=normalized_route_hints.get("backend_kind"),
+        fbx_units=fbx_units,
+        generic_receipt=generic_receipt,
+        # Bones Edit requests the full scene handoff; only that Blender route
+        # needs its bone matrices moved into the same Max-inch domain as Mesh.
+        bone_edit=(str(probe_mode or "full").strip().casefold() == "full"),
+    )
     payload["fbx_axes"] = fbx_axes
     payload["fbx_units"] = fbx_units
     payload["summary"]["fbx_axes"] = fbx_axes
     payload["summary"]["fbx_units"] = fbx_units
+    payload["fbx_model_scale_transform"] = fbx_model_scale_transform
+    payload["summary"]["fbx_model_scale_transform"] = dict(
+        fbx_model_scale_transform
+    )
+    payload["generic_fbx_normalization"] = generic_receipt
+    if (
+        isinstance(generic_receipt, dict)
+        and str(generic_receipt.get("status", "") or "").strip().lower()
+        == "normalized"
+    ):
+        # Publish the scene-wide writer policy at the Probe boundary as well
+        # as inside the nested Generic receipt.  The Bridge can therefore
+        # consume one explicit XYZ declaration without inspecting internals.
+        generic_axis_policy = str(
+            generic_receipt.get("fbx_axis_output_policy", "") or ""
+        ).strip().lower()
+        if generic_axis_policy:
+            payload["fbx_axis_output_policy"] = generic_axis_policy
+        payload["fbx_axis_transform_scope"] = "scene_global_once"
+        # The rebuilt bone Models are emitted in the same canonical XYZ domain
+        # as the rebuilt Geometry.  The Bridge adapts their translation into
+        # its legacy internal matrix representation exactly once before write.
+        payload["bone_matrix_axis_domain"] = FBX_NORMAL_AXIS_DOMAIN_CANONICAL
+        normalization = generic_receipt.get("normalization")
+        if not isinstance(normalization, dict):
+            normalization = generic_receipt
+        inverse_axis = normalization.get("canonical_to_source_axis_matrix")
+        if (
+            isinstance(inverse_axis, list)
+            and len(inverse_axis) >= 16
+            and all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in inverse_axis[:16])
+        ):
+            payload["bone_matrix_axis_inverse"] = [float(value) for value in inverse_axis[:16]]
+        payload["transform_stage"] = "Generic_to_mod_transform_code"
     return payload
 
 

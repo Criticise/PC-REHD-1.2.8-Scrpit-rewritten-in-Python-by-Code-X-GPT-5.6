@@ -4068,11 +4068,14 @@ MAIN_WINDOW_COLLAPSED_MIN_WIDTH = 260
 MAIN_WINDOW_COLLAPSED_MIN_HEIGHT = 270
 MAIN_WINDOW_ADVANCED_ORIGINAL_SIZE = (792, 1039)
 WINDOW_OFFSCREEN_STAGE_COORDINATE = 20000
+WINDOW_MINIMIZED_SENTINEL_COORDINATE = -30000
 MAIN_WINDOW_SCALING_MIN_SCALE = 0.08
 MAIN_WINDOW_SCALING_MIN_WIDGET_SCALE = 0.32
 MAIN_WINDOW_SCALING_MIN_FONT_SCALE = 0.7
 MAIN_WINDOW_SCALING_MAX_SCALE = 1.35
-MAIN_UI_SCALING_LAYOUT_CACHE_VERSION = "scaling-layout-v14-collapsed-fit"
+# Bump when the Launcher layout contract changes so stale compressed geometry
+# cannot be replayed over the current widget tree on startup.
+MAIN_UI_SCALING_LAYOUT_CACHE_VERSION = "scaling-layout-v15-collapsed-fit"
 MAIN_RESIZE_GRIP_SIZE = 18
 MAIN_RESIZE_GRIP_EXPANDED_SIZE = 34
 MAIN_UI_PRELOAD_SLICE_MS = 6
@@ -4080,10 +4083,23 @@ MAIN_UI_PRELOAD_NEXT_SLICE_MS = 1
 MAIN_VIEWPORT_SCROLL_SETTLE_MS = 120
 LAUNCHER_STATE_FILE_NAME = "PC_REHD_Code_X_Launcher_State.json"
 LAUNCHER_STATE_SCHEMA = "pc-rehd-code-x-launcher-state-v1"
+# The toolbox layout was rebuilt after the old cache could retain a Tk/DPI
+# default near the upper-left corner.  Migrate that cache once; new captures
+# continue to preserve the user's actual position and size.
+TOOLBOX_GEOMETRY_LAYOUT_VERSION = "toolbox-geometry-v2-centered-migration"
 RENAME_VALUE_HISTORY_DEFAULTS = ("0", "255", "2")
 RENAME_VALUE_HISTORY_LIMIT = 20
 RENAME_VALUE_HISTORY_VISIBLE_ROWS = 8
 MESH_RENAME_FIELDS = frozenset(("lod", "mat", "group", "display"))
+
+
+def _window_position_is_transient(x: int, y: int) -> bool:
+    """Return whether Windows/Tk is exposing a non-user staging position."""
+    return any(
+        coordinate >= WINDOW_OFFSCREEN_STAGE_COORDINATE
+        or coordinate <= WINDOW_MINIMIZED_SENTINEL_COORDINATE
+        for coordinate in (int(x), int(y))
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -6575,13 +6591,9 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
             pos_x, pos_y = int(raw_position[0]), int(raw_position[1])
         except (IndexError, TypeError, ValueError):
             return []
-        # +20000,+20000 is the temporary hidden-paint coordinate used by
-        # _show_themed_window. It is never a user position and must not
-        # survive a restart as the Launcher's saved location.
-        if (
-            pos_x >= WINDOW_OFFSCREEN_STAGE_COORDINATE
-            or pos_y >= WINDOW_OFFSCREEN_STAGE_COORDINATE
-        ):
+        # Reject both our +20000 paint stage and Windows' -32000 minimized
+        # sentinel. Neither is a user position and neither may survive restart.
+        if _window_position_is_transient(pos_x, pos_y):
             return []
         return [pos_x, pos_y] if pos_x >= -100000 and pos_y >= -100000 else []
 
@@ -6906,6 +6918,15 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
     blender_toolbox_geometry_verified = bool(
         source.get("blender_toolbox_geometry_verified", False)
     )
+    if (
+        str(source.get("toolbox_geometry_layout_version", "") or "").strip()
+        != TOOLBOX_GEOMETRY_LAYOUT_VERSION
+    ):
+        # Previous builds mixed Tk logical coordinates with the native desktop
+        # rectangle.  Their saved origin is not a reliable user position.
+        max_toolbox_geometry = ""
+        blender_toolbox_geometry = ""
+        blender_toolbox_geometry_verified = False
     max_toolbox_visible = bool(
         source.get("max_toolbox_visible", source.get("toolbox_visible", False))
     )
@@ -7113,6 +7134,7 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
         "max_toolbox_geometry": max_toolbox_geometry,
         "blender_toolbox_geometry": blender_toolbox_geometry,
         "blender_toolbox_geometry_verified": blender_toolbox_geometry_verified,
+        "toolbox_geometry_layout_version": TOOLBOX_GEOMETRY_LAYOUT_VERSION,
         "scene_normals_visible": bool(source.get("scene_normals_visible", False)),
         "scene_normals_geometry": scene_normals_geometry,
         "scene_normals_dock_side": scene_normals_dock_side,
@@ -21037,19 +21059,6 @@ def _max_user_prop(rt: Any, node: Any, key: str) -> str:
         return ""
 
 
-def _max_matrix3_from_property(rt: Any, value: str) -> Any | None:
-    try:
-        numbers = [float(token.strip()) for token in str(value).split(",")]
-    except (TypeError, ValueError):
-        return None
-    if len(numbers) != 12:
-        return None
-    return rt.matrix3(
-        rt.point3(*numbers[0:3]), rt.point3(*numbers[3:6]),
-        rt.point3(*numbers[6:9]), rt.point3(*numbers[9:12]),
-    )
-
-
 def _max_matrix3_close(left: Any, right: Any, *, tolerance: float = 1.0e-4) -> bool:
     left_rows = _matrix3(left)
     right_rows = _matrix3(right)
@@ -21577,58 +21586,28 @@ def _max_apply_authoritative_skin_limit(rt: Any, node: Any, modifier: Any) -> in
     return expected
 
 
-def _max_restore_imported_bone_world_matrices(rt: Any, nodes: list[Any]) -> int:
-    pending: dict[int, tuple[Any, Any]] = {}
+def _max_mark_imported_bone_handles(rt: Any, nodes: list[Any]) -> int:
+    """Record live Max handles without rewriting native FBX transforms.
+
+    The importer now declares the source inch unit in FBX metadata, so Max's
+    native FBX importer owns the bone transform conversion.  This marker is
+    only an identity receipt used by later scene-contract/export code.
+    """
+    marked = 0
     for node in nodes:
-        matrix_text = _max_user_prop(rt, node, "CodexRe6MaxWorldTM")
-        if not matrix_text:
-            continue
         name = str(getattr(node, "name", ""))
         if not name.casefold().startswith("b_"):
-            raise RuntimeError(f"Non-bone node declares CodexRe6MaxWorldTM: {name or '<unnamed>'}")
-        matrix_value = _max_matrix3_from_property(rt, matrix_text)
-        if matrix_value is None:
-            raise RuntimeError(f"Imported bone has an invalid Max world-matrix contract: {name}")
+            continue
         handle = _max_node_handle(rt, node)
-        if handle <= 0 or handle in pending:
-            raise RuntimeError(f"Imported bone has an invalid or duplicate node handle: {name}")
-        pending[handle] = (node, matrix_value)
-
-    restored = 0
-    while pending:
-        ready: list[int] = []
-        for handle, (node, _matrix_value) in pending.items():
-            try:
-                parent = node.parent
-            except Exception:
-                parent = None
-            parent_handle = _max_node_handle(rt, parent) if parent is not None else 0
-            if parent_handle not in pending:
-                ready.append(handle)
-        if not ready:
-            names = [str(getattr(node, "name", "")) for node, _matrix in pending.values()]
-            raise RuntimeError(f"Imported bone hierarchy is cyclic or unresolved: {names[:12]}")
-        for handle in ready:
-            node, matrix_value = pending.pop(handle)
-            if not _max_matrix3_close(getattr(node, "transform", None), matrix_value):
-                node.transform = matrix_value
-            if not _max_matrix3_close(getattr(node, "transform", None), matrix_value):
-                raise RuntimeError(
-                    f"Imported bone world-matrix verification failed: {getattr(node, 'name', '<unnamed>')}"
-                )
-            rt.setUserProp(node, "CodexV4ImportedBoneHandle", str(handle))
-            if _max_user_prop(rt, node, "CodexV4ImportedBoneHandle") != str(handle):
-                raise RuntimeError(
-                    f"Imported bone handle marker verification failed: {getattr(node, 'name', '<unnamed>')}"
-                )
-            try:
-                rt.deleteUserProp(node, "CodexRe6MaxWorldTM")
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Unable to consume imported bone matrix contract: {getattr(node, 'name', '<unnamed>')}"
-                ) from exc
-            restored += 1
-    return restored
+        if handle <= 0:
+            raise RuntimeError(f"Imported bone has an invalid node handle: {name or '<unnamed>'}")
+        rt.setUserProp(node, "CodexV4ImportedBoneHandle", str(handle))
+        if _max_user_prop(rt, node, "CodexV4ImportedBoneHandle") != str(handle):
+            raise RuntimeError(
+                f"Imported bone handle marker verification failed: {name or '<unnamed>'}"
+            )
+        marked += 1
+    return marked
 
 
 def _max_postprocess_import(
@@ -21643,7 +21622,7 @@ def _max_postprocess_import(
         for value in (bound_names or {"BoundSphere", "BoundBoxMin", "BoundBoxMax"})
         if str(value or "")
     }
-    restored_bones = _max_restore_imported_bone_world_matrices(rt, nodes)
+    marked_bones = _max_mark_imported_bone_handles(rt, nodes)
     skin_limits: dict[int, int] = {}
     for node in nodes:
         name = str(getattr(node, "name", ""))
@@ -21695,7 +21674,11 @@ def _max_postprocess_import(
     normalized_material_count = 0
     material_normalization_errors: list[str] = []
     return {
-        "restored_bone_matrices": restored_bones,
+        # Kept at zero for receipt compatibility: no Max-side matrix override
+        # is performed now that FBX unit metadata is authoritative.
+        "restored_bone_matrices": 0,
+        "imported_bone_handles_marked": marked_bones,
+        "bone_matrix_restore_policy": "native_fbx_unit_metadata",
         "skin_limits": skin_limits,
         "normalized_material_count": normalized_material_count,
         "material_normalization_errors": material_normalization_errors[:32],
@@ -22134,8 +22117,6 @@ def _max_validate_imported_scene(
         handle = _max_node_handle(rt, node)
         if _max_user_prop(rt, node, "CodexV4ImportedBoneHandle") != str(handle):
             raise RuntimeError(f"Imported bone handle marker is missing or stale: {bone_name}")
-        if _max_user_prop(rt, node, "CodexRe6MaxWorldTM"):
-            raise RuntimeError(f"Imported bone world-matrix contract was not consumed: {bone_name}")
         try:
             export_slot = int(_max_user_prop(rt, node, "CodexV4ExportBoneSlot") or -1)
         except ValueError as exc:
@@ -22177,8 +22158,8 @@ def _max_validate_imported_scene(
         raise RuntimeError("Scene contract node count does not match the source MOD")
     if str(contract.get("scope", "") or "") != "current_import_nodes":
         raise RuntimeError("Scene contract was not limited to the current import")
-    if int(postprocess.get("restored_bone_matrices", -1)) != len(expected_bones):
-        raise RuntimeError("Not every imported bone world matrix was restored and verified")
+    if int(postprocess.get("imported_bone_handles_marked", -1)) != len(expected_bones):
+        raise RuntimeError("Not every imported bone received a live handle marker")
     expected_skin_limits = {
         int(row["physical_slot"]): int(row["skin_bone_limit"])
         for row in expected_meshes
@@ -31806,6 +31787,19 @@ _FULL_RE6_MESH_HEADER_NAME_RE = re.compile(
     r"(?P<import_suffix>_Import_?(?:[2-9]|[1-9]\d+)(?:_[1-9]\d*)?)?"
     r"(?P<blender_suffix>\.\d{3,})?$"
 )
+# Keep the names used by the internal hierarchy repair code as aliases to the
+# canonical patterns above.  The Worker runs in its own namespace, so Launcher
+# globals (including these historical names) are not available there.
+_FBX_RE6_COMPACT_MESH_NAME_RE = _COMPACT_RE6_MESH_NAME_RE
+_FBX_RE6_FULL_MESH_NAME_RE = _FULL_RE6_MESH_HEADER_NAME_RE
+# Helper Model names (LodGroup_N / OtherMesh) use the same collision suffix
+# grammar as the Launcher.  Keep this definition inside the embedded agent:
+# the template is executed as an independent Blender process and cannot see
+# the Launcher module's globals.
+_FBX_RE6_HELPER_NAME_RE = re.compile(
+    r"(?i)^(?P<base>LodGroup_-?\d+|OtherMesh)"
+    r"(?P<import_suffix>_Import_?(?:[2-9]|[1-9]\d+)(?:_[1-9]\d*)?)?$"
+)
 # Some FBX writers append a __CIX_<pointer> marker to duplicate Model names
 # before Blender sees them. It is an import-time collision marker, not part of
 # the user's Mesh/Object name; keep it recognizable so the first occurrence
@@ -34786,10 +34780,234 @@ def _fbx_hierarchy_recover_scene_from_source(payload):
     return result
 
 
+def _repair_re6_internal_hierarchy(payload=None):
+    """Best-effort RE6 hierarchy recovery using only the live Blender scene.
+
+    The toolbox export path does not have an original FBX contract.  Use the
+    complete RE6 Mesh name plus the built-in LodGroup/OtherMesh convention to
+    select a parent.  A missing or ambiguous helper is evidence only: that
+    Mesh is left exactly where Blender currently has it and export continues.
+    """
+    scene = bpy.context.scene
+    all_objects = list(getattr(scene, "objects", ()) or ())
+    meshes = [
+        node
+        for node in all_objects
+        if str(getattr(node, "type", "") or "") == "MESH"
+        and not _is_re6_bound_sphere(node)
+    ]
+    receipt = {
+        "action": "scene.repair_re6_internal_hierarchy",
+        "schema": _FBX_HIERARCHY_CONTRACT_SCHEMA,
+        "status": "NO_RE6_MESH_NAMES",
+        "scope": "live_scene_re6_mesh_name_and_helper_convention",
+        "candidate_mesh_count": len(meshes),
+        "recognized_mesh_count": 0,
+        "routed_model_count": 0,
+        "unchanged_model_count": 0,
+        "missing_helper_count": 0,
+        "missing_helpers": [],
+        "unresolved_node_names": [],
+        "unresolved_nodes": [],
+        "issues": [],
+        "changed": False,
+    }
+    lod_group_ids = frozenset((0, 1, 2, 3, 4, 5, 6, 249, 252, 254, 255))
+
+    def without_blender_suffix(value):
+        return re.sub(r"\.\d{3,}$", "", str(value or "").strip())
+
+    # Older resident Worker bundles were generated before the helper-name
+    # pattern was embedded in this standalone namespace.  Keep the repair
+    # operation self-contained so a stale bundle cannot fail with NameError;
+    # the Launcher still refreshes stale bundles before this command runs.
+    helper_name_pattern = globals().get("_FBX_RE6_HELPER_NAME_RE")
+    if helper_name_pattern is None:
+        helper_name_pattern = re.compile(
+            r"(?i)^(?P<base>LodGroup_-?\d+|OtherMesh)"
+            r"(?P<import_suffix>_Import_?(?:[2-9]|[1-9]\d+)(?:_[1-9]\d*)?)?$"
+        )
+    compact_mesh_pattern = globals().get("_FBX_RE6_COMPACT_MESH_NAME_RE")
+    if compact_mesh_pattern is None:
+        compact_mesh_pattern = globals().get("_COMPACT_RE6_MESH_NAME_RE")
+    if compact_mesh_pattern is None:
+        compact_mesh_pattern = re.compile(
+            r"(?i)^(?P<mesh_slot>0*\d+)_X(?P<header_fvf>[0-9A-F]{8})_"
+            r"(?P<lod_level>-?\d+)_(?P<material_id>-?\d+)_"
+            r"(?P<group_id>-?\d+)_(?P<display_mode>-?\d+)_"
+            r"(?P<mesh_type>-?\d+)"
+            r"(?P<import_suffix>_Import_?(?:[2-9]|[1-9]\d+)(?:_[1-9]\d*)?)?$"
+        )
+    full_mesh_pattern = globals().get("_FBX_RE6_FULL_MESH_NAME_RE")
+    if full_mesh_pattern is None:
+        full_mesh_pattern = globals().get("_FULL_RE6_MESH_HEADER_NAME_RE")
+    if full_mesh_pattern is None:
+        full_mesh_pattern = re.compile(
+            r"(?i)^Mesh_(?P<mesh_slot>0*\d+)_"
+            r"(?:X|0X)?(?P<header_fvf>[0-9A-F]{8})_"
+            r"LODx(?P<lod_level>-?\d+)_MatID:(?P<material_id>-?\d+)_"
+            r"Group:(?P<group_id>-?\d+)_DisplayMode:(?P<display_mode>-?\d+)_"
+            r"Type:(?P<mesh_type>-?\d+)"
+            r"(?P<import_suffix>_Import_?(?:[2-9]|[1-9]\d+)(?:_[1-9]\d*)?)?$"
+        )
+
+    def helper_info(node):
+        base_name = without_blender_suffix(getattr(node, "name", ""))
+        match = helper_name_pattern.fullmatch(base_name)
+        if match is None:
+            return None
+        return {
+            "node": node,
+            "base": str(match.group("base")),
+            "suffix": str(match.group("import_suffix") or ""),
+            "name": str(getattr(node, "name", "") or ""),
+            "duplicate": (
+                int(re.search(r"\.(\d{3,})$", str(getattr(node, "name", "") or "")).group(1))
+                if re.search(r"\.(\d{3,})$", str(getattr(node, "name", "") or ""))
+                else 0
+            ),
+        }
+
+    helpers = [
+        info
+        for node in all_objects
+        if str(getattr(node, "type", "") or "") != "MESH"
+        for info in (helper_info(node),)
+        if info is not None
+    ]
+    helpers_by_name = {}
+    for info in helpers:
+        helpers_by_name.setdefault(info["name"].casefold(), []).append(info)
+    snapshot_plans = []
+    routed_nodes = []
+    missing_helpers = []
+    unresolved = []
+    recognized = 0
+    unchanged = 0
+
+    for mesh in sorted(meshes, key=lambda node: str(getattr(node, "name", "")).casefold()):
+        mesh_name = str(getattr(mesh, "name", "") or "")
+        facts = _mesh_name_facts(mesh_name)
+        required = (
+            "scene_name_mesh_slot", "header_fvf", "lod_level", "material_id",
+            "group_id", "display_mode", "mesh_type",
+        )
+        if facts is None or any(facts.get(key) in (None, "") for key in required):
+            unresolved.append({"node_name": mesh_name, "reason": "unrecognized_re6_mesh_name"})
+            continue
+        recognized += 1
+        name_without_suffix = without_blender_suffix(mesh_name)
+        full_match = full_mesh_pattern.fullmatch(name_without_suffix)
+        compact_match = compact_mesh_pattern.fullmatch(name_without_suffix)
+        import_suffix = ""
+        if full_match is not None:
+            import_suffix = str(full_match.group("import_suffix") or "")
+        elif compact_match is not None:
+            import_suffix = str(compact_match.group("import_suffix") or "")
+        declared_parent = _property_text(mesh, "PC_REHD_PARENT_NAME")
+        declared_base = without_blender_suffix(declared_parent)
+        declared_match = helper_name_pattern.fullmatch(declared_base)
+        if declared_match is not None:
+            expected_base = str(declared_match.group("base"))
+            if not import_suffix:
+                import_suffix = str(declared_match.group("import_suffix") or "")
+        else:
+            lod_level = int(facts["lod_level"])
+            has_skin = bool(_armature_modifier(mesh) is not None or len(getattr(mesh, "vertex_groups", ())) > 0)
+            expected_base = (
+                "LodGroup_%d" % lod_level
+                if lod_level == 0 or (lod_level in lod_group_ids and has_skin)
+                else "OtherMesh"
+            )
+
+        expected_name = (expected_base + import_suffix).casefold()
+        candidates = list(helpers_by_name.get(expected_name, ()))
+        if not candidates and import_suffix:
+            candidates = list(helpers_by_name.get(expected_base.casefold(), ()))
+        if not candidates:
+            candidates = [
+                info for info in helpers
+                if info["base"].casefold() == expected_base.casefold()
+                and (not import_suffix or info["suffix"].casefold() in {"", import_suffix.casefold()})
+            ]
+        if len(candidates) > 1:
+            duplicate_match = re.search(r"\.(\d{3,})$", mesh_name)
+            if duplicate_match is not None:
+                ordinal = int(duplicate_match.group(1))
+                ordinal_candidates = [info for info in candidates if info["duplicate"] == ordinal]
+                if len(ordinal_candidates) == 1:
+                    candidates = ordinal_candidates
+        if len(candidates) != 1:
+            unresolved.append({
+                "node_name": mesh_name,
+                "reason": "missing_helper" if not candidates else "ambiguous_helper",
+                "helper_name": expected_base + import_suffix,
+            })
+            if not candidates:
+                missing_helpers.append({"mesh_name": mesh_name, "helper_name": expected_base + import_suffix})
+            continue
+        target = candidates[0]["node"]
+        snapshot_plans.append((mesh, target))
+        parent_changed = getattr(mesh, "parent", None) is not target
+        current_collections = {_pointer(value) for value in _fbx_hierarchy_object_collections(mesh)}
+        target_collections = {_pointer(value) for value in _fbx_hierarchy_object_collections(target)}
+        collection_changed = bool(target_collections) and current_collections != target_collections
+        if not parent_changed and not collection_changed:
+            unchanged += 1
+            continue
+        try:
+            if parent_changed:
+                world_matrix = mesh.matrix_world.copy()
+                mesh.parent = target
+                mesh.matrix_parent_inverse = target.matrix_world.inverted_safe()
+                mesh.matrix_world = world_matrix
+            collection_result = _fbx_hierarchy_move_to_parent_collection(mesh, target)
+            if collection_result.get("issues"):
+                receipt["issues"].extend(list(collection_result.get("issues", [])))
+            mesh["PC_REHD_PARENT_NAME"] = str(getattr(target, "name", "") or "")
+            routed_nodes.append(mesh)
+            receipt["routed_model_count"] += 1 if parent_changed else 0
+            receipt["changed"] = True
+        except Exception as exc:
+            # A single malformed Blender RNA object must not cancel the export.
+            unresolved.append({"node_name": mesh_name, "reason": "%s: %s" % (type(exc).__name__, exc)})
+
+    if routed_nodes:
+        undo_snapshot = _fbx_hierarchy_capture_repair_undo(scene, snapshot_plans, "internal_re6_hierarchy")
+        receipt["undo_repair_id"] = _fbx_hierarchy_store_repair_undo(scene, undo_snapshot, routed_nodes)
+    receipt["recognized_mesh_count"] = recognized
+    receipt["unchanged_model_count"] = unchanged
+    receipt["missing_helper_count"] = len(missing_helpers)
+    receipt["missing_helpers"] = missing_helpers[:64]
+    receipt["unresolved_nodes"] = unresolved[:64]
+    receipt["unresolved_node_names"] = sorted(
+        {str(row.get("node_name", "") or "") for row in unresolved if str(row.get("node_name", "") or "")},
+        key=str.casefold,
+    )[:64]
+    receipt["status"] = (
+        "RESTORED"
+        if receipt["changed"] and not unresolved
+        else "PARTIAL"
+        if receipt["changed"]
+        else "NO_RE6_MESH_NAMES"
+        if not recognized
+        else "ALREADY_CORRECT"
+        if not unresolved
+        else "PARTIAL"
+    )
+    return _record_blender_scene_undo(
+        receipt,
+        "PC-REHD Restore Internal RE6 Hierarchy",
+        changed=bool(receipt["changed"]),
+    )
+
+
 def _repair_re6_fbx_hierarchy(payload=None):
     request = dict(payload) if isinstance(payload, dict) else {}
     source_path = str(request.get("source_path", "") or "").strip()
     if not source_path:
+        if bool(request.get("internal_re6", False)):
+            return _repair_re6_internal_hierarchy(request)
         raise ValueError(
             "Manual FBX hierarchy repair requires selecting the original source FBX"
         )
@@ -38765,8 +38983,17 @@ def _export_fbx(payload):
     ).strip().casefold()
     if bone_export_mode not in {"disabled", "bones_only", "bones_plus_mesh"}:
         raise ValueError("Blender FBX export received an unsupported Bone Edit mode")
-    scoped_export = bool(requested_mesh_handles or requested_bone_handles)
-    full_scene_export = bool(payload.get("full_scene_export", False))
+    # Bone-edit exports always carry the complete Blender scene.  Non-deforming
+    # source bones are represented by Empty/Null objects and are not recoverable
+    # after a selection-scoped FBX export has omitted them.
+    bone_export_requested = (
+        bone_export_mode != "disabled" or bool(requested_bone_handles)
+    )
+    full_scene_export = bone_export_requested or bool(
+        payload.get("full_scene_export", False)
+    )
+    # Keep selection-scoped export only for Mesh-only requests.
+    scoped_export = bool(requested_mesh_handles or requested_bone_handles) and not full_scene_export
     meshes = [
         node
         for node in bpy.context.scene.objects
@@ -38964,6 +39191,7 @@ def _export_fbx(payload):
         "bone_handles": sorted(resolved_bone_handles),
         "armature_handles": sorted(_pointer(node) for node in armatures),
         "mesh_count": len(meshes),
+        "full_scene_export": full_scene_export,
         "scope": (
             "selected_blender_bones_fbx"
             if requested_bone_handles and not meshes
@@ -42231,6 +42459,36 @@ class ManagedBlenderSession:
         with self._pending_state_lock:
             return self._pending_request_count > 0
 
+    def _refresh_worker_if_stale(self) -> None:
+        """Refresh an old resident Worker before hierarchy repair is dispatched."""
+        contract = _blender_worker_contract()
+        expected_revision = str(contract["component_revision"])
+        expected_source_id = str(contract["source_id"])
+        descriptor = _read_blender_agent_descriptor(
+            self.pid, "worker", allow_stale=True
+        )
+        descriptor_current = bool(
+            descriptor is not None
+            and str(descriptor.get("component_revision", "") or "")
+            == expected_revision
+            and str(descriptor.get("worker_source_id", "") or "")
+            == expected_source_id
+        )
+        session_current = bool(
+            str(self.worker_descriptor.get("component_revision", "") or "")
+            == expected_revision
+            and str(self.worker_descriptor.get("worker_source_id", "") or "")
+            == expected_source_id
+        )
+        if descriptor_current and session_current:
+            return
+        worker, health = _ensure_blender_worker_for_pid(
+            self.pid,
+            force_replace=False,
+        )
+        self.worker_descriptor = worker
+        self.health = health
+
     @classmethod
     def connect_existing(
         cls,
@@ -42324,6 +42582,11 @@ class ManagedBlenderSession:
                 pass
 
         with self._request_lock:
+            if normalized_command == "scene.repair_re6_fbx_hierarchy":
+                # A Launcher can outlive a Blender process's first Worker
+                # bundle.  Reconcile only when the source contract is stale;
+                # normal commands keep the existing fast path.
+                self._refresh_worker_if_stale()
             with self._pending_state_lock:
                 self._pending_request_count += 1
             try:
@@ -47515,6 +47778,102 @@ def _finalize_blender_embedded_texture_fbx(
         "output_mtime_ns": int(output_stat.st_mtime_ns),
         "temporary_cleanup": "PENDING",
     }
+
+
+def _write_generic_fbx_from_source(
+    source_path: str | Path,
+    output_path: str | Path,
+) -> dict[str, Any]:
+    """Build the Generic FBX in memory, then atomically write its final file.
+
+    The binary Generic normalizer is independent of the optional UFBX
+    accelerator, so this lane must not gate a Blender export on UFBX health.
+    """
+    probe = _load_operation_dependency("auxiliary", "auxiliary_probe")
+    prepare = getattr(probe, "_generic_prepare_fbx_bytes", None)
+    if not callable(prepare):
+        raise RuntimeError(
+            "FBX Probe Generic in-memory conversion entry point is unavailable"
+        )
+    source = Path(source_path).expanduser().resolve(strict=True)
+    output = Path(output_path).expanduser().resolve(strict=False)
+    if source.suffix.casefold() != ".fbx" or output.suffix.casefold() != ".fbx":
+        raise ValueError("Generic FBX source and output paths must use the .fbx extension")
+    if source == output:
+        raise ValueError("Generic FBX output must be different from its source FBX")
+    if output.exists():
+        raise FileExistsError(f"Generic FBX output already exists: {output}")
+    data, receipt = prepare(source)
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        raise RuntimeError("FBX Probe Generic conversion returned no FBX bytes")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(
+        f".{output.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        temporary.write_bytes(bytes(data))
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    output_stat = output.stat()
+    return {
+        **(dict(receipt) if isinstance(receipt, Mapping) else {}),
+        "path": str(output),
+        "size": int(output_stat.st_size),
+        "mtime_ns": int(output_stat.st_mtime_ns),
+    }
+
+
+EMBEDDED_MEDIA_FBX_STEM = "内置贴图 Embedded Media"
+GENERIC_EMBEDDED_MEDIA_FBX_STEM = "通用内置贴图 Generic Embedded Media"
+
+
+def _reserve_embedded_media_fbx_pair(
+    directory: str | Path,
+) -> tuple[Path, Path, Path]:
+    """Reserve one collision-free native/Generic FBX name pair.
+
+    The reservation marker is removed by the caller after the whole pair has
+    been written.  A shared ordinal keeps the native and Generic files easy to
+    identify when the same directory is used for several exports.
+    """
+    output_directory = Path(directory).expanduser().resolve(strict=False)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    for ordinal in range(10000):
+        suffix = "" if ordinal == 0 else f" {ordinal:02d}"
+        native_path = output_directory / f"{EMBEDDED_MEDIA_FBX_STEM}{suffix}.fbx"
+        generic_path = output_directory / f"{GENERIC_EMBEDDED_MEDIA_FBX_STEM}{suffix}.fbx"
+        if native_path.exists() or generic_path.exists():
+            continue
+        reservation_path = output_directory / f".{native_path.name}.pair.reserve"
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                str(reservation_path),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+            os.close(descriptor)
+            descriptor = -1
+            # Recheck after the exclusive marker was created.  This protects
+            # against another process that does not use the marker protocol.
+            if native_path.exists() or generic_path.exists():
+                reservation_path.unlink(missing_ok=True)
+                continue
+            return native_path, generic_path, reservation_path
+        except FileExistsError:
+            continue
+        except Exception:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            reservation_path.unlink(missing_ok=True)
+            raise
+    raise RuntimeError(
+        "无法为内置贴图 Embedded Media 和通用内置贴图 Generic Embedded Media 分配新文件名。"
+    )
 
 
 def _cleanup_fbx_interchange_temporary_files(
@@ -58716,6 +59075,7 @@ class LauncherApp:
                 self.root.update_idletasks()
                 self._position_content_after_toolbar(flush_layout=False)
                 self._reflow_left_sections(flush_layout=False)
+                self._sync_toolbar_region_geometry()
                 self.root.update_idletasks()
                 # This recomputes the exact visible bounds and replaces stale
                 # pre-collapse content dimensions without changing geometry.
@@ -59019,11 +59379,29 @@ class LauncherApp:
             ):
                 self._main_window_layout_finalized = False
                 return
-            if bool(getattr(self, "_scaling_mode_enabled", False)):
-                mapped_size = (
-                    max(1, int(self.root.winfo_width())),
-                    max(1, int(self.root.winfo_height())),
+            mapped_width = max(1, int(self.root.winfo_width()))
+            mapped_height = max(1, int(self.root.winfo_height()))
+            mapped_position = (
+                int(self.root.winfo_x()),
+                int(self.root.winfo_y()),
+            )
+            resolved_position = _resolve_launcher_position(
+                mapped_position,
+                window_width=mapped_width,
+                window_height=mapped_height,
+                virtual_bounds=_launcher_virtual_desktop_bounds(self.root),
+            )
+            if resolved_position != mapped_position:
+                self._main_window_requested_position = resolved_position
+                _set_themed_window_geometry(
+                    self.root,
+                    f"{mapped_width}x{mapped_height}"
+                    f"{resolved_position[0]:+d}{resolved_position[1]:+d}",
+                    dark=bool(getattr(self, "_theme_dark", False)),
                 )
+                self.root.update_idletasks()
+            if bool(getattr(self, "_scaling_mode_enabled", False)):
+                mapped_size = (mapped_width, mapped_height)
                 if (
                     self._main_ui_scaling_applied_size != mapped_size
                     or self._main_ui_scaling_committed_content_size is None
@@ -59813,13 +60191,21 @@ class LauncherApp:
             ]
         except (self.tk.TclError, TypeError, ValueError, AttributeError):
             live_position = list(positions.get(cache_key, []) or [])
-        staged_position = any(
-            coordinate >= WINDOW_OFFSCREEN_STAGE_COORDINATE
-            for coordinate in live_position
-        )
+        if len(live_position) < 2:
+            return
+        staged_position = _window_position_is_transient(*live_position)
+        requested_position_valid = False
+        if isinstance(requested_position, (list, tuple)) and len(
+            requested_position
+        ) >= 2:
+            try:
+                requested_position_valid = not _window_position_is_transient(
+                    int(requested_position[0]), int(requested_position[1])
+                )
+            except (TypeError, ValueError):
+                requested_position_valid = False
         if (
-            isinstance(requested_position, (list, tuple))
-            and len(requested_position) >= 2
+            requested_position_valid
             and (not is_mapped or staged_position)
         ):
             # LauncherApp restores size while the root is withdrawn. The
@@ -59831,6 +60217,8 @@ class LauncherApp:
                 int(requested_position[1]),
             ]
         else:
+            if staged_position:
+                return
             current_position = live_position
         if (
             sizes.get(cache_key) == size
@@ -59929,10 +60317,14 @@ class LauncherApp:
                         requested_position
                     ) >= 2:
                         try:
-                            target_position = (
+                            requested_target_position = (
                                 int(requested_position[0]),
                                 int(requested_position[1]),
                             )
+                            if not _window_position_is_transient(
+                                *requested_target_position
+                            ):
+                                target_position = requested_target_position
                         except (TypeError, ValueError):
                             target_position = None
                 # During startup the root is still withdrawn.  Scaling's
@@ -59951,10 +60343,14 @@ class LauncherApp:
                         requested_position
                     ) >= 2:
                         try:
-                            target_position = (
+                            requested_target_position = (
                                 int(requested_position[0]),
                                 int(requested_position[1]),
                             )
+                            if not _window_position_is_transient(
+                                *requested_target_position
+                            ):
+                                target_position = requested_target_position
                         except (TypeError, ValueError):
                             target_position = None
                     if target_position is None:
@@ -59975,13 +60371,12 @@ class LauncherApp:
                                 pending_y = int(pending_match.group("y"))
                             except (TypeError, ValueError):
                                 pending_x = pending_y = WINDOW_OFFSCREEN_STAGE_COORDINATE
-                            if (
-                                pending_x < WINDOW_OFFSCREEN_STAGE_COORDINATE
-                                and pending_y < WINDOW_OFFSCREEN_STAGE_COORDINATE
+                            if not _window_position_is_transient(
+                                pending_x, pending_y
                             ):
                                 target_position = (pending_x, pending_y)
                 if target_position is not None:
-                    geometry += f"+{target_position[0]}+{target_position[1]}"
+                    geometry += f"{target_position[0]:+d}{target_position[1]:+d}"
             current_size = (
                 max(1, int(self.root.winfo_width())),
                 max(1, int(self.root.winfo_height())),
@@ -65514,8 +65909,14 @@ class LauncherApp:
                         or 0
                     )
                 )
+                try:
+                    placed_width = int(float(right_info.get("width", 0) or 0))
+                except (TypeError, ValueError):
+                    placed_width = 0
                 panel_width = max(
                     1,
+                    placed_width,
+                    int(right_area.winfo_width()),
                     int(right_area.winfo_reqwidth()),
                 )
                 action_x = max(
@@ -71726,7 +72127,11 @@ class LauncherApp:
         )
 
     def _export_scene_embedded_texture_fbx(self) -> None:
-        """Save the active Max or Blender scene as one material-preserving FBX."""
+        """Save the active scene as a material-preserving embedded-texture FBX.
+
+        Blender emits a native FBX and a Generic FBX from that same native file;
+        Max keeps its existing single-file export route.
+        """
         session = self._active_model_session()
         workspace = self._active_workspace()
         if session is None or workspace is None:
@@ -71744,9 +72149,42 @@ class LauncherApp:
 
         def choose_output_path() -> Path | None:
             source_path = Path(str(workspace.source_mod or "")).expanduser()
+            blender_export = isinstance(session, ManagedBlenderSession)
+            if not blender_export:
+                if source_path.is_file():
+                    initial_directory = source_path.parent
+                else:
+                    log_directory = Path(
+                        str(workspace.log_dir or DEFAULT_LOG_DIR)
+                    ).expanduser()
+                    initial_directory = (
+                        log_directory if log_directory.is_dir() else Path.home()
+                    )
+                try:
+                    selected_directory = _managed_file_dialog(
+                        self.root,
+                        "askdirectory",
+                        title=self._tr(
+                            "选择内嵌贴图 FBX 生成目录",
+                            "Choose Embedded-Texture FBX Output Folder",
+                        ),
+                        initialdir=str(initial_directory),
+                        mustexist=False,
+                    )
+                except Exception as exc:
+                    self._show_error(exc)
+                    return None
+                if not selected_directory:
+                    return None
+                return Path(str(selected_directory)).expanduser().resolve(
+                    strict=False
+                )
+            # Blender follows the same pair-export workflow as MAX: choose a
+            # destination folder, then reserve the native and Generic names
+            # automatically.  The user should never have to invent either
+            # filename in the Windows chooser.
             if source_path.is_file():
                 initial_directory = source_path.parent
-                initial_file = f"{source_path.stem}_embedded_textures.fbx"
             else:
                 log_directory = Path(
                     str(workspace.log_dir or DEFAULT_LOG_DIR)
@@ -71754,42 +72192,25 @@ class LauncherApp:
                 initial_directory = (
                     log_directory if log_directory.is_dir() else Path.home()
                 )
-                initial_file = "scene_embedded_textures.fbx"
             try:
-                selected_path = _managed_file_dialog(
+                selected_directory = _managed_file_dialog(
                     self.root,
-                    "asksaveasfilename",
+                    "askdirectory",
                     title=self._tr(
-                        "场景导出内嵌贴图FBX",
-                        "Export Scene FBX with Embedded Textures",
+                        "选择内嵌贴图 FBX 生成目录",
+                        "Choose Embedded-Texture FBX Output Folder",
                     ),
                     initialdir=str(initial_directory),
-                    initialfile=initial_file,
-                    defaultextension=".fbx",
-                    filetypes=[
-                        ("FBX", "*.fbx"),
-                        (self._tr("所有文件", "All files"), "*.*"),
-                    ],
+                    mustexist=False,
                 )
             except Exception as exc:
                 self._show_error(exc)
                 return None
-            if not selected_path:
+            if not selected_directory:
                 return None
-            output_path = Path(str(selected_path)).expanduser().resolve(
+            return Path(str(selected_directory)).expanduser().resolve(
                 strict=False
             )
-            if output_path.suffix.casefold() != ".fbx":
-                self._show_error(
-                    ValueError(
-                        self._tr(
-                            "输出文件必须使用 .fbx 扩展名。",
-                            "The output file must use the .fbx extension.",
-                        )
-                    )
-                )
-                return None
-            return output_path
 
         export_map2 = bool(self.export_map2_var.get())
         temporary_log_directory = _resolve_log_directory(workspace.log_dir)
@@ -71802,74 +72223,163 @@ class LauncherApp:
 
             def operation() -> dict[str, Any]:
                 if isinstance(session, ManagedBlenderSession):
-                    # Rebuild only RE6 links proven by a complete RE6 Mesh
-                    # name. Unknown Blender nodes remain untouched.
-                    scene_hierarchy_repair = session.request(
-                        "scene.repair_re6_fbx_hierarchy"
-                    )
-                    if not isinstance(scene_hierarchy_repair, Mapping):
-                        raise ProtocolError(
-                            "Blender scene hierarchy repair returned an invalid receipt"
+                    native_output_path: Path | None = None
+                    generic_output_path: Path | None = None
+                    reservation_path: Path | None = None
+                    try:
+                        (
+                            native_output_path,
+                            generic_output_path,
+                            reservation_path,
+                        ) = _reserve_embedded_media_fbx_pair(output_path)
+                        # Rebuild only RE6 links proven by a complete RE6 Mesh
+                        # name. Unknown Blender nodes remain untouched.
+                        scene_hierarchy_repair = session.request(
+                            "scene.repair_re6_fbx_hierarchy",
+                            {"internal_re6": True},
                         )
-                    # Export the complete scene after the scoped repair, then
-                    # validate and correct the completed FBX independently.
-                    result = self._request_blender_fbx_export(
-                        session,
-                        {
-                            "path": str(output_path),
-                            "embed_textures": True,
-                            "preserve_materials": True,
-                            "export_map2": export_map2,
-                            "full_scene_export": True,
-                        },
-                    )
-                    result["blender_scene_hierarchy_repair"] = dict(
-                        scene_hierarchy_repair
-                    )
-                    returned_path = Path(
-                        str(result.get("path", "") or "")
-                    ).resolve(strict=False)
-                    result["exported_fbx_hierarchy_repair"] = (
-                        _repair_blender_exported_fbx_hierarchy_in_place(
-                            returned_path
+                        if not isinstance(scene_hierarchy_repair, Mapping):
+                            raise ProtocolError(
+                                "Blender scene hierarchy repair returned an invalid receipt"
+                            )
+                        # Export the complete scene after the scoped repair, then
+                        # validate and correct the completed FBX independently.
+                        result = self._request_blender_fbx_export(
+                            session,
+                            {
+                                "path": str(native_output_path),
+                                "embed_textures": True,
+                                "preserve_materials": True,
+                                "export_map2": export_map2,
+                                "full_scene_export": True,
+                            },
                         )
-                    )
-                    backend = "Blender"
-                    bitmap_texture_count = 0
+                        result["blender_scene_hierarchy_repair"] = dict(
+                            scene_hierarchy_repair
+                        )
+                        returned_path = Path(
+                            str(result.get("path", "") or "")
+                        ).resolve(strict=False)
+                        result["exported_fbx_hierarchy_repair"] = (
+                            _repair_blender_exported_fbx_hierarchy_in_place(
+                                returned_path
+                            )
+                        )
+                        generic_receipt = _write_generic_fbx_from_source(
+                            returned_path,
+                            generic_output_path,
+                        )
+                        if not generic_output_path.is_file():
+                            raise ProtocolError(
+                                "Generic embedded-texture FBX was not created"
+                            )
+                        result["native_path"] = str(returned_path)
+                        result["generic_path"] = str(generic_output_path)
+                        result["generic_fbx_receipt"] = generic_receipt
+                        result["output_directory"] = str(returned_path.parent)
+                        result["generated_files"] = [
+                            str(returned_path),
+                            str(generic_output_path),
+                        ]
+                        result["generic_conversion_status"] = str(
+                            generic_receipt.get("status", "")
+                            if isinstance(generic_receipt, Mapping)
+                            else ""
+                        )
+                        # Keep the native path as the operation's canonical path
+                        # for existing status/media-validation consumers.
+                        result["path"] = str(returned_path)
+                        backend = "Blender"
+                        bitmap_texture_count = 0
+                    finally:
+                        if reservation_path is not None:
+                            reservation_path.unlink(missing_ok=True)
                 else:
-                    _request_id, result = self._request_max_scene_interface(
-                        session,
-                        "toolbox.embedded_fbx.export",
-                        {
-                            "path": str(output_path),
-                            "temporary_log_directory": str(temporary_log_directory),
-                        },
-                    )
-                    if (
-                        str(result.get("status", "") or "").casefold()
-                        == "texture_paths_unavailable"
-                    ):
-                        return result
-                    returned_path = Path(
-                        str(result.get("path", "") or "")
-                    ).resolve(strict=False)
-                    if (
-                        str(result.get("status", "") or "").casefold() != "ok"
-                        or returned_path != output_path
-                        or not returned_path.is_file()
-                    ):
-                        raise ProtocolError("3ds Max embedded-texture FBX export receipt mismatch")
-                    if result.get("materials_exported") is not True:
-                        raise ProtocolError("3ds Max FBX export did not preserve materials")
-                    if result.get("textures_embedded") is not True:
-                        raise ProtocolError("3ds Max FBX export did not enable texture embedding")
-                    resident_capture = result.get("resident_media_capture", {})
-                    if not isinstance(resident_capture, Mapping):
-                        resident_capture = {}
-                    bitmap_texture_count = int(
-                        resident_capture.get("bitmap_texture_count", 0) or 0
-                    )
-                    backend = "3ds Max"
+                    native_output_path: Path | None = None
+                    generic_output_path: Path | None = None
+                    reservation_path: Path | None = None
+                    try:
+                        (
+                            native_output_path,
+                            generic_output_path,
+                            reservation_path,
+                        ) = _reserve_embedded_media_fbx_pair(output_path)
+                        _request_id, result = self._request_max_scene_interface(
+                            session,
+                            "toolbox.embedded_fbx.export",
+                            {
+                                "path": str(native_output_path),
+                                "temporary_log_directory": str(temporary_log_directory),
+                            },
+                        )
+                        if (
+                            str(result.get("status", "") or "").casefold()
+                            == "texture_paths_unavailable"
+                        ):
+                            return result
+                        returned_path = Path(
+                            str(result.get("path", "") or "")
+                        ).resolve(strict=False)
+                        if (
+                            str(result.get("status", "") or "").casefold() != "ok"
+                            or returned_path != native_output_path
+                            or not returned_path.is_file()
+                        ):
+                            raise ProtocolError(
+                                "3ds Max embedded-texture FBX export receipt mismatch"
+                            )
+                        if result.get("materials_exported") is not True:
+                            raise ProtocolError(
+                                "3ds Max FBX export did not preserve materials"
+                            )
+                        if result.get("textures_embedded") is not True:
+                            raise ProtocolError(
+                                "3ds Max FBX export did not enable texture embedding"
+                            )
+                        resident_capture = result.get("resident_media_capture", {})
+                        if not isinstance(resident_capture, Mapping):
+                            resident_capture = {}
+                        bitmap_texture_count = int(
+                            resident_capture.get("bitmap_texture_count", 0) or 0
+                        )
+                        # Convert the just-created native Max FBX in memory and
+                        # write the Generic companion without involving Max.
+                        generic_receipt = _write_generic_fbx_from_source(
+                            returned_path,
+                            generic_output_path,
+                        )
+                        if not generic_output_path.is_file():
+                            raise ProtocolError(
+                                "Generic embedded-texture FBX was not created"
+                            )
+                        result = dict(result)
+                        result.update(
+                            {
+                                "path": str(returned_path),
+                                "native_path": str(returned_path),
+                                "generic_path": str(generic_output_path),
+                                "output_directory": str(returned_path.parent),
+                                "generated_files": [
+                                    str(returned_path),
+                                    str(generic_output_path),
+                                ],
+                                "generic_fbx_receipt": generic_receipt,
+                                "generic_conversion_status": str(
+                                    generic_receipt.get("status", "")
+                                    if isinstance(generic_receipt, Mapping)
+                                    else ""
+                                ),
+                            }
+                        )
+                        backend = "3ds Max"
+                    finally:
+                        if reservation_path is not None:
+                            try:
+                                reservation_path.unlink(missing_ok=True)
+                            except OSError:
+                                # A locked marker must not turn two completed
+                                # FBX files into a reported export failure.
+                                pass
                 media_warning = ""
                 try:
                     media_validation = _fbx_embedded_media_summary(returned_path)
@@ -71997,6 +72507,109 @@ class LauncherApp:
                     f"{backend} scene embedded-texture FBX export completed.",
                 )
                 if not self._session_is_visible(session):
+                    return
+                if not isinstance(session, ManagedBlenderSession):
+                    native_path = Path(
+                        str(result.get("native_path", result.get("path", "")) or "")
+                    ).resolve(strict=False)
+                    generic_path_text = str(result.get("generic_path", "") or "").strip()
+                    generic_path = (
+                        Path(generic_path_text).resolve(strict=False)
+                        if generic_path_text
+                        else None
+                    )
+                    output_directory = Path(
+                        str(result.get("output_directory", native_path.parent) or native_path.parent)
+                    ).resolve(strict=False)
+                    generic_status = str(
+                        result.get("generic_conversion_status", "") or ""
+                    ).casefold()
+                    generic_note_cn = (
+                        "\n\n通用 FBX：转换器未能标准化该文件，已保留原始 FBX 内容。"
+                        if generic_status == "fallback"
+                        else ""
+                    )
+                    generic_note_en = (
+                        "\n\nGeneric FBX: normalization was unavailable, so the original FBX content was retained."
+                        if generic_status == "fallback"
+                        else ""
+                    )
+                    generic_name = (
+                        generic_path.name
+                        if generic_path is not None
+                        else self._tr("未生成", "Not generated")
+                    )
+                    session.workspace.last_status = self._tr(
+                        "3ds Max 已生成原生内嵌贴图 FBX 和通用内嵌贴图 FBX。",
+                        "3ds Max generated the native embedded-media FBX and the Generic embedded-media FBX.",
+                    )
+                    ChoiceDialog(
+                        self.root,
+                        title=self._tr(
+                            "3ds Max 内嵌贴图 FBX 导出完成",
+                            "3ds Max Embedded-Texture FBX Export Complete",
+                        ),
+                        message=self._tr(
+                            f"生成路径：\n{output_directory}\n\n"
+                            f"生成文件：\n{native_path.name}\n{generic_name}"
+                            f"{generic_note_cn}\n\n"
+                            f"实际内嵌媒体：{embedded_media_count} 个，{embedded_media_bytes:,} bytes。",
+                            f"Output path:\n{output_directory}\n\n"
+                            f"Generated files:\n{native_path.name}\n{generic_name}"
+                            f"{generic_note_en}\n\n"
+                            f"Embedded media verified: {embedded_media_count}, {embedded_media_bytes:,} bytes.",
+                        ),
+                        orange_banner_message=self._tr(
+                            "3ds Max 导出的 FBX 有时导入 Blender 会出现模型错乱，此时可导入生成的通用 FBX",
+                            "FBX exported by 3ds Max can sometimes appear corrupted when imported into Blender; import the generated Generic FBX in that case.",
+                        ),
+                        orange_banner_font=("Microsoft YaHei", 16, "bold"),
+                        orange_banner_centered=True,
+                        choices=[(self._tr("确定", "OK"), "ok")],
+                    ).show()
+                    self._set_status(session.workspace.last_status, progress=100)
+                    return
+                if isinstance(session, ManagedBlenderSession):
+                    native_path = Path(
+                        str(result.get("native_path", result.get("path", "")) or "")
+                    ).resolve(strict=False)
+                    generic_path_text = str(result.get("generic_path", "") or "").strip()
+                    generic_path = (
+                        Path(generic_path_text).resolve(strict=False)
+                        if generic_path_text
+                        else None
+                    )
+                    native_name = native_path.name
+                    generic_name = (
+                        generic_path.name
+                        if generic_path is not None
+                        else self._tr("未生成", "Not generated")
+                    )
+                    session.workspace.last_status = self._tr(
+                        "Blender 已生成原生内嵌贴图 FBX 和通用内嵌贴图 FBX。",
+                        "Blender generated the native embedded-media FBX and the Generic embedded-media FBX.",
+                    )
+                    ChoiceDialog(
+                        self.root,
+                        title=self._tr(
+                            "Blender 小工具完成",
+                            "Blender Tool Complete",
+                        ),
+                        message=self._tr(
+                            f"生成路径：\n{native_path.parent}\n\n"
+                            f"生成文件：\n{native_name}\n{generic_name}",
+                            f"Output path:\n{native_path.parent}\n\n"
+                            f"Generated files:\n{native_name}\n{generic_name}",
+                        ),
+                        orange_banner_message=self._tr(
+                            "3ds Max 导出的FBX 有时导入 Blender 会出现模型错乱，此时可导入生成的通用FBX",
+                            "FBX exported by 3ds Max can sometimes appear corrupted when imported into Blender; import the generated Generic FBX in that case.",
+                        ),
+                        orange_banner_font=("Microsoft YaHei", 16, "bold"),
+                        orange_banner_centered=True,
+                        choices=[(self._tr("确定", "OK"), "ok")],
+                    ).show()
+                    self._set_status(session.workspace.last_status, progress=100)
                     return
                 ChoiceDialog(
                     self.root,
@@ -74104,10 +74717,13 @@ class LauncherApp:
             if not bool(window.winfo_exists()):
                 return
             window.update_idletasks()
-            screen_width = max(640, int(window.winfo_screenwidth()))
-            screen_height = max(480, int(window.winfo_screenheight()))
+            virtual_x, virtual_y, virtual_width, virtual_height = (
+                self._toolbox_virtual_desktop_bounds(window)
+            )
+            virtual_width = max(640, int(virtual_width))
+            virtual_height = max(480, int(virtual_height))
             current_width = int(window.winfo_width())
-            maximum_width = max(320, screen_width - 80)
+            maximum_width = max(320, virtual_width - 80)
             minimum_width = min(560, maximum_width)
             width = min(
                 maximum_width,
@@ -74118,12 +74734,12 @@ class LauncherApp:
                 ),
             )
             height = min(
-                max(150, screen_height - 80),
+                max(150, virtual_height - 80),
                 max(150, int(window.winfo_reqheight())),
             )
-            x, y = _centered_window_position(
-                width, height, screen_width, screen_height
-            )
+            x, y = _centered_window_position(width, height, virtual_width, virtual_height)
+            x += virtual_x
+            y += virtual_y
             window.minsize(min(width, minimum_width), height)
             _set_themed_window_geometry(
                 window,
@@ -74198,6 +74814,8 @@ class LauncherApp:
             if not bool(window.winfo_exists()):
                 return
             window.update_idletasks()
+            # Keep the full virtual-desktop rectangle: the clamping below
+            # preserves the remembered position as well as the size.
             virtual_x, virtual_y, virtual_width, virtual_height = (
                 self._toolbox_virtual_desktop_bounds(window)
             )
@@ -74220,6 +74838,7 @@ class LauncherApp:
                     int(match.group("height")),
                 ),
             )
+            window.minsize(min(width, minimum_width), height)
             x = min(
                 max(virtual_x, int(match.group("x"))),
                 max(virtual_x, virtual_x + virtual_width - width),
@@ -74228,7 +74847,6 @@ class LauncherApp:
                 max(virtual_y, int(match.group("y"))),
                 max(virtual_y, virtual_y + virtual_height - height),
             )
-            window.minsize(min(width, minimum_width), height)
             _set_themed_window_geometry(
                 window,
                 f"{width}x{height}{x:+d}{y:+d}",
@@ -74296,7 +74914,7 @@ class LauncherApp:
         setattr(window, "_pc_rehd_toolbox_page", "max")
         setattr(window, "_pc_rehd_stack_layer", MANAGED_WINDOW_TOOLBOX_LAYER)
         self._persist_toolbox_visibility(True, window=window)
-        window.title(self._tr("小工具箱", "Toolbox"))
+        window.title(self._tr("3ds Max 小工具", "3ds Max Tools"))
         window.configure(background=self.colors["bg"])
         window.resizable(True, False)
 
@@ -74309,24 +74927,19 @@ class LauncherApp:
         body.grid(row=0, column=0, sticky="nsew")
         body.columnconfigure(0, weight=1)
         window.columnconfigure(0, weight=1)
-        self.ttk.Label(
-            body,
-            text=self._tr("小工具箱", "Toolbox"),
-            style="DialogTitle.TLabel",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
         self.ttk.Button(
             body,
             text=self._tr("脚本逻辑链条", "Script Logic Chain"),
             command=self._show_script_logic_chain,
             style="Accent.TButton",
-        ).grid(row=1, column=0, sticky="ew")
+        ).grid(row=0, column=0, sticky="ew")
         self.scene_normals_tool_button = self.ttk.Button(
             body,
             text=self._tr("显示场景法线", "Show Scene Normals"),
             command=self._show_scene_normals_monitor,
             style="Accent.TButton",
         )
-        self.scene_normals_tool_button.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.scene_normals_tool_button.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         random_normals_command = getattr(self, "_auto_add_random_normals", None)
         random_normals_available = callable(random_normals_command)
         self.random_normals_tool_button = self.ttk.Button(
@@ -74337,7 +74950,7 @@ class LauncherApp:
         )
         if not random_normals_available:
             self.random_normals_tool_button.configure(state="disabled")
-        self.random_normals_tool_button.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self.random_normals_tool_button.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self.random_normals_tooltip = HoverTooltip(
             self.random_normals_tool_button,
             lambda: self._tr(
@@ -74352,7 +74965,7 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.max_embedded_texture_fbx_tool_button.grid(
-            row=4, column=0, sticky="ew", pady=(8, 0)
+            row=3, column=0, sticky="ew", pady=(8, 0)
         )
         self.max_embedded_texture_fbx_tooltip = HoverTooltip(
             self.max_embedded_texture_fbx_tool_button,
@@ -74371,7 +74984,7 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.max_blender_fbx_import_tool_button.grid(
-            row=5, column=0, sticky="ew", pady=(8, 0)
+            row=4, column=0, sticky="ew", pady=(8, 0)
         )
         self.max_blender_fbx_import_tooltip = HoverTooltip(
             self.max_blender_fbx_import_tool_button,
@@ -74386,16 +74999,16 @@ class LauncherApp:
             command=self._show_message_editor,
             style="Accent.TButton",
         )
-        self.message_editor_tool_button.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+        self.message_editor_tool_button.grid(row=5, column=0, sticky="ew", pady=(8, 0))
         self.instance_copy_tool_button = self.ttk.Button(
             body,
             text=self._tr("复制 Max 场景 Instance", "Copy Max Scene Instances"),
             command=self._show_instance_copy_tool,
             style="Accent.TButton",
         )
-        self.instance_copy_tool_button.grid(row=7, column=0, sticky="ew", pady=(8, 0))
+        self.instance_copy_tool_button.grid(row=6, column=0, sticky="ew", pady=(8, 0))
         scene_auto_colors_row = self.ttk.Frame(body, style="Panel.TFrame")
-        scene_auto_colors_row.grid(row=8, column=0, sticky="ew", pady=(8, 0))
+        scene_auto_colors_row.grid(row=7, column=0, sticky="ew", pady=(8, 0))
         scene_auto_colors_row.columnconfigure(0, weight=2)
         scene_auto_colors_row.columnconfigure(1, weight=3)
         self.scene_auto_colors_tool_button = self.ttk.Button(
@@ -74422,7 +75035,7 @@ class LauncherApp:
             style="BakeSafe.TButton",
         )
         self.max_material_normalize_button.grid(
-            row=9, column=0, sticky="ew", pady=(8, 0), ipady=8
+            row=8, column=0, sticky="ew", pady=(8, 0), ipady=8
         )
         self.seam_weight_tool_button = self.ttk.Button(
             body,
@@ -74431,7 +75044,7 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.seam_weight_tool_button.grid(
-            row=10, column=0, sticky="ew", pady=(8, 0)
+            row=9, column=0, sticky="ew", pady=(8, 0)
         )
         self.max_mod_file_scan_button = self.ttk.Button(
             body,
@@ -74440,13 +75053,13 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.max_mod_file_scan_button.grid(
-            row=11, column=0, sticky="ew", pady=(8, 0)
+            row=10, column=0, sticky="ew", pady=(8, 0)
         )
         self.ttk.Button(
             body,
             text=self._tr("关闭", "Close"),
             command=close_toolbox,
-        ).grid(row=12, column=0, sticky="e", pady=(14, 0))
+        ).grid(row=11, column=0, sticky="e", pady=(14, 0))
 
         self._restore_toolbox_window_geometry(window)
         self._refresh_toolbox_action_states()
@@ -74774,11 +75387,6 @@ class LauncherApp:
         body.columnconfigure(0, weight=1)
         window.columnconfigure(0, weight=1)
         window.rowconfigure(0, weight=1)
-        self.ttk.Label(
-            body,
-            text=self._tr("Blender 小工具", "Blender Tools"),
-            style="DialogTitle.TLabel",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
         self.blender_texture_tool_button = self.ttk.Button(
             body,
             text=self._tr(
@@ -74788,7 +75396,7 @@ class LauncherApp:
             command=self._run_blender_texture_to_fbx_tool,
             style="Accent.TButton",
         )
-        self.blender_texture_tool_button.grid(row=1, column=0, sticky="ew")
+        self.blender_texture_tool_button.grid(row=0, column=0, sticky="ew")
         self.blender_texture_tooltip = HoverTooltip(
             self.blender_texture_tool_button,
             lambda: self._tr(
@@ -74806,7 +75414,7 @@ class LauncherApp:
             style="BakeSafe.TButton",
         )
         self.blender_material_normalize_button.grid(
-            row=2, column=0, sticky="ew", pady=(8, 0), ipady=8
+            row=1, column=0, sticky="ew", pady=(8, 0), ipady=8
         )
         self.blender_max_fbx_import_tool_button = self.ttk.Button(
             body,
@@ -74818,7 +75426,7 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.blender_max_fbx_import_tool_button.grid(
-            row=3, column=0, sticky="ew", pady=(8, 0)
+            row=2, column=0, sticky="ew", pady=(8, 0)
         )
         self.blender_max_fbx_import_tooltip = HoverTooltip(
             self.blender_max_fbx_import_tool_button,
@@ -74837,13 +75445,13 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.blender_embedded_texture_fbx_tool_button.grid(
-            row=4, column=0, sticky="ew", pady=(8, 0)
+            row=3, column=0, sticky="ew", pady=(8, 0)
         )
         self.blender_embedded_texture_fbx_tooltip = HoverTooltip(
             self.blender_embedded_texture_fbx_tool_button,
             lambda: self._tr(
-                "导出当前 Blender 场景为内嵌贴图 FBX，导出前自动执行一次 RE6 Mesh 层级修复，对于Mesh名字不符合标准RE6层级关系例如 123456 默认使用Blender场景的层级关系，材质贴图会随 FBX 一起内嵌写入。",
-                "Exports the current Blender scene as an FBX with embedded textures. Before export, RE6 Mesh hierarchy is repaired once; Mesh names that do not match the standard RE6 hierarchy, for example 123456, keep the current Blender scene hierarchy. Material textures are embedded into the FBX.",
+                "导出前使用当前场景的 RE6 Mesh 名称和 LodGroup / OtherMesh 自动恢复可识别层级；无法识别或无法确定父级的节点保持原位，不阻止导出。会同时生成一份内置贴图 FBX 和一份通用内置贴图 FBX。",
+                "Before export, recognized RE6 Mesh names and LodGroup / OtherMesh helpers restore only provable hierarchy links. Nodes without a recognizable or unique parent stay in place and never block export. The tool creates both an embedded-media FBX and a Generic embedded-media FBX.",
             ),
         )
         self.blender_mod_file_scan_button = self.ttk.Button(
@@ -74853,22 +75461,66 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.blender_mod_file_scan_button.grid(
-            row=5, column=0, sticky="ew", pady=(8, 0)
+            row=4, column=0, sticky="ew", pady=(8, 0)
         )
         self.ttk.Button(
             body,
             text=self._tr("关闭", "Close"),
             command=close_blender_toolbox,
-        ).grid(row=6, column=0, sticky="e", pady=(14, 0))
+        ).grid(row=5, column=0, sticky="e", pady=(14, 0))
 
         self._restore_toolbox_window_geometry(window)
         try:
             body.update_idletasks()
             window.update_idletasks()
-            width = max(int(body.winfo_reqwidth()) + 36, int(window.winfo_width()))
-            height = max(int(body.winfo_reqheight()) + 32, int(window.winfo_height()))
+            requested_width = max(320, int(body.winfo_reqwidth()) + 36)
+            requested_height = max(150, int(body.winfo_reqheight()) + 32)
+            virtual_x, virtual_y, virtual_width, virtual_height = (
+                self._toolbox_virtual_desktop_bounds(window)
+            )
+            maximum_width = max(320, int(virtual_width) - 40)
+            minimum_width = min(560, maximum_width)
+            saved_geometry = str(
+                self.launcher_state.get("blender_toolbox_geometry", "") or ""
+            ).strip()
+            saved_match = TK_WINDOW_GEOMETRY_RE.fullmatch(saved_geometry)
+            saved_width = (
+                int(saved_match.group("width"))
+                if saved_match is not None
+                else 0
+            )
+            width = min(
+                maximum_width,
+                max(
+                    minimum_width,
+                    requested_width,
+                    int(window.winfo_width()),
+                    saved_width,
+                ),
+            )
+            # The Blender toolbox has a fixed height.  Drop only obsolete
+            # vertical slack; preserve the user's remembered width and position.
+            height = requested_height
+            window.minsize(minimum_width, height)
+            position_match = TK_WINDOW_GEOMETRY_RE.fullmatch(
+                str(getattr(window, "_pc_rehd_requested_geometry", "") or "")
+            )
+            if position_match is not None:
+                position_x = int(position_match.group("x"))
+                position_y = int(position_match.group("y"))
+            else:
+                position_x, position_y = _centered_window_position(
+                    width,
+                    height,
+                    int(virtual_width),
+                    int(virtual_height),
+                )
+                position_x += int(virtual_x)
+                position_y += int(virtual_y)
             self._apply_window_geometry_snapshot(
-                window, f"{width}x{height}+0+0"
+                window,
+                f"{width}x{height}{position_x:+d}{position_y:+d}",
+                preserve_position=False,
             )
         except (TypeError, ValueError, self.tk.TclError):
             pass
@@ -74893,15 +75545,58 @@ class LauncherApp:
             if not bool(window.winfo_exists()):
                 return
             window.update_idletasks()
-            width = max(
-                320, int(window.winfo_reqwidth()), int(window.winfo_width())
+            children = list(window.winfo_children())
+            body = children[0] if children else None
+            if body is not None:
+                body.update_idletasks()
+            requested_width = (
+                int(body.winfo_reqwidth()) + 36
+                if body is not None
+                else int(window.winfo_reqwidth())
             )
-            height = max(
-                150, int(window.winfo_reqheight()), int(window.winfo_height())
+            _, _, virtual_width, _ = self._toolbox_virtual_desktop_bounds(window)
+            maximum_width = max(320, int(virtual_width) - 40)
+            minimum_width = min(560, maximum_width)
+            saved_geometry = str(
+                self.launcher_state.get("blender_toolbox_geometry", "") or ""
+            ).strip()
+            saved_match = TK_WINDOW_GEOMETRY_RE.fullmatch(saved_geometry)
+            saved_width = (
+                int(saved_match.group("width"))
+                if saved_match is not None
+                else 0
             )
-            window.minsize(width, height)
+            width = min(
+                maximum_width,
+                max(
+                    minimum_width,
+                    requested_width,
+                    int(window.winfo_width()),
+                    saved_width,
+                ),
+            )
+            content_height = (
+                int(body.winfo_reqheight()) + 32
+                if body is not None
+                else int(window.winfo_reqheight())
+            )
+            height = max(150, content_height)
+            window.minsize(minimum_width, height)
+            try:
+                position_x = int(window.winfo_x())
+                position_y = int(window.winfo_y())
+            except (self.tk.TclError, TypeError, ValueError):
+                position_match = TK_WINDOW_GEOMETRY_RE.fullmatch(
+                    str(getattr(window, "_pc_rehd_requested_geometry", "") or "")
+                )
+                if position_match is None:
+                    return
+                position_x = int(position_match.group("x"))
+                position_y = int(position_match.group("y"))
             self._apply_window_geometry_snapshot(
-                window, f"{width}x{height}+0+0"
+                window,
+                f"{width}x{height}{position_x:+d}{position_y:+d}",
+                preserve_position=False,
             )
         except (TypeError, ValueError, self.tk.TclError):
             return
@@ -86818,6 +87513,10 @@ class LauncherApp:
             self._sync_toolbar_region_geometry()
             self._position_content_after_toolbar(flush_layout=False)
             self._reflow_left_sections(flush_layout=False)
+            # Reflow may widen the advanced right panel to fill the current
+            # Scaling Mode window. Re-anchor the action column after that
+            # width is final so the two regions cannot overlap on first map.
+            self._sync_toolbar_region_geometry()
         if not scaling_mode:
             self.toolbar.update_idletasks()
             self._position_content_after_toolbar(flush_layout=False)
@@ -91476,6 +92175,16 @@ class LauncherApp:
         )
         if not str(requested_path):
             raise ValueError("Blender FBX export path is missing")
+        requested_bone_mode = str(
+            request.get("bone_edit_export_mode", "disabled") or "disabled"
+        ).strip().casefold()
+        requested_bone_handles_present = any(
+            int(value or 0) > 0 for value in request.get("bone_handles", [])
+        )
+        if requested_bone_mode != "disabled" or requested_bone_handles_present:
+            # Do not allow a bone-edit caller to downgrade this to a scoped
+            # export; the full scene is required to retain Empty/Null bones.
+            request["full_scene_export"] = True
         result = session.request("fbx.export", request)
         if str(result.get("status", "") or "").casefold() != "ok":
             raise ProtocolError("Blender FBX export did not return success")
@@ -91494,8 +92203,14 @@ class LauncherApp:
             for value in result.get("mesh_handles", [])
             if int(value or 0) > 0
         }
-        if requested_mesh_handles and returned_mesh_handles != requested_mesh_handles:
-            raise ProtocolError("Blender FBX export Mesh handle set mismatch")
+        if requested_mesh_handles:
+            if bool(request.get("full_scene_export", False)):
+                if not requested_mesh_handles.issubset(returned_mesh_handles):
+                    raise ProtocolError(
+                        "Blender full-scene FBX export omitted a requested Mesh handle"
+                    )
+            elif returned_mesh_handles != requested_mesh_handles:
+                raise ProtocolError("Blender FBX export Mesh handle set mismatch")
         requested_bone_handles = {
             int(value)
             for value in request.get("bone_handles", [])
@@ -91508,9 +92223,6 @@ class LauncherApp:
         }
         if requested_bone_handles and returned_bone_handles != requested_bone_handles:
             raise ProtocolError("Blender FBX export Bone handle set mismatch")
-        requested_bone_mode = str(
-            request.get("bone_edit_export_mode", "disabled") or "disabled"
-        ).strip().casefold()
         returned_bone_mode = str(
             result.get("bone_export_mode", "disabled") or "disabled"
         ).strip().casefold()
@@ -95921,24 +96633,35 @@ class LauncherApp:
                     if int(value or 0) > 0
                 ]
                 if blender_modify_handles or blender_bone_handles:
+                    blender_fbx_request = {
+                        "path": str(fbx_path),
+                        "mesh_handles": list(blender_modify_handles),
+                        "bone_handles": list(blender_bone_handles),
+                        "bone_edit_export_mode": resolved_bone_mode,
+                        "export_map2": bool(options["export_map2"]),
+                        "source_sha256": source_sha,
+                        "request_id": request_id,
+                    }
+                    if resolved_bone_mode != "disabled":
+                        # Every Blender Bones Edit export is deliberately a
+                        # full-scene FBX so Empty/Null source bones survive.
+                        blender_fbx_request["full_scene_export"] = True
                     fbx_receipt = self._request_blender_fbx_export(
                         session,
-                        {
-                            "path": str(fbx_path),
-                            "mesh_handles": list(blender_modify_handles),
-                            "bone_handles": list(blender_bone_handles),
-                            "bone_edit_export_mode": resolved_bone_mode,
-                            "export_map2": bool(options["export_map2"]),
-                            "source_sha256": source_sha,
-                            "request_id": request_id,
-                        },
+                        blender_fbx_request,
                     )
                     returned_mesh_handles = {
                         int(value)
                         for value in fbx_receipt.get("mesh_handles", [])
                         if int(value or 0) > 0
                     }
-                    if returned_mesh_handles != set(blender_modify_handles):
+                    requested_modify_handles = set(blender_modify_handles)
+                    if resolved_bone_mode != "disabled":
+                        if not requested_modify_handles.issubset(returned_mesh_handles):
+                            raise ProtocolError(
+                                "Blender full-scene FBX receipt omitted a Modify Mesh handle"
+                            )
+                    elif returned_mesh_handles != requested_modify_handles:
                         raise ProtocolError(
                             "Blender FBX receipt does not match the Modify Mesh handles"
                         )
@@ -97497,7 +98220,7 @@ def _resolve_launcher_position(
         x, y = int(requested_position[0]), int(requested_position[1])
     except (IndexError, TypeError, ValueError):
         return center_x, center_y
-    if x >= WINDOW_OFFSCREEN_STAGE_COORDINATE or y >= WINDOW_OFFSCREEN_STAGE_COORDINATE:
+    if _window_position_is_transient(x, y):
         return center_x, center_y
     right = left + desktop_width
     bottom = top + desktop_height
@@ -97558,6 +98281,9 @@ def run_ui(*, initial_target_pid: int = 0) -> int:
                 window_height=final_height,
                 virtual_bounds=virtual_bounds,
             )
+        # Startup scaling callbacks reuse this value while the root is still
+        # withdrawn. Keep the validated origin, never the stale cache value.
+        app._main_window_requested_position = (desired_x, desired_y)
 
         dark = bool(getattr(app, "_theme_dark", False))
         _set_themed_window_geometry(

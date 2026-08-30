@@ -1856,6 +1856,27 @@ BONES_PLUS_MESH_FBX_SKIN_EVALUATION_STATUS = "binary_cluster_evaluated"
 MAX_FBX_POSITION_AUTHORITY = "skinned_max_positions"
 FBX_PROBE_ROUTE_HINT_SCHEMA = "pc-rehd-fbx-probe-route-hints-v1"
 FBX_PROBE_ROUTE_RECEIPT_SCHEMA = "pc-rehd-fbx-probe-route-receipt-v1"
+FBX_PROBE_BACKEND_RECEIPT_SCHEMA = "pc-rehd-fbx-probe-backend-receipt-v1"
+# EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+# Transitional fixed-axis compatibility lane.  Current MAX/Blender exports
+# must carry the Generic scene-global canonical XYZ contract instead.
+FBX_AXIS_OUTPUT_POLICY_LEGACY = "legacy_xyz_neg_y"
+FBX_AXIS_OUTPUT_POLICY_MAX_XYZ = "max_xyz"
+# Generic_to_mod_transform_code receives an explicit per-Geometry normal
+# domain from Probe.  Keep the labels aligned with codex_fbx_probe.py.
+FBX_NORMAL_AXIS_DOMAIN_CANONICAL = "canonical_xyz"
+FBX_NORMAL_AXIS_DOMAIN_LEGACY = "legacy_max"
+FBX_BONE_MATRIX_DOMAIN_CANONICAL = "canonical_xyz"
+# EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+# Legacy Max FBX uses X,+Z,-Y storage.  This is only a compatibility fallback
+# for an older Generic receipt that predates the explicit inverse basis; current
+# Probe handoffs carry the exact source-axis inverse per request.
+FBX_CANONICAL_TO_LEGACY_MAX_AXIS = [
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, -1.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+]
 FBX_PROBE_TOPOLOGY_ROUTES = frozenset(
     {
         "fbx_geometry",
@@ -1872,6 +1893,107 @@ UNSKINNED_MESH_EDIT_EXPORT_AUTHORIZED_REASONS = frozenset(
         "enabled_for_bones_plus_mesh",
     }
 )
+
+
+def _fbx_probe_backend_receipt(value: Any) -> dict[str, Any] | None:
+    """Return Probe's backend receipt without inferring a route from FBX axes."""
+    if not isinstance(value, dict):
+        return None
+    receipt = value.get("probe_backend")
+    if isinstance(receipt, dict):
+        return receipt
+    summary = value.get("summary")
+    if isinstance(summary, dict) and isinstance(summary.get("probe_backend"), dict):
+        return summary["probe_backend"]
+    if str(value.get("schema", "") or "") == FBX_PROBE_BACKEND_RECEIPT_SCHEMA:
+        return value
+    return None
+
+
+def _fbx_axis_output_policy(value: Any) -> str:
+    """Keep the legacy writer unless Generic conversion explicitly opts in.
+
+    A plain ``fbx_axes`` receipt is not enough to change the established lane:
+    old Max/Blender callers may report Y-Up for reasons unrelated to the
+    embedded converter. Only the Generic normalizer's request-scoped receipt
+    (or the policy copied from it onto a Mesh) may select canonical XYZ.
+    """
+    if isinstance(value, dict):
+        explicit = str(value.get("fbx_axis_output_policy", "") or "").strip().lower()
+        if explicit in {FBX_AXIS_OUTPUT_POLICY_MAX_XYZ, FBX_AXIS_OUTPUT_POLICY_LEGACY}:
+            return explicit
+        generic = value.get("generic_fbx_normalization")
+        if isinstance(generic, dict):
+            generic_policy = str(
+                generic.get("fbx_axis_output_policy", "") or ""
+            ).strip().lower()
+            if generic_policy in {
+                FBX_AXIS_OUTPUT_POLICY_MAX_XYZ,
+                FBX_AXIS_OUTPUT_POLICY_LEGACY,
+            }:
+                return generic_policy
+            normalization = generic.get("normalization")
+            if (
+                str(generic.get("status", "") or "").strip().lower() == "normalized"
+                and isinstance(normalization, dict)
+                and str(normalization.get("axis_policy", "") or "").strip().lower()
+                == "normalize_to_xyz_axes"
+            ):
+                return FBX_AXIS_OUTPUT_POLICY_MAX_XYZ
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # Missing/old receipts still fall back to the historical X,+Z,-Y lane.
+    return FBX_AXIS_OUTPUT_POLICY_LEGACY
+
+
+class _FbxAxisPolicyVector(list):
+    """Three-value scale vector carrying the request-scoped writer policy."""
+
+    def __init__(self, values: list[float], axis_output_policy: str) -> None:
+        super().__init__(values)
+        self.axis_output_policy = axis_output_policy
+
+
+def _fbx_axis_policy_vector(values: list[float], receipt_source: Any) -> list[float]:
+    return _FbxAxisPolicyVector(values, _fbx_axis_output_policy(receipt_source))
+
+
+def _write_position_axis_policy(values: list[float], axis_output_policy: str) -> list[float]:
+    if axis_output_policy == FBX_AXIS_OUTPUT_POLICY_MAX_XYZ:
+        return [values[0], values[1], values[2]]
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # Fixed legacy X,+Z,-Y writer conversion.  Generic-normalized rows must
+    # never reach this branch.
+    return [values[0], values[2], -values[1]]
+
+
+def _fbx_normal_output_policy(mesh: dict[str, Any]) -> str:
+    """Resolve the one normal basis conversion allowed before MOD writing."""
+    # Mesh, bone, normal and tangent rows from one Generic request share one
+    # scene-level conversion.  An explicit request policy therefore wins over
+    # the older per-Geometry normal-domain hint; otherwise different Meshes
+    # can receive different rotations in the same export.
+    explicit_policy = str(mesh.get("fbx_axis_output_policy", "") or "").strip().lower()
+    if (
+        str(mesh.get("fbx_axis_transform_scope", "") or "").strip().lower()
+        == "scene_global_once"
+        and explicit_policy in {
+            FBX_AXIS_OUTPUT_POLICY_MAX_XYZ,
+            FBX_AXIS_OUTPUT_POLICY_LEGACY,
+        }
+    ):
+        return explicit_policy
+    domain = str(mesh.get("fbx_normal_axis_domain", "") or "").strip().lower()
+    if domain == FBX_NORMAL_AXIS_DOMAIN_CANONICAL:
+        return FBX_AXIS_OUTPUT_POLICY_MAX_XYZ
+    if domain == FBX_NORMAL_AXIS_DOMAIN_LEGACY:
+        # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+        # Legacy per-Geometry normal basis; retained only for old contracts.
+        return FBX_AXIS_OUTPUT_POLICY_LEGACY
+    # Compatibility callers without the new per-Geometry receipt retain the
+    # existing request-scoped axis policy.
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # This final fallback is the old non-Generic export behavior.
+    return _fbx_axis_output_policy(mesh)
 
 
 def _mesh_requires_bones_plus_mesh_fbx_world_authority(mesh: dict[str, Any]) -> bool:
@@ -1951,14 +2073,26 @@ def _copy_final_geometry_row(rows: Any, index: int, *, field: str) -> list[float
 
 
 def _build_bones_plus_mesh_fbx_object_to_max_matrix(mesh: dict[str, Any]) -> list[float]:
-    """Keep FBX Mesh scale/placement while removing only its axis helper basis."""
+    """Return the one object transform used by the final MOD boundary.
+
+    Generic MAX handoffs already use one canonical Y-up scene basis.  Preserve
+    each Mesh's authored world matrix here and let the writer's single global
+    axis policy perform the final conversion.  The legacy helper-basis
+    extraction remains only for old, unmarked authorities.
+    """
     node_to_world = _coerce_matrix4x4(mesh.get("fbx_node_to_world_matrix"))
     if node_to_world is None:
         raise ValueError("Bones+Mesh FBX authority is missing the Mesh node world matrix")
 
+    if str(mesh.get("fbx_axis_transform_scope", "") or "").strip().lower() == "scene_global_once":
+        return node_to_world
+
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
     # Importer-generated FBX carries the Max Z-up to FBX Y-up conversion on the
     # Mesh helper.  The MOD encoder consumes Max coordinates, so remove that
     # normalized basis after preserving the real Mesh scale and translation.
+    # This is the old unmarked/non-Generic fallback; Generic handoffs return
+    # above and keep their canonical world matrix unchanged.
     axis_basis = [0.0] * 16
     for row in range(3):
         offset = row * 4
@@ -2062,11 +2196,23 @@ def _get_semantic_world_position_rows(mesh: dict[str, Any]) -> list[Any]:
 
 
 def _max_normal_to_game_normal(vec: Any) -> list[float]:
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # Historical Max/MOD normal-axis swap. Generic canonical normal rows take
+    # the direct XYZ path and must not enter this helper.
     max_normal = _coerce_vec3(vec, (0.0, 0.0, 1.0))
     return [max_normal[0], max_normal[2], -max_normal[1]]
 
 
+# ============================================================================
+# Generic_to_mod_transform_code
+#
+# Probe's Generic pass may already have baked the source FBX axis into a
+# Geometry/ Skin normal stream.  Apply the legacy Max->MOD basis only when the
+# receipt says the row is still legacy; never rotate an explicitly canonical
+# row a second time.
+# ============================================================================
 def _get_semantic_game_normal(mesh: dict[str, Any], index: int) -> list[float]:
+    normal_policy = _fbx_normal_output_policy(mesh)
     authority = _get_bones_plus_mesh_final_geometry_authority(mesh)
     if authority is not None:
         authority_normals = authority.get("mod_write_normals")
@@ -2076,11 +2222,28 @@ def _get_semantic_game_normal(mesh: dict[str, Any], index: int) -> list[float]:
                 index,
                 field="mod_write_normals",
             )
+            if normal_policy == FBX_AXIS_OUTPUT_POLICY_MAX_XYZ:
+                return _normalize_vec3(normal, (0.0, 0.0, 1.0))
+            # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
             return _max_normal_to_game_normal(normal)
     max_normals = mesh.get("max_normals")
     if isinstance(max_normals, list) and index < len(max_normals):
+        if normal_policy == FBX_AXIS_OUTPUT_POLICY_MAX_XYZ:
+            return _normalize_vec3(max_normals[index], (0.0, 0.0, 1.0))
+        # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
         return _max_normal_to_game_normal(max_normals[index])
-    return _coerce_vec3(_get_semantic_row(mesh, "normals", index), (0.0, 0.0, 1.0))
+    raw_normal = _coerce_vec3(
+        _get_semantic_row(mesh, "normals", index),
+        (0.0, 0.0, 1.0),
+    )
+    # The raw ``normals`` lane is an established compatibility fallback.  It
+    # had historically bypassed the Max conversion; only an explicit Generic
+    # canonical receipt changes that behavior.
+    return (
+        _normalize_vec3(raw_normal, (0.0, 0.0, 1.0))
+        if normal_policy == FBX_AXIS_OUTPUT_POLICY_MAX_XYZ
+        else raw_normal
+    )
 
 
 def _get_authoritative_skin_bone_rows(mesh: dict[str, Any]) -> list[Any]:
@@ -2115,6 +2278,8 @@ def _get_short_position_write_pos(
     positions: list[Any],
     index: int,
     mesh_scale: list[float],
+    *,
+    axis_output_policy: str | None = None,
 ) -> list[float]:
     local_pos = _coerce_vec3(positions[index] if index < len(positions) else None)
     scaled = [
@@ -2122,13 +2287,18 @@ def _get_short_position_write_pos(
         local_pos[1] * mesh_scale[1],
         local_pos[2] * mesh_scale[2],
     ]
-    return [scaled[0], scaled[2], -scaled[1]]
+    policy = axis_output_policy or str(
+        getattr(mesh_scale, "axis_output_policy", FBX_AXIS_OUTPUT_POLICY_LEGACY)
+    )
+    return _write_position_axis_policy(scaled, policy)
 
 
 def _get_float_position_write_pos(
     positions: list[Any],
     index: int,
     mesh_scale: list[float],
+    *,
+    axis_output_policy: str | None = None,
 ) -> list[float]:
     local_pos = _coerce_vec3(positions[index] if index < len(positions) else None)
     scaled = [
@@ -2136,7 +2306,10 @@ def _get_float_position_write_pos(
         local_pos[1] * mesh_scale[1],
         local_pos[2] * mesh_scale[2],
     ]
-    return [scaled[0], scaled[2], -scaled[1]]
+    policy = axis_output_policy or str(
+        getattr(mesh_scale, "axis_output_policy", FBX_AXIS_OUTPUT_POLICY_LEGACY)
+    )
+    return _write_position_axis_policy(scaled, policy)
 
 
 def _get_world_remapped_short_position(
@@ -2145,6 +2318,8 @@ def _get_world_remapped_short_position(
     index: int,
     remap_scale: list[float],
     remap_offset: list[float],
+    *,
+    axis_output_policy: str | None = None,
 ) -> list[float]:
     world_pos = _coerce_vec3(
         world_positions[index] if index < len(world_positions) else (positions[index] if index < len(positions) else None),
@@ -2154,7 +2329,10 @@ def _get_world_remapped_short_position(
         (world_pos[1] * remap_scale[1]) + remap_offset[1],
         (world_pos[2] * remap_scale[2]) + remap_offset[2],
     ]
-    return [remapped[0], remapped[2], -remapped[1]]
+    policy = axis_output_policy or str(
+        getattr(remap_scale, "axis_output_policy", FBX_AXIS_OUTPUT_POLICY_LEGACY)
+    )
+    return _write_position_axis_policy(remapped, policy)
 
 
 def _mesh_uses_world_short_remap(mesh: dict[str, Any], fvf: int) -> bool:
@@ -2258,8 +2436,14 @@ def build_export_tangent_array(mesh: dict[str, Any], fvf: int) -> list[list[floa
     world_positions = _get_semantic_world_position_rows(mesh)
     uvs = mesh.get("uvs") if isinstance(mesh.get("uvs"), list) else []
     face_indices = _flatten_face_indices(mesh.get("face_indices"))
-    mesh_scale = _coerce_vec3(mesh.get("mesh_scale"), (1.0, 1.0, 1.0))
-    remap_scale = _coerce_vec3(mesh.get("short_remap_scale"), tuple(mesh_scale))
+    mesh_scale = _fbx_axis_policy_vector(
+        _coerce_vec3(mesh.get("mesh_scale"), (1.0, 1.0, 1.0)),
+        mesh,
+    )
+    remap_scale = _fbx_axis_policy_vector(
+        _coerce_vec3(mesh.get("short_remap_scale"), tuple(mesh_scale)),
+        mesh,
+    )
     remap_offset = _coerce_vec3(mesh.get("short_remap_offset"), (0.0, 0.0, 0.0))
     vertex_count = _get_semantic_vertex_count(mesh)
     tangents = [[0.0, 0.0, 0.0] for _ in range(vertex_count)]
@@ -2437,8 +2621,14 @@ def _build_source_backed_geometry_overlay_payload(
         and _mesh_has_fbx_uv_channel(mesh, 2)
     )
 
-    mesh_scale = _coerce_vec3(mesh.get("mesh_scale"), (1.0, 1.0, 1.0))
-    remap_scale = _coerce_vec3(mesh.get("short_remap_scale"), tuple(mesh_scale))
+    mesh_scale = _fbx_axis_policy_vector(
+        _coerce_vec3(mesh.get("mesh_scale"), (1.0, 1.0, 1.0)),
+        mesh,
+    )
+    remap_scale = _fbx_axis_policy_vector(
+        _coerce_vec3(mesh.get("short_remap_scale"), tuple(mesh_scale)),
+        mesh,
+    )
     remap_offset = _coerce_vec3(mesh.get("short_remap_offset"), (0.0, 0.0, 0.0))
     uses_world_short_remap = _mesh_uses_world_short_remap(mesh, fvf)
     normal_offset = PACKED_NORMAL_OFFSET_BY_FVF.get(fvf)
@@ -2567,8 +2757,14 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
 
     face_indices = _flatten_face_indices(mesh.get("face_indices"))
     vertex_count = _get_semantic_vertex_count(mesh)
-    mesh_scale = _coerce_vec3(mesh.get("mesh_scale"), (1.0, 1.0, 1.0))
-    remap_scale = _coerce_vec3(mesh.get("short_remap_scale"), tuple(mesh_scale))
+    mesh_scale = _fbx_axis_policy_vector(
+        _coerce_vec3(mesh.get("mesh_scale"), (1.0, 1.0, 1.0)),
+        mesh,
+    )
+    remap_scale = _fbx_axis_policy_vector(
+        _coerce_vec3(mesh.get("short_remap_scale"), tuple(mesh_scale)),
+        mesh,
+    )
     remap_offset = _coerce_vec3(mesh.get("short_remap_offset"), (0.0, 0.0, 0.0))
     tangent_array = tangents if tangents else build_export_tangent_array(mesh, fvf)
     uses_world_short_remap = _mesh_uses_world_short_remap(mesh, fvf)
@@ -9163,7 +9359,79 @@ def _normalize_scene_bone_entries(bones: Any) -> list[dict[str, Any]]:
 def _collect_fbx_bone_entries(fbx_handoff: dict[str, Any]) -> list[dict[str, Any]]:
     summary = fbx_handoff.get("summary") if isinstance(fbx_handoff, dict) else None
     bones = summary.get("bones") if isinstance(summary, dict) else None
-    return _normalize_scene_bone_entries(bones)
+    entries = _normalize_scene_bone_entries(bones)
+    # Generic Probe bone matrices are in the canonical XYZ/file domain.  The
+    # bone-edit planner works in the historical Max-import domain, so restore
+    # the complete source basis once (3x3 rows and translation) before the
+    # planner compares or writes them.  Keeping only the old translation swap
+    # leaves a 90-degree Max X,+Z,-Y basis in the output skeleton.
+    matrix_domain = str(
+        fbx_handoff.get("bone_matrix_axis_domain", "") or ""
+    ).strip().lower()
+    # Blender's Generic handoff is already in the canonical XYZ basis that
+    # _blender_fbx_rest_local_matrix() expects.  Applying the source-axis
+    # inverse here a second time makes the root/child deltas look like huge
+    # edits and writes the skeleton far outside the MOD coordinate space.
+    # Keep the conversion for the legacy/Max handoff only; the Blender route
+    # must consume its canonical matrices exactly once.
+    scene_authority = str(
+        fbx_handoff.get("scene_authority", fbx_handoff.get("authority", "")) or ""
+    ).strip().lower()
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # Transitional canonical-to-legacy matrix adapter.  It exists for the
+    # historical planner/old Max handoff and is a deletion candidate once the
+    # writer consumes canonical bone matrices directly.  The Blender local
+    # route is explicitly excluded below because its Armature basis is handled
+    # by the Blender-specific rest/local reconstruction.
+    if (
+        matrix_domain == FBX_BONE_MATRIX_DOMAIN_CANONICAL
+        and scene_authority != "blender_selected_fbx_bones"
+    ):
+        inverse_axis = _clone_matrix_values(
+            fbx_handoff.get("bone_matrix_axis_inverse")
+        )
+        if inverse_axis is None:
+            inverse_axis = list(FBX_CANONICAL_TO_LEGACY_MAX_AXIS)
+
+        # Convert the scene world basis once.  A child local matrix has already
+        # cancelled the common parent/root axis; multiplying every local by the
+        # global inverse rotates each hierarchy level again.  Rebuild locals
+        # from the converted worlds so every bone shares the same one global
+        # conversion and retains its authored parent-relative transform.
+        for entry in entries:
+            matrix = entry.get("world_matrix")
+            if matrix is None:
+                continue
+            converted = _multiply_matrix4x4(matrix, inverse_axis)
+            if converted is not None:
+                entry["world_matrix"] = converted
+
+        entries_by_name = {
+            str(entry.get("name", "") or "").strip().upper(): entry
+            for entry in entries
+            if str(entry.get("name", "") or "").strip()
+        }
+        for entry in entries:
+            world_matrix = _clone_matrix_values(entry.get("world_matrix"))
+            if world_matrix is None:
+                continue
+            parent_name = str(entry.get("parent_name", "") or "").strip().upper()
+            parent_entry = entries_by_name.get(parent_name)
+            parent_world = (
+                _clone_matrix_values(parent_entry.get("world_matrix"))
+                if isinstance(parent_entry, dict)
+                else None
+            )
+            if parent_world is None:
+                entry["local_matrix"] = list(world_matrix)
+                continue
+            inverse_parent = _invert_matrix4x4(parent_world)
+            if inverse_parent is not None:
+                entry["local_matrix"] = _multiply_matrix4x4(
+                    world_matrix,
+                    inverse_parent,
+                )
+    return entries
 
 
 def _memory_scene_matrix_or_none(value: Any) -> list[float] | None:
@@ -14825,69 +15093,6 @@ def _normalize_fbx_axes_receipt(value: Any) -> dict[str, Any]:
     }
 
 
-def _normalize_fbx_units_receipt(value: Any) -> dict[str, Any]:
-    """Normalize Probe's request-scoped FBX length-unit metadata."""
-    receipt = value if isinstance(value, dict) else {}
-    status = str(receipt.get("status", "missing") or "missing").strip().lower()
-    try:
-        unit_meters = float(receipt.get("unit_meters"))
-    except (TypeError, ValueError, OverflowError):
-        unit_meters = 0.0
-    try:
-        original_unit_meters = float(receipt.get("original_unit_meters"))
-    except (TypeError, ValueError, OverflowError):
-        original_unit_meters = unit_meters
-    try:
-        scale_to_centimeters = float(receipt.get("scale_to_centimeters"))
-    except (TypeError, ValueError, OverflowError):
-        scale_to_centimeters = 0.0
-    if scale_to_centimeters <= 0.0 and unit_meters > 0.0:
-        scale_to_centimeters = unit_meters / 0.01
-    values_valid = all(
-        math.isfinite(number) and number > 0.0
-        for number in (unit_meters, original_unit_meters, scale_to_centimeters)
-    )
-    if status != "reported" or not values_valid:
-        return {
-            "status": status or "missing",
-            "unit_meters": unit_meters if math.isfinite(unit_meters) else 0.0,
-            "original_unit_meters": (
-                original_unit_meters
-                if math.isfinite(original_unit_meters)
-                else 0.0
-            ),
-            "scale_to_centimeters": 0.0,
-            "source": str(receipt.get("source", "") or ""),
-        }
-    return {
-        "status": "reported",
-        "unit_meters": unit_meters,
-        "original_unit_meters": original_unit_meters,
-        "scale_to_centimeters": scale_to_centimeters,
-        "source": str(receipt.get("source", "") or ""),
-    }
-
-
-def _fbx_unit_scale_to_mod_centimeters(fbx_handoff: Any) -> float:
-    """Return one safe FBX-units→MOD-centimetres factor, or identity."""
-    handoff = fbx_handoff if isinstance(fbx_handoff, dict) else {}
-    units = handoff.get("fbx_units")
-    if not isinstance(units, dict):
-        summary = handoff.get("summary")
-        units = summary.get("fbx_units") if isinstance(summary, dict) else None
-    normalized = _normalize_fbx_units_receipt(units)
-    if normalized.get("status") != "reported":
-        return 1.0
-    factor = normalized.get("scale_to_centimeters")
-    try:
-        factor = float(factor)
-    except (TypeError, ValueError, OverflowError):
-        return 1.0
-    if not math.isfinite(factor) or factor <= 0.0:
-        return 1.0
-    return factor
-
-
 def _scale_fbx_position_rows(rows: Any, factor: float) -> list[list[float]] | None:
     if not isinstance(rows, list) or not rows:
         return None
@@ -14905,78 +15110,474 @@ def _scale_fbx_position_rows(rows: Any, factor: float) -> list[list[float]] | No
     return scaled
 
 
-def _apply_fbx_unit_scale_to_ordinary_max_positions(
+# The Probe has already resolved the FBX node matrix and removed its helper
+# axis basis before publishing max_positions/skinned_max_positions.  This
+# layer is the single final position-basis gate before MOD packing. Ordinary
+# MAX exports now keep max_positions as the complete vertex and transform
+# authority; paired Skin rows must not recalibrate them. BONE+MESH keeps its
+# explicit skinned authority.
+# Keep the receipts on each Mesh so a preparation retry or the final Writer
+# gate cannot apply a conversion twice.
+FBX_FINAL_POSITION_TRANSFORM_SCHEMA = "pc-rehd-fbx-final-position-transform-v1"
+FBX_FINAL_POSITION_TRANSFORM_TOLERANCE = 0.000000000001
+FBX_SKINNED_POSITION_CALIBRATION_SCHEMA = "pc-rehd-fbx-skinned-position-calibration-v1"
+# Retained only for controlled comparison. The production ordinary MAX route
+# no longer calls this Skin-basis calibration; max_positions stays authoritative.
+FBX_SKINNED_POSITION_CALIBRATION_SAMPLE_LIMIT = 8192
+
+
+def _derive_fbx_skinned_position_calibration(
+    mesh: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Find the Skin-derived global basis without importing Skin deformation.
+
+    This intentionally has no residual, pose, or Skin-count acceptance gate:
+    whenever Probe supplied aligned rows, their fitted global basis is used.
+    Only the per-vertex values from ``max_positions`` are exported.
+    """
+    max_rows = mesh.get("max_positions")
+    skinned_rows = mesh.get("skinned_max_positions")
+    if (
+        not isinstance(max_rows, list)
+        or not isinstance(skinned_rows, list)
+        or len(max_rows) != len(skinned_rows)
+        or len(max_rows) < 3
+    ):
+        return None
+
+    row_count = len(max_rows)
+    sample_step = max(1, row_count // FBX_SKINNED_POSITION_CALIBRATION_SAMPLE_LIMIT)
+    samples: list[tuple[list[float], list[float]]] = []
+    for row_index in range(0, row_count, sample_step):
+        max_row = max_rows[row_index]
+        skinned_row = skinned_rows[row_index]
+        if (
+            not isinstance(max_row, (list, tuple))
+            or not isinstance(skinned_row, (list, tuple))
+            or len(max_row) < 3
+            or len(skinned_row) < 3
+        ):
+            return None
+        try:
+            max_values = [float(value) for value in max_row[:3]]
+            skinned_values = [float(value) for value in skinned_row[:3]]
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not all(math.isfinite(value) for value in max_values + skinned_values):
+            return None
+        samples.append((max_values, skinned_values))
+    if len(samples) < 3:
+        return None
+
+    max_center = [
+        sum(pair[0][axis] for pair in samples) / len(samples)
+        for axis in range(3)
+    ]
+    skinned_center = [
+        sum(pair[1][axis] for pair in samples) / len(samples)
+        for axis in range(3)
+    ]
+    target_energy = 0.0
+    for max_row, skinned_row in samples:
+        centered_max = [max_row[axis] - max_center[axis] for axis in range(3)]
+        centered_skinned = [
+            skinned_row[axis] - skinned_center[axis] for axis in range(3)
+        ]
+        target_energy += sum(value * value for value in centered_skinned)
+    if target_energy <= 0.000000000001:
+        return None
+
+    # Probe normally gives both channels the same Max basis.  Keep that as the
+    # first candidate, but also solve the six FBX axis permutations so a MAX
+    # exporter axis arrangement is taken from the Skin channel exactly once.
+    axis_permutations = (
+        (0, 1, 2),
+        (0, 2, 1),
+        (1, 0, 2),
+        (1, 2, 0),
+        (2, 0, 1),
+        (2, 1, 0),
+    )
+    best: tuple[float, tuple[int, int, int], list[float], list[float]] | None = None
+    for permutation in axis_permutations:
+        slopes: list[float] = []
+        valid = True
+        for target_axis, source_axis in enumerate(permutation):
+            denominator = 0.0
+            numerator = 0.0
+            for max_row, skinned_row in samples:
+                source_value = max_row[source_axis] - max_center[source_axis]
+                target_value = skinned_row[target_axis] - skinned_center[target_axis]
+                denominator += source_value * source_value
+                numerator += source_value * target_value
+            if denominator <= 0.000000000001:
+                valid = False
+                break
+            slope = numerator / denominator
+            if not math.isfinite(slope):
+                valid = False
+                break
+            slopes.append(slope)
+        if not valid:
+            continue
+        offsets = [
+            skinned_center[target_axis]
+            - (slopes[target_axis] * max_center[permutation[target_axis]])
+            for target_axis in range(3)
+        ]
+        if not all(math.isfinite(value) for value in offsets):
+            continue
+        residual_energy = 0.0
+        for max_row, skinned_row in samples:
+            for target_axis, source_axis in enumerate(permutation):
+                expected = (slopes[target_axis] * max_row[source_axis]) + offsets[target_axis]
+                residual_energy += (skinned_row[target_axis] - expected) ** 2
+        relative_residual = residual_energy / target_energy
+        if best is None or relative_residual < best[0]:
+            best = (relative_residual, permutation, slopes, offsets)
+    if best is None:
+        return None
+
+    residual_squared, permutation, slopes, offset = best
+    relative_residual = math.sqrt(max(0.0, residual_squared))
+    axis_scales = [abs(value) for value in slopes]
+    axis_signs = [1 if value >= 0.0 else -1 for value in slopes]
+    scale_product = axis_scales[0] * axis_scales[1] * axis_scales[2]
+    scale = scale_product ** (1.0 / 3.0) if scale_product > 0.0 else 0.0
+    return {
+        "schema": FBX_SKINNED_POSITION_CALIBRATION_SCHEMA,
+        "status": "verified",
+        "scale": float(scale),
+        "axis_scales": axis_scales,
+        "axis_signs": axis_signs,
+        "axis_permutation": list(permutation),
+        "offset": [float(value) for value in offset],
+        "relative_residual": float(relative_residual),
+        "sample_count": len(samples),
+        "source": "paired_skinned_max_positions",
+        "vertex_source": "max_positions",
+        "axis_basis": "probe_max_basis",
+    }
+
+
+def _apply_fbx_skinned_position_calibration(
+    mesh: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Apply the Skin global position/scale/axis basis to MAX rows only.
+
+    The operation is a single global affine remap.  It does not replace the
+    MAX vertex table with posed Skin rows, so no per-vertex Skin deformation
+    enters the ordinary MAX export.
+    """
+    existing = mesh.get("fbx_skinned_position_calibration")
+    if isinstance(existing, dict) and existing.get("status") == "applied":
+        return existing
+    calibration = _derive_fbx_skinned_position_calibration(mesh)
+    if calibration is None:
+        return None
+    max_rows = mesh.get("max_positions")
+    if not isinstance(max_rows, list):
+        return None
+    axis_scales = calibration.get("axis_scales")
+    axis_signs = calibration.get("axis_signs")
+    axis_permutation = calibration.get("axis_permutation")
+    if (
+        not isinstance(axis_scales, list)
+        or len(axis_scales) != 3
+        or not isinstance(axis_signs, list)
+        or len(axis_signs) != 3
+        or not isinstance(axis_permutation, list)
+        or len(axis_permutation) != 3
+    ):
+        # Compatibility with a pre-v1 in-memory receipt.
+        scale = float(calibration["scale"])
+        axis_scales = [abs(scale)] * 3
+        axis_signs = [1, 1, 1]
+        axis_permutation = [0, 1, 2]
+    axis_scales = [float(value) for value in axis_scales]
+    axis_signs = [1 if int(value) >= 0 else -1 for value in axis_signs]
+    axis_permutation = [int(value) for value in axis_permutation]
+    offset = [float(value) for value in calibration["offset"]]
+    corrected: list[list[float]] = []
+    for row in max_rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
+            return None
+        try:
+            values = [
+                (
+                    float(row[axis_permutation[axis]])
+                    * axis_scales[axis]
+                    * axis_signs[axis]
+                )
+                + offset[axis]
+                for axis in range(3)
+            ]
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not all(math.isfinite(value) for value in values):
+            return None
+        corrected.append(values)
+    mesh["max_positions"] = corrected
+    world_rows = mesh.get("world_positions")
+    if isinstance(world_rows, list) and len(world_rows) == len(corrected):
+        world_corrected: list[list[float]] = []
+        for row in world_rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                world_corrected = []
+                break
+            try:
+                values = [
+                    (
+                        float(row[axis_permutation[axis]])
+                        * axis_scales[axis]
+                        * axis_signs[axis]
+                    )
+                    + offset[axis]
+                    for axis in range(3)
+                ]
+            except (TypeError, ValueError, OverflowError):
+                world_corrected = []
+                break
+            if not all(math.isfinite(value) for value in values):
+                world_corrected = []
+                break
+            world_corrected.append(values)
+        if world_corrected:
+            mesh["world_positions"] = world_corrected
+    calibration = dict(calibration)
+    calibration["status"] = "applied"
+    mesh["fbx_skinned_position_calibration"] = calibration
+    return calibration
+
+
+def _fbx_final_position_unit_factor(
     job: dict[str, Any],
     contract: dict[str, Any],
     fbx_handoff: Any,
-) -> int:
-    """Convert ordinary MAX Probe positions to the MOD centimetre basis once.
+) -> tuple[float, str]:
+    backend = str(
+        job.get("fbx_backend_kind", contract.get("fbx_backend_kind", ""))
+        if isinstance(job, dict)
+        else ""
+    ).strip().lower()
+    if backend == "max_fbx":
+        # Probe's max_positions/skinned_max_positions already include the FBX
+        # node transform and axis basis in the numeric Max/MOD space.  The
+        # FBX unit declaration is metadata for the interchange file; applying
+        # scale_to_centimeters here would convert the same length a second time
+        # and overflow the MOD int16 position lane on inch-authored FBX files.
+        return 1.0, "max_fbx_probe_max_basis"
+    if backend == "blender_fbx":
+        return 1.0, "blender_probe_max_basis"
+    return 1.0, "identity_unknown_backend"
 
-    This is deliberately a position-lane conversion only.  Blender positions,
-    Skin-authoritative BONE+MESH rows, source passthroughs, and world-authority
-    snapshots never enter this helper.
+
+def _apply_fbx_final_position_transform_layer(
+    job: dict[str, Any],
+    contract: dict[str, Any],
+    fbx_handoff: Any,
+) -> dict[str, Any]:
+    """Finish the FBX position lane exactly once for every export route.
+
+    Ordinary MAX exports consume ``max_positions`` for both vertex shape and
+    transform basis, without calibration from paired Skin rows. BONE+MESH
+    consumes the Probe-evaluated ``skinned_max_positions`` (or an already
+    frozen authority). Node placement and axes are already resolved by Probe.
     """
-    if str(job.get("fbx_backend_kind", "") or "").strip().lower() != "max_fbx":
-        return 0
-    if _job_uses_bones_plus_mesh_pose_route(job, contract):
-        return 0
-    factor = _fbx_unit_scale_to_mod_centimeters(fbx_handoff)
-    if abs(factor - 1.0) <= 0.000000000001:
-        return 0
-    applied_count = 0
-    targets: list[dict[str, Any]] = []
+    meshes = _ensure_contract_meshes(job, contract)
+    factor, factor_source = _fbx_final_position_unit_factor(job, contract, fbx_handoff)
+    if not math.isfinite(factor) or factor <= 0.0:
+        factor = 1.0
+        factor_source = "identity_invalid_unit_factor"
+    bones_plus_mesh = _job_uses_bones_plus_mesh_pose_route(job, contract)
+    target_rows_applied: list[int] = []
+    skinned_calibrations: dict[int, dict[str, Any]] = {}
+    skipped_rows: list[dict[str, Any]] = []
     seen_ids: set[int] = set()
-    for candidate in list(_ensure_contract_meshes(job, contract)) + list(
+    targets: list[dict[str, Any]] = []
+    for candidate in list(meshes) + list(
         job.get("meshes", []) if isinstance(job.get("meshes"), list) else []
     ):
         if not isinstance(candidate, dict) or id(candidate) in seen_ids:
             continue
         seen_ids.add(id(candidate))
         targets.append(candidate)
+
+    def previous_factor(mesh: dict[str, Any]) -> float | None:
+        receipt = mesh.get("fbx_final_position_transform")
+        if isinstance(receipt, dict):
+            raw = receipt.get("unit_factor")
+            try:
+                value = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                value = None
+            if value is not None and math.isfinite(value) and value > 0.0:
+                return value
+        # Older preparation builds recorded this marker only for ordinary
+        # MAX rows.  Treat an equal marker as already converted so the new
+        # gate remains compatible with an in-flight legacy preparation.
+        raw_legacy = mesh.get("fbx_position_unit_scale_applied")
+        try:
+            value = float(raw_legacy)
+        except (TypeError, ValueError, OverflowError):
+            value = None
+        return value if value is not None and math.isfinite(value) and value > 0.0 else None
+
+    def scale_optional_rows(mesh: dict[str, Any], key: str) -> None:
+        rows = mesh.get(key)
+        if not isinstance(rows, list) or not rows:
+            return
+        scaled = _scale_fbx_position_rows(rows, factor)
+        if scaled is not None:
+            mesh[key] = scaled
+
     for mesh in targets:
-        if not isinstance(mesh, dict):
-            continue
         if str(mesh.get("lane", "") or "").strip().lower() != "modify":
             continue
+        mesh_slot = _int_or_default(mesh.get("mesh_slot"), 0)
         if _mesh_uses_source_geometry(mesh):
+            skipped_rows.append({"mesh_slot": mesh_slot, "reason": "source_geometry"})
             continue
-        if _mesh_requires_bones_plus_mesh_fbx_world_authority(mesh):
+
+        authority = _get_bones_plus_mesh_final_geometry_authority(mesh)
+        uses_skin_authority = bones_plus_mesh and (
+            _mesh_uses_max_fbx_skinned_position_authority(mesh)
+            or (
+                isinstance(mesh.get("skinned_max_positions"), list)
+                and bool(mesh.get("skinned_max_positions"))
+                and _mesh_has_skin(mesh)
+            )
+        )
+        if authority is not None:
+            position_rows = authority.get("mod_write_positions")
+            position_field = "final_geometry_authority.mod_write_positions"
+        elif uses_skin_authority:
+            position_rows = mesh.get("skinned_max_positions")
+            position_field = "skinned_max_positions"
+        else:
+            position_field = "max_positions"
+            position_rows = mesh.get(position_field)
+            if not isinstance(position_rows, list) or not position_rows:
+                position_field = "positions"
+                position_rows = mesh.get(position_field)
+
+        if not isinstance(position_rows, list) or not position_rows:
+            skipped_rows.append({"mesh_slot": mesh_slot, "reason": "no_position_authority"})
             continue
-        applied_factor = mesh.get("fbx_position_unit_scale_applied")
-        try:
-            if applied_factor is not None and abs(float(applied_factor) - factor) <= 0.000000000001:
-                continue
-        except (TypeError, ValueError, OverflowError):
-            pass
-        rows = _scale_fbx_position_rows(mesh.get("max_positions"), factor)
-        if rows is None:
+
+        prior_factor = previous_factor(mesh)
+        already_applied = (
+            prior_factor is not None
+            and abs(prior_factor - factor) <= FBX_FINAL_POSITION_TRANSFORM_TOLERANCE
+        )
+        if already_applied:
+            target_rows_applied.append(mesh_slot)
             continue
-        mesh["max_positions"] = rows
-        world_rows = mesh.get("world_positions")
-        if isinstance(world_rows, list) and len(world_rows) == len(rows):
-            scaled_world_rows = _scale_fbx_position_rows(world_rows, factor)
-            if scaled_world_rows is not None:
-                mesh["world_positions"] = scaled_world_rows
+        if prior_factor is not None:
+            # A different factor means this object has crossed an older
+            # preparation boundary.  Do not compound an unknown conversion.
+            skipped_rows.append(
+                {
+                    "mesh_slot": mesh_slot,
+                    "reason": "prior_position_factor_mismatch",
+                    "prior_factor": prior_factor,
+                    "requested_factor": factor,
+                }
+            )
+            continue
+
+        scaled_rows = _scale_fbx_position_rows(position_rows, factor)
+        if scaled_rows is None or len(scaled_rows) != len(position_rows):
+            skipped_rows.append({"mesh_slot": mesh_slot, "reason": "invalid_position_rows"})
+            continue
+        if authority is not None:
+            authority["mod_write_positions"] = scaled_rows
+            authority["mod_write_world_positions"] = [list(row) for row in scaled_rows]
+            scale_optional_rows(
+                authority,
+                "binary_skin_unreferenced_max_positions",
+            )
+        else:
+            mesh[position_field] = scaled_rows
+            # World-remap writers use the same Probe Max basis. Keep their
+            # explicit alias aligned without touching raw FBX-local rows.
+            world_rows = mesh.get("world_positions")
+            if isinstance(world_rows, list) and len(world_rows) == len(scaled_rows):
+                scaled_world_rows = _scale_fbx_position_rows(world_rows, factor)
+                if scaled_world_rows is not None:
+                    mesh["world_positions"] = scaled_world_rows
+            if uses_skin_authority:
+                scale_optional_rows(
+                    mesh,
+                    "binary_skin_unreferenced_max_positions",
+                )
+        mesh["fbx_final_position_transform"] = {
+            "schema": FBX_FINAL_POSITION_TRANSFORM_SCHEMA,
+            "status": "applied",
+            "route": "bones_plus_mesh" if bones_plus_mesh else "ordinary",
+            "position_authority": (
+                "final_geometry_authority"
+                if authority is not None
+                else position_field
+            ),
+            "unit_factor": factor,
+            "unit_factor_source": factor_source,
+            "axis_handling": "probe_max_basis_preserved",
+            "applied_once": True,
+        }
+        # Keep the legacy marker in sync for ordinary callers that still
+        # inspect it, while the schema receipt above is the new authority.
         mesh["fbx_position_unit_scale_applied"] = factor
-        normal_fidelity = mesh.get("normal_fidelity")
-        if isinstance(normal_fidelity, dict):
-            normal_fidelity["position_unit_scale"] = factor
-            normal_fidelity["position_unit_scale_source"] = "fbx_scene_unit_meters"
-        applied_count += 1
-    return applied_count
+        target_rows_applied.append(mesh_slot)
+
+    receipt = {
+        "schema": FBX_FINAL_POSITION_TRANSFORM_SCHEMA,
+        "status": "applied" if target_rows_applied else "completed_no_geometry",
+        "route": "bones_plus_mesh" if bones_plus_mesh else "ordinary",
+        "backend": str(job.get("fbx_backend_kind", "") or "").strip().lower(),
+        "unit_factor": factor,
+        "unit_factor_source": factor_source,
+        "axis_handling": "probe_max_basis_preserved",
+        "applied_mesh_slots": sorted({slot for slot in target_rows_applied if slot > 0}),
+        "skinned_position_calibrations": skinned_calibrations,
+        "skipped": skipped_rows,
+        "applied_once": True,
+    }
+    job["fbx_final_position_transform_receipt"] = copy.deepcopy(receipt)
+    contract["fbx_final_position_transform_receipt"] = copy.deepcopy(receipt)
+    return receipt
 
 
-def _build_fbx_axis_log(launcher_axes: Any, probe_axes: Any) -> dict[str, Any]:
+def _build_fbx_axis_log(
+    launcher_axes: Any,
+    probe_axes: Any,
+    *,
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # The default is retained only for legacy diagnostic receipts.
+    axis_output_policy: str = FBX_AXIS_OUTPUT_POLICY_LEGACY,
+) -> dict[str, Any]:
     launcher = _normalize_fbx_axes_receipt(launcher_axes)
     probe = _normalize_fbx_axes_receipt(probe_axes)
-    writer = {
-        "status": "configured",
-        "signature": [0, 4, 3],
-        "right": "+X",
-        "up": "+Z",
-        "front": "-Y",
-        "source": "writer_max_z_up_identity",
-    }
+    if axis_output_policy == FBX_AXIS_OUTPUT_POLICY_MAX_XYZ:
+        writer = {
+            "status": "configured",
+            "signature": [0, 2, 4],
+            "right": "+X",
+            "up": "+Y",
+            "front": "+Z",
+            "source": "writer_generic_max_xyz",
+        }
+    else:
+        # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+        # Log-only description of the historical X,+Z,-Y writer lane.
+        writer = {
+            "status": "configured",
+            "signature": [0, 4, 3],
+            "right": "+X",
+            "up": "+Z",
+            "front": "-Y",
+            "source": "writer_legacy_x_z_neg_y",
+        }
     signatures = [launcher["signature"], probe["signature"], writer["signature"]]
     if any(len(signature) != 3 for signature in signatures):
         status = "UNKNOWN"
@@ -15115,6 +15716,8 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
     binary_parse: Any = None
     probe_stage: Any = None
     probe_route_receipt: Any = None
+    probe_backend: Any = None
+    generic_fbx_normalization: Any = None
     try:
         if hasattr(probe, "probe_fbx_handoff"):
             handoff_payload = probe.probe_fbx_handoff(
@@ -15138,6 +15741,17 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
             binary_parse = handoff_payload.get("binary_parse")
             probe_stage = handoff_payload.get("probe_stage")
             probe_route_receipt = handoff_payload.get("probe_route_receipt")
+            probe_backend = handoff_payload.get("probe_backend")
+            generic_fbx_normalization = handoff_payload.get("generic_fbx_normalization")
+            # Preserve the Generic Probe bone-matrix domain across this
+            # handoff boundary.  Bone Only and Bone+Mesh both consume the
+            # returned handoff later; dropping this field silently sends both
+            # routes back through the legacy bone-axis interpretation.
+            bone_matrix_axis_domain = handoff_payload.get("bone_matrix_axis_domain")
+            bone_matrix_axis_inverse = handoff_payload.get("bone_matrix_axis_inverse")
+            transform_stage = handoff_payload.get("transform_stage")
+            if not isinstance(probe_backend, dict) and isinstance(summary, dict):
+                probe_backend = summary.get("probe_backend")
         else:
             summary = probe.summarize_fbx(fbx_path)
             compare = probe.compare_fbx_to_max_snapshot(summary, max_snapshot)
@@ -15145,6 +15759,11 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
             fbx_axes = summary.get("fbx_axes") if isinstance(summary, dict) else None
             fbx_units = summary.get("fbx_units") if isinstance(summary, dict) else None
             normal_fidelity = None
+            probe_backend = summary.get("probe_backend") if isinstance(summary, dict) else None
+            generic_fbx_normalization = None
+            bone_matrix_axis_domain = None
+            bone_matrix_axis_inverse = None
+            transform_stage = None
             if hasattr(probe, "extract_fbx_mesh_contracts"):
                 try:
                     contract_meshes = probe.extract_fbx_mesh_contracts(fbx_path)
@@ -15232,9 +15851,97 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
         payload["probe_stage"] = dict(probe_stage)
     if isinstance(probe_route_receipt, dict):
         payload["probe_route_receipt"] = copy.deepcopy(probe_route_receipt)
+    if isinstance(probe_backend, dict):
+        payload["probe_backend"] = copy.deepcopy(probe_backend)
+    if isinstance(generic_fbx_normalization, dict):
+        payload["generic_fbx_normalization"] = copy.deepcopy(generic_fbx_normalization)
+        if str(generic_fbx_normalization.get("status", "") or "").strip().lower() == "normalized":
+            # Generic emits one canonical scene basis for both DCC routes.
+            payload["fbx_axis_output_policy"] = _fbx_axis_output_policy(
+                {"generic_fbx_normalization": generic_fbx_normalization}
+            )
+            payload["fbx_axis_transform_scope"] = "scene_global_once"
+    if bone_matrix_axis_domain not in {None, ""}:
+        payload["bone_matrix_axis_domain"] = str(bone_matrix_axis_domain)
+    if isinstance(bone_matrix_axis_inverse, list) and len(bone_matrix_axis_inverse) >= 16:
+        payload["bone_matrix_axis_inverse"] = [
+            _float_or_default(value, 0.0) for value in bone_matrix_axis_inverse[:16]
+        ]
+    if transform_stage not in {None, ""}:
+        payload["transform_stage"] = str(transform_stage)
     if contract_extract_error != "":
         payload["contract_extract_error"] = contract_extract_error
     return payload
+
+
+def _propagate_fbx_probe_backend_receipt(
+    job: dict[str, Any],
+    contract: dict[str, Any],
+    fbx_handoff: Any,
+) -> str:
+    """Attach Probe provenance and the resolved axis policy to every writer Mesh."""
+    receipt = _fbx_probe_backend_receipt(fbx_handoff)
+    # Generic Probe handoffs currently expose a normalization receipt at the
+    # top level, without a separate ``probe_backend`` receipt.  Do not lose its
+    # explicit writer policy at the boundary; all other callers retain the old
+    # receipt-gated behavior.
+    policy = _fbx_axis_output_policy(fbx_handoff)
+    generic_normalization = (
+        fbx_handoff.get("generic_fbx_normalization")
+        if isinstance(fbx_handoff, dict)
+        else None
+    )
+    has_generic_receipt = isinstance(generic_normalization, dict) and (
+        str(generic_normalization.get("status", "") or "").strip().lower()
+        == "normalized"
+        or str(generic_normalization.get("fbx_axis_output_policy", "") or "")
+        .strip()
+        .lower()
+        in {FBX_AXIS_OUTPUT_POLICY_MAX_XYZ, FBX_AXIS_OUTPUT_POLICY_LEGACY}
+    )
+    generic_normal_domains: dict[str, str] = {}
+    if has_generic_receipt:
+        normalization = generic_normalization.get("normalization")
+        if not isinstance(normalization, dict):
+            normalization = generic_normalization
+        raw_domains = normalization.get("normal_axis_domain_by_geometry_id")
+        if isinstance(raw_domains, dict):
+            for raw_geometry_id, raw_domain in raw_domains.items():
+                geometry_id = _int_or_default(raw_geometry_id, 0)
+                domain = str(raw_domain or "").strip().lower()
+                if geometry_id > 0 and domain in {
+                    FBX_NORMAL_AXIS_DOMAIN_CANONICAL,
+                    FBX_NORMAL_AXIS_DOMAIN_LEGACY,
+                }:
+                    generic_normal_domains[str(geometry_id)] = domain
+    if not isinstance(receipt, dict) and not has_generic_receipt:
+        return policy
+    generic_scene_global_once = bool(
+        has_generic_receipt
+        and str(generic_normalization.get("axis_transform_contract", "") or "")
+        .strip()
+        .lower()
+        == "scene_global_once"
+    )
+    targets: list[dict[str, Any]] = [job, contract]
+    targets.extend(mesh for mesh in job.get("meshes", []) if isinstance(mesh, dict))
+    targets.extend(
+        mesh for mesh in _ensure_contract_meshes(job, contract) if isinstance(mesh, dict)
+    )
+    seen: set[int] = set()
+    for target in targets:
+        if id(target) in seen:
+            continue
+        seen.add(id(target))
+        if isinstance(receipt, dict):
+            target["probe_backend"] = copy.deepcopy(receipt)
+        target["fbx_axis_output_policy"] = policy
+        if generic_scene_global_once:
+            target["fbx_axis_transform_scope"] = "scene_global_once"
+        geometry_id = _int_or_default(target.get("fbx_geometry_id"), 0)
+        if geometry_id > 0 and str(geometry_id) in generic_normal_domains:
+            target["fbx_normal_axis_domain"] = generic_normal_domains[str(geometry_id)]
+    return policy
 
 
 def _max_fbx_route_protocol_is_required(
@@ -15585,7 +16292,10 @@ def _preserve_source_short_anchor_positions(
         source_vertex_indices = mesh.get("source_vertex_indices")
         if not isinstance(source_vertex_indices, list):
             continue
-        mesh_scale = _coerce_vec3(mesh.get("mesh_scale"), (1.0, 1.0, 1.0))
+        mesh_scale = _fbx_axis_policy_vector(
+            _coerce_vec3(mesh.get("mesh_scale"), (1.0, 1.0, 1.0)),
+            mesh,
+        )
         mesh_preserved_count = _preserve_unchanged_source_short_anchor_rows(
             position_rows,
             source_rows,
@@ -17646,6 +18356,7 @@ def _merge_fbx_contract_meshes(
             "skinned_normals",
             "skinned_max_normals",
             "skinned_is_local",
+            "fbx_normal_axis_domain",
         ):
             if stale_key not in matched:
                 mesh.pop(stale_key, None)
@@ -17699,6 +18410,7 @@ def _merge_fbx_contract_meshes(
             "fbx_export_face_indices",
             "fbx_uv_channels",
             "normal_fidelity",
+            "fbx_normal_axis_domain",
         ):
             if (
                 require_explicit_route
@@ -20114,6 +20826,7 @@ def _prepare_writer_payload(
         fbx_handoff = _try_collect_fbx_handoff(job, source_mesh_headers)
         if isinstance(timing, dict):
             _record_timing_phase(timing, "collect_fbx_handoff_seconds", time.perf_counter() - handoff_started_at)
+    _propagate_fbx_probe_backend_receipt(job, contract, fbx_handoff)
     _validate_header_bucket_scene_witnesses(job, fbx_handoff)
     contract_meshes = fbx_handoff.get("contract_meshes")
     if isinstance(contract_meshes, list) and contract_meshes:
@@ -20125,6 +20838,7 @@ def _prepare_writer_payload(
     if _job_uses_bone_edit(job, contract) and not _job_uses_bones_plus_mesh_pose_route(job, contract):
         # BONE ONLY is a skeleton-table operation. Its Mesh bytes stay as the
         # selected source MOD, so it must never enter the ordinary Mesh path.
+        _apply_fbx_final_position_transform_layer(job, contract, fbx_handoff)
         return contract, fbx_handoff
     if _job_uses_bones_plus_mesh_pose_route(job, contract):
         # BONE+MESH is ordinary Mesh export plus one final Probe Skin pose
@@ -20211,6 +20925,7 @@ def _prepare_writer_payload(
             fbx_handoff["bones_plus_mesh_fbx_world_geometry_receipt"] = copy.deepcopy(
                 bones_plus_mesh_authority_receipt
             )
+    _apply_fbx_final_position_transform_layer(job, contract, fbx_handoff)
     return contract, fbx_handoff
 
 
@@ -20445,6 +21160,15 @@ def _short_tuple_to_max_position(short_pos: Any, mesh_scale: list[float]) -> lis
     scale_x = mesh_scale[0] if abs(mesh_scale[0]) > 0.000001 else 1.0
     scale_y = mesh_scale[1] if abs(mesh_scale[1]) > 0.000001 else 1.0
     scale_z = mesh_scale[2] if abs(mesh_scale[2]) > 0.000001 else 1.0
+    if (
+        str(getattr(mesh_scale, "axis_output_policy", FBX_AXIS_OUTPUT_POLICY_LEGACY))
+        == FBX_AXIS_OUTPUT_POLICY_MAX_XYZ
+    ):
+        return [
+            short_xyz[0] / scale_x,
+            short_xyz[1] / scale_y,
+            short_xyz[2] / scale_z,
+        ]
     return [
         short_xyz[0] / scale_x,
         -short_xyz[2] / scale_y,
@@ -23012,11 +23736,19 @@ def _encode_bones_plus_mesh_position_patch(
     source_fvf: int,
     vertex_stride: int,
     mesh_scale: list[float],
+    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
+    # Legacy callers without a Generic axis receipt retain the old default.
+    axis_output_policy: str = FBX_AXIS_OUTPUT_POLICY_LEGACY,
 ) -> bytes:
     # The probe returns Max-space positions. Convert them once to the exact MOD
     # position lane while leaving every other source vertex byte untouched.
     if source_fvf in SHORT_POSITION_FVFS:
-        write_position = _get_short_position_write_pos([position], 0, mesh_scale)
+        write_position = _get_short_position_write_pos(
+            [position],
+            0,
+            mesh_scale,
+            axis_output_policy=axis_output_policy,
+        )
         return struct.pack(
             "<hhh",
             _clamp_short(write_position[0]),
@@ -23024,7 +23756,12 @@ def _encode_bones_plus_mesh_position_patch(
             _clamp_short(write_position[2]),
         )
     if source_fvf in VERTEX_STRIDE_BY_FVF and vertex_stride >= 12:
-        write_position = _get_float_position_write_pos([position], 0, mesh_scale)
+        write_position = _get_float_position_write_pos(
+            [position],
+            0,
+            mesh_scale,
+            axis_output_policy=axis_output_policy,
+        )
         return struct.pack("<fff", write_position[0], write_position[1], write_position[2])
     raise ValueError(
         f"Bones+Mesh source FVF 0x{source_fvf:08X} has no proven position-only patch layout"
@@ -23075,6 +23812,7 @@ def _build_bones_plus_mesh_position_patch_layout(
         )
         source_fvf = _parse_fvf_int(source_mesh_header.get("fvf_info"))
         mesh_scale = _require_bones_plus_mesh_source_scale(mesh)
+        axis_output_policy = _fbx_axis_output_policy(mesh)
 
         encoded_position_by_source_vertex: dict[int, bytes] = {}
         for export_vertex_index, source_vertex_index in enumerate(source_vertex_indices):
@@ -23088,6 +23826,7 @@ def _build_bones_plus_mesh_position_patch_layout(
                 source_fvf=source_fvf,
                 vertex_stride=vertex_stride,
                 mesh_scale=mesh_scale,
+                axis_output_policy=axis_output_policy,
             )
             prior_position = encoded_position_by_source_vertex.get(source_vertex_index)
             if prior_position is not None and prior_position != encoded_position:
@@ -23117,6 +23856,7 @@ def _build_bones_plus_mesh_position_patch_layout(
                 source_fvf=source_fvf,
                 vertex_stride=vertex_stride,
                 mesh_scale=mesh_scale,
+                axis_output_policy=axis_output_policy,
             )
         unreferenced_source_vertex_count += len(unreferenced_source_indices)
 
@@ -23440,6 +24180,14 @@ def _write_output_mod_unlocked(
             preserve_source_skeleton=not _job_uses_bone_edit(job, effective_contract),
             allow_output_overwrite=allow_output_overwrite,
         )
+    # Final writer gate: direct Writer callers must receive the same single
+    # FBX position-basis conversion as the preparation routes.  The layer is
+    # receipt-backed and therefore a preparation pass cannot scale twice.
+    _apply_fbx_final_position_transform_layer(
+        job,
+        effective_contract,
+        fbx_handoff or {},
+    )
     if _job_uses_bone_edit(job, effective_contract):
         return _write_output_mod_with_bone_edit(
             source,
@@ -31008,6 +31756,7 @@ def _prepare_memory_scene_contract(
     if _job_uses_bone_edit(job, contract) and not _job_uses_bones_plus_mesh_pose_route(job, contract):
         # BONE ONLY deliberately skips every ordinary Mesh preparation pass.
         # Its output layout is built from the source MOD verbatim below.
+        _apply_fbx_final_position_transform_layer(job, contract, fbx_handoff)
         if isinstance(timing, dict):
             _record_timing_phase(
                 timing,
@@ -31046,11 +31795,6 @@ def _prepare_memory_scene_contract(
 
     phase_started_at = time.perf_counter()
     _apply_fbx_world_space_overrides(job, contract)
-    # MAX FBX exports may be authored in inches (0.0254 m).  Convert the
-    # already node-transformed ordinary position lane before any source-anchor
-    # preservation or MOD quantization.  The helper is a no-op for Blender,
-    # BONE+MESH, source passthrough, and legacy handoffs without unit metadata.
-    _apply_fbx_unit_scale_to_ordinary_max_positions(job, contract, fbx_handoff)
     if isinstance(timing, dict):
         _record_timing_phase(
             timing,
@@ -31196,6 +31940,7 @@ def _prepare_memory_scene_contract(
             "contract_post_uv_seconds",
             time.perf_counter() - post_uv_started_at,
         )
+    _apply_fbx_final_position_transform_layer(job, contract, fbx_handoff)
     return contract
 
 
@@ -31604,6 +32349,7 @@ def _run_memory_export_impl(
                 fbx_modify_meshes = []
             else:
                 raise RuntimeError(f"Python could not read the Max FBX geometry carrier: {detail}")
+        _propagate_fbx_probe_backend_receipt(job, contract, fbx_handoff)
     else:
         _record_timing_phase(timing, "fbx_probe_seconds", 0.0)
 
@@ -31680,7 +32426,11 @@ def _run_memory_export_impl(
                 fbx_contract_meshes,
                 require_explicit_route=require_explicit_max_route,
             )
-        fbx_axis_log = _build_fbx_axis_log(receipt.get("fbx_axes"), fbx_handoff.get("fbx_axes"))
+        fbx_axis_log = _build_fbx_axis_log(
+            receipt.get("fbx_axes"),
+            fbx_handoff.get("fbx_axes"),
+            axis_output_policy=_fbx_axis_output_policy(fbx_handoff),
+        )
         job["fbx_axis_log"] = fbx_axis_log
         contract["fbx_axis_log"] = fbx_axis_log
     elif not bone_edit_enabled:

@@ -69,7 +69,12 @@ IMPORT_MANIFEST_SCHEMA = "codex-re6-mod-import-manifest-v1"
 BLENDER_SCENE_DATA_SCHEMA = "pc-rehd-code-x-blender-scene-data-v1"
 BLENDER_SCENE_DATA_REVISION = 1
 FBX_BINARY_VERSION = 7400
-FBX_UNIT_METERS = 0.01
+# MOD coordinates and the matrices below are authored in the Max scene's
+# native inch basis.  Declare that basis in FBX metadata so Max and Blender
+# apply the same 2.54 cm-per-unit conversion; geometry and Skin arrays stay
+# numerically untouched.
+FBX_UNIT_METERS = 0.0254
+FBX_UNIT_SCALE_FACTOR = FBX_UNIT_METERS / 0.01
 FBX_CREATOR = "Codex RE6 MOD Import FBX Builder"
 FBX_MAX_BITMAP_COMPATIBILITY_POLICY = "DiffuseColor"
 FBX_NORMAL_PROFILE_MAX = "max"
@@ -3979,8 +3984,22 @@ def _build_fbx_roots(
     _fbx_property70(global_props, "CoordAxisSign", "int", "Integer", "", [1])
     _fbx_property70(global_props, "OriginalUpAxis", "int", "Integer", "", [2])
     _fbx_property70(global_props, "OriginalUpAxisSign", "int", "Integer", "", [1])
-    _fbx_property70(global_props, "UnitScaleFactor", "double", "Number", "", [1.0])
-    _fbx_property70(global_props, "OriginalUnitScaleFactor", "double", "Number", "", [1.0])
+    _fbx_property70(
+        global_props,
+        "UnitScaleFactor",
+        "double",
+        "Number",
+        "",
+        [FBX_UNIT_SCALE_FACTOR],
+    )
+    _fbx_property70(
+        global_props,
+        "OriginalUnitScaleFactor",
+        "double",
+        "Number",
+        "",
+        [FBX_UNIT_SCALE_FACTOR],
+    )
 
     documents = _FbxNode(b"Documents")
     documents.add("Count", ("I", 1))
@@ -4107,7 +4126,6 @@ def _build_fbx_roots(
                 "CodexV4AnimMapId": int(bone["anim_map_id"]),
                 "CodexRe6ImportContractId": scene["contract_id"],
                 "CodexRe6RequestSha256": scene["request_contract_sha256"],
-                "CodexRe6MaxWorldTM": _encode_max_matrix_user_property(bone["max_world_matrix"]),
             },
         )
         if is_deforming_bone:
@@ -6402,8 +6420,12 @@ def run_import_maintenance_regression_suite() -> dict[str, Any]:
             and prop.props
             and prop.props[0] in {("S", "UnitScaleFactor"), ("S", "OriginalUnitScaleFactor")}
         }
-        if unit_values != {"UnitScaleFactor": 1.0, "OriginalUnitScaleFactor": 1.0}:
-            raise AssertionError("FBX centimeter unit metadata regression")
+        expected_unit_values = {
+            "UnitScaleFactor": FBX_UNIT_SCALE_FACTOR,
+            "OriginalUnitScaleFactor": FBX_UNIT_SCALE_FACTOR,
+        }
+        if unit_values != expected_unit_values:
+            raise AssertionError("FBX Max-compatible inch unit metadata regression")
 
         root_world_fixture = [
             2.0, 0.0, 0.0, 0.0,
@@ -6513,9 +6535,8 @@ def run_import_maintenance_regression_suite() -> dict[str, Any]:
         udp_row = root_property_rows.get("UDP3DSMAX", [])
         if not udp_row or "CodexV4ExportBoneSlot = 0\r\n" not in str(udp_row[-1][1]):
             raise AssertionError("Max user properties must be serialized through UDP3DSMAX")
-        expected_root_world_tm = _encode_max_matrix_user_property(root_world_fixture)
-        if f"CodexRe6MaxWorldTM = {expected_root_world_tm}\r\n" not in str(udp_row[-1][1]):
-            raise AssertionError("exact Max bone world-matrix user property regression")
+        if "CodexRe6MaxWorldTM = " in str(udp_row[-1][1]):
+            raise AssertionError("retired Max bone world-matrix override leaked into FBX")
 
         fixture_clusters = [
             node
@@ -6659,7 +6680,7 @@ def run_import_maintenance_regression_suite() -> dict[str, Any]:
                 "bone_model_type_contract": "deforming-limb-unused-null",
                 "max_user_property_contract": "UDP3DSMAX",
                 "max_post_import_bounds_contract": "native-sphere-point-from-exact-user-properties",
-                "max_post_import_bone_matrix_contract": "12-value-max-world-matrix",
+                "max_post_import_bone_matrix_contract": "native-fbx-unit-metadata-no-override",
                 "da55_stride_contract": "writer-record-28/header-normal-stride",
                 "bone_map_contract": "one-based-row-start/local-slot-to-global-strict",
                 "writer_skin_layout_contract": "0CB-667-0D9E-DA-77-75C3-D84E",
