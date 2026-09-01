@@ -1285,6 +1285,47 @@ def _normalize_vec3(vec: Any, fallback: tuple[float, float, float]) -> list[floa
     return [fallback[0], fallback[1], fallback[2]]
 
 
+def _normalize_required_writer_normal(
+    value: Any,
+    *,
+    field: str,
+    row_index: int | None,
+    mesh_label: str,
+) -> list[float]:
+    """Validate and normalize one normal that is about to reach the MOD writer.
+
+    This is intentionally separate from the general-purpose vector helpers:
+    those helpers still have compatibility defaults for non-writer math, while
+    a missing/invalid normal authority must never become an invented ``+Z``
+    normal in an exported vertex.
+    """
+    row_text = "" if row_index is None else f" row {row_index}"
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        raise ValueError(
+            f"{mesh_label} has invalid {field}{row_text}; expected three numeric components"
+        )
+    values: list[float] = []
+    for component_index, component in enumerate(value[:3]):
+        try:
+            parsed = float(component)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"{mesh_label} has non-numeric {field}{row_text} component {component_index}"
+            ) from exc
+        if not math.isfinite(parsed):
+            raise ValueError(
+                f"{mesh_label} has non-finite {field}{row_text} component {component_index}"
+            )
+        values.append(parsed)
+    length_squared = sum(component * component for component in values)
+    if not math.isfinite(length_squared) or length_squared <= 0.000000000001:
+        raise ValueError(
+            f"{mesh_label} has a zero-length {field}{row_text}; refusing to invent a normal"
+        )
+    length = math.sqrt(length_squared)
+    return [component / length for component in values]
+
+
 def _is_near_zero_vec(vec: Any) -> bool:
     xyz = _coerce_vec3(vec)
     return ((xyz[0] * xyz[0]) + (xyz[1] * xyz[1]) + (xyz[2] * xyz[2])) <= 0.000000000001
@@ -1307,7 +1348,14 @@ def _dot_vec3(a: Any, b: Any) -> float:
 
 
 def _encode_normal_bytes(vec: Any) -> tuple[int, int, int, int]:
-    n = _normalize_vec3(vec, (0.0, 0.0, 1.0))
+    # Writer normals have already been selected from an explicit Probe
+    # authority.  Do not turn a malformed row into the historical +Z normal.
+    n = _normalize_required_writer_normal(
+        vec,
+        field="packed normal",
+        row_index=None,
+        mesh_label="Writer",
+    )
     return (
         _clamp_byte((n[0] * 127.0) + 127.0),
         _clamp_byte((n[1] * 127.0) + 127.0),
@@ -1854,29 +1902,24 @@ def _get_semantic_row(mesh: dict[str, Any], key: str, index: int) -> Any:
 BONES_PLUS_MESH_FBX_WORLD_GEOMETRY_AUTHORITY = "fbx_probe_binary_cluster_skinned_max_positions_v4"
 BONES_PLUS_MESH_FBX_SKIN_EVALUATION_STATUS = "binary_cluster_evaluated"
 MAX_FBX_POSITION_AUTHORITY = "skinned_max_positions"
+ORDINARY_FBX_POSITION_AUTHORITY = "max_positions"
+ORDINARY_FBX_NORMAL_AUTHORITY = "max_normals"
+GEOMETRY_POSITION_AUTHORITY_KEY = "geometry_position_authority"
 FBX_PROBE_ROUTE_HINT_SCHEMA = "pc-rehd-fbx-probe-route-hints-v1"
 FBX_PROBE_ROUTE_RECEIPT_SCHEMA = "pc-rehd-fbx-probe-route-receipt-v1"
 FBX_PROBE_BACKEND_RECEIPT_SCHEMA = "pc-rehd-fbx-probe-backend-receipt-v1"
-# EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-# Transitional fixed-axis compatibility lane.  Current MAX/Blender exports
-# must carry the Generic scene-global canonical XYZ contract instead.
-FBX_AXIS_OUTPUT_POLICY_LEGACY = "legacy_xyz_neg_y"
 FBX_AXIS_OUTPUT_POLICY_MAX_XYZ = "max_xyz"
+FBX_TRANSFORM_SCALE_SCHEMA = "pc-rehd-fbx-transform-scale-v1"
+FBX_TARGET_UNIT_METERS = 0.0254
 # Generic_to_mod_transform_code receives an explicit per-Geometry normal
 # domain from Probe.  Keep the labels aligned with codex_fbx_probe.py.
 FBX_NORMAL_AXIS_DOMAIN_CANONICAL = "canonical_xyz"
-FBX_NORMAL_AXIS_DOMAIN_LEGACY = "legacy_max"
 FBX_BONE_MATRIX_DOMAIN_CANONICAL = "canonical_xyz"
-# EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-# Legacy Max FBX uses X,+Z,-Y storage.  This is only a compatibility fallback
-# for an older Generic receipt that predates the explicit inverse basis; current
-# Probe handoffs carry the exact source-axis inverse per request.
-FBX_CANONICAL_TO_LEGACY_MAX_AXIS = [
-    1.0, 0.0, 0.0, 0.0,
-    0.0, 0.0, 1.0, 0.0,
-    0.0, -1.0, 0.0, 0.0,
-    0.0, 0.0, 0.0, 1.0,
-]
+# The writer-side dynamic mapping is deliberately request-scoped.  It is the
+# only place where a canonical Generic-FBX value is mapped back into the MOD
+# file domain; no DCC name or hard-coded per-Mesh axis branch is consulted.
+DYNAMIC_MOD_FBX_MAPPING_SCHEMA = "pc-rehd-dynamic-mod-fbx-mapping-v1"
+DYNAMIC_MOD_FBX_MAPPING_TOLERANCE = 0.0000001
 FBX_PROBE_TOPOLOGY_ROUTES = frozenset(
     {
         "fbx_geometry",
@@ -1911,38 +1954,12 @@ def _fbx_probe_backend_receipt(value: Any) -> dict[str, Any] | None:
 
 
 def _fbx_axis_output_policy(value: Any) -> str:
-    """Keep the legacy writer unless Generic conversion explicitly opts in.
+    """MAX and Blender Generic exports always write canonical XYZ.
 
-    A plain ``fbx_axes`` receipt is not enough to change the established lane:
-    old Max/Blender callers may report Y-Up for reasons unrelated to the
-    embedded converter. Only the Generic normalizer's request-scoped receipt
-    (or the policy copied from it onto a Mesh) may select canonical XYZ.
+    Receipt loss, Probe failure metadata, and stale callers must never revive
+    the retired per-Mesh X,+Z,-Y writer conversion.
     """
-    if isinstance(value, dict):
-        explicit = str(value.get("fbx_axis_output_policy", "") or "").strip().lower()
-        if explicit in {FBX_AXIS_OUTPUT_POLICY_MAX_XYZ, FBX_AXIS_OUTPUT_POLICY_LEGACY}:
-            return explicit
-        generic = value.get("generic_fbx_normalization")
-        if isinstance(generic, dict):
-            generic_policy = str(
-                generic.get("fbx_axis_output_policy", "") or ""
-            ).strip().lower()
-            if generic_policy in {
-                FBX_AXIS_OUTPUT_POLICY_MAX_XYZ,
-                FBX_AXIS_OUTPUT_POLICY_LEGACY,
-            }:
-                return generic_policy
-            normalization = generic.get("normalization")
-            if (
-                str(generic.get("status", "") or "").strip().lower() == "normalized"
-                and isinstance(normalization, dict)
-                and str(normalization.get("axis_policy", "") or "").strip().lower()
-                == "normalize_to_xyz_axes"
-            ):
-                return FBX_AXIS_OUTPUT_POLICY_MAX_XYZ
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # Missing/old receipts still fall back to the historical X,+Z,-Y lane.
-    return FBX_AXIS_OUTPUT_POLICY_LEGACY
+    return FBX_AXIS_OUTPUT_POLICY_MAX_XYZ
 
 
 class _FbxAxisPolicyVector(list):
@@ -1958,50 +1975,74 @@ def _fbx_axis_policy_vector(values: list[float], receipt_source: Any) -> list[fl
 
 
 def _write_position_axis_policy(values: list[float], axis_output_policy: str) -> list[float]:
-    if axis_output_policy == FBX_AXIS_OUTPUT_POLICY_MAX_XYZ:
-        return [values[0], values[1], values[2]]
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # Fixed legacy X,+Z,-Y writer conversion.  Generic-normalized rows must
-    # never reach this branch.
-    return [values[0], values[2], -values[1]]
+    return [values[0], values[1], values[2]]
 
 
 def _fbx_normal_output_policy(mesh: dict[str, Any]) -> str:
-    """Resolve the one normal basis conversion allowed before MOD writing."""
-    # Mesh, bone, normal and tangent rows from one Generic request share one
-    # scene-level conversion.  An explicit request policy therefore wins over
-    # the older per-Geometry normal-domain hint; otherwise different Meshes
-    # can receive different rotations in the same export.
-    explicit_policy = str(mesh.get("fbx_axis_output_policy", "") or "").strip().lower()
-    if (
-        str(mesh.get("fbx_axis_transform_scope", "") or "").strip().lower()
-        == "scene_global_once"
-        and explicit_policy in {
-            FBX_AXIS_OUTPUT_POLICY_MAX_XYZ,
-            FBX_AXIS_OUTPUT_POLICY_LEGACY,
-        }
-    ):
-        return explicit_policy
-    domain = str(mesh.get("fbx_normal_axis_domain", "") or "").strip().lower()
-    if domain == FBX_NORMAL_AXIS_DOMAIN_CANONICAL:
-        return FBX_AXIS_OUTPUT_POLICY_MAX_XYZ
-    if domain == FBX_NORMAL_AXIS_DOMAIN_LEGACY:
-        # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-        # Legacy per-Geometry normal basis; retained only for old contracts.
-        return FBX_AXIS_OUTPUT_POLICY_LEGACY
-    # Compatibility callers without the new per-Geometry receipt retain the
-    # existing request-scoped axis policy.
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # This final fallback is the old non-Generic export behavior.
-    return _fbx_axis_output_policy(mesh)
+    """Normals share the same canonical XYZ contract as positions."""
+    return FBX_AXIS_OUTPUT_POLICY_MAX_XYZ
 
 
-def _mesh_requires_bones_plus_mesh_fbx_world_authority(mesh: dict[str, Any]) -> bool:
-    return _as_bool(mesh.get("requires_fbx_world_geometry_authority"), False)
+def _has_canonical_bone_matrix_handoff(fbx_handoff: Any) -> bool:
+    """Return whether Probe has already normalized bone matrices to XYZ.
+
+    This is a writer-boundary contract, not a request to reinterpret old MOD
+    tables.  Source MOD matrices may still be decoded while building a
+    comparison baseline, but a current Probe matrix in this domain must be
+    packed unchanged: X stays X, Y stays Y, and Z stays Z.
+    """
+    if not isinstance(fbx_handoff, dict):
+        return False
+    matrix_domain = str(
+        fbx_handoff.get("bone_matrix_axis_domain", "") or ""
+    ).strip().lower()
+    if matrix_domain == FBX_BONE_MATRIX_DOMAIN_CANONICAL:
+        return True
+    summary = fbx_handoff.get("summary")
+    if not isinstance(summary, dict):
+        return False
+    return str(
+        summary.get("bone_matrix_axis_domain", "") or ""
+    ).strip().lower() == FBX_BONE_MATRIX_DOMAIN_CANONICAL
+
+
+def _require_current_bone_matrix(value: Any, *, label: str) -> list[float]:
+    """Validate one current Probe bone matrix in the canonical XYZ domain."""
+    matrix = _clone_matrix_values(value)
+    if matrix is None or len(matrix) < 16 or not all(math.isfinite(item) for item in matrix):
+        raise ValueError(f"Current FBX Probe bone {label} has no valid world/local matrix")
+    if any(abs(matrix[index]) > 0.0001 for index in (3, 7, 11)) or abs(matrix[15] - 1.0) > 0.0001:
+        raise ValueError(f"Current FBX Probe bone {label} has a non-affine matrix")
+    return matrix[:16]
 
 
 def _mesh_uses_max_fbx_skinned_position_authority(mesh: dict[str, Any]) -> bool:
     return str(mesh.get("fbx_position_authority", "") or "") == MAX_FBX_POSITION_AUTHORITY
+
+
+def _resolve_geometry_position_authority(mesh: dict[str, Any]) -> str:
+    """Resolve the single Probe-owned position table consumed by the writer.
+
+    The bridge may validate an authority, but it must not invent one from the
+    source MOD or silently fall back to the raw ``positions`` lane.  BONE+MESH
+    marks ``skinned_max_positions`` upstream; every other writable route uses
+    ``max_positions``.
+    """
+    explicit = str(mesh.get(GEOMETRY_POSITION_AUTHORITY_KEY, "") or "").strip()
+    if explicit in {ORDINARY_FBX_POSITION_AUTHORITY, MAX_FBX_POSITION_AUTHORITY}:
+        return explicit
+    legacy = str(mesh.get("fbx_position_authority", "") or "").strip()
+    if legacy == MAX_FBX_POSITION_AUTHORITY:
+        return MAX_FBX_POSITION_AUTHORITY
+    return ORDINARY_FBX_POSITION_AUTHORITY
+
+
+def _require_geometry_position_rows(mesh: dict[str, Any], *, context: str = "FBX Mesh") -> tuple[str, list[Any]]:
+    authority = _resolve_geometry_position_authority(mesh)
+    rows = mesh.get(authority)
+    if not isinstance(rows, list) or not rows:
+        raise ValueError(f"{context} is missing its required {authority} authority")
+    return authority, rows
 
 
 def _max_unskinned_mesh_geometry_authorized(job: dict[str, Any]) -> bool:
@@ -2045,6 +2086,67 @@ def _copy_final_geometry_rows(rows: Any, *, field: str) -> list[list[float]]:
     return copied
 
 
+def _copy_final_skin_rows(
+    bone_rows: Any,
+    weight_rows: Any,
+    *,
+    expected_count: int,
+) -> tuple[list[list[int]], list[list[float]]]:
+    """Freeze the Probe Skin rows that produced the posed Mesh positions."""
+    if (
+        not isinstance(bone_rows, list)
+        or not isinstance(weight_rows, list)
+        or len(bone_rows) != expected_count
+        or len(weight_rows) != expected_count
+    ):
+        raise ValueError(
+            "Bones+Mesh immutable FBX authority has no aligned raw_bones/raw_weights rows"
+        )
+    copied_bones: list[list[int]] = []
+    copied_weights: list[list[float]] = []
+    for row_index, (raw_bones, raw_weights) in enumerate(zip(bone_rows, weight_rows)):
+        if (
+            not isinstance(raw_bones, (list, tuple))
+            or not isinstance(raw_weights, (list, tuple))
+            or len(raw_bones) != len(raw_weights)
+            or not raw_bones
+        ):
+            raise ValueError(
+                f"Bones+Mesh immutable FBX authority has invalid Skin row {row_index}"
+            )
+        bones: list[int] = []
+        weights: list[float] = []
+        positive_weight_total = 0.0
+        for influence_index, (raw_bone, raw_weight) in enumerate(zip(raw_bones, raw_weights)):
+            try:
+                bone_id = int(raw_bone)
+                weight = float(raw_weight)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    "Bones+Mesh immutable FBX authority has a non-numeric Skin influence "
+                    f"at row {row_index}, influence {influence_index}"
+                ) from exc
+            if bone_id < 0 or bone_id > 255:
+                raise ValueError(
+                    f"Bones+Mesh immutable FBX authority bone {bone_id} is outside the MOD byte domain"
+                )
+            if not math.isfinite(weight) or weight < 0.0:
+                raise ValueError(
+                    f"Bones+Mesh immutable FBX authority has an invalid weight at row {row_index}"
+                )
+            bones.append(bone_id)
+            weights.append(weight)
+            if weight > 0.0:
+                positive_weight_total += weight
+        if positive_weight_total <= 0.000000000001:
+            raise ValueError(
+                f"Bones+Mesh immutable FBX authority Skin row {row_index} has no positive influence"
+            )
+        copied_bones.append(bones)
+        copied_weights.append(weights)
+    return copied_bones, copied_weights
+
+
 def _copy_final_geometry_row(rows: Any, index: int, *, field: str) -> list[float]:
     """Return one detached authority row without cloning the entire vertex table."""
     if not isinstance(rows, list) or not rows:
@@ -2072,78 +2174,10 @@ def _copy_final_geometry_row(rows: Any, index: int, *, field: str) -> list[float
     return values
 
 
-def _build_bones_plus_mesh_fbx_object_to_max_matrix(mesh: dict[str, Any]) -> list[float]:
-    """Return the one object transform used by the final MOD boundary.
-
-    Generic MAX handoffs already use one canonical Y-up scene basis.  Preserve
-    each Mesh's authored world matrix here and let the writer's single global
-    axis policy perform the final conversion.  The legacy helper-basis
-    extraction remains only for old, unmarked authorities.
-    """
-    node_to_world = _coerce_matrix4x4(mesh.get("fbx_node_to_world_matrix"))
-    if node_to_world is None:
-        raise ValueError("Bones+Mesh FBX authority is missing the Mesh node world matrix")
-
-    if str(mesh.get("fbx_axis_transform_scope", "") or "").strip().lower() == "scene_global_once":
-        return node_to_world
-
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # Importer-generated FBX carries the Max Z-up to FBX Y-up conversion on the
-    # Mesh helper.  The MOD encoder consumes Max coordinates, so remove that
-    # normalized basis after preserving the real Mesh scale and translation.
-    # This is the old unmarked/non-Generic fallback; Generic handoffs return
-    # above and keep their canonical world matrix unchanged.
-    axis_basis = [0.0] * 16
-    for row in range(3):
-        offset = row * 4
-        axis_length = math.sqrt(
-            (node_to_world[offset] * node_to_world[offset])
-            + (node_to_world[offset + 1] * node_to_world[offset + 1])
-            + (node_to_world[offset + 2] * node_to_world[offset + 2])
-        )
-        if axis_length <= 0.000000000001:
-            raise ValueError("Bones+Mesh FBX authority has a non-invertible Mesh axis basis")
-        axis_basis[offset] = node_to_world[offset] / axis_length
-        axis_basis[offset + 1] = node_to_world[offset + 1] / axis_length
-        axis_basis[offset + 2] = node_to_world[offset + 2] / axis_length
-    axis_basis[15] = 1.0
-    world_to_max = _invert_matrix4x4(axis_basis)
-    if world_to_max is None:
-        raise ValueError("Bones+Mesh FBX authority cannot invert the Mesh axis basis")
-    return _multiply_matrix4x4(node_to_world, world_to_max)
-
-
-def _build_bones_plus_mesh_fbx_object_max_positions(mesh: dict[str, Any]) -> list[list[float]]:
-    """Project raw FBX Mesh rows once into MOD's Max-coordinate basis."""
-    raw_positions = mesh.get("positions")
-    if not isinstance(raw_positions, list) or not raw_positions:
-        raise ValueError("Bones+Mesh FBX authority is missing raw Mesh positions")
-    object_to_max = _build_bones_plus_mesh_fbx_object_to_max_matrix(mesh)
-    return _copy_final_geometry_rows(
-        [_transform_position_row_major(position, object_to_max) for position in raw_positions],
-        field="fbx_object_max_positions",
-    )
-
-
-def _build_bones_plus_mesh_fbx_object_max_normals(
-    mesh: dict[str, Any],
-    *,
-    vertex_count: int,
-) -> list[list[float]]:
-    raw_normals = mesh.get("normals")
-    if not isinstance(raw_normals, list) or len(raw_normals) != vertex_count:
-        raise ValueError("Bones+Mesh FBX authority raw Mesh normals do not match positions")
-    object_to_max = _build_bones_plus_mesh_fbx_object_to_max_matrix(mesh)
-    return _copy_final_geometry_rows(
-        [_transform_normal_row_major(normal, object_to_max) for normal in raw_normals],
-        field="fbx_object_max_normals",
-    )
-
-
 def _get_bones_plus_mesh_final_geometry_authority(mesh: dict[str, Any]) -> dict[str, Any] | None:
-    if not _mesh_requires_bones_plus_mesh_fbx_world_authority(mesh):
-        return None
     authority = mesh.get("final_geometry_authority")
+    if authority is None:
+        return None
     if not isinstance(authority, dict):
         raise ValueError("Bones+Mesh Mesh is missing its immutable FBX world geometry authority")
     if authority.get("schema") != BONES_PLUS_MESH_FBX_WORLD_GEOMETRY_AUTHORITY:
@@ -2154,99 +2188,131 @@ def _get_bones_plus_mesh_final_geometry_authority(mesh: dict[str, Any]) -> dict[
 
 
 def _get_semantic_position_rows(mesh: dict[str, Any]) -> list[Any]:
-    authority = _get_bones_plus_mesh_final_geometry_authority(mesh)
-    if authority is not None:
-        # The authority projects raw FBX Mesh rows into Max coordinates once.
-        # Return a copy so later compatibility passes cannot mutate the authority.
-        return _copy_final_geometry_rows(authority.get("mod_write_positions"), field="mod_write_positions")
-    if _mesh_uses_max_fbx_skinned_position_authority(mesh):
-        skinned_max_positions = mesh.get(MAX_FBX_POSITION_AUTHORITY)
-        if not isinstance(skinned_max_positions, list) or not skinned_max_positions:
-            raise ValueError("Max FBX Mesh is missing its sole skinned_max_positions authority")
-        return skinned_max_positions
-    # Ordinary Max and Blender routes consume Probe positions after their FBX
-    # node transform. BONE+MESH selects its Skin pose authority above.
-    max_positions = mesh.get("max_positions")
-    if isinstance(max_positions, list):
-        return max_positions
-    positions = mesh.get("positions")
-    return positions if isinstance(positions, list) else []
+    _authority, rows = _require_geometry_position_rows(mesh)
+    # Do not fall back to raw FBX-local ``positions`` or source MOD bytes.  The
+    # selected table has already been normalized by Probe and is the only lane
+    # permitted to reach the MOD vertex writer.
+    return rows
 
 
 def _get_semantic_world_position_rows(mesh: dict[str, Any]) -> list[Any]:
-    authority = _get_bones_plus_mesh_final_geometry_authority(mesh)
-    if authority is not None:
-        # MOD world-remap encoders use the same Max-coordinate basis as the
-        # regular position writer, not raw FBX-axis coordinates.  Older
-        # in-memory authorities predate the explicit world alias, so retain a
-        # same-basis fallback while every newly frozen authority stores both.
-        world_positions = authority.get("mod_write_world_positions")
-        if not isinstance(world_positions, list) or not world_positions:
-            world_positions = authority.get("mod_write_positions")
-        return _copy_final_geometry_rows(
-            world_positions,
-            field="mod_write_world_positions",
-        )
-    if _mesh_uses_max_fbx_skinned_position_authority(mesh):
-        return _get_semantic_position_rows(mesh)
-    world_positions = mesh.get("world_positions")
-    if isinstance(world_positions, list):
-        return world_positions
+    # World-remap encoding is still fed by the same authoritative Probe table;
+    # a stale scene-local ``world_positions`` array must not override it.
     return _get_semantic_position_rows(mesh)
-
-
-def _max_normal_to_game_normal(vec: Any) -> list[float]:
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # Historical Max/MOD normal-axis swap. Generic canonical normal rows take
-    # the direct XYZ path and must not enter this helper.
-    max_normal = _coerce_vec3(vec, (0.0, 0.0, 1.0))
-    return [max_normal[0], max_normal[2], -max_normal[1]]
 
 
 # ============================================================================
 # Generic_to_mod_transform_code
 #
-# Probe's Generic pass may already have baked the source FBX axis into a
-# Geometry/ Skin normal stream.  Apply the legacy Max->MOD basis only when the
-# receipt says the row is still legacy; never rotate an explicitly canonical
-# row a second time.
+# Probe's Generic pass has already baked the source FBX axis into one canonical
+# scene domain. Positions and normals are consumed directly as XYZ.
 # ============================================================================
+def _writer_mesh_label(mesh: dict[str, Any]) -> str:
+    slot = _int_or_default(mesh.get("mesh_slot"), 0)
+    name = str(
+        mesh.get("scene_node")
+        or mesh.get("node_name")
+        or mesh.get("mesh_name")
+        or ""
+    ).strip()
+    if slot > 0 and name:
+        return f"Mesh slot {slot} ({name})"
+    if slot > 0:
+        return f"Mesh slot {slot}"
+    return f"Mesh {name}" if name else "Mesh"
+
+
+def _get_writer_normal_authority_rows(
+    mesh: dict[str, Any],
+) -> tuple[list[Any], str, int | None]:
+    """Return the one normal table permitted to reach the Writer.
+
+    Ordinary export owns ``max_normals``.  BONE+MESH owns the frozen
+    ``final_geometry_authority.mod_write_normals`` table.  ``normals`` and
+    ``skinned_*`` are descriptive/compatibility fields only; they are never a
+    substitute when the selected authority is absent or malformed.
+    """
+    label = _writer_mesh_label(mesh)
+    final_authority = _get_bones_plus_mesh_final_geometry_authority(mesh)
+    explicit_count = _int_or_default(mesh.get("vert_count"), 0)
+    if final_authority is not None:
+        field = "final_geometry_authority.mod_write_normals"
+        rows = final_authority.get("mod_write_normals")
+        position_rows = final_authority.get("mod_write_positions")
+        expected_count = (
+            explicit_count
+            if explicit_count > 0
+            else len(position_rows)
+            if isinstance(position_rows, list)
+            else None
+        )
+    else:
+        field = ORDINARY_FBX_NORMAL_AUTHORITY
+        rows = mesh.get(ORDINARY_FBX_NORMAL_AUTHORITY)
+        position_rows = mesh.get(ORDINARY_FBX_POSITION_AUTHORITY)
+        expected_count = (
+            explicit_count
+            if explicit_count > 0
+            else len(position_rows)
+            if isinstance(position_rows, list)
+            else None
+        )
+
+    if not isinstance(rows, list) or not rows:
+        raise ValueError(f"{label} is missing required {field} authority")
+    if expected_count is None:
+        expected_count = explicit_count if explicit_count > 0 else len(rows)
+    if len(rows) != expected_count:
+        raise ValueError(
+            f"{label} {field} count {len(rows)} does not match expected vertex count {expected_count}"
+        )
+    return rows, field, expected_count
+
+
+def _validate_writer_normal_authority(
+    mesh: dict[str, Any],
+    *,
+    expected_count: int | None = None,
+) -> list[list[float]]:
+    rows, field, _authority_count = _get_writer_normal_authority_rows(mesh)
+    label = _writer_mesh_label(mesh)
+    if expected_count is not None and len(rows) != expected_count:
+        raise ValueError(
+            f"{label} {field} count {len(rows)} does not match output vertex count {expected_count}"
+        )
+    return [
+        _normalize_required_writer_normal(
+            row,
+            field=field,
+            row_index=row_index,
+            mesh_label=label,
+        )
+        for row_index, row in enumerate(rows)
+    ]
+
+
 def _get_semantic_game_normal(mesh: dict[str, Any], index: int) -> list[float]:
-    normal_policy = _fbx_normal_output_policy(mesh)
-    authority = _get_bones_plus_mesh_final_geometry_authority(mesh)
-    if authority is not None:
-        authority_normals = authority.get("mod_write_normals")
-        if isinstance(authority_normals, list) and authority_normals:
-            normal = _copy_final_geometry_row(
-                authority_normals,
-                index,
-                field="mod_write_normals",
-            )
-            if normal_policy == FBX_AXIS_OUTPUT_POLICY_MAX_XYZ:
-                return _normalize_vec3(normal, (0.0, 0.0, 1.0))
-            # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-            return _max_normal_to_game_normal(normal)
-    max_normals = mesh.get("max_normals")
-    if isinstance(max_normals, list) and index < len(max_normals):
-        if normal_policy == FBX_AXIS_OUTPUT_POLICY_MAX_XYZ:
-            return _normalize_vec3(max_normals[index], (0.0, 0.0, 1.0))
-        # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-        return _max_normal_to_game_normal(max_normals[index])
-    raw_normal = _coerce_vec3(
-        _get_semantic_row(mesh, "normals", index),
-        (0.0, 0.0, 1.0),
-    )
-    # The raw ``normals`` lane is an established compatibility fallback.  It
-    # had historically bypassed the Max conversion; only an explicit Generic
-    # canonical receipt changes that behavior.
-    return (
-        _normalize_vec3(raw_normal, (0.0, 0.0, 1.0))
-        if normal_policy == FBX_AXIS_OUTPUT_POLICY_MAX_XYZ
-        else raw_normal
+    rows, field, _expected_count = _get_writer_normal_authority_rows(mesh)
+    label = _writer_mesh_label(mesh)
+    if index < 0 or index >= len(rows):
+        raise ValueError(
+            f"{label} {field} has no row for output vertex {index}"
+        )
+    return _normalize_required_writer_normal(
+        rows[index],
+        field=field,
+        row_index=index,
+        mesh_label=label,
     )
 
 
 def _get_authoritative_skin_bone_rows(mesh: dict[str, Any]) -> list[Any]:
+    final_authority = _get_bones_plus_mesh_final_geometry_authority(mesh)
+    if final_authority is not None:
+        rows = final_authority.get("mod_write_bones")
+        if not isinstance(rows, list):
+            raise ValueError("Bones+Mesh immutable FBX authority is missing mod_write_bones")
+        return rows
     for key in (
         "ordinary_source_ordered_skin_bones",
         "target_bones",
@@ -2261,6 +2327,12 @@ def _get_authoritative_skin_bone_rows(mesh: dict[str, Any]) -> list[Any]:
 
 
 def _get_authoritative_skin_weight_rows(mesh: dict[str, Any]) -> list[Any]:
+    final_authority = _get_bones_plus_mesh_final_geometry_authority(mesh)
+    if final_authority is not None:
+        rows = final_authority.get("mod_write_weights")
+        if not isinstance(rows, list):
+            raise ValueError("Bones+Mesh immutable FBX authority is missing mod_write_weights")
+        return rows
     for key in (
         "ordinary_source_ordered_skin_weights",
         "target_weights",
@@ -2287,8 +2359,18 @@ def _get_short_position_write_pos(
         local_pos[1] * mesh_scale[1],
         local_pos[2] * mesh_scale[2],
     ]
+    for axis, value in enumerate(scaled):
+        encoded = int(round(_float_or_default(value)))
+        if encoded < -32768 or encoded > 32767:
+            raise ValueError(
+                "MOD int16 position overflow before packing: "
+                f"vertex={index}, axis={axis}, position={local_pos[axis]}, "
+                f"mesh_scale={mesh_scale[axis]}, encoded={encoded}. "
+                "The FBX/Bridge unit contract is inconsistent; refusing to "
+                "silently clamp and truncate the Mesh."
+            )
     policy = axis_output_policy or str(
-        getattr(mesh_scale, "axis_output_policy", FBX_AXIS_OUTPUT_POLICY_LEGACY)
+        getattr(mesh_scale, "axis_output_policy", FBX_AXIS_OUTPUT_POLICY_MAX_XYZ)
     )
     return _write_position_axis_policy(scaled, policy)
 
@@ -2307,7 +2389,7 @@ def _get_float_position_write_pos(
         local_pos[2] * mesh_scale[2],
     ]
     policy = axis_output_policy or str(
-        getattr(mesh_scale, "axis_output_policy", FBX_AXIS_OUTPUT_POLICY_LEGACY)
+        getattr(mesh_scale, "axis_output_policy", FBX_AXIS_OUTPUT_POLICY_MAX_XYZ)
     )
     return _write_position_axis_policy(scaled, policy)
 
@@ -2330,7 +2412,7 @@ def _get_world_remapped_short_position(
         (world_pos[2] * remap_scale[2]) + remap_offset[2],
     ]
     policy = axis_output_policy or str(
-        getattr(remap_scale, "axis_output_policy", FBX_AXIS_OUTPUT_POLICY_LEGACY)
+        getattr(remap_scale, "axis_output_policy", FBX_AXIS_OUTPUT_POLICY_MAX_XYZ)
     )
     return _write_position_axis_policy(remapped, policy)
 
@@ -2600,10 +2682,29 @@ def _build_source_backed_geometry_overlay_payload(
     if any(index < 0 or index >= vertex_count for index in face_indices):
         raise ValueError("Source-backed geometry overlay face indices reference a missing output vertex")
 
+    # A source-backed overlay may legitimately leave the source normal bytes
+    # untouched when no semantic normal table was supplied.  If any normal
+    # rows are present, however, they must be the single Writer authority;
+    # malformed ``normals``/``skinned_*`` compatibility rows must not trigger
+    # a silent +Z substitution.
     normal_rows_present = any(
-        isinstance(mesh.get(key), list) and len(mesh.get(key)) >= vertex_count
-        for key in ("normals", "max_normals", "skinned_normals", "skinned_max_normals")
+        key in mesh
+        for key in (
+            "mod_write_normals",
+            "normals",
+            "max_normals",
+            "skinned_normals",
+            "skinned_max_normals",
+        )
     )
+    if _get_bones_plus_mesh_final_geometry_authority(mesh) is not None:
+        normal_rows_present = True
+    validated_normals: list[list[float]] = []
+    if normal_rows_present:
+        validated_normals = _validate_writer_normal_authority(
+            mesh,
+            expected_count=vertex_count,
+        )
     primary_uv_rows = mesh.get("uvs")
     primary_uv_present = (
         isinstance(primary_uv_rows, list)
@@ -2680,7 +2781,7 @@ def _build_source_backed_geometry_overlay_payload(
                 "<4B",
                 patched,
                 normal_offset,
-                *_encode_normal_bytes(_get_semantic_game_normal(mesh, index)),
+                *_encode_normal_bytes(validated_normals[index]),
             )
 
         if primary_uv_present and primary_uv_offset is not None:
@@ -2745,18 +2846,27 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
 
     positions = _get_semantic_position_rows(mesh)
     world_positions = _get_semantic_world_position_rows(mesh)
+    vertex_count = _get_semantic_vertex_count(mesh)
+    validated_normals = (
+        _validate_writer_normal_authority(mesh, expected_count=vertex_count)
+        if vertex_count > 0
+        else []
+    )
     tangents = mesh.get("tangents") if isinstance(mesh.get("tangents"), list) else []
     uvs = mesh.get("uvs") if isinstance(mesh.get("uvs"), list) else []
     raw_bones_rows = _get_authoritative_skin_bone_rows(mesh)
     raw_weight_rows = _get_authoritative_skin_weight_rows(mesh)
-    has_ordinary_source_ordered_skin = isinstance(mesh.get("ordinary_source_ordered_skin_bones"), list)
+    has_frozen_probe_skin = _get_bones_plus_mesh_final_geometry_authority(mesh) is not None
+    has_ordinary_source_ordered_skin = (
+        not has_frozen_probe_skin
+        and isinstance(mesh.get("ordinary_source_ordered_skin_bones"), list)
+    )
     fvf_weight_capacity_reduction_limit = _int_or_default(
         mesh.get("fvf_weight_capacity_reduction_limit"),
         0,
     )
 
     face_indices = _flatten_face_indices(mesh.get("face_indices"))
-    vertex_count = _get_semantic_vertex_count(mesh)
     mesh_scale = _fbx_axis_policy_vector(
         _coerce_vec3(mesh.get("mesh_scale"), (1.0, 1.0, 1.0)),
         mesh,
@@ -2777,7 +2887,7 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             _clamp_half_float(1.0 - uv[1]),
         ]
         write_uv2 = _get_write_uv_from_channel(mesh, "uv2s", index, uv)
-        normal_vec = _get_semantic_game_normal(mesh, index)
+        normal_vec = validated_normals[index]
         raw_bones = _get_semantic_row({"rows": raw_bones_rows}, "rows", index)
         raw_weights = _get_semantic_row({"rows": raw_weight_rows}, "rows", index)
         if not isinstance(raw_bones, list):
@@ -3529,8 +3639,16 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             )
             continue
 
-        if uses_world_short_remap:
-            short_pos = _get_world_remapped_short_position(world_positions, positions, index, remap_scale, remap_offset)
+        if uses_world_short_remap or fvf in WORLD_SHORT_REMAP_FVFS:
+            # BB4240X/CBCF7027 share this packed layout even when the
+            # experimental BONE+MESH route temporarily retires WORLD OBJECT
+            # REMAP.  In that case write the canonical local position while
+            # retaining the same Skin/UV/tangent byte layout.
+            short_pos = (
+                _get_world_remapped_short_position(world_positions, positions, index, remap_scale, remap_offset)
+                if uses_world_short_remap
+                else _get_short_position_write_pos(positions, index, mesh_scale)
+            )
             if has_ordinary_source_ordered_skin:
                 top_bones, top_weights, _ = build_legacy4_skin_from_rows(raw_bones, raw_weights)
             else:
@@ -3851,8 +3969,30 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             patched_vertex[field_start:field_end] = source_vertex[field_start:field_end]
             vertex_chunks[vertex_index] = bytes(patched_vertex)
 
+    # BONE+MESH owns the source MOD binding even when Probe supplied an exact
+    # FBX corner table.  The old strict-corner guard disabled byte restoration
+    # here, so the freshly packed FBX Skin palette replaced the source rows and
+    # produced stretched meshes (notably Mesh 57).  Permit the override only
+    # for the explicit exact-source-binding contract; ordinary strict-corner
+    # exports retain the existing protection.
+    ordinary_skin_contract = mesh.get("ordinary_skin_contract")
+    exact_source_binding = (
+        # The semantic payload may be built from a reduced mesh dict and lose
+        # the receipt metadata.  The authoritative ordered Skin rows are
+        # retained on that dict, so use them as the durable marker as well.
+        has_ordinary_source_ordered_skin
+        or (
+            isinstance(ordinary_skin_contract, dict)
+            and str(ordinary_skin_contract.get("policy", "") or "")
+            == "bones_plus_mesh_source_binding_exact_bytes"
+        )
+    )
     source_skin_field_rows = (
-        None if strict_fbx_corner_rows else mesh.get("source_skin_field_hex_rows")
+        None
+        if has_frozen_probe_skin
+        else mesh.get("source_skin_field_hex_rows")
+        if (not strict_fbx_corner_rows or exact_source_binding)
+        else None
     )
     if isinstance(source_skin_field_rows, list):
         skin_ranges = SOURCE_SKIN_FIELD_RANGES_BY_FVF.get(fvf, ())
@@ -7851,6 +7991,41 @@ def _file_matrix_from_import_values(values: Any, template_values: Any | None = N
     return out
 
 
+def _bone_edit_matrix_file_values(
+    values: Any,
+    *,
+    matrix_domain: str = "mod_file",
+    label: str = "bone matrix",
+) -> list[float] | None:
+    """Encode one mapped bone matrix into the MOD file matrix domain.
+
+    The dynamic FBX mapping produces a matrix in the MOD/Max scene domain so
+    world/local hierarchy math can be evaluated consistently.  MOD's binary
+    matrix table uses the same linear rows but stores translation as
+    ``[-x, -z, y]``.  Keep this conversion at the single serialization edge;
+    applying it while composing parent/child matrices would rotate or mirror
+    the hierarchy a second time.
+    """
+    matrix = _clone_matrix_values(values)
+    if matrix is None:
+        return None
+    domain = str(matrix_domain or "mod_file").strip().lower()
+    if domain in {"mod_file", "file", "serialized"}:
+        return matrix
+    if domain not in {
+        "mod_internal",
+        "mod_max",
+        "canonical_mod",
+        "canonical_xyz",
+        "max_internal",
+    }:
+        raise ValueError(f"Unsupported {label} domain: {matrix_domain!r}")
+    encoded = _file_matrix_from_import_values(matrix)
+    if encoded is None:
+        raise ValueError(f"Cannot encode {label} into the MOD file domain")
+    return encoded
+
+
 def _matrix_row_vec3(values: list[float], row_index: int) -> list[float]:
     base = row_index * 4
     return [values[base], values[base + 1], values[base + 2]]
@@ -7888,6 +8063,24 @@ def _multiply_matrix4x4(left: list[float], right: list[float]) -> list[float]:
         for col in range(4):
             out[(row * 4) + col] = sum(left[(row * 4) + k] * right[(k * 4) + col] for k in range(4))
     return out
+
+
+# The MOD importer emits MAX bone world rows as ``MOD/Max * MAX_TO_FBX_YUP``.
+# Generic FBX keeps that authored root basis; it is not the final MOD matrix
+# domain.  Remove this one importer basis before re-encoding a MAX bone row.
+MAX_FBX_IMPORTER_ROOT_BASIS_INVERSE = [
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, -1.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+]
+
+
+def _max_fbx_world_to_import_matrix(values: Any) -> list[float] | None:
+    matrix = _clone_matrix_values(values)
+    if matrix is None:
+        return None
+    return _multiply_matrix4x4(matrix, MAX_FBX_IMPORTER_ROOT_BASIS_INVERSE)
 
 
 BLENDER_FBX_LOCAL_MATRIX_AUTHORITY = "fbx_probe_local_matrices"
@@ -8107,6 +8300,96 @@ def _matrix_without_linear_row_scale(values: list[float] | None) -> list[float] 
         matrix[base] /= scale
         matrix[base + 1] /= scale
         matrix[base + 2] /= scale
+    return matrix
+
+
+def _matrix_uniform_root_scale(values: list[float] | None) -> float:
+    """Return a removable common root scale, or identity for authored scale."""
+    matrix = _clone_matrix_values(values)
+    if matrix is None:
+        return 1.0
+    scales = [_vec3_length(_matrix_row_vec3(matrix, row)) for row in range(3)]
+    if any(scale <= 0.000001 for scale in scales):
+        return 1.0
+    common_scale = sum(scales) / 3.0
+    if common_scale <= 1.0001:
+        return 1.0
+    if max(abs(scale - common_scale) for scale in scales) > common_scale * 0.0001:
+        return 1.0
+    return common_scale
+
+
+def _matrix_uniform_linear_scale(values: list[float] | None) -> float | None:
+    """Return any common finite 3x3 row scale, including reciprocal root scale."""
+    matrix = _clone_matrix_values(values)
+    if matrix is None:
+        return None
+    scales = [_vec3_length(_matrix_row_vec3(matrix, row)) for row in range(3)]
+    if any((not math.isfinite(scale)) or scale <= 0.000001 for scale in scales):
+        return None
+    common_scale = sum(scales) / 3.0
+    if max(abs(scale - common_scale) for scale in scales) > common_scale * 0.0001:
+        return None
+    return common_scale
+
+
+def _matrix_without_uniform_root_scale(values: list[float] | None) -> list[float] | None:
+    """Remove only a common root linear scale; retain rotation and anisotropic scale."""
+    matrix = _clone_matrix_values(values)
+    if matrix is None:
+        return None
+    common_scale = _matrix_uniform_root_scale(matrix)
+    if abs(common_scale - 1.0) <= 0.0000001:
+        return matrix
+    for row in range(3):
+        base = row * 4
+        matrix[base] /= common_scale
+        matrix[base + 1] /= common_scale
+        matrix[base + 2] /= common_scale
+    return matrix
+
+
+def _matrix_with_uniform_linear_scale(
+    values: list[float] | None,
+    scale: float,
+) -> list[float] | None:
+    """Restore MOD's orthonormal shared world scale without scaling translation."""
+    matrix = _clone_matrix_values(values)
+    if matrix is None:
+        return None
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("MOD bone world scale is invalid")
+
+    axes = [_matrix_row_vec3(matrix, row) for row in range(3)]
+
+    def normalized(axis: list[float], *, label: str) -> list[float]:
+        length = _vec3_length(axis)
+        if length <= 0.000001:
+            raise ValueError(f"MOD bone world {label} axis is singular")
+        return [component / length for component in axis]
+
+    x_axis = normalized(axes[0], label="X")
+    xy_dot = sum(axes[1][axis] * x_axis[axis] for axis in range(3))
+    y_axis = normalized(
+        [axes[1][axis] - (xy_dot * x_axis[axis]) for axis in range(3)],
+        label="Y",
+    )
+    xz_dot = sum(axes[2][axis] * x_axis[axis] for axis in range(3))
+    yz_dot = sum(axes[2][axis] * y_axis[axis] for axis in range(3))
+    z_axis = normalized(
+        [
+            axes[2][axis]
+            - (xz_dot * x_axis[axis])
+            - (yz_dot * y_axis[axis])
+            for axis in range(3)
+        ],
+        label="Z",
+    )
+    for row, axis_values in enumerate((x_axis, y_axis, z_axis)):
+        base = row * 4
+        matrix[base] = axis_values[0] * scale
+        matrix[base + 1] = axis_values[1] * scale
+        matrix[base + 2] = axis_values[2] * scale
     return matrix
 
 
@@ -9032,46 +9315,6 @@ def _job_uses_bones_plus_mesh_pose_route(job: dict[str, Any], contract: dict[str
     return _normalize_bone_edit_export_mode(bone_edit_export_mode) == "bones_plus_mesh"
 
 
-def _mark_bones_plus_mesh_fbx_world_geometry_requirements(
-    job: dict[str, Any],
-    contract: dict[str, Any],
-) -> None:
-    use_fbx_world_geometry = _job_uses_bones_plus_mesh_pose_route(job, contract)
-    for mesh in _ensure_contract_meshes(job, contract):
-        if not isinstance(mesh, dict):
-            continue
-        if (
-            not use_fbx_world_geometry
-            or str(mesh.get("lane", "") or "").lower() != "modify"
-            or _mesh_uses_source_geometry(mesh)
-        ):
-            mesh.pop("requires_fbx_world_geometry_authority", None)
-            mesh.pop("final_geometry_authority", None)
-            continue
-        if not _mesh_has_skin(mesh):
-            # BONE+MESH still runs ordinary Mesh export for non-Skin Meshes.
-            # Only a true Skin Mesh needs the additional evaluated-pose
-            # authority; making every Mesh source-passthrough would discard
-            # valid ordinary geometry edits.
-            mesh.pop("requires_fbx_world_geometry_authority", None)
-            mesh.pop("final_geometry_authority", None)
-            mesh.pop("bones_plus_mesh_source_passthrough", None)
-            continue
-        skin_status = str(mesh.get("fbx_skin_pose_evaluation_status", "") or "").strip()
-        if skin_status == BONES_PLUS_MESH_FBX_SKIN_EVALUATION_STATUS:
-            mesh["requires_fbx_world_geometry_authority"] = True
-            mesh.pop("bones_plus_mesh_source_passthrough", None)
-            continue
-
-        # A Mesh without a fully aligned Skin evaluation is not reconstructed.
-        # Its complete source vertex range remains in the output unchanged.
-        mesh.pop("requires_fbx_world_geometry_authority", None)
-        mesh.pop("final_geometry_authority", None)
-        fallback_reason = skin_status or "fbx_skin_pose_evaluation_unavailable"
-        _mark_mesh_source_passthrough(mesh, f"bones_plus_mesh_{fallback_reason}")
-        mesh["bones_plus_mesh_source_passthrough"] = fallback_reason
-
-
 def _record_bones_plus_mesh_ordinary_mesh_rewrite(
     job: dict[str, Any],
     contract: dict[str, Any],
@@ -9360,77 +9603,8 @@ def _collect_fbx_bone_entries(fbx_handoff: dict[str, Any]) -> list[dict[str, Any
     summary = fbx_handoff.get("summary") if isinstance(fbx_handoff, dict) else None
     bones = summary.get("bones") if isinstance(summary, dict) else None
     entries = _normalize_scene_bone_entries(bones)
-    # Generic Probe bone matrices are in the canonical XYZ/file domain.  The
-    # bone-edit planner works in the historical Max-import domain, so restore
-    # the complete source basis once (3x3 rows and translation) before the
-    # planner compares or writes them.  Keeping only the old translation swap
-    # leaves a 90-degree Max X,+Z,-Y basis in the output skeleton.
-    matrix_domain = str(
-        fbx_handoff.get("bone_matrix_axis_domain", "") or ""
-    ).strip().lower()
-    # Blender's Generic handoff is already in the canonical XYZ basis that
-    # _blender_fbx_rest_local_matrix() expects.  Applying the source-axis
-    # inverse here a second time makes the root/child deltas look like huge
-    # edits and writes the skeleton far outside the MOD coordinate space.
-    # Keep the conversion for the legacy/Max handoff only; the Blender route
-    # must consume its canonical matrices exactly once.
-    scene_authority = str(
-        fbx_handoff.get("scene_authority", fbx_handoff.get("authority", "")) or ""
-    ).strip().lower()
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # Transitional canonical-to-legacy matrix adapter.  It exists for the
-    # historical planner/old Max handoff and is a deletion candidate once the
-    # writer consumes canonical bone matrices directly.  The Blender local
-    # route is explicitly excluded below because its Armature basis is handled
-    # by the Blender-specific rest/local reconstruction.
-    if (
-        matrix_domain == FBX_BONE_MATRIX_DOMAIN_CANONICAL
-        and scene_authority != "blender_selected_fbx_bones"
-    ):
-        inverse_axis = _clone_matrix_values(
-            fbx_handoff.get("bone_matrix_axis_inverse")
-        )
-        if inverse_axis is None:
-            inverse_axis = list(FBX_CANONICAL_TO_LEGACY_MAX_AXIS)
-
-        # Convert the scene world basis once.  A child local matrix has already
-        # cancelled the common parent/root axis; multiplying every local by the
-        # global inverse rotates each hierarchy level again.  Rebuild locals
-        # from the converted worlds so every bone shares the same one global
-        # conversion and retains its authored parent-relative transform.
-        for entry in entries:
-            matrix = entry.get("world_matrix")
-            if matrix is None:
-                continue
-            converted = _multiply_matrix4x4(matrix, inverse_axis)
-            if converted is not None:
-                entry["world_matrix"] = converted
-
-        entries_by_name = {
-            str(entry.get("name", "") or "").strip().upper(): entry
-            for entry in entries
-            if str(entry.get("name", "") or "").strip()
-        }
-        for entry in entries:
-            world_matrix = _clone_matrix_values(entry.get("world_matrix"))
-            if world_matrix is None:
-                continue
-            parent_name = str(entry.get("parent_name", "") or "").strip().upper()
-            parent_entry = entries_by_name.get(parent_name)
-            parent_world = (
-                _clone_matrix_values(parent_entry.get("world_matrix"))
-                if isinstance(parent_entry, dict)
-                else None
-            )
-            if parent_world is None:
-                entry["local_matrix"] = list(world_matrix)
-                continue
-            inverse_parent = _invert_matrix4x4(parent_world)
-            if inverse_parent is not None:
-                entry["local_matrix"] = _multiply_matrix4x4(
-                    world_matrix,
-                    inverse_parent,
-                )
+    # Generic Probe already emits bone and Mesh matrices in one canonical XYZ
+    # scene domain. Never restore the retired Max/Blender source-axis basis.
     return entries
 
 
@@ -10362,13 +10536,22 @@ def _build_bone_edit_export_plan(
     source_skin_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     source_header = mod_file["header"]
+    dynamic_mapping = _build_dynamic_mod_fbx_mapping(job, contract, fbx_handoff)
+
+    def current_bone_matrix(value: Any, *, label: str) -> list[float]:
+        probe_matrix = _require_current_bone_matrix(value, label=label)
+        mapped_matrix = _dynamic_map_bone_matrix(probe_matrix, dynamic_mapping)
+        if mapped_matrix is None:
+            raise ValueError(
+                f"Dynamic MOD-FBX mapping could not transform bone matrix {label}"
+            )
+        return mapped_matrix
+
     # Reuse the request-scoped source-table decode created by the live memory
     # export.  A missing/stale context deliberately falls back to the legacy
     # direct read so standalone regression callers keep their old contract.
     source_tables = _source_skin_context_tables(source_skin_context, mod_file)
     source_bone_info = [_clone_bone_info_record(record) for record in source_tables["bone_info"]]
-    source_local_matrices = [_clone_matrix_values(values) or _flatten_identity_matrix() for values in source_tables["bone_local_matrices"]]
-    source_world_matrices = [_clone_matrix_values(values) or _flatten_identity_matrix() for values in source_tables["bone_world_matrices"]]
     source_bone_count = len(source_bone_info)
 
     scene_authority = str(
@@ -10381,32 +10564,15 @@ def _build_bone_edit_export_plan(
         )
     scene_bones = _collect_fbx_bone_entries(fbx_handoff)
     _require_bone_edit_scene_bones(job, fbx_handoff, scene_bones)
-    blender_fbx_local_route = (
-        scene_authority == "blender_selected_fbx_bones"
-    )
-    baseline_world_import = (
-        _build_blender_fbx_baseline_world_import_matrices(source_world_matrices)
-        if blender_fbx_local_route
-        else [_import_matrix_from_file_values(values) for values in source_world_matrices]
-    )
-    baseline_local_import = _build_baseline_local_import_matrices(
-        source_bone_info,
-        source_world_matrices,
-        world_import_matrices=baseline_world_import,
-    )
-    scene_bone_handoff_collapsed = (
-        not blender_fbx_local_route
-        and _scene_bone_handoff_collapses_to_identity(scene_bones, baseline_world_import)
-    )
+    # Probe owns the one scene-wide axis normalization.  This writer receives
+    # canonical XYZ matrices and must never infer a Max/Blender-specific axis
+    # route from a receipt or a missing marker.  Source MOD matrices are not a
+    # transform baseline: they are layout data only and never fill a current
+    # FBX matrix.
+    # Candidate matching is structural (ID/name/order), never a comparison of
+    # source MOD matrices against the current FBX domain.
+    scene_bone_handoff_collapsed = False
     scene_bone_handoff_warning = ""
-    if scene_bone_handoff_collapsed:
-        handoff_label = "current " + BONE_EDIT_FBX_HANDOFF_LABELS_BY_AUTHORITY.get(
-            scene_authority,
-            "selected FBX",
-        )
-        scene_bone_handoff_warning = (
-            f"Bones Edit {handoff_label} collapsed to identity matrices; continuing export with raw scene bone data."
-        )
     scene_bones_by_id: dict[int, list[dict[str, Any]]] = {}
     scene_bones_by_name: dict[str, dict[str, Any]] = {}
     scene_order_index: dict[str, int] = {}
@@ -10424,7 +10590,10 @@ def _build_bone_edit_export_plan(
     # sidecar.  The one current FBX Probe snapshot is the only authority for
     # source-slot deletion and newly introduced FBX bone nodes.
     fbx_structure = _analyze_fbx_bone_edit_structure(source_bone_count, scene_bones)
-    if blender_fbx_local_route:
+    # Blender's exporter may omit an isolated leaf helper even when the user
+    # made no structural edit.  Preserve that existing structural safeguard;
+    # it does not select or re-encode any matrix axis.
+    if scene_authority == "blender_selected_fbx_bones":
         blender_omitted_leaf_source_bone_ids = _blender_fbx_exporter_omitted_leaf_source_bone_ids(
             source_bone_info,
             list(fbx_structure["deleted_source_bone_ids"]),
@@ -10472,69 +10641,41 @@ def _build_bone_edit_export_plan(
         )
 
         candidate_pool = scene_bones_by_id.get(source_bone_id, [])
-        baseline_world = baseline_world_import[source_slot - 1] if source_slot - 1 < len(baseline_world_import) else None
         candidate = _take_best_scene_bone_candidate(
             candidate_pool,
-            baseline_world_import=baseline_world,
             used_scene_bone_names=used_scene_bone_names,
         )
         if isinstance(candidate, dict):
             name_key = _scene_bone_name_key(candidate.get("name"))
             if name_key:
                 used_scene_bone_names.add(name_key)
-        current_world_import = _clone_matrix_values(candidate.get("world_matrix")) if isinstance(candidate, dict) else None
-        current_local_import = _clone_matrix_values(candidate.get("local_matrix")) if isinstance(candidate, dict) else None
-        blender_fbx_local_delta: list[float] | None = None
-        blender_fbx_current_local_import: list[float] | None = None
-        if blender_fbx_local_route and isinstance(candidate, dict):
-            source_local_import = (
-                _clone_matrix_values(baseline_local_import[source_bone_id])
-                if source_bone_id < len(baseline_local_import)
-                else None
+        if not isinstance(candidate, dict):
+            raise ValueError(
+                f"Current FBX Probe has no matrix for source bone slot {source_slot}"
             )
-            raw_blender_fbx_delta, _current_fbx_local = _derive_blender_fbx_local_delta(
-                candidate.get("local_matrix"),
-                source_local_import,
-                source_is_root=source_parent_id == 255,
-                source_parent_is_root=_source_bone_parent_is_root(
-                    source_bone_info,
-                    source_bone_id,
-                ),
-                label=str(candidate.get("name", f"source bone {source_bone_id}")),
+        current_world_import = current_bone_matrix(
+            candidate.get("world_matrix"),
+            label=str(candidate.get("name", f"B_Source_{source_slot}") or source_slot),
+        )
+        current_local_raw = candidate.get("local_matrix")
+        current_local_import = (
+            current_bone_matrix(
+                current_local_raw,
+                label=f"{candidate.get('name', source_slot)} local",
             )
-            raw_change_meta = _classify_import_matrix_change(
-                raw_blender_fbx_delta,
-                _flatten_identity_matrix(),
-            )
-            blender_fbx_local_delta = _blender_fbx_local_delta_for_semantics(
-                raw_blender_fbx_delta,
-                move_enabled=move_enabled and bool(raw_change_meta.get("move_changed")),
-                rotate_enabled=rotate_enabled and bool(raw_change_meta.get("rotate_changed")),
-                scale_enabled=scale_enabled and bool(raw_change_meta.get("scale_changed")),
-            )
-            change_meta = _classify_import_matrix_change(
-                blender_fbx_local_delta,
-                _flatten_identity_matrix(),
-            )
-            blender_fbx_current_local_import = _multiply_matrix4x4(
-                blender_fbx_local_delta,
-                source_local_import,
-            )
-        elif blender_fbx_local_route:
-            # The Blender exporter can omit leaf helpers.  The structural pass
-            # above preserves those source-template rows instead of turning an
-            # FBX exporter omission into a destructive delete operation.
-            change_meta = {
-                "change_class": "unchanged",
-                "move_changed": False,
-                "rotate_changed": False,
-                "scale_changed": False,
-            }
-        else:
-            change_meta = _classify_bones_edit_scene_world_route_change(current_world_import, baseline_world)
-        change_class = str(change_meta.get("change_class", "unchanged"))
-        if current_world_import is None and not blender_fbx_local_route:
-            change_class = "delete"
+            if current_local_raw is not None
+            else None
+        )
+        # Every surviving row is written from the current FBX snapshot.  There
+        # is intentionally no "unchanged" route that can reinsert a source MOD
+        # matrix into this plan.
+        change_meta = {
+            "move_changed": True,
+            "rotate_changed": True,
+            "scale_changed": True,
+            "change_class": "transform_changed",
+        }
+        change_class = "transform_changed"
 
         plan_entries.append(
             {
@@ -10557,12 +10698,6 @@ def _build_bone_edit_export_plan(
                 "move_changed": bool(change_meta.get("move_changed", False)),
                 "rotate_changed": bool(change_meta.get("rotate_changed", False)),
                 "scale_changed": bool(change_meta.get("scale_changed", False)),
-                "blender_fbx_local_delta": blender_fbx_local_delta,
-                "blender_fbx_current_local_import": blender_fbx_current_local_import,
-                "blender_fbx_local_changed": bool(
-                    blender_fbx_local_route
-                    and change_class != "unchanged"
-                ),
                 "structure_changed": bool(
                     true_delete_enabled
                     and parent_id != source_parent_id
@@ -10581,11 +10716,9 @@ def _build_bone_edit_export_plan(
         if true_delete_enabled and source_bone_id in skip_bone_ids:
             continue
         candidate_pool = scene_bones_by_id.get(source_bone_id, [])
-        baseline_world = baseline_world_import[source_bone_id] if source_bone_id < len(baseline_world_import) else None
         while candidate_pool:
             scene_bone = _take_best_scene_bone_candidate(
                 candidate_pool,
-                baseline_world_import=baseline_world,
                 used_scene_bone_names=used_scene_bone_names,
             )
             if not isinstance(scene_bone, dict):
@@ -10593,38 +10726,6 @@ def _build_bone_edit_export_plan(
             scene_name_key = _scene_bone_name_key(scene_bone.get("name"))
             if scene_name_key:
                 used_scene_bone_names.add(scene_name_key)
-            duplicate_blender_fbx_local_delta: list[float] | None = None
-            duplicate_blender_fbx_current_local_import: list[float] | None = None
-            if blender_fbx_local_route:
-                source_local_import = (
-                    _clone_matrix_values(baseline_local_import[source_bone_id])
-                    if source_bone_id < len(baseline_local_import)
-                    else None
-                )
-                raw_duplicate_delta, _current_fbx_local = _derive_blender_fbx_local_delta(
-                    scene_bone.get("local_matrix"),
-                    source_local_import,
-                    source_is_root=_int_or_default(source_bone_info[source_bone_id].get("Parent"), 255) == 255,
-                    source_parent_is_root=_source_bone_parent_is_root(
-                        source_bone_info,
-                        source_bone_id,
-                    ),
-                    label=str(scene_bone.get("name", f"duplicate source bone {source_bone_id}")),
-                )
-                raw_duplicate_change = _classify_import_matrix_change(
-                    raw_duplicate_delta,
-                    _flatten_identity_matrix(),
-                )
-                duplicate_blender_fbx_local_delta = _blender_fbx_local_delta_for_semantics(
-                    raw_duplicate_delta,
-                    move_enabled=move_enabled and bool(raw_duplicate_change.get("move_changed")),
-                    rotate_enabled=rotate_enabled and bool(raw_duplicate_change.get("rotate_changed")),
-                    scale_enabled=scale_enabled and bool(raw_duplicate_change.get("scale_changed")),
-                )
-                duplicate_blender_fbx_current_local_import = _multiply_matrix4x4(
-                    duplicate_blender_fbx_local_delta,
-                    source_local_import,
-                )
             export_bone_id = _reserve_next_export_bone_id(reserved_export_ids, next_export_bone_id)
             next_export_bone_id = export_bone_id + 1
             plan_entries.append(
@@ -10640,15 +10741,22 @@ def _build_bone_edit_export_plan(
                     "mirror_id": 255,
                     "original_parent_id": 255,
                     "original_mirror_id": 255,
-                    "current_world_import": _clone_matrix_values(scene_bone.get("world_matrix")),
-                    "current_local_import": _clone_matrix_values(scene_bone.get("local_matrix")),
+                    "current_world_import": current_bone_matrix(
+                        scene_bone.get("world_matrix"),
+                        label=str(scene_bone.get("name", source_bone_id) or source_bone_id),
+                    ),
+                    "current_local_import": (
+                        current_bone_matrix(
+                            scene_bone.get("local_matrix"),
+                            label=f"{scene_bone.get('name', source_bone_id)} local",
+                        )
+                        if scene_bone.get("local_matrix") is not None
+                        else None
+                    ),
                     "change_class": "duplicate",
                     "move_changed": True,
                     "rotate_changed": True,
                     "scale_changed": True,
-                    "blender_fbx_local_delta": duplicate_blender_fbx_local_delta,
-                    "blender_fbx_current_local_import": duplicate_blender_fbx_current_local_import,
-                    "blender_fbx_local_changed": bool(blender_fbx_local_route),
                     "structure_changed": True,
                 }
             )
@@ -10674,20 +10782,6 @@ def _build_bone_edit_export_plan(
             export_bone_id = _reserve_next_export_bone_id(reserved_export_ids, next_export_bone_id)
             next_export_bone_id = export_bone_id + 1
             used_scene_bone_names.add(scene_name_key)
-            added_blender_fbx_current_local_import: list[float] | None = None
-            if blender_fbx_local_route:
-                parent_name_key = _scene_bone_name_key(scene_bone.get("parent_name"))
-                added_label = str(scene_bone.get("name", f"added bone {export_bone_id}"))
-                if parent_name_key and parent_name_key in scene_bones_by_name:
-                    added_blender_fbx_current_local_import = _validated_blender_fbx_local_matrix(
-                        scene_bone.get("local_matrix"),
-                        label=added_label,
-                    )
-                else:
-                    added_blender_fbx_current_local_import = _blender_fbx_external_root_local_to_import_matrix(
-                        scene_bone.get("local_matrix"),
-                        label=added_label,
-                    )
             plan_entries.append(
                 {
                     "bone_name": str(scene_bone.get("name", "") or ""),
@@ -10705,15 +10799,22 @@ def _build_bone_edit_export_plan(
                     "mirror_id": 255,
                     "original_parent_id": 255,
                     "original_mirror_id": 255,
-                    "current_world_import": _clone_matrix_values(scene_bone.get("world_matrix")),
-                    "current_local_import": _clone_matrix_values(scene_bone.get("local_matrix")),
+                    "current_world_import": current_bone_matrix(
+                        scene_bone.get("world_matrix"),
+                        label=str(scene_bone.get("name", "added") or "added"),
+                    ),
+                    "current_local_import": (
+                        current_bone_matrix(
+                            scene_bone.get("local_matrix"),
+                            label=f"{scene_bone.get('name', 'added')} local",
+                        )
+                        if scene_bone.get("local_matrix") is not None
+                        else None
+                    ),
                     "change_class": "add",
                     "move_changed": True,
                     "rotate_changed": True,
                     "scale_changed": True,
-                    "blender_fbx_local_delta": None,
-                    "blender_fbx_current_local_import": added_blender_fbx_current_local_import,
-                    "blender_fbx_local_changed": bool(blender_fbx_local_route),
                     "structure_changed": True,
                 }
             )
@@ -10757,58 +10858,122 @@ def _build_bone_edit_export_plan(
     for entry in plan_entries:
         entry["route"] = _classify_bone_route(entry)
 
-    if blender_fbx_local_route:
-        (
-            output_world_matrices,
-            output_world_by_export_id,
-            output_world_import_by_export_id,
-            output_world_changed_by_export_id,
-        ) = (
-            _build_blender_fbx_output_world_matrices(
-                plan_entries,
-                source_world_matrices,
-                baseline_world_import,
-                baseline_local_import,
-            )
+    # Probe local rows are the hierarchy/bind authority.  Re-deriving every
+    # local from a mapped world row carries parent metric scale into each child
+    # and is what caused the observed oversized skeleton and Skin stretch. Keep
+    # those local rows, but remove the two scene-container scale artifacts that
+    # cannot be serialized as authored bone scale: a common scale on the root,
+    # and its reciprocal on a direct child of that root.
+    local_by_export_id: dict[int, list[float]] = {}
+    parent_by_export_id: dict[int, int] = {}
+    output_world_import_by_export_id: dict[int, list[float]] = {}
+    current_world_by_export_id: dict[int, list[float]] = {}
+    for entry in plan_entries:
+        export_bone_id = _int_or_default(entry.get("export_bone_id"), 0)
+        current_world_by_export_id[export_bone_id] = _require_current_bone_matrix(
+            entry.get("current_world_import"),
+            label=str(entry.get("bone_name", export_bone_id) or export_bone_id),
         )
-        for entry in plan_entries:
-            export_bone_id = _int_or_default(entry.get("export_bone_id"), -1)
-            entry["blender_fbx_inherited_changed"] = bool(
-                output_world_changed_by_export_id.get(export_bone_id, False)
-                and not entry.get("blender_fbx_local_changed")
+        parent_by_export_id[export_bone_id] = _int_or_default(entry.get("parent_id"), 255)
+    for entry in plan_entries:
+        export_bone_id = _int_or_default(entry.get("export_bone_id"), 0)
+        current_local = _clone_matrix_values(entry.get("current_local_import"))
+        if current_local is None:
+            current_world = current_world_by_export_id[export_bone_id]
+            parent_id = parent_by_export_id[export_bone_id]
+            parent_world = current_world_by_export_id.get(parent_id) if parent_id != 255 else None
+            current_local = _build_local_import_matrix(
+                current_world, parent_world, fallback_import=current_world
             )
-    else:
-        output_world_matrices = []
-        output_world_by_export_id = {}
-        output_world_import_by_export_id = {}
-        for entry in plan_entries:
-            source_template_bone_slot = _int_or_default(entry.get("source_template_bone_slot"), -1)
-            original_world_template = (
-                _clone_matrix_values(source_world_matrices[source_template_bone_slot])
-                if 0 <= source_template_bone_slot < len(source_world_matrices)
-                else None
+        if current_local is None:
+            raise ValueError(
+                f"Current FBX Probe bone {entry.get('bone_name', export_bone_id)} has no local matrix"
             )
-            out_world = _build_scene_bone_route_world_matrix(
-                str(entry.get("route", "unchanged") or "unchanged"),
-                current_world_import=_clone_matrix_values(entry.get("current_world_import")),
-                original_world_template=original_world_template,
-                bone_move_enabled=move_enabled,
-                bone_rotate_enabled=rotate_enabled,
-                bone_scale_enabled=scale_enabled,
-                move_changed=bool(entry.get("move_changed")),
-                rotate_changed=bool(entry.get("rotate_changed")),
-                scale_changed=bool(entry.get("scale_changed")),
-            )
-            if out_world is None and original_world_template is not None:
-                out_world = original_world_template
-            if out_world is None:
-                out_world = _file_matrix_from_import_values(entry.get("current_world_import"), None) or _flatten_identity_matrix()
-            output_world_matrices.append(out_world)
-            export_bone_id = _int_or_default(entry.get("export_bone_id"), 0)
-            output_world_by_export_id[export_bone_id] = out_world
-            output_world_import_by_export_id[export_bone_id] = (
-                _import_matrix_from_file_values(out_world) or _flatten_identity_matrix()
-            )
+        local_by_export_id[export_bone_id] = current_local
+
+    # MOD stores one shared metric scale in the world table. Generic FBX may
+    # represent its removal as a reciprocal scale on each direct root child.
+    # If the root scale has already been stripped below, retaining that exact
+    # reciprocal (for em4700: 1 / 366.7236 = 0.002727) shrinks the entire child
+    # hierarchy around an otherwise correct root position.
+    source_world_rows = source_tables.get("bone_world_matrices")
+    source_mod_world_scale = 1.0
+    if isinstance(source_world_rows, list) and source_world_rows:
+        source_mod_world_scale = _matrix_uniform_root_scale(source_world_rows[0])
+    if not math.isfinite(source_mod_world_scale) or source_mod_world_scale <= 0.0:
+        raise ValueError("Source MOD has no valid bone world-table scale")
+
+    root_ids = [bone_id for bone_id, parent_id in parent_by_export_id.items() if parent_id == 255]
+    removed_root_uniform_scales: dict[int, float] = {}
+    for root_id in root_ids:
+        removed_scale = _matrix_uniform_root_scale(local_by_export_id[root_id])
+        if abs(removed_scale - 1.0) > 0.0000001:
+            removed_root_uniform_scales[root_id] = removed_scale
+        local_by_export_id[root_id] = _matrix_without_uniform_root_scale(local_by_export_id[root_id]) or local_by_export_id[root_id]
+
+    removed_root_child_reciprocal_scales: dict[int, float] = {}
+    if source_mod_world_scale > 1.0001:
+        expected_reciprocal_scale = 1.0 / source_mod_world_scale
+        reciprocal_tolerance = max(0.000001, expected_reciprocal_scale * 0.01)
+        root_id_set = set(root_ids)
+        for bone_id, parent_id in parent_by_export_id.items():
+            if parent_id not in root_id_set:
+                continue
+            local_scale = _matrix_uniform_linear_scale(local_by_export_id.get(bone_id))
+            if local_scale is None:
+                continue
+            if abs(local_scale - expected_reciprocal_scale) > reciprocal_tolerance:
+                continue
+            reciprocal_translation = list(local_by_export_id[bone_id][12:15])
+            normalized_local = _matrix_without_linear_row_scale(local_by_export_id[bone_id])
+            if normalized_local is None:
+                continue
+            # This Generic-FBX container correction scales the complete local
+            # transform, not only its 3x3 basis. Restore the child offset by the
+            # same source world factor or the first bone segment remains tiny.
+            normalized_local[12:15] = [
+                component * source_mod_world_scale
+                for component in reciprocal_translation
+            ]
+            local_by_export_id[bone_id] = normalized_local
+            removed_root_child_reciprocal_scales[bone_id] = local_scale
+
+    # MOD uses one shared metric scale in every world-matrix linear basis. Its
+    # Mesh decoder reads that scale from world row 0, while bone locals remain
+    # unit-scale. Compose the posed skeleton first, then restore only the source
+    # MOD world-table basis. Scaling translation would displace the skeleton;
+    # omitting the linear scale collapses short-position Meshes at the origin.
+    output_world_matrices: list[list[float]] = []
+    output_world_by_export_id: dict[int, list[float]] = {}
+    resolving_world: set[int] = set()
+
+    def compose_world(export_bone_id: int) -> list[float]:
+        cached = output_world_import_by_export_id.get(export_bone_id)
+        if cached is not None:
+            return list(cached)
+        if export_bone_id in resolving_world:
+            raise ValueError(f"Bone hierarchy cycle at export bone {export_bone_id}")
+        resolving_world.add(export_bone_id)
+        local = local_by_export_id[export_bone_id]
+        parent_id = parent_by_export_id.get(export_bone_id, 255)
+        if parent_id != 255 and parent_id in local_by_export_id:
+            world = _multiply_matrix4x4(local, compose_world(parent_id))
+        else:
+            world = list(local)
+        resolving_world.remove(export_bone_id)
+        output_world_import_by_export_id[export_bone_id] = list(world)
+        output_world_by_export_id[export_bone_id] = list(world)
+        return world
+
+    for entry in plan_entries:
+        canonical_world = compose_world(_int_or_default(entry.get("export_bone_id"), 0))
+        mod_world = _matrix_with_uniform_linear_scale(
+            canonical_world,
+            source_mod_world_scale,
+        )
+        if mod_world is None:
+            raise ValueError("Cannot restore the source MOD bone world-table scale")
+        output_world_matrices.append(mod_world)
 
     uses_anim_maps = _mod_version_uses_anim_maps(source_header.get("mod_ver"))
     used_anim_map_ids: set[int] = set()
@@ -10834,71 +10999,18 @@ def _build_bone_edit_export_plan(
             if 0 <= source_template_bone_slot < len(source_bone_info)
             else None
         )
-        original_local_template = (
-            _clone_matrix_values(source_local_matrices[source_template_bone_slot])
-            if 0 <= source_template_bone_slot < len(source_local_matrices)
-            else None
+        out_world = _require_current_bone_matrix(
+            output_world_matrices[plan_index],
+            label=str(entry.get("bone_name", export_bone_id) or export_bone_id),
         )
-        original_world_template = (
-            _clone_matrix_values(source_world_matrices[source_template_bone_slot])
-            if 0 <= source_template_bone_slot < len(source_world_matrices)
-            else None
-        )
-        out_world = output_world_matrices[plan_index]
-        output_world_import = _clone_matrix_values(
-            output_world_import_by_export_id.get(export_bone_id)
-        ) or _import_matrix_from_file_values(out_world)
-        parent_world_import = _clone_matrix_values(
-            output_world_import_by_export_id.get(
-                _int_or_default(entry.get("parent_id"), 255)
-            )
-        )
-        rebuilt_local_import = _build_local_import_matrix(
-            output_world_import,
-            parent_world_import,
-            fallback_import=(
-                _clone_matrix_values(entry.get("current_local_import"))
-                or (baseline_local_import[source_template_bone_slot] if 0 <= source_template_bone_slot < len(baseline_local_import) else None)
-            ),
-        )
-        route_local_import = rebuilt_local_import
-        local_route = str(entry.get("route", "unchanged") or "unchanged")
-        local_move_changed = bool(entry.get("move_changed"))
-        local_rotate_changed = bool(entry.get("rotate_changed"))
-        local_scale_changed = bool(entry.get("scale_changed"))
-        blender_baseline_local = (
-            _clone_matrix_values(baseline_local_import[source_template_bone_slot])
-            if 0 <= source_template_bone_slot < len(baseline_local_import)
-            else None
-        )
-        if (
-            blender_fbx_local_route
-            and local_route != "unchanged"
-            and original_local_template is not None
-            and blender_baseline_local is not None
-        ):
-            out_local = _reencode_blender_fbx_matrix_file_values(
-                route_local_import,
-                blender_baseline_local,
-                original_local_template,
-            )
-        else:
-            out_local = _build_scene_bone_route_local_matrix(
-                local_route,
-                route_local_import=route_local_import,
-                original_local_template=original_local_template,
-                bone_move_enabled=move_enabled,
-                bone_rotate_enabled=rotate_enabled,
-                bone_scale_enabled=scale_enabled,
-                move_changed=local_move_changed,
-                rotate_changed=local_rotate_changed,
-                scale_changed=local_scale_changed,
-            )
-        if out_local is None and original_local_template is not None:
-            out_local = original_local_template
+        output_world_import = list(out_world)
+        # Preserve the Probe local/bind row.  It is already in the mapped
+        # canonical domain and must remain paired with the Probe Skin data.
+        out_local = _clone_matrix_values(local_by_export_id.get(export_bone_id))
         if out_local is None:
-            out_local = _file_matrix_from_import_values(rebuilt_local_import, None) or _flatten_identity_matrix()
-
+            raise ValueError(
+                f"Current FBX Probe bone {entry.get('bone_name', export_bone_id)} has no local matrix"
+            )
         preserves_source_template_record = (
             original_info_template is not None
             and source_template_bone_slot >= 0
@@ -10990,9 +11102,24 @@ def _build_bone_edit_export_plan(
         "fbx_structure": fbx_structure,
         "bone_count": len(output_bone_info),
         "uses_anim_maps": uses_anim_maps,
-        "blender_fbx_local_authority": (
-            BLENDER_FBX_LOCAL_MATRIX_AUTHORITY if blender_fbx_local_route else ""
+        # Compatibility metadata: the old Blender-local re-encoding route is
+        # retired.  All current scene matrices now share Probe's canonical XYZ
+        # handoff and are written directly by this bridge.
+        "bone_matrix_axis_domain": FBX_BONE_MATRIX_DOMAIN_CANONICAL,
+        "bone_matrix_source_domain": FBX_BONE_MATRIX_DOMAIN_CANONICAL,
+        "bone_matrix_target_domain": "mod_file",
+        # The plan keeps matrices in the mapped MOD/Max scene domain while
+        # composing hierarchy; _build_bone_edit_mod_bytes() performs the sole
+        # file-position encoding at serialization.
+        "bone_matrix_output_domain": "mod_internal",
+        "bone_only_math_rule": "VERSION_E_PROBE_LOCAL_MOD_WORLD_SCALE",
+        "source_mod_world_scale": source_mod_world_scale,
+        "removed_root_uniform_scales": removed_root_uniform_scales,
+        "removed_root_child_reciprocal_scales": removed_root_child_reciprocal_scales,
+        "dynamic_mod_fbx_mapping_fingerprint": str(
+            dynamic_mapping.get("fingerprint", "") or ""
         ),
+        "blender_fbx_local_authority": "",
         "scene_bone_handoff_collapsed": scene_bone_handoff_collapsed,
         "scene_bone_handoff_warning": scene_bone_handoff_warning,
     }
@@ -11452,6 +11579,7 @@ def _run_source_skin_truth_regression_guard() -> dict[str, Any]:
                 "vert_count": 1,
                 "positions": [[0.0, 0.0, 0.0]],
                 "normals": [[0.0, 0.0, 1.0]],
+                "max_normals": [[0.0, 0.0, 1.0]],
                 "uvs": [[0.25, 0.75]],
                 "uv2s": [[0.5, 0.5]],
                 "raw_bones": [edited_legacy8_bones],
@@ -11572,6 +11700,7 @@ def _run_source_skin_truth_regression_guard() -> dict[str, Any]:
             "vert_count": 2,
             "positions": [[0.0, 0.0, 0.0], [0.5, -0.25, 0.125]],
             "normals": [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+            "max_normals": [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
             "uvs": [[0.25, 0.75], [0.5, 0.25]],
             "raw_bones": [[0, 1, 2, 3], [4, 5, 6, 7]],
             "raw_weights": [[0.5, 0.25, 0.125, 0.125], [0.25, 0.375, 0.125, 0.25]],
@@ -11685,6 +11814,7 @@ def _run_source_skin_truth_regression_guard() -> dict[str, Any]:
             "positions": [[0.0, 0.0, 0.0]],
             "world_positions": [[0.0, 0.0, 0.0]],
             "normals": [[0.0, 0.0, 1.0]],
+            "max_normals": [[0.0, 0.0, 1.0]],
             "uvs": [[0.0, 0.0]],
             "raw_bones": [[zero_bb_bones[7]]],
             "raw_weights": [[1.0]],
@@ -11719,6 +11849,101 @@ def _run_source_skin_truth_regression_guard() -> dict[str, Any]:
         "legacy8_edited_payload_sizes": edited_legacy8_payloads,
         "bb_zero_weight_fallback_bone": zero_bb_bones[7],
         "bb_zero_exact_skin_bytes": True,
+    }
+
+
+def _run_writer_normal_authority_regression_guard() -> dict[str, Any]:
+    """Ensure Writer normals never cross-field/default-fallback silently."""
+    ordinary = {
+        "mesh_slot": 7,
+        "scene_node": "NormalAuthority_007",
+        "vert_count": 2,
+        "max_positions": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        "max_normals": [[0.0, 2.0, 0.0], [0.0, 0.0, -3.0]],
+    }
+    if _get_semantic_game_normal(ordinary, 0) != [0.0, 1.0, 0.0]:
+        raise RuntimeError("Writer normal authority regression: ordinary max_normals was not consumed")
+    if _get_semantic_game_normal(ordinary, 1) != [0.0, 0.0, -1.0]:
+        raise RuntimeError("Writer normal authority regression: ordinary normal was not normalized")
+
+    def expect_rejection(mesh: dict[str, Any], label: str) -> None:
+        try:
+            _get_semantic_game_normal(mesh, 0)
+        except ValueError:
+            return
+        raise RuntimeError(f"Writer normal authority regression: {label} was accepted")
+
+    expect_rejection(
+        {
+            "mesh_slot": 8,
+            "vert_count": 1,
+            "max_positions": [[0.0, 0.0, 0.0]],
+            "normals": [[0.0, 0.0, 1.0]],
+        },
+        "raw normals fallback",
+    )
+    expect_rejection(
+        {
+            "mesh_slot": 9,
+            "vert_count": 2,
+            "max_positions": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            "max_normals": [[0.0, 0.0, 1.0]],
+        },
+        "short max_normals table",
+    )
+    expect_rejection(
+        {
+            "mesh_slot": 10,
+            "vert_count": 1,
+            "max_positions": [[0.0, 0.0, 0.0]],
+            "max_normals": [[0.0, 0.0, 0.0]],
+        },
+        "zero normal",
+    )
+    expect_rejection(
+        {
+            "mesh_slot": 11,
+            "vert_count": 1,
+            "max_positions": [[0.0, 0.0, 0.0]],
+            "max_normals": [[float("nan"), 0.0, 1.0]],
+        },
+        "non-finite normal",
+    )
+
+    authority_base = {
+        "mesh_slot": 12,
+        "scene_node": "NormalAuthority_012",
+        "final_geometry_authority": {
+            "schema": BONES_PLUS_MESH_FBX_WORLD_GEOMETRY_AUTHORITY,
+            "fbx_sha256": "A" * 64,
+            "mesh_slot": 12,
+            "mod_write_positions": [[0.0, 0.0, 0.0]],
+            "mod_write_normals": [[0.0, 4.0, 0.0]],
+        },
+        # This deliberately disagrees.  The frozen authority must win, and
+        # its absence must not fall through to this ordinary table.
+        "max_normals": [[0.0, 0.0, 1.0]],
+        "normals": [[0.0, 0.0, 1.0]],
+    }
+    if _get_semantic_game_normal(authority_base, 0) != [0.0, 1.0, 0.0]:
+        raise RuntimeError("Writer normal authority regression: frozen mod_write_normals was not consumed")
+    missing_frozen = copy.deepcopy(authority_base)
+    missing_frozen["final_geometry_authority"].pop("mod_write_normals", None)
+    expect_rejection(missing_frozen, "frozen authority fallback")
+
+    try:
+        _encode_normal_bytes([0.0, 0.0, 0.0])
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("Writer normal authority regression: encoder accepted a zero normal")
+
+    return {
+        "status": "PASS",
+        "ordinary_authority": ORDINARY_FBX_NORMAL_AUTHORITY,
+        "bones_plus_mesh_authority": "final_geometry_authority.mod_write_normals",
+        "cross_field_fallback": False,
+        "default_normal_fallback": False,
     }
 
 
@@ -11782,6 +12007,7 @@ def _run_semantic_writer_layout_regression_guard() -> dict[str, Any]:
         "vert_count": 1,
         "positions": [[0.0, 0.0, 0.0]],
         "normals": [[0.0, 0.0, 1.0]],
+        "max_normals": [[0.0, 0.0, 1.0]],
         "uvs": [[0.125, 0.75]],
         "face_indices": [],
         "mesh_scale": [1.0, 1.0, 1.0],
@@ -11839,6 +12065,7 @@ def _run_semantic_writer_layout_regression_guard() -> dict[str, Any]:
         "writer_fvf": "0xA320C016",
         "vertex_stride": 28,
         "normals": [_decode_source_packed_normal(raw_a320_normal)],
+        "max_normals": [_decode_source_packed_normal(raw_a320_normal)],
         "source_vertex_indices": [0],
     }
     a320_contract = {"meshes": [a320_mesh]}
@@ -11921,6 +12148,7 @@ def _run_semantic_writer_layout_regression_guard() -> dict[str, Any]:
         "writer_fvf": "0xA8FAB018",
         "vertex_stride": 20,
         "normals": [_decode_source_packed_normal(raw_a8_normal)],
+        "max_normals": [_decode_source_packed_normal(raw_a8_normal)],
         "raw_bones": [[0]],
         "raw_weights": [[1.0]],
         "source_vertex_indices": [0],
@@ -11940,7 +12168,11 @@ def _run_semantic_writer_layout_regression_guard() -> dict[str, Any]:
     a8_payload = build_semantic_mesh_payload(a8_mesh)["vertex_bytes"]
     if a8_payload[8:12] != raw_a8_normal:
         raise RuntimeError("Source normal preservation regression: unchanged A8 bytes drifted")
-    edited_a8_mesh = {**a8_mesh, "normals": [[0.0, 0.0, 1.0]]}
+    edited_a8_mesh = {
+        **a8_mesh,
+        "normals": [[0.0, 0.0, 1.0]],
+        "max_normals": [[0.0, 0.0, 1.0]],
+    }
     edited_a8_mesh.pop("source_normal_field_hex_rows", None)
     if _preserve_semantically_unchanged_source_normal_bytes(
         {},
@@ -12261,6 +12493,26 @@ def _apply_ordinary_export_source_ordered_skin_contract(
             and len(mesh.get("raw_bones", [])) >= _get_semantic_vertex_count(mesh)
             and len(mesh.get("raw_weights", [])) >= _get_semantic_vertex_count(mesh)
         )
+        bones_plus_mesh_source_binding = _job_uses_bones_plus_mesh_pose_route(job, contract)
+        if bones_plus_mesh_source_binding:
+            # Posed positions are meaningful only together with the exact
+            # Probe Bone/Weight rows used to evaluate them.  Do not remap them
+            # through source MOD vertex rows or preserve old packed Skin bytes.
+            _copy_final_skin_rows(
+                mesh.get("raw_bones"),
+                mesh.get("raw_weights"),
+                expected_count=_get_semantic_vertex_count(mesh),
+            )
+            mesh.pop("ordinary_source_ordered_skin_bones", None)
+            mesh.pop("ordinary_source_ordered_skin_weights", None)
+            mesh.pop("source_skin_field_hex_rows", None)
+            mesh["ordinary_skin_contract"] = {
+                "source_fvf": f"0x{source_fvf:08X}",
+                "row_count": _get_semantic_vertex_count(mesh),
+                "policy": "bones_plus_mesh_probe_aligned_atomic_skin",
+            }
+            applied_meshes += 1
+            continue
         source_owns_skin_fields = (
             source_fvf in V4_NON_SCENE_SKIN_FVFS
             and not strict_corner_skin_authority
@@ -12420,7 +12672,9 @@ def _apply_ordinary_export_source_ordered_skin_contract(
             "changed_rows": changed_rows,
             "restored_zero_weight_fallback_rows": restored_zero_weight_fallback_rows,
             "policy": (
-                "fbx_corner_skin_with_source_palette"
+                "bones_plus_mesh_source_binding_exact_bytes"
+                if bones_plus_mesh_source_binding
+                else "fbx_corner_skin_with_source_palette"
                 if strict_corner_skin_authority
                 else "source_slot_order_with_exact_unchanged_bytes"
             ),
@@ -13113,42 +13367,6 @@ def _transform_bones_plus_mesh_max_position(
 # === END RETIRED Bones+Mesh Source-LBS Experiment ===
 
 
-def _require_bones_plus_mesh_fbx_world_geometry_authority(
-    job: dict[str, Any],
-    contract: dict[str, Any],
-) -> None:
-    """Refuse BONE+MESH unless every editable Mesh has one verified FBX contract."""
-    if not _job_uses_bones_plus_mesh_pose_route(job, contract):
-        return
-    for mesh in _ensure_contract_meshes(job, contract):
-        if not isinstance(mesh, dict) or _mesh_uses_source_geometry(mesh):
-            continue
-        if str(mesh.get("lane", "") or "").lower() != "modify":
-            continue
-        if not _mesh_has_skin(mesh):
-            continue
-        authority = _get_bones_plus_mesh_final_geometry_authority(mesh)
-        if authority is None:
-            raise ValueError("Bones+Mesh Mesh has no FBX world geometry authority")
-        positions = _copy_final_geometry_rows(
-            authority.get("mod_write_positions"),
-            field="mod_write_positions",
-        )
-        _copy_fbx_world_authority_indices(
-            authority.get("source_vertex_indices"),
-            field="source_vertex_indices",
-            expected_count=len(positions),
-        )
-        if (
-            str(authority.get("fbx_skin_pose_evaluation_status", "") or "").strip()
-            != BONES_PLUS_MESH_FBX_SKIN_EVALUATION_STATUS
-        ):
-            raise ValueError("Bones+Mesh immutable FBX authority has no verified Skin evaluation")
-        expected_count = _int_or_default(mesh.get("vert_count"), len(positions))
-        if expected_count != len(positions):
-            raise ValueError("Bones+Mesh immutable FBX authority vertex count does not match the Mesh contract")
-
-
 def _read_source_vertex_local_slot_rows(mod_file: dict[str, Any], mesh_header: dict[str, Any]) -> list[list[int]]:
     fvf = _parse_fvf_int(mesh_header.get("fvf_info"))
     # Source truth stays readable for every known local-binding layout.  The
@@ -13825,19 +14043,6 @@ def _apply_bone_edit_mesh_local_binding(
 
 
 def _run_bones_plus_mesh_binding_regression_guard() -> dict[str, Any]:
-    forbidden_pose_calls = {
-        "_build_export_aligned_source_max_position_rows",
-        "_resolve_bones_plus_mesh_pose_skin_triplet",
-        "_transform_bones_plus_mesh_max_position",
-    }
-    revived_calls = forbidden_pose_calls.intersection(
-        _require_bones_plus_mesh_fbx_world_geometry_authority.__code__.co_names
-    )
-    if revived_calls:
-        raise RuntimeError(
-            "Bones+Mesh regression: retired source-LBS pose reconstruction was revived: "
-            + ", ".join(sorted(revived_calls))
-        )
     if "_copy_final_geometry_rows" in _get_semantic_game_normal.__code__.co_names:
         raise RuntimeError(
             "Bones+Mesh regression: per-vertex normal lookup cloned the full FBX authority table"
@@ -13857,12 +14062,28 @@ def _run_bones_plus_mesh_binding_regression_guard() -> dict[str, Any]:
             raise RuntimeError(
                 "Blender Bones Edit regression: BPY Pose contract re-entered the pure FBX route"
             )
-    if (
-        "_collect_fbx_bone_entries" not in _build_bone_edit_export_plan.__code__.co_names
-        or "_build_blender_fbx_output_world_matrices"
-        not in _build_bone_edit_export_plan.__code__.co_names
-    ):
-        raise RuntimeError("Blender Bones Edit regression: current FBX Probe local route disappeared")
+    writer_symbols = set(_build_bone_edit_export_plan.__code__.co_names)
+    forbidden_axis_writer_helpers = {
+        "_import_matrix_from_file_values",
+        "_file_matrix_from_import_values",
+        "_file_pos_from_max_pos",
+        "_max_pos_from_file_pos",
+        "_build_baseline_local_import_matrices",
+        "_classify_import_matrix_change",
+        "_max_fbx_world_to_import_matrix",
+        "_build_scene_bone_route_world_matrix",
+        "_build_scene_bone_route_local_matrix",
+        "_build_blender_fbx_output_world_matrices",
+        "_reencode_blender_fbx_matrix_file_values",
+    }
+    if "_collect_fbx_bone_entries" not in writer_symbols:
+        raise RuntimeError("Bones Edit regression: current FBX Probe bone authority disappeared")
+    revived_axis_helpers = forbidden_axis_writer_helpers.intersection(writer_symbols)
+    if revived_axis_helpers:
+        raise RuntimeError(
+            "Bones Edit regression: final MOD writer revived an axis conversion: "
+            + ", ".join(sorted(revived_axis_helpers))
+        )
     external_root_fbx_local = _flatten_identity_matrix()
     external_root_fbx_local[0:3] = list(BLENDER_FBX_ARMATURE_ROOT_BASIS[0:3])
     external_root_fbx_local[4:7] = list(BLENDER_FBX_ARMATURE_ROOT_BASIS[3:6])
@@ -13891,6 +14112,7 @@ def _run_bones_plus_mesh_binding_regression_guard() -> dict[str, Any]:
         "vert_count": 3,
         "positions": [[-1.0, -2.0, -3.0], [-4.0, -5.0, -6.0], [-7.0, -8.0, -9.0]],
         "normals": [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+        "max_normals": [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
         "fbx_node_to_world_matrix": frozen_node_to_world,
         # These deliberately differ from raw FBX object rows. BONE+MESH writes
         # only the Probe-verified Skin positions into source vertex position lanes.
@@ -13944,6 +14166,7 @@ def _run_bones_plus_mesh_binding_regression_guard() -> dict[str, Any]:
                 "mesh_slot_hint": {"slot": 1},
                 "positions": [[-10.0, -20.0, -30.0]] * 3,
                 "normals": [[0.0, 0.0, -1.0]] * 3,
+                "max_normals": [[0.0, 0.0, -1.0]] * 3,
                 "fbx_node_to_world_matrix": _flatten_identity_matrix(),
                 "skinned_world_positions": [[-100.0, -200.0, -300.0]] * 3,
                 "skinned_max_positions": [[-1000.0, -2000.0, -3000.0]] * 3,
@@ -13985,24 +14208,18 @@ def _run_bones_plus_mesh_binding_regression_guard() -> dict[str, Any]:
         "bone_edit_export_mode": "bones_plus_mesh",
         "meshes": [unavailable_skin_mesh],
     }
-    unavailable_skin_receipt = _freeze_bones_plus_mesh_fbx_world_geometry_authority(
+    unavailable_receipt = _freeze_bones_plus_mesh_fbx_world_geometry_authority(
         unavailable_skin_job,
         unavailable_skin_contract,
         {"fbx_sha256": "C" * 64},
     )
     if (
-        unavailable_skin_receipt.get("status") != "not_required_no_editable_mesh"
-        or not _mesh_uses_source_geometry(unavailable_skin_mesh)
-        or unavailable_skin_mesh.get("bones_plus_mesh_source_passthrough")
-        != "fbx_skin_pose_evaluation_unavailable"
+        unavailable_receipt.get("status") != "not_required_no_editable_mesh"
+        or "final_geometry_authority" in unavailable_skin_mesh
     ):
         raise RuntimeError(
-            "Bones+Mesh regression: an unverified Skin Mesh did not become source passthrough"
+            "Bones+Mesh regression: Skin evaluation metadata incorrectly created an authority"
         )
-    _require_bones_plus_mesh_fbx_world_geometry_authority(
-        unavailable_skin_job,
-        unavailable_skin_contract,
-    )
 
     direct_global_header = {
         "fvf_info": 0x14D40020,
@@ -14137,25 +14354,19 @@ def _run_bones_plus_mesh_binding_regression_guard() -> dict[str, Any]:
             )
         )
         source_mod = read_mod_file(source_path)
-        raw_fbx_world = [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            77.0, -31.0, 5.0, 1.0,
-        ]
         pose_translate = _flatten_identity_matrix()
         # Real Blender FBX handoffs contain tiny row-scale noise even for a
         # pure Pose translation. It must not become a user scale edit.
         pose_translate[0] = 0.99995
         pose_translate[12] = 33.714208
-        effective_pose_translate = _blender_fbx_local_delta_for_semantics(
-            pose_translate,
-            move_enabled=True,
-            rotate_enabled=False,
-            scale_enabled=False,
-        )
 
         source_tables = _read_mod_bone_tables(source_mod)
+        direct_world_import = [
+            _import_matrix_from_file_values(matrix)
+            for matrix in source_tables["bone_world_matrices"]
+        ]
+        if any(matrix is None for matrix in direct_world_import):
+            raise RuntimeError("Blender Bones Edit regression fixture lost a direct world matrix")
         baseline_world_import = _build_blender_fbx_baseline_world_import_matrices(
             source_tables["bone_world_matrices"]
         )
@@ -14195,6 +14406,19 @@ def _run_bones_plus_mesh_binding_regression_guard() -> dict[str, Any]:
                 )
                 return _multiply_matrix4x4(local_delta, rest_local)
 
+            def fbx_world(index: int) -> list[float]:
+                # This fixture models the post-Probe canonical handoff.  World
+                # rows are supplied in the same XYZ domain the writer packs;
+                # no file-axis conversion belongs in this regression.
+                world = _clone_matrix_values(direct_world_import[index])
+                if world is None:
+                    raise RuntimeError("Blender FBX regression fixture lost a baseline world matrix")
+                if index == 0 and root_delta is not None:
+                    return _multiply_matrix4x4(root_delta, world)
+                if index == 1:
+                    return _multiply_matrix4x4(parent_delta, world)
+                return world
+
             return {
                 "scene_authority": "blender_selected_fbx_bones",
                 "summary": {
@@ -14203,9 +14427,7 @@ def _run_bones_plus_mesh_binding_regression_guard() -> dict[str, Any]:
                             "name": names[index], "parsed_bone_id": index,
                             "parent_name": "Armature" if index == 0 else names[index - 1],
                             "parent_parsed_bone_id": -1 if index == 0 else index - 1,
-                            # The pure Blender route must not consume this
-                            # deliberately invalid world carrier.
-                            "world_matrix": raw_fbx_world,
+                            "world_matrix": fbx_world(index),
                             "local_matrix": fbx_local(index), "is_root": index == 0,
                         }
                         for index in range(3)
@@ -14219,8 +14441,8 @@ def _run_bones_plus_mesh_binding_regression_guard() -> dict[str, Any]:
             {},
             blender_handoff(_flatten_identity_matrix()),
         )
-        if no_edit_plan.get("blender_fbx_local_authority") != BLENDER_FBX_LOCAL_MATRIX_AUTHORITY:
-            raise RuntimeError("Blender Bones Edit regression: Probe local-matrix authority was not recorded")
+        if no_edit_plan.get("bone_matrix_axis_domain") != FBX_BONE_MATRIX_DOMAIN_CANONICAL:
+            raise RuntimeError("Bones Edit regression: canonical XYZ matrix domain was not recorded")
         if any(entry.get("route") != "unchanged" for entry in no_edit_plan.get("plan_entries", [])):
             raise RuntimeError("Blender Bones Edit regression: unedited local Pose changed a source bone")
         if (
@@ -14256,24 +14478,19 @@ def _run_bones_plus_mesh_binding_regression_guard() -> dict[str, Any]:
             {},
             blender_handoff(_flatten_identity_matrix(), root_translate),
         )
-        expected_root_world_import = _multiply_matrix4x4(
+        expected_root_world = _multiply_matrix4x4(
             root_translate,
-            baseline_local_import[0],
-        )
-        expected_root_world = _reencode_blender_fbx_matrix_file_values(
-            expected_root_world_import,
-            baseline_world_import[0],
-            source_tables["bone_world_matrices"][0],
+            direct_world_import[0],
         )
         if (
             expected_root_world is None
             or root_plan.get("plan_entries", [{}])[0].get("route") != "transform_changed"
             or root_plan.get("output_world_matrices", [[]])[0] != expected_root_world
             or root_plan.get("output_world_matrices", [[], []])[1]
-            == source_tables["bone_world_matrices"][1]
+            != source_tables["bone_world_matrices"][1]
         ):
             raise RuntimeError(
-                "Blender Bones Edit regression: FBX root edit was lost behind the Armature rest basis"
+                "Bones Edit regression: direct canonical root edit changed an untouched parent"
             )
 
         pose_plan = _build_bone_edit_export_plan(
@@ -14282,60 +14499,17 @@ def _run_bones_plus_mesh_binding_regression_guard() -> dict[str, Any]:
             {},
             blender_handoff(pose_translate),
         )
-        expected_parent_import = _multiply_matrix4x4(
-            effective_pose_translate,
-            baseline_local_import[1],
-        )
-        expected_parent_world_import = _multiply_matrix4x4(
-            expected_parent_import,
-            baseline_world_import[0],
-        )
-        expected_parent_world = _reencode_blender_fbx_matrix_file_values(
-            expected_parent_world_import,
-            baseline_world_import[1],
-            source_tables["bone_world_matrices"][1],
-        )
-        expected_child_world_import = _multiply_matrix4x4(
-            baseline_local_import[2],
-            expected_parent_world_import,
-        )
-        expected_child_world = _reencode_blender_fbx_matrix_file_values(
-            expected_child_world_import,
-            baseline_world_import[2],
-            source_tables["bone_world_matrices"][2],
-        )
-        legacy_baseline_local_import = _build_baseline_local_import_matrices(
-            source_tables["bone_info"],
-            source_tables["bone_world_matrices"],
-        )
-        legacy_parent_import = _multiply_matrix4x4(
+        expected_parent_world = _multiply_matrix4x4(
             pose_translate,
-            legacy_baseline_local_import[1],
+            direct_world_import[1],
         )
-        legacy_parent_import = _multiply_matrix4x4(
-            legacy_parent_import,
-            _import_matrix_from_file_values(source_tables["bone_world_matrices"][0]),
-        )
-        actual_parent_import = _import_matrix_from_file_values(
-            pose_plan.get("output_world_matrices", [[], [], []])[1]
-        )
-        actual_child_import = _import_matrix_from_file_values(
-            pose_plan.get("output_world_matrices", [[], [], []])[2]
-        )
+        actual_parent_world = pose_plan.get("output_world_matrices", [[], [], []])[1]
+        actual_child_world = pose_plan.get("output_world_matrices", [[], [], []])[2]
         if (
-            expected_parent_world is None
-            or expected_child_world is None
-            or actual_parent_import is None
-            or actual_child_import is None
-            or pose_plan.get("plan_entries", [{}, {}, {}])[1].get("route") != "transform_changed"
+            pose_plan.get("plan_entries", [{}, {}, {}])[1].get("route") != "transform_changed"
             or pose_plan.get("plan_entries", [{}, {}, {}])[2].get("route") != "unchanged"
-            or pose_plan.get("output_world_matrices", [[], [], []])[1] != expected_parent_world
-            or pose_plan.get("output_world_matrices", [[], [], []])[2] != expected_child_world
-            or abs(actual_parent_import[12] - 37.714208) > 0.0002
-            or abs(actual_child_import[12] - 39.714208) > 0.0002
-            or abs(legacy_parent_import[12] - actual_parent_import[12]) <= 1.0
-            or abs(_vec3_length(_matrix_row_vec3(actual_parent_import, 0)) - 9.0) > 0.0002
-            or abs(_vec3_length(_matrix_row_vec3(actual_child_import, 0)) - 5.0) > 0.0002
+            or actual_parent_world != expected_parent_world
+            or actual_child_world != source_tables["bone_world_matrices"][2]
             or pose_plan.get("output_local_matrices", [[], [], []])[2]
             != source_tables["bone_local_matrices"][2]
             or pose_plan.get("output_bone_info") != source_tables["bone_info"]
@@ -14471,6 +14645,7 @@ def _run_bones_plus_mesh_binding_regression_guard() -> dict[str, Any]:
             "vert_count": 3,
             "positions": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
             "normals": [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+            "max_normals": [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
             "uvs": [[0.125, 0.25], [0.5, 0.625], [0.75, 0.875]],
             "raw_bones": [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
             "raw_weights": [[1.0, 0.0, 0.0, 0.0]] * 3,
@@ -14623,7 +14798,7 @@ def _run_bones_plus_mesh_binding_regression_guard() -> dict[str, Any]:
             or combined_rewrite_receipt.get("layout") != "fbx_mesh_rewrite_plus_bone_plan"
             or combined_rewrite_receipt.get("modified_mesh_slots") != [1]
             or combined_patch_receipt != {}
-            or combined_position_rows != [[10, 30, -20], [40, 60, -50], [70, 90, -80]]
+            or combined_position_rows != [[10, 20, 30], [40, 50, 60], [70, 80, 90]]
             or combined_non_position_bytes_preserved is not True
             or combined_source_faces != combined_output_faces
             or combined_source_mod["mesh_headers"] != combined_output_mod["mesh_headers"]
@@ -14655,6 +14830,7 @@ def _run_bones_plus_mesh_binding_regression_guard() -> dict[str, Any]:
             "vert_count": 4,
             "positions": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
             "normals": [[0.0, 0.0, 1.0]] * 4,
+            "max_normals": [[0.0, 0.0, 1.0]] * 4,
             "uvs": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
             "raw_bones": [[0, 0, 0, 0]] * 4,
             "raw_weights": [[1.0, 0.0, 0.0, 0.0]] * 4,
@@ -15093,21 +15269,521 @@ def _normalize_fbx_axes_receipt(value: Any) -> dict[str, Any]:
     }
 
 
-def _scale_fbx_position_rows(rows: Any, factor: float) -> list[list[float]] | None:
-    if not isinstance(rows, list) or not rows:
+# ============================================================================
+# Dynamic MOD <-> Generic-FBX mapping (Bridge-owned, request-scoped)
+#
+# Generic Probe publishes one canonical XYZ scene.  The Writer must map that
+# scene back through the explicit affine matrix carried by the handoff before
+# packing a MOD.  This block never infers an axis from a DCC name, a Mesh name,
+# a slot number, or a stale source-MOD row. A current Probe handoff must carry
+# the explicit inverse matrix pair; receipt loss is a hard export error instead
+# of an identity fallback that silently bypasses this layer.
+# ============================================================================
+
+
+def _dynamic_matrix_from_value(value: Any, *, depth: int = 0) -> list[float] | None:
+    """Coerce a flat/nested 3x3 or 4x4 receipt value to row-major affine form."""
+    if depth > 3:
         return None
-    scaled: list[list[float]] = []
+    if isinstance(value, dict):
+        for key in ("matrix", "values", "flat", "data", "rows"):
+            if key in value:
+                matrix = _dynamic_matrix_from_value(value.get(key), depth=depth + 1)
+                if matrix is not None:
+                    return matrix
+        return None
+    if not isinstance(value, (list, tuple)):
+        return None
+
+    # A flat matrix is accepted only when its elements are scalar.  This keeps
+    # a nested row representation from being silently converted to zeros.
+    if len(value) >= 16 and not any(
+        isinstance(item, (list, tuple, dict)) for item in value[:16]
+    ):
+        try:
+            matrix = [float(item) for item in value[:16]]
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        rows = list(value)
+        if len(rows) >= 4 and all(isinstance(row, (list, tuple)) for row in rows[:4]):
+            if not all(len(row) >= 4 for row in rows[:4]):
+                return None
+            try:
+                matrix = [float(component) for row in rows[:4] for component in row[:4]]
+            except (TypeError, ValueError, OverflowError):
+                return None
+        elif len(rows) >= 3 and all(isinstance(row, (list, tuple)) for row in rows[:3]):
+            if not all(len(row) >= 3 for row in rows[:3]):
+                return None
+            try:
+                linear = [
+                    float(component)
+                    for row in rows[:3]
+                    for component in row[:3]
+                ]
+            except (TypeError, ValueError, OverflowError):
+                return None
+            matrix = [
+                linear[0], linear[1], linear[2], 0.0,
+                linear[3], linear[4], linear[5], 0.0,
+                linear[6], linear[7], linear[8], 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ]
+        else:
+            return None
+
+    if not all(math.isfinite(component) for component in matrix):
+        return None
+    homogeneous = matrix[15]
+    if abs(homogeneous) <= DYNAMIC_MOD_FBX_MAPPING_TOLERANCE:
+        return None
+    if abs(homogeneous - 1.0) > DYNAMIC_MOD_FBX_MAPPING_TOLERANCE:
+        matrix = [component / homogeneous for component in matrix]
+    if any(
+        abs(matrix[index]) > DYNAMIC_MOD_FBX_MAPPING_TOLERANCE
+        for index in (3, 7, 11)
+    ):
+        return None
+    matrix[3] = 0.0
+    matrix[7] = 0.0
+    matrix[11] = 0.0
+    matrix[15] = 1.0
+    return matrix
+
+
+def _dynamic_mapping_identity() -> list[float]:
+    return _flatten_identity_matrix()
+
+
+def _dynamic_mapping_is_identity(matrix: Any, *, epsilon: float = 0.0000001) -> bool:
+    values = _dynamic_matrix_from_value(matrix)
+    if values is None:
+        return False
+    identity = _flatten_identity_matrix()
+    return all(abs(values[index] - identity[index]) <= epsilon for index in range(16))
+
+
+def _dynamic_mapping_require_axis_basis(
+    matrix: list[float],
+    *,
+    label: str,
+) -> None:
+    """Validate that a mapping is a coordinate-basis change, not a scale.
+
+    Mesh scale is already an explicit Probe authority and is multiplied by the
+    MOD vertex writer.  Letting a unit conversion hide inside this matrix would
+    multiply that scale a second time.  The dynamic receipt therefore accepts
+    only an orthonormal (possibly reflected) XYZ basis plus translation.
+    """
+    linear = [
+        [float(matrix[(row * 4) + col]) for col in range(3)]
+        for row in range(3)
+    ]
+    row_lengths = [math.sqrt(sum(value * value for value in row)) for row in linear]
+    column_lengths = [
+        math.sqrt(sum(linear[row][col] * linear[row][col] for row in range(3)))
+        for col in range(3)
+    ]
+    if any(length <= DYNAMIC_MOD_FBX_MAPPING_TOLERANCE for length in row_lengths + column_lengths):
+        raise ValueError(f"Dynamic MOD-FBX {label} matrix has a singular axis basis")
+    row_dot_error = max(
+        abs(sum(linear[left][axis] * linear[right][axis] for axis in range(3)))
+        for left in range(3)
+        for right in range(left + 1, 3)
+    )
+    column_dot_error = max(
+        abs(sum(linear[axis][left] * linear[axis][right] for axis in range(3)))
+        for left in range(3)
+        for right in range(left + 1, 3)
+    )
+    metric_error = max(
+        max(abs(length - 1.0) for length in row_lengths),
+        max(abs(length - 1.0) for length in column_lengths),
+    )
+    if (
+        metric_error > 0.0001
+        or row_dot_error > 0.0001
+        or column_dot_error > 0.0001
+    ):
+        raise ValueError(
+            f"Dynamic MOD-FBX {label} matrix contains metric scale/shear; "
+            "Probe mesh_scale must remain the sole scale authority"
+        )
+
+
+def _dynamic_mapping_containers(
+    job: Any,
+    contract: Any,
+    fbx_handoff: Any,
+) -> list[dict[str, Any]]:
+    """Return the small, explicit receipt locations accepted by the Bridge."""
+    roots = [fbx_handoff, contract, job]
+    containers: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    pending: list[dict[str, Any]] = [
+        value for value in roots if isinstance(value, dict)
+    ]
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        containers.append(current)
+        for key in (
+            "dynamic_mod_fbx_mapping_receipt",
+            "generic_fbx_normalization",
+            "normalization",
+            "transform_stage",
+            "mapping",
+            "dynamic_mapping",
+        ):
+            nested = current.get(key)
+            if isinstance(nested, dict) and id(nested) not in seen:
+                pending.append(nested)
+    return containers
+
+
+def _dynamic_mapping_find_matrix(
+    containers: list[dict[str, Any]],
+    keys: tuple[str, ...],
+) -> tuple[list[float] | None, str]:
+    for container in containers:
+        for key in keys:
+            if key not in container:
+                continue
+            matrix = _dynamic_matrix_from_value(container.get(key))
+            if matrix is not None:
+                return matrix, key
+    return None, ""
+
+
+def _build_dynamic_mod_fbx_mapping(
+    job: Any,
+    contract: Any,
+    fbx_handoff: Any,
+) -> dict[str, Any]:
+    """Build the single canonical-FBX -> MOD affine mapping for this request."""
+    containers = _dynamic_mapping_containers(job, contract, fbx_handoff)
+    forward, forward_key = _dynamic_mapping_find_matrix(
+        containers,
+        (
+            "mod_to_canonical_matrix",
+            # ``canonical_from_mod_matrix`` is the only accepted alias.  Do
+            # not consume generic ``axis_conversion_matrix``/DCC source-axis
+            # hints: those describe the FBX import normalization and applying
+            # one here would reintroduce the retired 90-degree fallback.
+            "canonical_from_mod_matrix",
+        ),
+    )
+    inverse, inverse_key = _dynamic_mapping_find_matrix(
+        containers,
+        (
+            "canonical_to_mod_matrix",
+            "mod_from_canonical_matrix",
+        ),
+    )
+
+    if forward is None and inverse is None:
+        raise ValueError(
+            "Current FBX Probe handoff is missing the required dynamic "
+            "MOD-FBX mapping receipt"
+        )
+    if inverse is None and forward is not None:
+        inverse = _invert_matrix4x4(forward)
+    if forward is None and inverse is not None:
+        forward = _invert_matrix4x4(inverse)
+    if forward is None or inverse is None:
+        raise ValueError(
+            "Dynamic MOD-FBX mapping receipt contains a singular affine matrix"
+        )
+    _dynamic_mapping_require_axis_basis(
+        forward,
+        label="MOD-to-canonical",
+    )
+    _dynamic_mapping_require_axis_basis(
+        inverse,
+        label="canonical-to-MOD",
+    )
+    if forward_key and inverse_key:
+        forward_inverse = _multiply_matrix4x4(forward, inverse)
+        inverse_forward = _multiply_matrix4x4(inverse, forward)
+        if not (
+            _dynamic_mapping_is_identity(forward_inverse, epsilon=0.0001)
+            and _dynamic_mapping_is_identity(inverse_forward, epsilon=0.0001)
+        ):
+            raise ValueError(
+                "Dynamic MOD-FBX mapping receipt contains non-inverse "
+                "MOD/canonical matrices"
+            )
+    # Matrices use the Bridge's row-vector convention.  ``forward`` maps
+    # MOD -> canonical; ``inverse`` maps canonical -> MOD.
+    mod_to_canonical = list(forward)
+    canonical_to_mod = list(inverse)
+    status = "mapped"
+    source = "+".join(part for part in (forward_key, inverse_key) if part)
+
+    fingerprint_payload = {
+        "schema": DYNAMIC_MOD_FBX_MAPPING_SCHEMA,
+        "mod_to_canonical": [round(value, 12) for value in mod_to_canonical],
+        "canonical_to_mod": [round(value, 12) for value in canonical_to_mod],
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest().upper()
+    return {
+        "schema": DYNAMIC_MOD_FBX_MAPPING_SCHEMA,
+        "status": status,
+        "source": source,
+        "source_domain": FBX_NORMAL_AXIS_DOMAIN_CANONICAL,
+        "target_domain": "mod_file",
+        "vector_convention": "row_vector_row_major",
+        "matrix_semantics": "axis_basis_only",
+        "scale_owner": "probe_mesh_scale",
+        "units_baked": False,
+        "mod_to_canonical_matrix": mod_to_canonical,
+        "canonical_to_mod_matrix": canonical_to_mod,
+        "fingerprint": fingerprint,
+        "applied_once": False,
+    }
+
+
+def _dynamic_map_position_rows(
+    rows: Any,
+    mapping: dict[str, Any],
+) -> list[list[float]] | None:
+    if not isinstance(rows, list):
+        return None
+    mapped_rows: list[list[float]] = []
     for row in rows:
         if not isinstance(row, (list, tuple)) or len(row) < 3:
             return None
-        try:
-            values = [float(component) for component in row]
-        except (TypeError, ValueError, OverflowError):
+        # Scheme E: Probe's canonical position rows are already in the MOD
+        # writer axis domain for this route.  Keep Mesh XYZ unchanged; only
+        # the writer's source mesh scale performs quantization.  Bone matrices
+        # remain on the separate dynamic conjugation path.
+        mapped = [float(row[0]), float(row[1]), float(row[2])]
+        if not all(math.isfinite(value) for value in mapped):
             return None
-        if not all(math.isfinite(component) for component in values):
+        # Position rows normally contain exactly XYZ.  Preserve any metadata
+        # components instead of silently truncating a future Probe extension.
+        mapped_rows.append(mapped + [float(value) for value in row[3:]])
+    return mapped_rows
+
+
+def _is_max_fbx_mesh_math_route(
+    job: dict[str, Any],
+    contract: dict[str, Any],
+    fbx_handoff: Any,
+) -> bool:
+    """Resolve the MAX-only Mesh math lane without depending on one carrier."""
+    candidates: list[Any] = [
+        job.get("fbx_backend_kind"),
+        contract.get("fbx_backend_kind"),
+        job.get("scene_authority"),
+        contract.get("scene_authority"),
+    ]
+    if isinstance(fbx_handoff, dict):
+        candidates.extend(
+            (
+                fbx_handoff.get("fbx_backend_kind"),
+                fbx_handoff.get("scene_authority"),
+                fbx_handoff.get("authority"),
+            )
+        )
+        backend_receipt = _fbx_probe_backend_receipt(fbx_handoff)
+        if isinstance(backend_receipt, dict):
+            candidates.extend(
+                (
+                    backend_receipt.get("kind"),
+                    backend_receipt.get("backend"),
+                    backend_receipt.get("backend_kind"),
+                )
+            )
+    normalized = {str(value or "").strip().lower() for value in candidates}
+    return bool(
+        "max_fbx" in normalized
+        or any("max_selected_fbx" in value for value in normalized)
+    )
+
+
+def _max_mesh_residual_axis_basis(mesh: dict[str, Any]) -> list[float] | None:
+    """Return one scale-free row-vector basis from the MAX Mesh node matrix."""
+    matrix = _dynamic_matrix_from_value(mesh.get("fbx_node_to_world_matrix"))
+    if matrix is None:
+        return None
+    rows: list[list[float]] = []
+    for row_index in range(3):
+        base = row_index * 4
+        row = [float(matrix[base + axis]) for axis in range(3)]
+        length = math.sqrt(sum(value * value for value in row))
+        if not math.isfinite(length) or length <= 0.000001:
             return None
-        scaled.append([component * factor for component in values])
-    return scaled
+        rows.append([value / length for value in row])
+
+    # Gram-Schmidt removes node scale/shear while retaining its authored axis.
+    x_axis = rows[0]
+    y_projection = sum(rows[1][axis] * x_axis[axis] for axis in range(3))
+    y_raw = [rows[1][axis] - y_projection * x_axis[axis] for axis in range(3)]
+    y_length = math.sqrt(sum(value * value for value in y_raw))
+    if not math.isfinite(y_length) or y_length <= 0.000001:
+        return None
+    y_axis = [value / y_length for value in y_raw]
+    z_axis = [
+        (x_axis[1] * y_axis[2]) - (x_axis[2] * y_axis[1]),
+        (x_axis[2] * y_axis[0]) - (x_axis[0] * y_axis[2]),
+        (x_axis[0] * y_axis[1]) - (x_axis[1] * y_axis[0]),
+    ]
+    if sum(z_axis[axis] * rows[2][axis] for axis in range(3)) < 0.0:
+        z_axis = [-value for value in z_axis]
+    basis = [
+        x_axis[0], x_axis[1], x_axis[2], 0.0,
+        y_axis[0], y_axis[1], y_axis[2], 0.0,
+        z_axis[0], z_axis[1], z_axis[2], 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+    if _dynamic_mapping_is_identity(basis, epsilon=0.0001):
+        return None
+    return basis
+
+
+def _apply_max_mesh_residual_axis_rows(
+    rows: Any,
+    mesh: dict[str, Any],
+) -> list[list[float]] | None:
+    """Bake one MAX node's residual axis around its geometry centre."""
+    if not isinstance(rows, list):
+        return None
+    basis = _max_mesh_residual_axis_basis(mesh)
+    if basis is None:
+        copied: list[list[float]] = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                return None
+            copied.append([float(value) for value in row])
+        return copied
+    xyz_rows: list[list[float]] = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
+            return None
+        xyz = [float(row[0]), float(row[1]), float(row[2])]
+        if not all(math.isfinite(value) for value in xyz):
+            return None
+        xyz_rows.append(xyz)
+    if not xyz_rows:
+        return []
+    centre = [
+        sum(row[axis] for row in xyz_rows) / len(xyz_rows)
+        for axis in range(3)
+    ]
+    corrected: list[list[float]] = []
+    for source, raw_row in zip(xyz_rows, rows):
+        relative = [source[axis] - centre[axis] for axis in range(3)]
+        rotated = _transform_position_row_major(relative, basis)
+        corrected.append(
+            [rotated[axis] + centre[axis] for axis in range(3)]
+            + [float(value) for value in raw_row[3:]]
+        )
+    return corrected
+
+
+def _dynamic_map_bone_matrix(
+    values: Any,
+    mapping: dict[str, Any],
+) -> list[float] | None:
+    probe_matrix = _dynamic_matrix_from_value(values)
+    mod_to_canonical = _dynamic_matrix_from_value(mapping.get("mod_to_canonical_matrix"))
+    canonical_to_mod = _dynamic_matrix_from_value(mapping.get("canonical_to_mod_matrix"))
+    if probe_matrix is None or mod_to_canonical is None or canonical_to_mod is None:
+        return None
+    # Preserve the empirically verified Bridge convention for bone rows.  The
+    # MOD importer expects the inverse conjugation used by the original bridge;
+    # do not replace it with the generic row-vector textbook ordering.
+    mapped = _multiply_matrix4x4(
+        _multiply_matrix4x4(canonical_to_mod, probe_matrix),
+        mod_to_canonical,
+    )
+    return _dynamic_matrix_from_value(mapped)
+
+
+def _dynamic_mapping_receipt_for_target(
+    mapping: dict[str, Any],
+    *,
+    status: str,
+    field: str,
+    mesh_slot: int = 0,
+) -> dict[str, Any]:
+    receipt = {
+        "schema": DYNAMIC_MOD_FBX_MAPPING_SCHEMA,
+        "status": status,
+        "field": field,
+        "mesh_slot": mesh_slot,
+        "mapping_fingerprint": str(mapping.get("fingerprint", "") or ""),
+        "source_domain": mapping.get("source_domain", FBX_NORMAL_AXIS_DOMAIN_CANONICAL),
+        "target_domain": mapping.get("target_domain", "mod_file"),
+        "applied_once": status == "applied",
+    }
+    return receipt
+
+
+def _sync_dynamic_mod_fbx_mapping_receipts(
+    writer_handoff: Any,
+    job: Any,
+    contract: Any,
+    fbx_handoff: Any,
+) -> None:
+    """Copy the request's final mapping receipt onto the actual Writer handoff.
+
+    ``writer_handoff`` is intentionally a shallow snapshot in the live export
+    path.  Preparation therefore updates the source handoff/contract after the
+    snapshot was made.  Keep the Writer's top-level receipt in sync without
+    changing geometry, route selection, or source-passthrough policy.
+    """
+    if not isinstance(writer_handoff, dict):
+        return
+    containers = (fbx_handoff, contract, job)
+    for key in (
+        "dynamic_mod_fbx_mapping_receipt",
+        "fbx_final_position_transform_receipt",
+    ):
+        for container in containers:
+            if not isinstance(container, dict):
+                continue
+            value = container.get(key)
+            if isinstance(value, dict):
+                writer_handoff[key] = copy.deepcopy(value)
+                break
+    # Preserve the explicit canonical-domain declarations if they were added
+    # during preparation; never synthesize a legacy axis conversion here.  The
+    # final Writer gate receives a shallow handoff snapshot, so carrying these
+    # fields forward is also what lets its scale-owner decision remain
+    # auditable on a second invocation.
+    for key in (
+        "fbx_axis_output_policy",
+        "fbx_axis_transform_scope",
+        "canonical_axis_domain",
+        "canonical_unit_domain",
+        "transform_stage",
+        "bone_matrix_axis_domain",
+        "generic_fbx_normalization",
+    ):
+        for container in containers:
+            if not isinstance(container, dict):
+                continue
+            value = container.get(key)
+            if value not in (None, ""):
+                writer_handoff[key] = copy.deepcopy(value)
+                break
+
+
+# ============================================================================
+# End dynamic MOD <-> Generic-FBX mapping
+# ============================================================================
 
 
 # The Probe has already resolved the FBX node matrix and removed its helper
@@ -15119,8 +15795,15 @@ def _scale_fbx_position_rows(rows: Any, factor: float) -> list[list[float]] | No
 # Keep the receipts on each Mesh so a preparation retry or the final Writer
 # gate cannot apply a conversion twice.
 FBX_FINAL_POSITION_TRANSFORM_SCHEMA = "pc-rehd-fbx-final-position-transform-v1"
-FBX_FINAL_POSITION_TRANSFORM_TOLERANCE = 0.000000000001
 FBX_SKINNED_POSITION_CALIBRATION_SCHEMA = "pc-rehd-fbx-skinned-position-calibration-v1"
+# Generic Probe publishes positions in this unit/basis domain.  Keep these
+# labels local to the Bridge boundary instead of deriving them from a DCC name
+# or from the source MOD.  The position scale is always an identity at this
+# boundary; MOD MeshScale is the sole quantization scale.
+FBX_CANONICAL_UNIT_DOMAIN = "max_inches_numeric"
+FBX_CANONICAL_TRANSFORM_STAGE = "generic_memory_to_canonical_domain"
+FBX_CANONICAL_AXIS_DOMAIN = FBX_NORMAL_AXIS_DOMAIN_CANONICAL
+FBX_CANONICAL_POSITION_SCALE_OWNER = "mod_writer_mesh_scale"
 # Retained only for controlled comparison. The production ordinary MAX route
 # no longer calls this Skin-basis calibration; max_positions stays authoritative.
 FBX_SKINNED_POSITION_CALIBRATION_SAMPLE_LIMIT = 8192
@@ -15350,26 +16033,123 @@ def _apply_fbx_skinned_position_calibration(
     return calibration
 
 
-def _fbx_final_position_unit_factor(
-    job: dict[str, Any],
-    contract: dict[str, Any],
-    fbx_handoff: Any,
-) -> tuple[float, str]:
-    backend = str(
-        job.get("fbx_backend_kind", contract.get("fbx_backend_kind", ""))
-        if isinstance(job, dict)
-        else ""
-    ).strip().lower()
-    if backend == "max_fbx":
-        # Probe's max_positions/skinned_max_positions already include the FBX
-        # node transform and axis basis in the numeric Max/MOD space.  The
-        # FBX unit declaration is metadata for the interchange file; applying
-        # scale_to_centimeters here would convert the same length a second time
-        # and overflow the MOD int16 position lane on inch-authored FBX files.
-        return 1.0, "max_fbx_probe_max_basis"
-    if backend == "blender_fbx":
-        return 1.0, "blender_probe_max_basis"
-    return 1.0, "identity_unknown_backend"
+def _source_mod_root_scale(job: dict[str, Any], contract: dict[str, Any]) -> float:
+    for container in (contract, job):
+        if not isinstance(container, dict):
+            continue
+        for key in ("source_mod_root_scale", "root_mesh_scale", "root_scale"):
+            raw = container.get(key)
+            values = raw if isinstance(raw, (list, tuple)) else [raw]
+            finite: list[float] = []
+            for value in values:
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(numeric) and numeric > 0.0:
+                    finite.append(numeric)
+            if finite:
+                return sum(finite) / len(finite)
+    return 1.0
+
+
+def _fbx_canonical_handoff_status(fbx_handoff: Any) -> tuple[bool, dict[str, Any]]:
+    """Validate the complete Generic/Probe canonical position handoff.
+
+    The final position layer is called from several preparation and Writer
+    entrypoints.  Looking at only ``fbx_transform_scale_receipt`` is unsafe:
+    an old receipt may report a producer root/unit scale even though the
+    current Probe has already emitted Max-inch numeric rows.  Conversely,
+    treating any one canonical-looking field as sufficient would make a
+    partially populated legacy handoff silently skip its required conversion.
+
+    Keep the gate deliberately strict and receipt-based.  All four facts below
+    must be present in the current handoff (or its documented ``summary`` /
+    ``generic_fbx_normalization`` containers):
+
+    * ``canonical_unit_domain=max_inches_numeric``;
+    * ``transform_stage=generic_memory_to_canonical_domain``;
+    * Generic normalization status is ``normalized``; and
+    * the writer policy is ``max_xyz``.
+
+    The returned detail object is written to receipts so an audit can tell why
+    the identity factor was (or was not) selected.  No geometry is mutated.
+    """
+    if not isinstance(fbx_handoff, dict):
+        return False, {
+            "status": "not_canonical",
+            "reason": "handoff_not_dict",
+            "checks": {},
+        }
+
+    containers: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    def add_container(value: Any) -> None:
+        if not isinstance(value, dict) or id(value) in seen:
+            return
+        seen.add(id(value))
+        containers.append(value)
+
+    # The Probe contract is top-level in current handoffs.  ``summary`` and
+    # the normalization receipt are accepted because older in-flight callers
+    # copied those fields there before the Bridge snapshot was made.
+    add_container(fbx_handoff)
+    summary = fbx_handoff.get("summary")
+    add_container(summary)
+    generic_values: list[Any] = [fbx_handoff.get("generic_fbx_normalization")]
+    if isinstance(summary, dict):
+        generic_values.append(summary.get("generic_fbx_normalization"))
+    for generic in generic_values:
+        add_container(generic)
+        if isinstance(generic, dict):
+            add_container(generic.get("normalization"))
+
+    def text_value(key: str) -> str:
+        for container in containers:
+            raw = container.get(key)
+            if raw not in (None, ""):
+                return str(raw).strip().lower()
+        return ""
+
+    canonical_unit_domain = text_value("canonical_unit_domain")
+    transform_stage = text_value("transform_stage")
+    axis_output_policy = text_value("fbx_axis_output_policy")
+
+    normalization_statuses: list[str] = []
+    for generic in generic_values:
+        if not isinstance(generic, dict):
+            continue
+        raw_status = generic.get("status")
+        if raw_status not in (None, ""):
+            normalization_statuses.append(str(raw_status).strip().lower())
+    normalization_status = normalization_statuses[0] if normalization_statuses else ""
+    # If two snapshots were accidentally merged, do not let a later
+    # ``normalized`` marker hide an earlier failure/legacy status.  A current
+    # canonical handoff must have one unambiguous normalization state.
+    normalization_status_consistent = bool(normalization_statuses) and all(
+        status == "normalized" for status in normalization_statuses
+    )
+
+    checks = {
+        "canonical_unit_domain": canonical_unit_domain == FBX_CANONICAL_UNIT_DOMAIN,
+        "transform_stage": transform_stage == FBX_CANONICAL_TRANSFORM_STAGE,
+        "generic_fbx_normalization_status": normalization_status_consistent,
+        "fbx_axis_output_policy": axis_output_policy == FBX_AXIS_OUTPUT_POLICY_MAX_XYZ,
+    }
+    canonical = all(checks.values())
+    missing = [name for name, passed in checks.items() if not passed]
+    details = {
+        "status": "canonical" if canonical else "not_canonical",
+        "checks": checks,
+        "canonical_unit_domain": canonical_unit_domain,
+        "transform_stage": transform_stage,
+        "generic_fbx_normalization_status": normalization_status,
+        "generic_fbx_normalization_statuses": normalization_statuses,
+        "fbx_axis_output_policy": axis_output_policy,
+        "missing_or_mismatched": missing,
+    }
+    return canonical, details
 
 
 def _apply_fbx_final_position_transform_layer(
@@ -15385,51 +16165,75 @@ def _apply_fbx_final_position_transform_layer(
     frozen authority). Node placement and axes are already resolved by Probe.
     """
     meshes = _ensure_contract_meshes(job, contract)
-    factor, factor_source = _fbx_final_position_unit_factor(job, contract, fbx_handoff)
-    if not math.isfinite(factor) or factor <= 0.0:
-        factor = 1.0
-        factor_source = "identity_invalid_unit_factor"
+    dynamic_mapping = _build_dynamic_mod_fbx_mapping(job, contract, fbx_handoff)
+    canonical_handoff, canonical_details = _fbx_canonical_handoff_status(fbx_handoff)
+    dynamic_receipt = copy.deepcopy(dynamic_mapping)
+    dynamic_receipt.update(
+        {
+            "route": (
+                "bones_plus_mesh"
+                if _job_uses_bones_plus_mesh_pose_route(job, contract)
+                else "ordinary"
+            ),
+            "position_authority_policy": {
+                "ordinary": ORDINARY_FBX_POSITION_AUTHORITY,
+                "bones_plus_mesh": MAX_FBX_POSITION_AUTHORITY,
+            },
+            "position_mapping": "canonical_to_mod_affine",
+            "bone_mapping": "mod_to_canonical_conjugation",
+            # Position length is encoded only at the MOD writer edge.  The
+            # dynamic matrix remains a dimensionless axis basis, and a
+            # canonical Probe handoff therefore has no additional position
+            # scale to consume here.
+            "scale_owner": FBX_CANONICAL_POSITION_SCALE_OWNER,
+            "canonical_position_scale_applied": False,
+            "canonical_handoff": copy.deepcopy(canonical_details),
+        }
+    )
+    job["dynamic_mod_fbx_mapping_receipt"] = copy.deepcopy(dynamic_receipt)
+    contract["dynamic_mod_fbx_mapping_receipt"] = copy.deepcopy(dynamic_receipt)
+    if isinstance(fbx_handoff, dict):
+        fbx_handoff["dynamic_mod_fbx_mapping_receipt"] = copy.deepcopy(dynamic_receipt)
+    # Generic Probe rows already use the MOD numeric unit domain.  The old
+    # Blender centimeter-to-inch factor is retired and is never applied.
+    factor = 1.0
+    factor_source = "canonical_generic_unit_domain"
     bones_plus_mesh = _job_uses_bones_plus_mesh_pose_route(job, contract)
+    # Unified Blender-style local-bind Mesh writer for all FBX backends.
+    max_mesh_math_route = False
+    canonical_position_scale_applied = False
+    # Complete the mapping receipt only after the factor decision is known.
+    # The initial builder metadata is intentionally provisional because this
+    # gate can still select the legacy compatibility factor for an incomplete
+    # handoff.
+    dynamic_receipt["scale_owner"] = FBX_CANONICAL_POSITION_SCALE_OWNER
+    dynamic_receipt["canonical_position_scale_applied"] = canonical_position_scale_applied
+    dynamic_receipt["unit_factor_source"] = factor_source
     target_rows_applied: list[int] = []
     skinned_calibrations: dict[int, dict[str, Any]] = {}
     skipped_rows: list[dict[str, Any]] = []
-    seen_ids: set[int] = set()
-    targets: list[dict[str, Any]] = []
-    for candidate in list(meshes) + list(
-        job.get("meshes", []) if isinstance(job.get("meshes"), list) else []
-    ):
-        if not isinstance(candidate, dict) or id(candidate) in seen_ids:
-            continue
-        seen_ids.add(id(candidate))
-        targets.append(candidate)
+    # Only contract meshes own FBX geometry.  ``job["meshes"]`` is the
+    # Launcher metadata mirror and intentionally contains no position rows;
+    # feeding that mirror into the geometry transform layer makes the later
+    # authority check fail after the real contract row was already processed.
+    targets: list[dict[str, Any]] = [
+        mesh for mesh in meshes if isinstance(mesh, dict)
+    ]
 
-    def previous_factor(mesh: dict[str, Any]) -> float | None:
-        receipt = mesh.get("fbx_final_position_transform")
-        if isinstance(receipt, dict):
-            raw = receipt.get("unit_factor")
-            try:
-                value = float(raw)
-            except (TypeError, ValueError, OverflowError):
-                value = None
-            if value is not None and math.isfinite(value) and value > 0.0:
-                return value
-        # Older preparation builds recorded this marker only for ordinary
-        # MAX rows.  Treat an equal marker as already converted so the new
-        # gate remains compatible with an in-flight legacy preparation.
-        raw_legacy = mesh.get("fbx_position_unit_scale_applied")
-        try:
-            value = float(raw_legacy)
-        except (TypeError, ValueError, OverflowError):
-            value = None
-        return value if value is not None and math.isfinite(value) and value > 0.0 else None
-
-    def scale_optional_rows(mesh: dict[str, Any], key: str) -> None:
+    def map_optional_rows(mesh: dict[str, Any], key: str) -> None:
         rows = mesh.get(key)
         if not isinstance(rows, list) or not rows:
             return
-        scaled = _scale_fbx_position_rows(rows, factor)
-        if scaled is not None:
-            mesh[key] = scaled
+        dynamic_done = (
+            isinstance(mesh.get("dynamic_mod_fbx_mapping"), dict)
+            and str(mesh["dynamic_mod_fbx_mapping"].get("mapping_fingerprint", "") or "")
+            == str(dynamic_mapping.get("fingerprint", "") or "")
+        )
+        if dynamic_done:
+            return
+        mapped = _dynamic_map_position_rows(rows, dynamic_mapping)
+        if mapped is not None:
+            mesh[key] = mapped
 
     for mesh in targets:
         if str(mesh.get("lane", "") or "").strip().lower() != "modify":
@@ -15439,97 +16243,116 @@ def _apply_fbx_final_position_transform_layer(
             skipped_rows.append({"mesh_slot": mesh_slot, "reason": "source_geometry"})
             continue
 
-        authority = _get_bones_plus_mesh_final_geometry_authority(mesh)
-        uses_skin_authority = bones_plus_mesh and (
-            _mesh_uses_max_fbx_skinned_position_authority(mesh)
-            or (
-                isinstance(mesh.get("skinned_max_positions"), list)
-                and bool(mesh.get("skinned_max_positions"))
-                and _mesh_has_skin(mesh)
+        try:
+            position_field, position_rows = _require_geometry_position_rows(
+                mesh,
+                context=f"Mesh slot {mesh_slot}",
             )
+        except ValueError:
+            # Standalone Writer callers and source-backed/new-Mesh fixtures may
+            # provide only raw ``positions``; there is no FBX authority to map
+            # in that case.  A live FBX/BONE+MESH route remains strict so a
+            # missing Probe authority cannot be mistaken for source geometry.
+            handoff_status = (
+                str(fbx_handoff.get("status", "") or "").strip().lower()
+                if isinstance(fbx_handoff, dict)
+                else ""
+            )
+            if bones_plus_mesh or handoff_status == "ok":
+                raise
+            skipped_rows.append({"mesh_slot": mesh_slot, "reason": "no_fbx_position_authority"})
+            continue
+        uses_skin_authority = position_field == MAX_FBX_POSITION_AUTHORITY
+        # Keep the authority explicit for every later writer stage.  In
+        # particular, never let a stale ``positions``/``world_positions`` lane
+        # become an implicit replacement.
+        mesh[GEOMETRY_POSITION_AUTHORITY_KEY] = position_field
+        if uses_skin_authority:
+            mesh["fbx_position_authority"] = MAX_FBX_POSITION_AUTHORITY
+
+        # Position rows are already in the canonical numeric unit domain.
+        # Do not apply Probe geometry_factor or any legacy Blender unit scale.
+        rows_for_mapping = position_rows
+
+        dynamic_done = (
+            isinstance(mesh.get("dynamic_mod_fbx_mapping"), dict)
+            and str(mesh["dynamic_mod_fbx_mapping"].get("mapping_fingerprint", "") or "")
+            == str(dynamic_mapping.get("fingerprint", "") or "")
         )
-        if authority is not None:
-            position_rows = authority.get("mod_write_positions")
-            position_field = "final_geometry_authority.mod_write_positions"
-        elif uses_skin_authority:
-            position_rows = mesh.get("skinned_max_positions")
-            position_field = "skinned_max_positions"
+        if not dynamic_done:
+            mapped_rows = _dynamic_map_position_rows(rows_for_mapping, dynamic_mapping)
+            if mapped_rows is None or len(mapped_rows) != len(rows_for_mapping):
+                skipped_rows.append({"mesh_slot": mesh_slot, "reason": "invalid_dynamic_mapping_rows"})
+                continue
+            mesh[position_field] = mapped_rows
+            dynamic_status = "applied"
         else:
-            position_field = "max_positions"
-            position_rows = mesh.get(position_field)
-            if not isinstance(position_rows, list) or not position_rows:
-                position_field = "positions"
-                position_rows = mesh.get(position_field)
+            # The authority rows already carry this request's mapping.  Keep
+            # the current list object untouched so a second writer gate is a
+            # true no-op.
+            dynamic_status = "already_applied"
 
-        if not isinstance(position_rows, list) or not position_rows:
-            skipped_rows.append({"mesh_slot": mesh_slot, "reason": "no_position_authority"})
-            continue
+        if uses_skin_authority:
+            map_optional_rows(mesh, "binary_skin_unreferenced_max_positions")
 
-        prior_factor = previous_factor(mesh)
-        already_applied = (
-            prior_factor is not None
-            and abs(prior_factor - factor) <= FBX_FINAL_POSITION_TRANSFORM_TOLERANCE
-        )
-        if already_applied:
-            target_rows_applied.append(mesh_slot)
-            continue
-        if prior_factor is not None:
-            # A different factor means this object has crossed an older
-            # preparation boundary.  Do not compound an unknown conversion.
-            skipped_rows.append(
-                {
-                    "mesh_slot": mesh_slot,
-                    "reason": "prior_position_factor_mismatch",
-                    "prior_factor": prior_factor,
-                    "requested_factor": factor,
-                }
-            )
-            continue
-
-        scaled_rows = _scale_fbx_position_rows(position_rows, factor)
-        if scaled_rows is None or len(scaled_rows) != len(position_rows):
-            skipped_rows.append({"mesh_slot": mesh_slot, "reason": "invalid_position_rows"})
-            continue
-        if authority is not None:
-            authority["mod_write_positions"] = scaled_rows
-            authority["mod_write_world_positions"] = [list(row) for row in scaled_rows]
-            scale_optional_rows(
-                authority,
-                "binary_skin_unreferenced_max_positions",
-            )
-        else:
-            mesh[position_field] = scaled_rows
-            # World-remap writers use the same Probe Max basis. Keep their
-            # explicit alias aligned without touching raw FBX-local rows.
-            world_rows = mesh.get("world_positions")
-            if isinstance(world_rows, list) and len(world_rows) == len(scaled_rows):
-                scaled_world_rows = _scale_fbx_position_rows(world_rows, factor)
-                if scaled_world_rows is not None:
-                    mesh["world_positions"] = scaled_world_rows
-            if uses_skin_authority:
-                scale_optional_rows(
-                    mesh,
-                    "binary_skin_unreferenced_max_positions",
+        final_authority = mesh.get("final_geometry_authority")
+        if isinstance(final_authority, dict):
+            authority_rows = final_authority.get("mod_write_positions")
+            if isinstance(authority_rows, list) and authority_rows:
+                authority_fingerprint = str(
+                    final_authority.get("dynamic_mod_fbx_mapping_fingerprint", "") or ""
                 )
+                if authority_fingerprint != str(dynamic_mapping.get("fingerprint", "") or ""):
+                    if authority_rows == mesh.get(position_field):
+                        final_authority["dynamic_mod_fbx_mapping_fingerprint"] = str(
+                            dynamic_mapping.get("fingerprint", "") or ""
+                        )
+                    else:
+                        authority_rows_for_mapping = authority_rows
+                        mapped_authority = _dynamic_map_position_rows(
+                            authority_rows_for_mapping,
+                            dynamic_mapping,
+                        )
+                        if mapped_authority is not None:
+                            final_authority["mod_write_positions"] = mapped_authority
+                            final_authority["dynamic_mod_fbx_mapping_fingerprint"] = str(
+                                dynamic_mapping.get("fingerprint", "") or ""
+                            )
+            
+        mesh["dynamic_mod_fbx_mapping"] = _dynamic_mapping_receipt_for_target(
+            dynamic_mapping,
+            status=dynamic_status,
+            field=position_field,
+            mesh_slot=mesh_slot,
+        )
         mesh["fbx_final_position_transform"] = {
             "schema": FBX_FINAL_POSITION_TRANSFORM_SCHEMA,
             "status": "applied",
             "route": "bones_plus_mesh" if bones_plus_mesh else "ordinary",
             "position_authority": (
-                "final_geometry_authority"
-                if authority is not None
-                else position_field
+                position_field
             ),
             "unit_factor": factor,
             "unit_factor_source": factor_source,
-            "axis_handling": "probe_max_basis_preserved",
+            "axis_handling": "dynamic_mod_fbx_mapping",
+            "max_mesh_residual_axis": "disabled_unified_local_bind",
+            "dynamic_mapping_fingerprint": str(dynamic_mapping.get("fingerprint", "") or ""),
+            "scale_owner": FBX_CANONICAL_POSITION_SCALE_OWNER,
+            "canonical_position_scale_applied": canonical_position_scale_applied,
+            "canonical_handoff": copy.deepcopy(canonical_details),
+            "axis_applied_once": True,
             "applied_once": True,
         }
-        # Keep the legacy marker in sync for ordinary callers that still
-        # inspect it, while the schema receipt above is the new authority.
-        mesh["fbx_position_unit_scale_applied"] = factor
         target_rows_applied.append(mesh_slot)
 
+    # Publish the completed application state, rather than the builder's
+    # initial ``applied_once=False`` value.  This is copied to the final
+    # Writer handoff and to the export log below.
+    dynamic_receipt["applied_once"] = bool(target_rows_applied)
+    dynamic_receipt["axis_applied_once"] = bool(target_rows_applied)
+    dynamic_receipt["applied_mesh_slots"] = sorted(
+        {slot for slot in target_rows_applied if slot > 0}
+    )
     receipt = {
         "schema": FBX_FINAL_POSITION_TRANSFORM_SCHEMA,
         "status": "applied" if target_rows_applied else "completed_no_geometry",
@@ -15537,7 +16360,12 @@ def _apply_fbx_final_position_transform_layer(
         "backend": str(job.get("fbx_backend_kind", "") or "").strip().lower(),
         "unit_factor": factor,
         "unit_factor_source": factor_source,
-        "axis_handling": "probe_max_basis_preserved",
+        "axis_handling": "dynamic_mod_fbx_mapping",
+        "scale_owner": FBX_CANONICAL_POSITION_SCALE_OWNER,
+        "canonical_position_scale_applied": canonical_position_scale_applied,
+        "canonical_handoff": copy.deepcopy(canonical_details),
+        "axis_applied_once": bool(target_rows_applied),
+        "dynamic_mod_fbx_mapping": copy.deepcopy(dynamic_receipt),
         "applied_mesh_slots": sorted({slot for slot in target_rows_applied if slot > 0}),
         "skinned_position_calibrations": skinned_calibrations,
         "skipped": skipped_rows,
@@ -15545,6 +16373,11 @@ def _apply_fbx_final_position_transform_layer(
     }
     job["fbx_final_position_transform_receipt"] = copy.deepcopy(receipt)
     contract["fbx_final_position_transform_receipt"] = copy.deepcopy(receipt)
+    job["dynamic_mod_fbx_mapping_receipt"] = copy.deepcopy(dynamic_receipt)
+    contract["dynamic_mod_fbx_mapping_receipt"] = copy.deepcopy(dynamic_receipt)
+    if isinstance(fbx_handoff, dict):
+        fbx_handoff["fbx_final_position_transform_receipt"] = copy.deepcopy(receipt)
+        fbx_handoff["dynamic_mod_fbx_mapping_receipt"] = copy.deepcopy(dynamic_receipt)
     return receipt
 
 
@@ -15552,32 +16385,18 @@ def _build_fbx_axis_log(
     launcher_axes: Any,
     probe_axes: Any,
     *,
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # The default is retained only for legacy diagnostic receipts.
-    axis_output_policy: str = FBX_AXIS_OUTPUT_POLICY_LEGACY,
+    axis_output_policy: str = FBX_AXIS_OUTPUT_POLICY_MAX_XYZ,
 ) -> dict[str, Any]:
     launcher = _normalize_fbx_axes_receipt(launcher_axes)
     probe = _normalize_fbx_axes_receipt(probe_axes)
-    if axis_output_policy == FBX_AXIS_OUTPUT_POLICY_MAX_XYZ:
-        writer = {
-            "status": "configured",
-            "signature": [0, 2, 4],
-            "right": "+X",
-            "up": "+Y",
-            "front": "+Z",
-            "source": "writer_generic_max_xyz",
-        }
-    else:
-        # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-        # Log-only description of the historical X,+Z,-Y writer lane.
-        writer = {
-            "status": "configured",
-            "signature": [0, 4, 3],
-            "right": "+X",
-            "up": "+Z",
-            "front": "-Y",
-            "source": "writer_legacy_x_z_neg_y",
-        }
+    writer = {
+        "status": "configured",
+        "signature": [0, 2, 4],
+        "right": "+X",
+        "up": "+Y",
+        "front": "+Z",
+        "source": "writer_generic_max_xyz",
+    }
     signatures = [launcher["signature"], probe["signature"], writer["signature"]]
     if any(len(signature) != 3 for signature in signatures):
         status = "UNKNOWN"
@@ -15718,6 +16537,8 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
     probe_route_receipt: Any = None
     probe_backend: Any = None
     generic_fbx_normalization: Any = None
+    dynamic_mod_fbx_mapping_receipt: Any = None
+    dynamic_mapping_fields: dict[str, Any] = {}
     try:
         if hasattr(probe, "probe_fbx_handoff"):
             handoff_payload = probe.probe_fbx_handoff(
@@ -15743,34 +16564,36 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
             probe_route_receipt = handoff_payload.get("probe_route_receipt")
             probe_backend = handoff_payload.get("probe_backend")
             generic_fbx_normalization = handoff_payload.get("generic_fbx_normalization")
-            # Preserve the Generic Probe bone-matrix domain across this
-            # handoff boundary.  Bone Only and Bone+Mesh both consume the
-            # returned handoff later; dropping this field silently sends both
-            # routes back through the legacy bone-axis interpretation.
+            transform_scale_receipt = handoff_payload.get(
+                "fbx_transform_scale_receipt"
+            )
+            if not isinstance(transform_scale_receipt, dict) and isinstance(summary, dict):
+                transform_scale_receipt = summary.get("fbx_transform_scale_receipt")
+            dynamic_mod_fbx_mapping_receipt = handoff_payload.get(
+                "dynamic_mod_fbx_mapping_receipt"
+            )
+            # Preserve only the unambiguous, request-scoped matrix names.  Do
+            # not forward the retired generic axis-conversion aliases.
+            for mapping_key in (
+                "mod_to_canonical_matrix",
+                "canonical_to_mod_matrix",
+                "canonical_from_mod_matrix",
+                "mod_from_canonical_matrix",
+            ):
+                if mapping_key in handoff_payload:
+                    dynamic_mapping_fields[mapping_key] = copy.deepcopy(
+                        handoff_payload[mapping_key]
+                    )
+            # Preserve only the canonical Generic bone-matrix domain.  The
+            # retired inverse/source-axis hint is intentionally not forwarded.
             bone_matrix_axis_domain = handoff_payload.get("bone_matrix_axis_domain")
-            bone_matrix_axis_inverse = handoff_payload.get("bone_matrix_axis_inverse")
             transform_stage = handoff_payload.get("transform_stage")
             if not isinstance(probe_backend, dict) and isinstance(summary, dict):
                 probe_backend = summary.get("probe_backend")
         else:
-            summary = probe.summarize_fbx(fbx_path)
-            compare = probe.compare_fbx_to_max_snapshot(summary, max_snapshot)
-            contract_meshes = None
-            fbx_axes = summary.get("fbx_axes") if isinstance(summary, dict) else None
-            fbx_units = summary.get("fbx_units") if isinstance(summary, dict) else None
-            normal_fidelity = None
-            probe_backend = summary.get("probe_backend") if isinstance(summary, dict) else None
-            generic_fbx_normalization = None
-            bone_matrix_axis_domain = None
-            bone_matrix_axis_inverse = None
-            transform_stage = None
-            if hasattr(probe, "extract_fbx_mesh_contracts"):
-                try:
-                    contract_meshes = probe.extract_fbx_mesh_contracts(fbx_path)
-                except Exception as exc:
-                    contract_extract_error = str(exc)
-            if hasattr(probe, "extract_fbx_route_model_observations"):
-                route_models = probe.extract_fbx_route_model_observations(fbx_path)
+            raise RuntimeError(
+                "Current FBX Probe lacks the mandatory Generic handoff API"
+            )
     except Exception as exc:
         if isinstance(exc, (ImportError, ModuleNotFoundError)) or _as_bool(
             getattr(exc, "runtime_retryable", False),
@@ -15861,12 +16684,18 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
                 {"generic_fbx_normalization": generic_fbx_normalization}
             )
             payload["fbx_axis_transform_scope"] = "scene_global_once"
+    if isinstance(transform_scale_receipt, dict):
+        payload["fbx_transform_scale_receipt"] = copy.deepcopy(
+            transform_scale_receipt
+        )
+    if isinstance(dynamic_mod_fbx_mapping_receipt, dict):
+        payload["dynamic_mod_fbx_mapping_receipt"] = copy.deepcopy(
+            dynamic_mod_fbx_mapping_receipt
+        )
+    if dynamic_mapping_fields:
+        payload.update(dynamic_mapping_fields)
     if bone_matrix_axis_domain not in {None, ""}:
         payload["bone_matrix_axis_domain"] = str(bone_matrix_axis_domain)
-    if isinstance(bone_matrix_axis_inverse, list) and len(bone_matrix_axis_inverse) >= 16:
-        payload["bone_matrix_axis_inverse"] = [
-            _float_or_default(value, 0.0) for value in bone_matrix_axis_inverse[:16]
-        ]
     if transform_stage not in {None, ""}:
         payload["transform_stage"] = str(transform_stage)
     if contract_extract_error != "":
@@ -15897,7 +16726,7 @@ def _propagate_fbx_probe_backend_receipt(
         or str(generic_normalization.get("fbx_axis_output_policy", "") or "")
         .strip()
         .lower()
-        in {FBX_AXIS_OUTPUT_POLICY_MAX_XYZ, FBX_AXIS_OUTPUT_POLICY_LEGACY}
+        == FBX_AXIS_OUTPUT_POLICY_MAX_XYZ
     )
     generic_normal_domains: dict[str, str] = {}
     if has_generic_receipt:
@@ -15909,20 +16738,10 @@ def _propagate_fbx_probe_backend_receipt(
             for raw_geometry_id, raw_domain in raw_domains.items():
                 geometry_id = _int_or_default(raw_geometry_id, 0)
                 domain = str(raw_domain or "").strip().lower()
-                if geometry_id > 0 and domain in {
-                    FBX_NORMAL_AXIS_DOMAIN_CANONICAL,
-                    FBX_NORMAL_AXIS_DOMAIN_LEGACY,
-                }:
-                    generic_normal_domains[str(geometry_id)] = domain
-    if not isinstance(receipt, dict) and not has_generic_receipt:
-        return policy
-    generic_scene_global_once = bool(
-        has_generic_receipt
-        and str(generic_normalization.get("axis_transform_contract", "") or "")
-        .strip()
-        .lower()
-        == "scene_global_once"
-    )
+                if geometry_id > 0:
+                    generic_normal_domains[str(geometry_id)] = (
+                        FBX_NORMAL_AXIS_DOMAIN_CANONICAL
+                    )
     targets: list[dict[str, Any]] = [job, contract]
     targets.extend(mesh for mesh in job.get("meshes", []) if isinstance(mesh, dict))
     targets.extend(
@@ -15936,8 +16755,7 @@ def _propagate_fbx_probe_backend_receipt(
         if isinstance(receipt, dict):
             target["probe_backend"] = copy.deepcopy(receipt)
         target["fbx_axis_output_policy"] = policy
-        if generic_scene_global_once:
-            target["fbx_axis_transform_scope"] = "scene_global_once"
+        target["fbx_axis_transform_scope"] = "scene_global_once"
         geometry_id = _int_or_default(target.get("fbx_geometry_id"), 0)
         if geometry_id > 0 and str(geometry_id) in generic_normal_domains:
             target["fbx_normal_axis_domain"] = generic_normal_domains[str(geometry_id)]
@@ -16256,10 +17074,7 @@ def _preserve_source_short_anchor_positions(
             continue
         if str(mesh.get("lane", "") or "").lower() != "modify":
             continue
-        if (
-            _job_uses_bones_plus_mesh_pose_route(job, contract)
-            or _mesh_requires_bones_plus_mesh_fbx_world_authority(mesh)
-        ):
+        if _job_uses_bones_plus_mesh_pose_route(job, contract):
             continue
         if not _has_semantic_mesh_payload(mesh):
             continue
@@ -16434,6 +17249,10 @@ def _preserve_semantically_unchanged_source_normal_bytes(
     for mesh in _ensure_contract_meshes(job, contract):
         if not isinstance(mesh, dict) or str(mesh.get("lane", "") or "").lower() != "modify":
             continue
+        if _mesh_uses_source_geometry(mesh):
+            # Header-only/source routes do not consume a semantic normal
+            # authority; their source bytes remain untouched by design.
+            continue
         normal_fidelity = mesh.get("normal_fidelity")
         if isinstance(normal_fidelity, dict) and str(normal_fidelity.get("status", "") or "") == "exact":
             mesh.pop("source_normal_field_hex_rows", None)
@@ -16484,10 +17303,7 @@ def _preserve_semantically_unchanged_source_normal_bytes(
             source_offset = (source_index * vertex_stride) + normal_offset
             source_normal_bytes = source_vertex_blob[source_offset : source_offset + 4]
             source_normal = _decode_source_packed_normal(source_normal_bytes)
-            export_normal = _normalize_vec3(
-                _get_semantic_game_normal(mesh, export_index),
-                (0.0, 0.0, 1.0),
-            )
+            export_normal = _get_semantic_game_normal(mesh, export_index)
             semantic_error = max(abs(source_normal[axis] - export_normal[axis]) for axis in range(3))
             if semantic_error <= SOURCE_NORMAL_SEMANTIC_TOLERANCE:
                 source_normal_rows.append(source_normal_bytes.hex())
@@ -17561,21 +18377,6 @@ def _apply_fbx_probe_route_receipt(
         fbx_faces = _int_or_default(route_row.get("fbx_face_count"), matched_faces)
         route_downgraded = False
         route_downgrade_reason = ""
-        if (
-            route == "fbx_geometry"
-            and not fbx_skin
-            and not _max_unskinned_mesh_geometry_authorized(job)
-        ):
-            # A no-Skin Mesh with faces is writable only when Max Launcher
-            # explicitly opted into the experimental route.  Stale/legacy
-            # Probe receipts must remain exportable through source bytes.
-            route = (
-                "unskinned_with_fbx_faces"
-                if fbx_faces > 0
-                else "unskinned_without_fbx_faces"
-            )
-            route_downgraded = True
-            route_downgrade_reason = "unskinned_geometry_requires_explicit_max_launcher_receipt"
         if isinstance(matched, dict):
             matched_route = str(matched.get("fbx_probe_route", "") or "").strip()
             if matched_route != declared_route and not (
@@ -18273,6 +19074,18 @@ def _merge_fbx_contract_meshes(
     uses_bones_plus_mesh_pose = _job_uses_bones_plus_mesh_pose_route(job, contract)
     merged_count = 0
 
+    def mark_source_fallback(mesh: dict[str, Any], reason: str) -> None:
+        _mark_mesh_source_passthrough(mesh, reason)
+        handle = _int_or_default(mesh.get("scene_node_handle"), 0)
+        if handle <= 0:
+            return
+        for job_mesh in job.get("meshes", []):
+            if (
+                isinstance(job_mesh, dict)
+                and _int_or_default(job_mesh.get("scene_node_handle"), 0) == handle
+            ):
+                _mark_mesh_source_passthrough(job_mesh, reason)
+
     for mesh in meshes:
         if not isinstance(mesh, dict):
             continue
@@ -18292,6 +19105,12 @@ def _merge_fbx_contract_meshes(
         # Do not let the generic FBX merge put geometry back into that route.
         if _mesh_uses_source_geometry(mesh):
             continue
+        if uses_bones_plus_mesh_pose and _get_bones_plus_mesh_final_geometry_authority(mesh) is not None:
+            # BONE+MESH freezes the Probe Skin rows after the final topology/UV
+            # pass.  A repeated preparation call may receive a different or
+            # stale carrier, but it must never overwrite that immutable
+            # authority with a second FBX snapshot.
+            continue
 
         matched = _match_fbx_contract_mesh(
             mesh,
@@ -18301,32 +19120,62 @@ def _merge_fbx_contract_meshes(
             require_explicit_route=require_explicit_route,
         )
         if matched is None:
+            if uses_bones_plus_mesh_pose:
+                raise ValueError(
+                    f"FBX Probe did not return a contract Mesh for writable slot {mesh_slot or '<unknown>'}"
+                )
+            reason = "fbx_probe_contract_mesh_missing"
+            mark_source_fallback(mesh, reason)
             continue
         if not isinstance(matched.get("positions"), list) or not isinstance(matched.get("face_indices"), list):
+            if uses_bones_plus_mesh_pose:
+                raise ValueError(
+                    f"FBX Probe contract Mesh for slot {mesh_slot or '<unknown>'} has no complete topology"
+                )
+            mark_source_fallback(mesh, "fbx_probe_contract_topology_missing")
             continue
         if len(matched["positions"]) <= 0 or len(matched["face_indices"]) <= 0:
+            if uses_bones_plus_mesh_pose:
+                raise ValueError(
+                    f"FBX Probe contract Mesh for slot {mesh_slot or '<unknown>'} has empty topology"
+                )
+            mark_source_fallback(mesh, "fbx_probe_contract_topology_empty")
             continue
-        matched_skin_count = matched.get("skin_deformer_count")
-        matched_has_skin = _int_or_default(matched_skin_count, 0) > 0
-        if matched_skin_count in {None, ""}:
-            # Older contract fixtures did not carry the explicit count; their
-            # non-empty evaluated Skin position channel is the established
-            # compatibility witness.  Current Probe contracts always include
-            # skin_deformer_count (including an explicit zero for no Skin).
-            matched_has_skin = bool(
-                isinstance(matched.get(MAX_FBX_POSITION_AUTHORITY), list)
-                and matched.get(MAX_FBX_POSITION_AUTHORITY)
+        required_position_field = (
+            MAX_FBX_POSITION_AUTHORITY
+            if uses_bones_plus_mesh_pose
+            else ORDINARY_FBX_POSITION_AUTHORITY
+        )
+        required_position_rows = matched.get(required_position_field)
+        if (
+            not isinstance(required_position_rows, list)
+            or not required_position_rows
+            or len(required_position_rows) != len(matched["positions"])
+        ):
+            route_handle = _int_or_default(matched.get("fbx_route_handle"), 0)
+            if uses_bones_plus_mesh_pose:
+                raise ValueError(
+                    f"FBX Probe route handle {route_handle} is missing aligned {required_position_field}"
+                )
+            mark_source_fallback(
+                mesh,
+                f"fbx_probe_missing_{required_position_field}",
             )
-        if require_explicit_route and uses_bones_plus_mesh_pose and matched_has_skin:
-            skinned_max_positions = matched.get(MAX_FBX_POSITION_AUTHORITY)
+            continue
+        if uses_bones_plus_mesh_pose:
+            # Route receipt has already removed Header-only/source Meshes.  Every
+            # remaining writable BONE+MESH row uses the Probe Skin pose, for both
+            # MAX and Blender; no skin-count/status flag may downgrade it to
+            # max_positions or source MOD bytes.
+            skinned_max_positions = required_position_rows
             route_handle = _int_or_default(matched.get("fbx_route_handle"), 0)
             if not isinstance(skinned_max_positions, list) or not skinned_max_positions:
                 raise ValueError(
-                    f"Max FBX route handle {route_handle} missing skinned_max_positions"
+                    f"BONE+MESH route handle {route_handle} missing skinned_max_positions"
                 )
             if len(skinned_max_positions) != len(matched["positions"]):
                 raise ValueError(
-                    f"Max FBX route handle {route_handle} skinned_max_positions count mismatch"
+                    f"BONE+MESH route handle {route_handle} skinned_max_positions count mismatch"
                 )
 
         if mesh.get("scene_node") in {None, ""}:
@@ -18357,8 +19206,23 @@ def _merge_fbx_contract_meshes(
             "skinned_max_normals",
             "skinned_is_local",
             "fbx_normal_axis_domain",
+            # These markers belong to the previous Probe snapshot.  A fresh
+            # merge must pass the new rows through the dynamic mapping gate
+            # again; retaining the fingerprint would incorrectly short-circuit
+            # that gate when two snapshots happen to use the same schema.
+            "dynamic_mod_fbx_mapping",
+            "fbx_final_position_transform",
+            "fbx_position_unit_scale_applied",
         ):
-            if stale_key not in matched:
+            if stale_key in {
+                "dynamic_mod_fbx_mapping",
+                "fbx_final_position_transform",
+                "fbx_position_unit_scale_applied",
+            }:
+                # A new Probe merge always invalidates the previous per-row
+                # transform receipt, even if a carrier copied that metadata.
+                mesh.pop(stale_key, None)
+            elif stale_key not in matched:
                 mesh.pop(stale_key, None)
 
         for key in (
@@ -18412,26 +19276,24 @@ def _merge_fbx_contract_meshes(
             "normal_fidelity",
             "fbx_normal_axis_domain",
         ):
-            if (
-                require_explicit_route
-                and uses_bones_plus_mesh_pose
-                and matched_has_skin
-                and key == "max_positions"
-            ):
-                continue
             if key in matched:
                 mesh[key] = matched[key]
-        if require_explicit_route and uses_bones_plus_mesh_pose and matched_has_skin:
-            # BONE+MESH writes the evaluated Skin pose. Ordinary Max keeps the
-            # Probe's node-transformed max_positions and follows the normal
-            # source-MOD scale/axis conversion in the writer.
+        if uses_bones_plus_mesh_pose:
+            # BONE+MESH writes the evaluated Skin pose.  This is independent of
+            # backend, explicit-route mode, Skin-count metadata, or evaluation
+            # labels; Header-only/source routes were filtered above.
             mesh.pop("max_positions", None)
             mesh.pop("world_positions", None)
             mesh["fbx_position_authority"] = MAX_FBX_POSITION_AUTHORITY
-        elif require_explicit_route:
-            # Handle routing identifies the Mesh; it does not imply a Skin-pose
-            # export. Ordinary Max (including Skin Meshes) uses max_positions.
+            mesh[GEOMETRY_POSITION_AUTHORITY_KEY] = MAX_FBX_POSITION_AUTHORITY
+            # Probe has already evaluated Skin into canonical Max/world rows.
+            # The MOD writer consumes that posed geometry directly and applies
+            # only the source MOD short-position quantization scale.
+            mesh["skin_geometry_domain"] = "POSED_MAX"
+            mesh["fbx_position_space"] = "max_world"
+        else:
             mesh.pop("fbx_position_authority", None)
+            mesh[GEOMETRY_POSITION_AUTHORITY_KEY] = ORDINARY_FBX_POSITION_AUTHORITY
         normal_fidelity = matched.get("normal_fidelity")
         if isinstance(normal_fidelity, dict) and str(normal_fidelity.get("status", "") or "") == "exact":
             # A raw FBX corner stream is the current source of truth.  Never
@@ -18515,12 +19377,9 @@ def _build_bones_plus_mesh_fbx_world_geometry_authority(
     if re.fullmatch(r"[0-9A-F]{64}", normalized_sha) is None:
         raise ValueError("Bones+Mesh FBX world geometry authority requires a SHA-256 fingerprint")
 
+    # The evaluation label is diagnostic metadata.  It is not a geometry
+    # admission gate; the presence of Probe Skin rows is checked below.
     evaluation_status = str(mesh.get("fbx_skin_pose_evaluation_status", "") or "").strip()
-    if evaluation_status != BONES_PLUS_MESH_FBX_SKIN_EVALUATION_STATUS:
-        raise ValueError(
-            "Bones+Mesh requires FBX Probe binary Skin evaluation "
-            f"({BONES_PLUS_MESH_FBX_SKIN_EVALUATION_STATUS}); got {evaluation_status or 'missing'}"
-        )
 
     # This is deliberately a frozen copy of the Probe's already evaluated Max
     # positions.  The exporter must not re-evaluate Skin from scene snapshots or
@@ -18533,18 +19392,30 @@ def _build_bones_plus_mesh_fbx_world_geometry_authority(
     expected_count = _int_or_default(mesh.get("vert_count"), vertex_count)
     if expected_count != vertex_count:
         raise ValueError("Bones+Mesh FBX Skin position count disagrees with the Mesh contract")
-    mod_write_normals: list[list[float]] | None = None
-    raw_skinned_normals = mesh.get("skinned_max_normals")
-    if isinstance(raw_skinned_normals, list) and raw_skinned_normals:
-        mod_write_normals = _copy_final_geometry_rows(
-            raw_skinned_normals,
+    # Skin positions and Skin normals are one immutable Probe result.  A
+    # missing normal table is an invalid handoff, not permission to reuse raw
+    # ``max_normals``/``normals`` or to synthesize +Z in the Writer.
+    mod_write_normals = _copy_final_geometry_rows(
+        mesh.get("skinned_max_normals"),
+        field="skinned_max_normals",
+    )
+    if len(mod_write_normals) != vertex_count:
+        raise ValueError("Bones+Mesh FBX Skin normal count disagrees with the Mesh contract")
+    for normal_index, normal_row in enumerate(mod_write_normals):
+        _normalize_required_writer_normal(
+            normal_row,
             field="skinned_max_normals",
+            row_index=normal_index,
+            mesh_label=_writer_mesh_label(mesh),
         )
-        if len(mod_write_normals) != vertex_count:
-            raise ValueError("Bones+Mesh FBX Skin normal count disagrees with the Mesh contract")
     source_vertex_indices = _copy_fbx_world_authority_indices(
         mesh.get("source_vertex_indices"),
         field="source_vertex_indices",
+        expected_count=vertex_count,
+    )
+    mod_write_bones, mod_write_weights = _copy_final_skin_rows(
+        mesh.get("raw_bones"),
+        mesh.get("raw_weights"),
         expected_count=vertex_count,
     )
     unreferenced_source_indices, unreferenced_max_positions = (
@@ -18556,6 +19427,8 @@ def _build_bones_plus_mesh_fbx_world_geometry_authority(
     authority = {
         "schema": BONES_PLUS_MESH_FBX_WORLD_GEOMETRY_AUTHORITY,
         "source": "fbx_probe_binary_cluster_skinned_max_positions",
+        "skin_geometry_domain": "POSED_MAX",
+        "position_space": "max_world",
         "fbx_sha256": normalized_sha,
         "mesh_slot": mesh_slot,
         "node_name": str(
@@ -18564,13 +19437,14 @@ def _build_bones_plus_mesh_fbx_world_geometry_authority(
         "fbx_skin_pose_evaluation_status": evaluation_status,
         "mod_write_positions": mod_write_positions,
         "mod_write_world_positions": [list(position) for position in mod_write_positions],
+        "mod_write_bones": mod_write_bones,
+        "mod_write_weights": mod_write_weights,
         "source_vertex_indices": source_vertex_indices,
     }
     if unreferenced_source_indices:
         authority["binary_skin_unreferenced_source_indices"] = unreferenced_source_indices
         authority["binary_skin_unreferenced_max_positions"] = unreferenced_max_positions
-    if mod_write_normals is not None:
-        authority["mod_write_normals"] = mod_write_normals
+    authority["mod_write_normals"] = mod_write_normals
     return authority
 
 
@@ -18597,14 +19471,19 @@ def _mirror_bones_plus_mesh_fbx_world_authority_to_job(
             target = by_slot.get(_get_mesh_slot_value(job_mesh) or -1)
         if target is None:
             continue
-        if _mesh_requires_bones_plus_mesh_fbx_world_authority(target):
-            job_mesh["requires_fbx_world_geometry_authority"] = True
+        authority = target.get("final_geometry_authority")
+        if isinstance(authority, dict):
             job_mesh["final_geometry_authority"] = copy.deepcopy(
-                target["final_geometry_authority"]
+                authority
             )
         else:
-            job_mesh.pop("requires_fbx_world_geometry_authority", None)
             job_mesh.pop("final_geometry_authority", None)
+        if _mesh_uses_max_fbx_skinned_position_authority(target):
+            job_mesh["fbx_position_authority"] = MAX_FBX_POSITION_AUTHORITY
+            job_mesh.pop("max_positions", None)
+            job_mesh.pop("world_positions", None)
+        else:
+            job_mesh.pop("fbx_position_authority", None)
 
 
 def _freeze_bones_plus_mesh_fbx_world_geometry_authority(
@@ -18613,8 +19492,20 @@ def _freeze_bones_plus_mesh_fbx_world_geometry_authority(
     fbx_handoff: dict[str, Any],
 ) -> dict[str, Any]:
     """Create the one geometry authority that BONE + MESH may write from."""
-    _mark_bones_plus_mesh_fbx_world_geometry_requirements(job, contract)
     if not _job_uses_bones_plus_mesh_pose_route(job, contract):
+        # This function is also called by direct maintenance/legacy callers.
+        # A reused contract must not leak a prior BONE+MESH authority into
+        # BONE ONLY or ordinary export, where Mesh geometry is not frozen.
+        meshes = list(_ensure_contract_meshes(job, contract)) + list(
+            job.get("meshes", []) if isinstance(job.get("meshes"), list) else []
+        )
+        seen_ids: set[int] = set()
+        for mesh in meshes:
+            if not isinstance(mesh, dict) or id(mesh) in seen_ids:
+                continue
+            seen_ids.add(id(mesh))
+            mesh.pop("final_geometry_authority", None)
+            mesh.pop("fbx_position_authority", None)
         receipt = {"status": "not_required", "mesh_slots": []}
         job["bones_plus_mesh_fbx_world_geometry_receipt"] = dict(receipt)
         contract["bones_plus_mesh_fbx_world_geometry_receipt"] = dict(receipt)
@@ -18623,8 +19514,30 @@ def _freeze_bones_plus_mesh_fbx_world_geometry_authority(
     fbx_sha256 = str(fbx_handoff.get("fbx_sha256", "") or "").strip().upper()
     frozen_slots: list[int] = []
     for mesh in _ensure_contract_meshes(job, contract):
-        if not isinstance(mesh, dict) or not _mesh_requires_bones_plus_mesh_fbx_world_authority(mesh):
+        if not isinstance(mesh, dict):
             continue
+        if str(mesh.get("lane", "") or "").strip().lower() != "modify":
+            continue
+        if _mesh_uses_source_geometry(mesh):
+            continue
+        # A zero-geometry placeholder has no writable vertex lane.  It is
+        # handled by the Header-only/source route; only a Mesh carrying actual
+        # geometry must provide the Skin position authority below.
+        raw_positions = mesh.get("positions")
+        raw_faces = mesh.get("face_indices")
+        if (
+            not isinstance(raw_positions, list)
+            or not raw_positions
+            or not isinstance(raw_faces, list)
+            or len(raw_faces) < 3
+        ):
+            continue
+        # Route receipt has already separated Header-only/source Meshes.  Every
+        # remaining writable Mesh must carry the Probe Skin position authority;
+        # there is no secondary eligibility flag or skin-status gate.
+        mesh["fbx_position_authority"] = MAX_FBX_POSITION_AUTHORITY
+        mesh.pop("max_positions", None)
+        mesh.pop("world_positions", None)
         mesh_slot = _get_mesh_slot_value(mesh)
         existing = mesh.get("final_geometry_authority")
         if isinstance(existing, dict):
@@ -18646,25 +19559,30 @@ def _freeze_bones_plus_mesh_fbx_world_geometry_authority(
                 field="mod_write_world_positions",
             ) != frozen_positions:
                 raise ValueError("Bones+Mesh immutable FBX authority world positions disagree with positions")
-            frozen_normal_rows = existing.get("mod_write_normals")
-            if isinstance(frozen_normal_rows, list) and frozen_normal_rows:
-                frozen_normals = _copy_final_geometry_rows(
-                    frozen_normal_rows,
+            frozen_normals = _copy_final_geometry_rows(
+                existing.get("mod_write_normals"),
+                field="mod_write_normals",
+            )
+            if len(frozen_normals) != len(frozen_positions):
+                raise ValueError("Bones+Mesh immutable FBX authority normal count disagrees with positions")
+            for normal_index, normal_row in enumerate(frozen_normals):
+                _normalize_required_writer_normal(
+                    normal_row,
                     field="mod_write_normals",
+                    row_index=normal_index,
+                    mesh_label=_writer_mesh_label(mesh),
                 )
-                if len(frozen_normals) != len(frozen_positions):
-                    raise ValueError("Bones+Mesh immutable FBX authority normal count disagrees with positions")
             _copy_fbx_world_authority_indices(
                 existing.get("source_vertex_indices"),
                 field="source_vertex_indices",
                 expected_count=len(frozen_positions),
             )
+            _copy_final_skin_rows(
+                existing.get("mod_write_bones"),
+                existing.get("mod_write_weights"),
+                expected_count=len(frozen_positions),
+            )
             _copy_bones_plus_mesh_unreferenced_skin_rows(existing)
-            if (
-                str(existing.get("fbx_skin_pose_evaluation_status", "") or "").strip()
-                != BONES_PLUS_MESH_FBX_SKIN_EVALUATION_STATUS
-            ):
-                raise ValueError("Bones+Mesh immutable FBX authority lost its verified Skin evaluation status")
         else:
             mesh["final_geometry_authority"] = _build_bones_plus_mesh_fbx_world_geometry_authority(
                 mesh,
@@ -18706,6 +19624,7 @@ def _get_semantic_row_value(rows: Any, index: int) -> Any:
 
 
 def _apply_fbx_world_space_overrides(job: dict[str, Any], contract: dict[str, Any]) -> int:
+    """Keep already-canonical Probe rows; never synthesize per-Mesh transforms."""
     meshes = _ensure_contract_meshes(job, contract)
     applied_count = 0
     for mesh in meshes:
@@ -18713,7 +19632,7 @@ def _apply_fbx_world_space_overrides(job: dict[str, Any], contract: dict[str, An
             continue
         if str(mesh.get("lane", "") or "").lower() != "modify":
             continue
-        if _mesh_requires_bones_plus_mesh_fbx_world_authority(mesh):
+        if _get_bones_plus_mesh_final_geometry_authority(mesh) is not None:
             # The immutable FBX authority already carries its tested world basis.
             continue
         if _mesh_uses_max_fbx_skinned_position_authority(mesh):
@@ -18742,30 +19661,9 @@ def _apply_fbx_world_space_overrides(job: dict[str, Any], contract: dict[str, An
                 normal_fidelity["position_mode"] = "fbx_max_positions"
             continue
 
-        fvf = _parse_mesh_writer_fvf(mesh)
-        positions = mesh.get("positions")
-        node_to_world_matrix = _coerce_matrix4x4(mesh.get("fbx_node_to_world_matrix"))
-        if not isinstance(positions, list) or not positions or node_to_world_matrix is None:
-            continue
-        if isinstance(mesh.get("max_positions"), list) and mesh.get("max_positions"):
-            continue
-        if isinstance(mesh.get("world_positions"), list) and mesh.get("world_positions"):
-            continue
-
-        max_positions: list[list[float]] = []
-        for position in positions:
-            max_positions.append(_transform_position_row_major(position, node_to_world_matrix))
-        mesh["max_positions"] = max_positions
-
-        normals = mesh.get("normals")
-        if isinstance(normals, list) and normals:
-            max_normals: list[list[float]] = []
-            for normal in normals:
-                max_normals.append(_transform_normal_row_major(normal, node_to_world_matrix))
-            mesh["max_normals"] = max_normals
-        if _mesh_uses_world_short_remap(mesh, fvf):
-            mesh["world_positions"] = [list(position) for position in max_positions]
-        applied_count += 1
+        # Missing canonical rows are an invalid Probe handoff.  Do not rebuild
+        # them from ``fbx_node_to_world_matrix`` on a Mesh-by-Mesh basis.
+        continue
     return applied_count
 
 
@@ -20397,198 +21295,6 @@ def _show_map2_fallback_notice_async(receipt: dict[str, Any]) -> None:
     ).start()
 
 
-def _require_fbx_geometry_for_requested_mesh_rewrites(
-    job: dict[str, Any],
-    contract: dict[str, Any],
-    fbx_handoff: dict[str, Any],
-    source_mesh_headers: list[dict[str, Any]] | None = None,
-) -> None:
-    requested: list[dict[str, Any]] = []
-    for mesh in job.get("meshes", []):
-        if not isinstance(mesh, dict):
-            continue
-        lane = str(mesh.get("lane", "") or "").strip().lower()
-        # LOD0 and proven header-only Modify routes preserve the source vertex
-        # and face bytes. They must remain exportable when FBX geometry is not
-        # available; only a real Mesh rewrite requires the FBX handoff.
-        if lane == "lod0":
-            continue
-        if lane != "modify":
-            continue
-        if _mesh_uses_source_geometry(mesh):
-            continue
-        requested.append(mesh)
-    if not requested:
-        return
-
-    handoff_status = str(fbx_handoff.get("status", "") or "").strip().lower()
-    if handoff_status != "ok":
-        if requested and all(_mesh_allows_source_geometry_fallback(mesh) for mesh in requested):
-            contract_by_slot = _build_contract_mesh_index(contract)
-            for mesh in requested:
-                reason = f"fbx_handoff_{handoff_status or 'missing'}"
-                _mark_mesh_source_passthrough(mesh, reason)
-                slot = _get_mesh_slot_value(mesh)
-                if slot is not None and isinstance(contract_by_slot.get(slot), dict):
-                    _mark_mesh_source_passthrough(contract_by_slot[slot], reason)
-            return
-        error_text = str(fbx_handoff.get("error", "") or "").strip()
-        detail = f" status={handoff_status or 'missing'}"
-        if error_text:
-            detail += f" error={error_text}"
-        raise ValueError("FBX geometry is required for requested Mesh rewrites." + detail)
-
-    by_slot: dict[int, dict[str, Any]] = {}
-    by_name: dict[str, dict[str, Any]] = {}
-    for mesh in contract.get("meshes", []):
-        if not isinstance(mesh, dict):
-            continue
-        slot = _get_mesh_slot_value(mesh)
-        if slot is not None:
-            by_slot[int(slot)] = mesh
-        for value in (mesh.get("scene_node"), mesh.get("node_name"), mesh.get("mesh_name")):
-            normalized = _normalize_mesh_match_name(value)
-            if normalized:
-                by_name[normalized] = mesh
-
-    missing: list[str] = []
-    for mesh in requested:
-        slot = _get_mesh_slot_value(mesh)
-        target = by_slot.get(int(slot)) if slot is not None else None
-        if target is None:
-            target = by_name.get(_normalize_mesh_match_name(mesh.get("scene_node")))
-        positions = None if target is None else next(
-            (
-                target.get(key)
-                for key in ("positions", "max_positions", "world_positions")
-                if isinstance(target.get(key), list) and len(target.get(key)) > 0
-            ),
-            None,
-        )
-        face_indices = target.get("face_indices") if isinstance(target, dict) else None
-        if positions is None or not isinstance(face_indices, list) or len(face_indices) < 3:
-            label = str(mesh.get("scene_node", "") or "").strip()
-            if _mesh_allows_source_geometry_fallback(mesh):
-                reason = "fbx_geometry_missing_or_incomplete"
-                _mark_mesh_source_passthrough(mesh, reason)
-                if isinstance(target, dict):
-                    _mark_mesh_source_passthrough(target, reason)
-                continue
-            missing.append(label or (f"Mesh slot {slot}" if slot is not None else "unnamed Mesh"))
-    if missing:
-        raise ValueError(
-            "FBX handoff did not provide complete geometry for requested Mesh rewrites: " + "; ".join(missing)
-        )
-
-
-def _run_required_fbx_geometry_regression_guard() -> dict[str, Any]:
-    job = {
-        "meshes": [
-            {"lane": "modify", "mesh_slot": 7, "scene_node": "Mesh_007", "has_skin": True}
-        ]
-    }
-    valid_contract = {
-        "meshes": [
-            {
-                "lane": "modify",
-                "mesh_slot": 7,
-                "has_skin": True,
-                "positions": [[0.0, 0.0, 0.0]],
-                "face_indices": [0, 0, 0],
-            }
-        ]
-    }
-    failures: list[str] = []
-    try:
-        _require_fbx_geometry_for_requested_mesh_rewrites(job, valid_contract, {"status": "missing_fbx_file"})
-        failures.append("missing FBX was accepted for a requested Mesh rewrite")
-    except ValueError:
-        pass
-    try:
-        _require_fbx_geometry_for_requested_mesh_rewrites(job, {"meshes": [{"mesh_slot": 7}]}, {"status": "ok"})
-        failures.append("incomplete FBX geometry was accepted for a requested Mesh rewrite")
-    except ValueError:
-        pass
-    _require_fbx_geometry_for_requested_mesh_rewrites(job, valid_contract, {"status": "ok"})
-    _require_fbx_geometry_for_requested_mesh_rewrites({"meshes": [{"lane": "delete", "mesh_slot": 7}]}, {}, {"status": "missing_fbx_file"})
-    _require_fbx_geometry_for_requested_mesh_rewrites(
-        {"meshes": [{"lane": "lod0", "mesh_slot": 7}]},
-        {},
-        {"status": "missing_fbx_file"},
-    )
-    header_only_source = {
-        "fvf_info": 0x0B424024,
-        "vert_count": 1,
-        "face_count": 3,
-        "lod_level": 1,
-        "mat_id": 2,
-        "unk01": 3,
-        "unk05": 4,
-        "meshtype": 5,
-    }
-    unskinned_job = {
-        "export_header_mode": 1,
-        "meshes": [
-            {
-                "lane": "modify",
-                "mesh_slot": 1,
-                "scene_node": "Mesh_001_X0B424024_LODx0_MatID:2_Group:3_DisplayMode:4_Type:5",
-                "header_fvf": "0x0B424024",
-                "has_skin": False,
-                "scene_vert_count": 1,
-                "scene_face_count": 1,
-            }
-        ],
-    }
-    if _is_modify_header_only_candidate(
-        unskinned_job,
-        unskinned_job["meshes"][0],
-        header_only_source,
-    ):
-        failures.append("an unskinned same-topology Mesh was silently downgraded to Header-only")
-    try:
-        _require_fbx_geometry_for_requested_mesh_rewrites(
-            unskinned_job,
-            {"meshes": [{"lane": "modify", "mesh_slot": 1, "has_skin": False}]},
-            {"status": "missing_fbx_file"},
-            [header_only_source],
-        )
-        failures.append("an unskinned FBX failure was accepted without geometry")
-    except ValueError:
-        pass
-    if _as_bool(unskinned_job["meshes"][0].get("source_passthrough"), False):
-        failures.append("an unskinned FBX failure silently preserved source geometry")
-    auto_header_job = {
-        "meshes": [
-            {
-                "lane": "modify",
-                "mesh_slot": 2,
-                "scene_node": "Mesh_002_LODx0_MatID:2_Group:3_DisplayMode:4_Type:5",
-                "has_skin": True,
-                "scene_vert_count": 0,
-                "scene_face_count": 0,
-                "auto_header_only": True,
-                "requires_selected_fbx": False,
-            }
-        ]
-    }
-    _require_fbx_geometry_for_requested_mesh_rewrites(
-        auto_header_job,
-        {},
-        {"status": "missing_fbx_file"},
-        [header_only_source, header_only_source],
-    )
-    if failures:
-        raise RuntimeError("Required FBX geometry regression gate failed: " + "; ".join(failures))
-    return {
-        "status": "PASS",
-        "mesh_rewrite_requires_fbx": True,
-        "delete_remains_independent": True,
-        "skin_zero_geometry_uses_header_only": True,
-        "unskinned_failure_rejected": True,
-    }
-
-
 # Mandatory maintenance oracle for the two degenerate Bucket 3 paths. A future
 # writer change must preserve only explicit Header-only source geometry and
 # reject malformed geometry instead of silently exporting the source Mesh.
@@ -20687,6 +21393,7 @@ def _run_special_mesh_source_fallback_regression_guard() -> dict[str, Any]:
         "has_skin": True,
         "positions": [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
         "normals": [[0.0, 0.0, 1.0]] * 3,
+        "max_normals": [[0.0, 0.0, 1.0]] * 3,
         "uvs": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
         "face_indices": [0, 1, 2],
         **scene_header(2),
@@ -20702,6 +21409,7 @@ def _run_special_mesh_source_fallback_regression_guard() -> dict[str, Any]:
         "has_skin": False,
         "positions": [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [0.0, 3.0, 0.0]],
         "normals": [[0.0, 0.0, 1.0]] * 3,
+        "max_normals": [[0.0, 0.0, 1.0]] * 3,
         "uvs": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
         "face_indices": [0, 1, 9],
         **scene_header(3),
@@ -20857,12 +21565,6 @@ def _prepare_writer_payload(
     _apply_writer_contract_defaults(job, contract)
     _apply_fbx_world_space_overrides(job, contract)
     _apply_export_uv_layout(job, contract)
-    _require_fbx_geometry_for_requested_mesh_rewrites(
-        job,
-        contract,
-        fbx_handoff,
-        source_mesh_headers,
-    )
     _populate_source_short_mesh_scale(
         job,
         contract,
@@ -21160,19 +21862,10 @@ def _short_tuple_to_max_position(short_pos: Any, mesh_scale: list[float]) -> lis
     scale_x = mesh_scale[0] if abs(mesh_scale[0]) > 0.000001 else 1.0
     scale_y = mesh_scale[1] if abs(mesh_scale[1]) > 0.000001 else 1.0
     scale_z = mesh_scale[2] if abs(mesh_scale[2]) > 0.000001 else 1.0
-    if (
-        str(getattr(mesh_scale, "axis_output_policy", FBX_AXIS_OUTPUT_POLICY_LEGACY))
-        == FBX_AXIS_OUTPUT_POLICY_MAX_XYZ
-    ):
-        return [
-            short_xyz[0] / scale_x,
-            short_xyz[1] / scale_y,
-            short_xyz[2] / scale_z,
-        ]
     return [
         short_xyz[0] / scale_x,
-        -short_xyz[2] / scale_y,
-        short_xyz[1] / scale_z,
+        short_xyz[1] / scale_y,
+        short_xyz[2] / scale_z,
     ]
 
 
@@ -21809,11 +22502,12 @@ def _enforce_output_mesh_count_capacity(
                 f"Explicit Bucket 3 new Mesh {scene_name} cannot be appended: {reason}"
             )
         else:
-            semantic_payloads.pop(mesh_slot, None)
-            _mark_mesh_source_passthrough(mesh, reason)
-            if isinstance(job_mesh, dict):
-                _mark_mesh_source_passthrough(job_mesh, reason)
-            fallback_source_slots.append(mesh_slot)
+            # Capacity exhaustion is a hard writer constraint, not permission
+            # to discard the current FBX geometry and copy the source Mesh.
+            # Source passthrough remains reserved for an explicit Probe route.
+            raise ValueError(
+                f"Modified Mesh slot {mesh_slot} cannot be emitted: {reason}"
+            )
 
     job["source_missing_skipped_meshes"] = skipped_rows
     return {
@@ -22057,6 +22751,7 @@ def _run_pc_rehd_128_writer_fvf_boundary_regression_guard() -> dict[str, Any]:
     base_geometry = {
         "positions": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
         "normals": [[0.0, 0.0, 1.0]] * 3,
+        "max_normals": [[0.0, 0.0, 1.0]] * 3,
         "uvs": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
         "face_indices": [0, 1, 2],
     }
@@ -22412,7 +23107,7 @@ def _run_unskinned_mesh_edit_export_regression_guard() -> dict[str, Any]:
         if (
             staged != 1
             or [row.get("reason") for row in active_rows] != [UNSKINNED_MESH_EDIT_EXPORT_MODE]
-            or struct.unpack_from("<hhh", output_row, 0) != (10, 30, -20)
+            or struct.unpack_from("<hhh", output_row, 0) != (10, 20, 30)
             or payload.get("face_indices") != [2, 1, 0]
             or output_row[6:36] != source_rows[2][6:36]
         ):
@@ -23114,6 +23809,21 @@ def _build_mod_rewrite_layout(mod_file: dict[str, Any], job: dict[str, Any], con
                 modified_mesh_slots.append(source_slot)
                 vertex_stride = int(semantic_payload["vertex_stride"])
                 vertex_bytes = semantic_payload["vertex_bytes"]
+                if _job_uses_bones_plus_mesh_pose_route(job, contract):
+                    # The semantic payload has already packed the immutable
+                    # Probe Position/Bone/Weight tuple.  Any source-MOD Skin
+                    # overlay here would detach the posed position from the
+                    # influences that produced it.
+                    authority = _get_bones_plus_mesh_final_geometry_authority(contract_mesh)
+                    if authority is None:
+                        raise ValueError(
+                            f"Bones+Mesh Mesh {source_slot} lost its atomic posed Skin authority"
+                        )
+                    _copy_final_skin_rows(
+                        authority.get("mod_write_bones"),
+                        authority.get("mod_write_weights"),
+                        expected_count=_int_or_default(semantic_payload.get("vert_count"), 0),
+                    )
                 face_bytes = semantic_payload["face_bytes"]
                 face_indices = list(semantic_payload["face_indices"])
                 contract_mesh = {
@@ -23155,6 +23865,19 @@ def _build_mod_rewrite_layout(mod_file: dict[str, Any], job: dict[str, Any], con
                     modified_mesh_slots.append(source_slot)
                 if contract_vertex_bytes is not None:
                     vertex_bytes = contract_vertex_bytes
+                if (
+                    not has_semantic_payload
+                    and not has_binary_payload
+                    and not _mesh_uses_source_geometry(contract_mesh)
+                ):
+                    # A writable Modify Mesh must have a payload from the
+                    # current FBX Probe.  Keeping the initial source bytes here
+                    # would silently discard the user's FBX edit.  Explicit
+                    # Probe Header-only/source routes have already been
+                    # removed from this branch.
+                    raise ValueError(
+                        f"Modify Mesh slot {source_slot} has no FBX Probe geometry payload"
+                    )
             if has_semantic_payload or has_binary_payload:
                 if len(vertex_bytes) % vertex_stride != 0:
                     raise ValueError(
@@ -23736,9 +24459,7 @@ def _encode_bones_plus_mesh_position_patch(
     source_fvf: int,
     vertex_stride: int,
     mesh_scale: list[float],
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # Legacy callers without a Generic axis receipt retain the old default.
-    axis_output_policy: str = FBX_AXIS_OUTPUT_POLICY_LEGACY,
+    axis_output_policy: str = FBX_AXIS_OUTPUT_POLICY_MAX_XYZ,
 ) -> bytes:
     # The probe returns Max-space positions. Convert them once to the exact MOD
     # position lane while leaving every other source vertex byte untouched.
@@ -23789,7 +24510,10 @@ def _build_bones_plus_mesh_position_patch_layout(
         mesh = contract_meshes.get(source_slot)
         if not isinstance(mesh, dict):
             continue
-        if not _mesh_requires_bones_plus_mesh_fbx_world_authority(mesh):
+        if (
+            str(mesh.get("lane", "") or "").lower() != "modify"
+            or _mesh_uses_source_geometry(mesh)
+        ):
             if str(mesh.get("lane", "") or "").lower() == "modify":
                 source_passthrough_slots.append(source_slot)
             continue
@@ -23930,10 +24654,36 @@ def _build_bone_edit_mod_bytes(
     prefix_bytes: bytes = source_tables["prefix_bytes"]
     mat_bytes: bytes = source_tables["mat_bytes"]
 
+    # Plan matrices are composed in the mapped MOD/Max scene domain.  Encode
+    # their translation into the on-disk MOD convention exactly once here.
+    matrix_domain = str(
+        bone_edit_plan.get("bone_matrix_output_domain", "mod_file") or "mod_file"
+    )
+    local_matrix_values: list[list[float]] = []
+    for index, values in enumerate(bone_edit_plan["output_local_matrices"]):
+        encoded = _bone_edit_matrix_file_values(
+            values,
+            matrix_domain=matrix_domain,
+            label=f"bone local matrix {index + 1}",
+        )
+        if encoded is None:
+            raise ValueError(f"Bone local matrix {index + 1} is missing or invalid")
+        local_matrix_values.append(encoded)
+    world_matrix_values: list[list[float]] = []
+    for index, values in enumerate(bone_edit_plan["output_world_matrices"]):
+        encoded = _bone_edit_matrix_file_values(
+            values,
+            matrix_domain=matrix_domain,
+            label=f"bone world matrix {index + 1}",
+        )
+        if encoded is None:
+            raise ValueError(f"Bone world matrix {index + 1} is missing or invalid")
+        world_matrix_values.append(encoded)
+
     bone_blob = (
         b"".join(_pack_bone_info_record(record) for record in bone_edit_plan["output_bone_info"])
-        + b"".join(_pack_matrix_values(values) for values in bone_edit_plan["output_local_matrices"])
-        + b"".join(_pack_matrix_values(values) for values in bone_edit_plan["output_world_matrices"])
+        + b"".join(_pack_matrix_values(values) for values in local_matrix_values)
+        + b"".join(_pack_matrix_values(values) for values in world_matrix_values)
         + bytes((bone_edit_plan.get("mtp_bytes") or [255] * BONE_MTP_BYTES)[:BONE_MTP_BYTES])
     )
     bone_map_blob = _pack_bone_map_rows(bone_edit_plan["bone_map_rows"])
@@ -23990,8 +24740,33 @@ def _build_bone_edit_verify_expectation(
     export_mode: str,
 ) -> dict[str, Any]:
     bone_info_bytes = b"".join(_pack_bone_info_record(record) for record in bone_edit_plan["output_bone_info"])
-    local_matrix_bytes = b"".join(_pack_matrix_values(values) for values in bone_edit_plan["output_local_matrices"])
-    world_matrix_bytes = b"".join(_pack_matrix_values(values) for values in bone_edit_plan["output_world_matrices"])
+    matrix_domain = str(
+        bone_edit_plan.get("bone_matrix_output_domain", "mod_file") or "mod_file"
+    )
+    local_matrix_values = [
+        _bone_edit_matrix_file_values(
+            values,
+            matrix_domain=matrix_domain,
+            label=f"bone local matrix {index + 1}",
+        )
+        for index, values in enumerate(bone_edit_plan["output_local_matrices"])
+    ]
+    world_matrix_values = [
+        _bone_edit_matrix_file_values(
+            values,
+            matrix_domain=matrix_domain,
+            label=f"bone world matrix {index + 1}",
+        )
+        for index, values in enumerate(bone_edit_plan["output_world_matrices"])
+    ]
+    if any(value is None for value in local_matrix_values + world_matrix_values):
+        raise ValueError("Bone edit verification cannot encode an invalid matrix")
+    local_matrix_bytes = b"".join(
+        _pack_matrix_values(value) for value in local_matrix_values if value is not None
+    )
+    world_matrix_bytes = b"".join(
+        _pack_matrix_values(value) for value in world_matrix_values if value is not None
+    )
     mtp_bytes = bytes((bone_edit_plan.get("mtp_bytes") or [255] * BONE_MTP_BYTES)[:BONE_MTP_BYTES])
     bone_map_bytes = _pack_bone_map_rows(bone_edit_plan["bone_map_rows"])
     return {
@@ -24062,16 +24837,16 @@ def _write_output_mod_with_bone_edit(
     if export_mode == "bones_only":
         mesh_layout = _build_bone_edit_passthrough_layout(mod_file)
     else:
-        _require_bones_plus_mesh_fbx_world_geometry_authority(job, contract)
         # BONE+MESH is one normal FBX Mesh rewrite plus the bone-edit plan.  The
         # source MOD supplies the file layout and FVF defaults only; it does not
-        # cap FBX vertex rows or topology.  Semantic packing reads the frozen
-        # Probe Skin positions through _get_semantic_position_rows().
+        # cap FBX vertex rows or topology.  Semantic packing reads the Probe
+        # Skin positions through _get_semantic_position_rows().
         mesh_layout = _build_mod_rewrite_layout(mod_file, job, contract)
         mesh_layout["bones_plus_mesh_mesh_rewrite"] = {
             "status": "PASS",
             "geometry_authority": "fbx_probe_binary_cluster_skinned_max_positions",
             "layout": "fbx_mesh_rewrite_plus_bone_plan",
+            "source_mod_world_scale": bone_edit_plan.get("source_mod_world_scale", 1.0),
             "modified_mesh_slots": list(mesh_layout.get("modified_mesh_slots", [])),
         }
     bone_edit_verify = _build_bone_edit_verify_expectation(bone_edit_plan, export_mode=export_mode)
@@ -24171,6 +24946,14 @@ def _write_output_mod_unlocked(
         )
     effective_contract = contract
     _hydrate_bone_edit_job_fields_from_contract(job, effective_contract)
+    # Apply the same request-scoped mapping before any staging shortcut.  A
+    # staging write may still be a source-only route, in which case the gate is
+    # a no-op; canonical geometry must never bypass it silently.
+    _apply_fbx_final_position_transform_layer(
+        job,
+        effective_contract,
+        fbx_handoff or {},
+    )
     if effective_contract.get("staging_mod_path"):
         return _copy_staging_output_mod(
             source,
@@ -24180,14 +24963,6 @@ def _write_output_mod_unlocked(
             preserve_source_skeleton=not _job_uses_bone_edit(job, effective_contract),
             allow_output_overwrite=allow_output_overwrite,
         )
-    # Final writer gate: direct Writer callers must receive the same single
-    # FBX position-basis conversion as the preparation routes.  The layer is
-    # receipt-backed and therefore a preparation pass cannot scale twice.
-    _apply_fbx_final_position_transform_layer(
-        job,
-        effective_contract,
-        fbx_handoff or {},
-    )
     if _job_uses_bone_edit(job, effective_contract):
         return _write_output_mod_with_bone_edit(
             source,
@@ -24395,8 +25170,13 @@ def _base_writer_regression_scene_mesh(
         "vertex_stride": stride,
         "vert_count": 1,
         "positions": [[0.0, 0.0, 0.0]],
+        # Direct regression callers model the post-Probe contract.  The
+        # writer intentionally consumes this explicit ordinary authority,
+        # never the raw ``positions`` compatibility lane.
+        "max_positions": [[0.0, 0.0, 0.0]],
         "world_positions": [[0.0, 0.0, 0.0]],
         "normals": [[0.0, 0.0, 1.0]],
+        "max_normals": [[0.0, 0.0, 1.0]],
         "uvs": [[0.25, 0.75]],
         "uv2s": [[0.5, 0.5]],
         "raw_bones": [list(bones)],
@@ -29552,6 +30332,7 @@ def _run_mesh_slot_limit_regression_guard() -> dict[str, Any]:
         "vertex_stride": stride,
         "positions": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
         "normals": [[0.0, 0.0, 1.0]] * 3,
+        "max_normals": [[0.0, 0.0, 1.0]] * 3,
         "uvs": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
         "tangents": [[1.0, 0.0, 0.0]] * 3,
         "face_indices": [0, 1, 2],
@@ -29702,6 +30483,7 @@ def _run_mesh_slot_limit_regression_guard() -> dict[str, Any]:
             "vertex_stride": skin_stride,
             "positions": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             "normals": [[0.0, 0.0, 1.0]] * 3,
+            "max_normals": [[0.0, 0.0, 1.0]] * 3,
             "uvs": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
             "raw_bones": [[1, 0], [1, 0], [1, 0]],
             "raw_weights": [[0.75, 0.25], [0.75, 0.25], [0.75, 0.25]],
@@ -31386,6 +32168,7 @@ def _run_fvf_weight_capacity_policy_regression_guard() -> dict[str, Any]:
         {
             "positions": [[0.0, 0.0, 0.0]],
             "normals": [[0.0, 0.0, 1.0]],
+            "max_normals": [[0.0, 0.0, 1.0]],
             "uvs": [[0.0, 0.0]],
             "face_indices": [0, 0, 0],
             "mesh_scale": [1.0, 1.0, 1.0],
@@ -31687,56 +32470,6 @@ def _validate_memory_header_witnesses(job: dict[str, Any], contract: dict[str, A
     contract["memory_header_commands"] = [commands[slot] for slot in sorted(commands)]
 
 
-def _require_memory_fbx_geometry_for_requested_rewrites(job: dict[str, Any], contract: dict[str, Any]) -> None:
-    scene_contract = contract.get("scene_contract")
-    if not isinstance(scene_contract, dict):
-        raise ValueError("Memory export geometry validation lost its live scene contract")
-    scene_backend = _memory_scene_backend(scene_contract)
-    by_handle = {
-        _int_or_default(mesh.get("scene_node_handle"), 0): mesh
-        for mesh in contract.get("meshes", [])
-        if isinstance(mesh, dict)
-    }
-    for entry in job.get("meshes", []):
-        if not isinstance(entry, dict) or str(entry.get("lane", "") or "") != "modify":
-            continue
-        if _mesh_uses_source_geometry(entry):
-            continue
-        handle = _int_or_default(entry.get("scene_node_handle"), 0)
-        payload = by_handle.get(handle)
-        if payload is None:
-            raise ValueError(f"Modify bucket handle {handle} is missing from the memory contract")
-        if _mesh_uses_source_geometry(payload):
-            continue
-        failure = ""
-        if payload.get("scene_contract_authority") != scene_backend["authority"]:
-            failure = f"lost_live_{scene_backend['kind']}_scene_authority"
-        elif payload.get("geometry_carrier") != scene_backend["geometry_carrier"]:
-            failure = f"missing_selected_{scene_backend['kind']}_fbx_carrier"
-        elif payload.get("geometry_source") != scene_backend["exported_geometry_source"]:
-            failure = f"missing_{scene_backend['kind']}_exported_fbx_provenance"
-        positions = payload.get("max_positions")
-        if not isinstance(positions, list) or not positions:
-            positions = payload.get("positions")
-        face_indices = payload.get("face_indices")
-        normals = payload.get("max_normals")
-        if not isinstance(normals, list) or not normals:
-            normals = payload.get("normals")
-        if not failure and (not isinstance(positions, list) or not positions):
-            failure = "missing_fbx_positions"
-        if not failure and (not isinstance(face_indices, list) or len(face_indices) < 3):
-            failure = "missing_fbx_faces"
-        if not failure and (not isinstance(normals, list) or not normals):
-            failure = "missing_fbx_normal_layout"
-        if not failure:
-            continue
-        if _mesh_allows_source_geometry_fallback(payload):
-            _mark_mesh_source_passthrough(payload, failure)
-            _mark_mesh_source_passthrough(entry, failure)
-            continue
-        raise ValueError(f"Modify bucket handle {handle} {failure.replace('_', ' ')}")
-
-
 def _prepare_memory_scene_contract(
     job: dict[str, Any],
     contract: dict[str, Any],
@@ -31813,13 +32546,6 @@ def _prepare_memory_scene_contract(
 
     post_uv_started_at = time.perf_counter()
     phase_started_at = post_uv_started_at
-    _require_memory_fbx_geometry_for_requested_rewrites(job, contract)
-    if isinstance(timing, dict):
-        _record_timing_phase(
-            timing,
-            "contract_require_geometry_seconds",
-            time.perf_counter() - phase_started_at,
-        )
     phase_started_at = time.perf_counter()
     _populate_source_short_mesh_scale(
         job,
@@ -31979,12 +32705,13 @@ def _validate_memory_fbx_receipt(
     }
 
     def fallback_optional(entries: list[dict[str, Any]], reason: str) -> bool:
+        # A missing/failed FBX carrier is an explicit transport failure.  For
+        # an ordinary Mesh export the only lossless result is the source MOD
+        # bytes; this exception is deliberately not used for matrix/position
+        # authority selection or for Bones Edit.
         if bone_edit_required:
             return False
-        if not entries or not all(
-            _mesh_allows_source_geometry_fallback(entry)
-            for entry in entries
-        ):
+        if not entries:
             return False
         for entry in entries:
             if _skip_memory_source_missing_mesh(job, contract, entry, reason):
@@ -32325,30 +33052,29 @@ def _run_memory_export_impl(
             detail = str(fbx_handoff.get("error", "") or handoff_status or "unknown FBX probe failure")
             if bone_edit_enabled:
                 raise RuntimeError(f"Python could not read the current Bones Edit FBX: {detail}")
-            if all(
-                _mesh_allows_source_geometry_fallback(mesh)
-                for mesh in fbx_modify_meshes
-            ):
-                for mesh in fbx_modify_meshes:
-                    if _skip_memory_source_missing_mesh(
-                        job,
-                        contract,
-                        mesh,
-                        f"fbx_probe_failed: {detail}",
+            # A failed/missing FBX response is an explicit transport failure.
+            # Ordinary exports may preserve the source bytes for the affected
+            # Meshes; this exception never applies to Bones Edit, whose current
+            # bone matrices/skin pose are mandatory.
+            for mesh in fbx_modify_meshes:
+                if _skip_memory_source_missing_mesh(
+                    job,
+                    contract,
+                    mesh,
+                    f"fbx_probe_failed: {detail}",
+                ):
+                    continue
+                reason = f"fbx_probe_failed: {detail}"
+                _mark_mesh_source_passthrough(mesh, reason)
+                for job_mesh in job.get("meshes", []):
+                    if (
+                        isinstance(job_mesh, dict)
+                        and _int_or_default(job_mesh.get("scene_node_handle"), 0)
+                        == _int_or_default(mesh.get("scene_node_handle"), 0)
                     ):
-                        continue
-                    _mark_mesh_source_passthrough(mesh, f"fbx_probe_failed: {detail}")
-                    for job_mesh in job.get("meshes", []):
-                        if (
-                            isinstance(job_mesh, dict)
-                            and _int_or_default(job_mesh.get("scene_node_handle"), 0)
-                            == _int_or_default(mesh.get("scene_node_handle"), 0)
-                        ):
-                            _mark_mesh_source_passthrough(job_mesh, f"fbx_probe_failed: {detail}")
-                fbx_handoff = {"status": "source_fallback", "contract_meshes": [], "error": detail}
-                fbx_modify_meshes = []
-            else:
-                raise RuntimeError(f"Python could not read the Max FBX geometry carrier: {detail}")
+                        _mark_mesh_source_passthrough(job_mesh, reason)
+            fbx_handoff = {"status": "source_fallback", "contract_meshes": [], "error": detail}
+            fbx_modify_meshes = []
         _propagate_fbx_probe_backend_receipt(job, contract, fbx_handoff)
     else:
         _record_timing_phase(timing, "fbx_probe_seconds", 0.0)
@@ -32373,39 +33099,46 @@ def _run_memory_export_impl(
                     require_explicit_route=require_explicit_max_route,
                 )
             except ValueError as exc:
-                if require_explicit_max_route:
-                    # MAX never enters the legacy name/slot downgrade path.
-                    # Only the identity-quarantine branch inside the adapter
-                    # may make a missing marker non-blocking.
+                if bone_edit_enabled:
                     raise
-                fallback_receipt = _downgrade_unskinned_fbx_contract_rows_without_route_receipt(
-                    job, contract, fbx_contract_meshes
-                )
-                if _int_or_default(fallback_receipt.get("downgraded_mesh_count"), 0) <= 0:
-                    raise
-                compatibility_receipt = fallback_receipt
-                route_receipt_error = exc
+                # A malformed route receipt is still a missing FBX response
+                # for an ordinary Mesh export. Preserve each affected source
+                # Mesh rather than letting the bridge infer a slot/name route.
+                reason = f"fbx_probe_route_receipt_invalid: {exc}"
+                for mesh in fbx_modify_meshes:
+                    _mark_mesh_source_passthrough(mesh, reason)
+                    for job_mesh in job.get("meshes", []):
+                        if (
+                            isinstance(job_mesh, dict)
+                            and _int_or_default(job_mesh.get("scene_node_handle"), 0)
+                            == _int_or_default(mesh.get("scene_node_handle"), 0)
+                        ):
+                            _mark_mesh_source_passthrough(job_mesh, reason)
+                compatibility_receipt = {
+                    "status": "source_fallback",
+                    "authority": "fbx_probe_route_receipt_missing_or_invalid",
+                    "blocking_user_export": False,
+                    "error": str(exc),
+                }
+                route_receipt_error = None
         else:
-            if require_explicit_max_route:
-                # A Max FBX without a route receipt cannot be matched by name
-                # or slot.  Quarantine the affected rows to source MOD bytes
-                # and keep the export non-blocking.
-                compatibility_receipt = _exclude_unresolved_max_fbx_route_rows(
-                    job,
-                    contract,
-                    reason="max_fbx_route_receipt_missing",
-                )
-            else:
-                compatibility_receipt = _downgrade_unskinned_fbx_contract_rows_without_route_receipt(
-                    job, contract, fbx_contract_meshes
-                )
-                if _int_or_default(compatibility_receipt.get("downgraded_mesh_count"), 0) <= 0:
-                    # Do not silently re-enter the retired duplicate topology policy.
-                    # The old helper remains maintenance-testable, but it is isolated
-                    # from the production export chain.
-                    raise RuntimeError(
-                        "Current FBX Probe did not return its required route receipt"
-                    )
+            if bone_edit_enabled:
+                raise RuntimeError("Current FBX Probe did not return its required route receipt")
+            reason = "fbx_probe_route_receipt_missing"
+            for mesh in fbx_modify_meshes:
+                _mark_mesh_source_passthrough(mesh, reason)
+                for job_mesh in job.get("meshes", []):
+                    if (
+                        isinstance(job_mesh, dict)
+                        and _int_or_default(job_mesh.get("scene_node_handle"), 0)
+                        == _int_or_default(mesh.get("scene_node_handle"), 0)
+                    ):
+                        _mark_mesh_source_passthrough(job_mesh, reason)
+            compatibility_receipt = {
+                "status": "source_fallback",
+                "authority": "fbx_probe_route_receipt_missing",
+                "blocking_user_export": False,
+            }
         fbx_handoff["topology_reconciliation"] = copy.deepcopy(compatibility_receipt)
         fbx_modify_meshes = [
             mesh
@@ -32519,6 +33252,16 @@ def _run_memory_export_impl(
             "contract_bones_plus_mesh_geometry_freeze_seconds",
             time.perf_counter() - phase_started_at,
         )
+    # ``writer_handoff`` was snapshotted before contract preparation.  Carry
+    # the final dynamic mapping/position receipts into the object that is
+    # actually passed to ``write_output_mod``.
+    _sync_dynamic_mod_fbx_mapping_receipts(
+        writer_handoff,
+        job,
+        contract,
+        fbx_handoff,
+    )
+    writer_handoff["scene_contract"] = scene_contract
     _record_timing_phase(
         timing,
         "contract_prepare_total_seconds",
@@ -33754,6 +34497,7 @@ _WRITER_MAINTENANCE_RUNNERS: tuple[tuple[str, Callable[[], dict[str, Any]]], ...
     ("PREPARED_64593023_WRITER_PASSTHROUGH_REGRESSION_STATUS", _run_prepared_64593023_writer_passthrough_regression_guard),
     ("LEGACY_COMPACTED_RECOVERY_REGRESSION_STATUS", _run_legacy_compacted_recovery_regression_guard),
     ("SOURCE_SKIN_TRUTH_REGRESSION_STATUS", _run_source_skin_truth_regression_guard),
+    ("WRITER_NORMAL_AUTHORITY_REGRESSION_STATUS", _run_writer_normal_authority_regression_guard),
     ("SEMANTIC_WRITER_LAYOUT_REGRESSION_STATUS", _run_semantic_writer_layout_regression_guard),
     ("BB4240X_FINAL_GEOMETRY_NORMAL_REGRESSION_STATUS", _run_bb4240x_final_geometry_normal_regression_guard),
     ("ORDINARY_SKIN_ROUND_TRIP_REGRESSION_STATUS", _run_ordinary_skin_round_trip_regression_guard),
@@ -33761,7 +34505,6 @@ _WRITER_MAINTENANCE_RUNNERS: tuple[tuple[str, Callable[[], dict[str, Any]]], ...
     ("REAL_PL0600_SKIN_REGRESSION_STATUS", _run_real_pl0600_skin_regression_guard),
     ("ROUND_TRIP_BYTE_ALLOWLIST_REGRESSION_STATUS", _run_round_trip_byte_allowlist_regression_guard),
     ("HEADER_BUCKET_AUTHORITY_REGRESSION_STATUS", _run_header_bucket_authority_regression_guard),
-    ("REQUIRED_FBX_GEOMETRY_REGRESSION_STATUS", _run_required_fbx_geometry_regression_guard),
     ("SPECIAL_MESH_SOURCE_FALLBACK_REGRESSION_STATUS", _run_special_mesh_source_fallback_regression_guard),
     ("BLENDER_BUCKET3_HEADER_ONLY_CLASSIFICATION_REGRESSION_STATUS", _run_blender_bucket3_header_only_classification_regression_guard),
     ("STANDARD_RE6_EXPORT_MESH_NAME_REGRESSION_STATUS", _run_standard_re6_export_mesh_name_regression_guard),

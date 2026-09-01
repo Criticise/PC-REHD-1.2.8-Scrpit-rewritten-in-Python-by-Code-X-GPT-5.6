@@ -27872,6 +27872,35 @@ def _bring_process_window_to_front(target_pid: int) -> tuple[bool, str]:
     hwnd_value = _process_main_window_handle(pid)
     if hwnd_value <= 0:
         return False, f"Max PID {pid} has no visible main window"
+    # Activating Max must never leave its main window in the persistent
+    # TOPMOST band. HWND_TOP only changes Z-order inside the current band, so
+    # explicitly demote a stale TOPMOST Max before foreground activation.
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        user32.SetWindowPos(
+            wintypes.HWND(hwnd_value),
+            wintypes.HWND(-2),  # HWND_NOTOPMOST
+            0,
+            0,
+            0,
+            0,
+            0x0001 | 0x0002 | 0x0010 | 0x0020 | 0x0200,
+        )
+    except Exception:
+        pass
     return _bring_window_handle_to_front(hwnd_value, pid, label="Max")
 
 
@@ -31305,7 +31334,14 @@ def _bring_launcher_window_to_front() -> tuple[bool, str]:
 
 
 def _topmost_visible_process_pid(candidate_pids: Any) -> int:
-    """Return the first non-minimized candidate in the desktop Z-order."""
+    """Return the frontmost candidate *main window* in desktop Z-order.
+
+    A Max process can own floating/plugin windows which remain above another
+    Max instance even though its real application window is behind. Selecting
+    by arbitrary ownerless windows therefore binds the Launcher to the wrong
+    PID. Resolve one authoritative main HWND per PID first, then compare only
+    those handles in the desktop Z-order.
+    """
     if os.name != "nt":
         return 0
     candidates = {int(pid) for pid in candidate_pids if int(pid) > 0}
@@ -31326,16 +31362,23 @@ def _topmost_visible_process_pid(candidate_pids: Any) -> int:
     user32.GetWindow.restype = wintypes.HWND
     user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    main_window_pids = {
+        int(hwnd): int(pid)
+        for pid in candidates
+        for hwnd in (_process_main_window_handle(int(pid)),)
+        if int(hwnd) > 0
+    }
+    if not main_window_pids:
+        return 0
     found = 0
 
     def callback(hwnd: int, _lparam: int) -> bool:
         nonlocal found
         if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd) or user32.GetWindow(hwnd, 4):
             return True
-        pid = wintypes.DWORD(0)
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if int(pid.value) in candidates:
-            found = int(pid.value)
+        matched_pid = main_window_pids.get(int(hwnd))
+        if matched_pid is not None:
+            found = int(matched_pid)
             return False
         return True
 
@@ -56387,6 +56430,9 @@ class LauncherApp:
         self.blender_last_foreground_pid: int | None = None
         self.blender_switch_inflight_pid: int | None = None
         self.blender_switch_generation = 0
+        # Invalidates late Bone Edit inspection callbacks after the checkbox,
+        # active session, or backend mode has changed.
+        self._bone_edit_toggle_generation = 0
         self._blender_pid_discovery_at = 0.0
         self._blender_pid_discovery_inflight = False
         self.blender_launch_in_flight = False
@@ -56459,6 +56505,7 @@ class LauncherApp:
             int(initial_foreground_pid) if int(initial_foreground_pid) > 0 else None
         )
         self._last_foreground_probe_pid = 0
+        self._last_topmost_visible_max_pid = 0
         self._launcher_map_pid_refresh_pending = False
         self._pid_discovery_at = 0.0
         self._pid_discovery_inflight = False
@@ -63664,7 +63711,7 @@ class LauncherApp:
             self.compact_blender_mode_return_button = ttk.Button(
                 self.compact_blender_mode_frame,
                 text=self._tr("回到MAX模式", "Back to MAX Mode"),
-                command=self._deactivate_blender_mode,
+                command=self._toggle_backend_mode,
                 style="BlenderModeReturn.TButton",
                 takefocus=False,
             )
@@ -64539,11 +64586,7 @@ class LauncherApp:
                 if self.blender_mode_enabled
                 else self._tr("回到BLENDER模式", "Back to BLENDER Mode")
             ),
-            command=(
-                self._deactivate_blender_mode
-                if self.blender_mode_enabled
-                else self._activate_blender_mode
-            ),
+            command=self._toggle_backend_mode,
         )
         panel_collapsed = bool(self._compact_mode_panel_collapsed)
         self._configure_widget_if_changed(
@@ -65602,7 +65645,7 @@ class LauncherApp:
             text=self._tr("Blender\n模式", "Blender\nMode"),
             width=9,
             style="BlenderMode.TButton",
-            command=self._activate_blender_mode,
+            command=self._toggle_backend_mode,
         )
         self.blender_mode_button.grid(row=5, column=0, sticky="ew", pady=(4, 0))
         self.toolbox_button = ttk.Button(
@@ -67104,6 +67147,18 @@ class LauncherApp:
     ) -> bool:
         if workspace is None:
             return False
+        if workspace is self._active_workspace():
+            try:
+                enabled = bool(self.bone_edit_var.get())
+            except (AttributeError, self.tk.TclError):
+                enabled = bool(workspace.experimental_bone_edit)
+            workspace.experimental_bone_edit = enabled
+            if not enabled:
+                # The visible checkbox is authoritative for the active page.
+                # Never let a cached export mode reopen the Bone Edit dialog.
+                workspace.bone_export_mode = "disabled"
+                return False
+            return True
         if bool(workspace.experimental_bone_edit):
             return True
         if str(workspace.bone_export_mode or "disabled").strip().lower() in {
@@ -67111,12 +67166,7 @@ class LauncherApp:
             "bones_plus_mesh",
         }:
             return True
-        if workspace is not self._active_workspace():
-            return False
-        try:
-            return bool(self.bone_edit_var.get())
-        except (AttributeError, self.tk.TclError):
-            return False
+        return False
 
     def _sync_legacy_export_control(
         self, workspace: MaxWorkspaceState | None = None
@@ -87166,6 +87216,8 @@ class LauncherApp:
         )
 
     def _toggle_bone_edit(self) -> None:
+        self._bone_edit_toggle_generation += 1
+        toggle_generation = int(self._bone_edit_toggle_generation)
         session = self._active_model_session()
         workspace = self._active_workspace()
         enabled = bool(self.bone_edit_var.get())
@@ -87204,7 +87256,12 @@ class LauncherApp:
             )
 
         def success(value: tuple[str, dict[str, Any]]) -> None:
-            if not self._owns_session_operation(session, action, generation):
+            if (
+                toggle_generation != self._bone_edit_toggle_generation
+                or not self._owns_session_operation(session, action, generation)
+                or self._active_model_session() is not session
+                or not bool(self.bone_edit_var.get())
+            ):
                 return
             request_id, result = value
             contract = dict(result.get("scene_contract", {}))
@@ -87229,7 +87286,11 @@ class LauncherApp:
                 self._set_status(session.workspace.last_status, progress=20)
 
         def failure(exc: Exception) -> None:
-            if not self._owns_session_operation(session, action, generation):
+            if (
+                toggle_generation != self._bone_edit_toggle_generation
+                or not self._owns_session_operation(session, action, generation)
+                or self._active_model_session() is not session
+            ):
                 return
             session.workspace.experimental_bone_edit = False
             session.workspace.bone_export_mode = "disabled"
@@ -87363,12 +87424,8 @@ class LauncherApp:
                         if blender_mode
                         else self._tr("Blender\n模式", "Blender\nMode")
                     ),
-            command=(
-                self._deactivate_blender_mode
-                if blender_mode
-                else self._activate_blender_mode
-            ),
-        )
+                    command=self._toggle_backend_mode,
+                )
             except self.tk.TclError:
                 pass
 
@@ -87654,14 +87711,9 @@ class LauncherApp:
                 padx=(0, 0),
                 pady=(0, 0),
             )
-            switch_command = (
-                self._manual_switch_blender_pid
-                if blender_mode
-                else self._manual_switch_pid
-            )
             self.max_exe_combo.bind(
                 "<<ComboboxSelected>>",
-                lambda _event, command=switch_command: command(),
+                lambda _event: self._manual_switch_pid(),
             )
             self._set_widget_grid_visible(self.max_browse_button, False)
             for widget in (
@@ -87762,12 +87814,12 @@ class LauncherApp:
             )
             self.pid_combo.bind(
                 "<<ComboboxSelected>>",
-                lambda _event: self._manual_switch_blender_pid(),
+                lambda _event: self._manual_switch_pid(),
             )
             self._configure_widget_if_changed(
                 self.pid_switch_button,
                 text=self._tr("切换", "Use"),
-                command=self._manual_switch_blender_pid,
+                command=self._manual_switch_pid,
             )
             self.pid_switch_button.grid_configure(
                 row=0,
@@ -88512,6 +88564,10 @@ class LauncherApp:
         if source_blender_enabled == target_blender_enabled:
             return source_advanced_visible
 
+        # Any Bone Edit inspection started on the previous backend must not
+        # write its result into the newly visible backend workspace.
+        self._bone_edit_toggle_generation += 1
+
         self._hide_mesh_rename_failure_notice()
         self._capture_main_window_size(self._main_window_size_mode)
         self._persist_active_ui_page_preferences()
@@ -88564,6 +88620,13 @@ class LauncherApp:
             except (self.tk.TclError, TypeError, ValueError):
                 pass
         return source_advanced_visible
+
+    def _toggle_backend_mode(self) -> None:
+        """Switch backend using the mode state at click time."""
+        if bool(self.blender_mode_enabled):
+            self._deactivate_blender_mode()
+        else:
+            self._activate_blender_mode()
 
     def _activate_blender_mode(self) -> None:
         if not self.blender_mode_enabled:
@@ -91131,12 +91194,13 @@ class LauncherApp:
             else getattr(self, "pid_combo", None)
         )
 
-        def publish() -> list[str]:
+        def publish() -> tuple[list[str], dict[int, str]]:
             labels: list[str] = []
+            labels_by_pid: dict[int, str] = {}
             for discovered_pid in sorted(set(self.discovered_processes) | set(self.sessions)):
                 session = self.sessions.get(discovered_pid)
                 if session is not None:
-                    labels.append(f"{session.label}  |  Agent Ready")
+                    label = f"{session.label}  |  Agent Ready"
                 else:
                     info = self.discovered_processes[discovered_pid]
                     if discovered_pid in self.launching_pids:
@@ -91147,19 +91211,21 @@ class LauncherApp:
                         agent_state = "Agent Starting"
                     else:
                         agent_state = "Agent Offline"
-                    labels.append(
+                    label = (
                         f"PID {discovered_pid}  |  3ds Max {info.version_hint}  |  {agent_state}"
                     )
+                labels.append(label)
+                labels_by_pid[int(discovered_pid)] = label
             signature = tuple(labels)
             combo_values = tuple(combo.cget("values")) if combo is not None else ()
             if combo is not None and signature != combo_values:
                 combo["values"] = labels
             self._pid_combo_signature = signature
-            return labels
+            return labels, labels_by_pid
 
         # OS discovery is authoritative for the selector. Publish it before any
         # descriptor, socket, or build-health work so a stale Agent cannot hide Max.
-        labels = publish()
+        labels, labels_by_pid = publish()
         foreground_pid = _foreground_window_pid()
         self.foreground_connection_attempted_pids.intersection_update(
             self.discovered_processes
@@ -91179,12 +91245,27 @@ class LauncherApp:
                 self._schedule_active_agent_start(foreground_pid)
             else:
                 self._schedule_existing_session_connect(foreground_pid)
-        labels = publish()
-        if self.active_pid in self.sessions:
-            session = self.sessions[int(self.active_pid)]
-            active_label = f"{session.label}  |  Agent Ready"
-            if self.target_pid_var.get() != active_label:
-                self.target_pid_var.set(active_label)
+        labels, labels_by_pid = publish()
+        current_combo_pid = self._pid_from_combo()
+        preferred_pids = (
+            self.active_pid,
+            current_combo_pid,
+            self.offline_pid,
+            self.manual_target_pid,
+            self.last_foreground_pid,
+            self._last_topmost_visible_max_pid,
+        )
+        selected_label = next(
+            (
+                labels_by_pid[int(pid)]
+                for pid in preferred_pids
+                if pid is not None and int(pid) in labels_by_pid
+            ),
+            None,
+        )
+        if selected_label is not None:
+            if self.target_pid_var.get() != selected_label:
+                self.target_pid_var.set(selected_label)
         elif self.target_pid_var.get() not in labels:
             self.target_pid_var.set("PID --")
 
@@ -92313,6 +92394,8 @@ class LauncherApp:
         }
         workspace.log_dir = self.log_dir_var.get().strip()
         workspace.experimental_bone_edit = bool(self.bone_edit_var.get())
+        if not workspace.experimental_bone_edit:
+            workspace.bone_export_mode = "disabled"
         workspace.rename_value = self.rename_value_var.get()
         workspace.rename_field = _normalize_mesh_rename_field(
             self.rename_field_var.get()

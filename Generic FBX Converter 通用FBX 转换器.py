@@ -58,6 +58,7 @@ FBX_NORMAL_AXIS_DOMAIN_LEGACY = "legacy_max"
 # must not infer or apply a second per-Mesh axis rotation.
 FBX_AXIS_OUTPUT_POLICY = "max_xyz"
 FBX_AXIS_TRANSFORM_CONTRACT = "scene_global_once"
+FBX_TARGET_UNIT_SCALE_CM = 2.54
 
 
 @dataclass
@@ -735,95 +736,6 @@ def _matrices_match(left: list[float], right: list[float]) -> bool:
     return max(abs(float(left[index]) - float(right[index])) for index in range(16)) <= magnitude * 1.0e-4
 
 
-def _matrix_relative_error(left: list[float], right: list[float]) -> float:
-    left_values = _finite_matrix(left, "left matrix")
-    right_values = _finite_matrix(right, "right matrix")
-    magnitude = max(
-        1.0,
-        *(abs(value) for value in left_values),
-        *(abs(value) for value in right_values),
-    )
-    return max(
-        abs(left_values[index] - right_values[index])
-        for index in range(16)
-    ) / magnitude
-
-
-def _is_unit_rigid_axis_matrix(matrix: list[float]) -> bool:
-    """Return whether a bind only describes an already-baked axis basis."""
-    values = _finite_matrix(matrix, "bind matrix")
-    rows = [values[offset : offset + 3] for offset in (0, 4, 8)]
-    lengths = [math.sqrt(sum(component * component for component in row)) for row in rows]
-    if any(abs(length - 1.0) > 1.0e-3 for length in lengths):
-        return False
-    if math.sqrt(sum(values[index] ** 2 for index in (12, 13, 14))) > 1.0e-3:
-        return False
-    normalized = [
-        [component / length for component in row]
-        for row, length in zip(rows, lengths)
-    ]
-    for left_index in range(3):
-        for right_index in range(left_index + 1, 3):
-            dot = sum(
-                left_component * right_component
-                for left_component, right_component in zip(
-                    normalized[left_index], normalized[right_index]
-                )
-            )
-            if abs(dot) > 1.0e-3:
-                return False
-    determinant = (
-        normalized[0][0]
-        * (
-            normalized[1][1] * normalized[2][2]
-            - normalized[1][2] * normalized[2][1]
-        )
-        - normalized[0][1]
-        * (
-            normalized[1][0] * normalized[2][2]
-            - normalized[1][2] * normalized[2][0]
-        )
-        + normalized[0][2]
-        * (
-            normalized[1][0] * normalized[2][1]
-            - normalized[1][1] * normalized[2][0]
-        )
-    )
-    return abs(abs(determinant) - 1.0) <= 1.0e-3
-
-
-def _classify_skin_geometry_domain(
-    mesh_clusters: dict[int, list[dict[str, Any]]],
-) -> str:
-    """Classify the scene before any Max-specific Skin matrix is reapplied."""
-    votes: list[bool] = []
-    for clusters in mesh_clusters.values():
-        active = [
-            cluster
-            for cluster in clusters
-            if int(cluster.get("positive_weight_count", 0) or 0) > 0
-            and cluster.get("transform") is not None
-            and cluster.get("transform_link") is not None
-        ]
-        if not active:
-            continue
-        candidates = [
-            _multiply_row_major_matrices(
-                cluster["transform"], cluster["transform_link"]
-            )
-            for cluster in active
-        ]
-        first = candidates[0]
-        if any(_matrix_relative_error(first, candidate) > 1.0e-4 for candidate in candidates[1:]):
-            return "MIXED"
-        votes.append(_is_unit_rigid_axis_matrix(first))
-    if votes and all(votes):
-        return "ALREADY_BAKED"
-    if votes and not any(votes):
-        return "LOCAL_BIND"
-    return "MIXED"
-
-
 _PRODUCER_TRANSFORM_PROPERTIES = {
     "Lcl Translation",
     "Lcl Rotation",
@@ -1154,6 +1066,23 @@ def _global_unit_scale(roots: list[FbxNode]) -> float:
     return 1.0
 
 
+def _canonical_unit_conversion(roots: list[FbxNode]) -> tuple[float, float, float]:
+    """Return source cm/unit, target cm/unit, and source-to-target numeric factor."""
+    source_unit_scale_cm = float(_global_unit_scale(roots))
+    target_unit_scale_cm = float(FBX_TARGET_UNIT_SCALE_CM)
+    if (
+        not math.isfinite(source_unit_scale_cm)
+        or source_unit_scale_cm <= 0.0
+        or not math.isfinite(target_unit_scale_cm)
+        or target_unit_scale_cm <= 0.0
+    ):
+        raise ValueError("Generic FBX unit conversion has an invalid unit declaration")
+    unit_factor = source_unit_scale_cm / target_unit_scale_cm
+    if not math.isfinite(unit_factor) or unit_factor <= 0.0:
+        raise ValueError("Generic FBX unit conversion produced an invalid factor")
+    return source_unit_scale_cm, target_unit_scale_cm, unit_factor
+
+
 def _generic_axis_conversion_matrix(roots: list[FbxNode]) -> list[float]:
     """Map source storage coordinates to the converter's X/Y/Z target axes."""
     signature = _axis_signature(roots)
@@ -1207,9 +1136,20 @@ def _v5_scene_context(
     parent_ids = dict(source_graph.get("model_parent_ids", {}))
     worlds = _source_model_world_matrices(model_nodes, parent_ids)
     axis_conversion = _generic_axis_conversion_matrix(roots)
-    target_worlds = {
+    source_unit_scale_cm, target_unit_scale_cm, unit_factor = (
+        _canonical_unit_conversion(roots)
+    )
+    axis_worlds = {
         model_id: _multiply_row_major_matrices(world, axis_conversion)
         for model_id, world in worlds.items()
+    }
+    target_worlds = {
+        model_id: _scale_affine_matrix(
+            axis_world,
+            unit_factor,
+            label=f"Model {model_id} canonical unit world",
+        )
+        for model_id, axis_world in axis_worlds.items()
     }
     mesh_ids = set(int(value) for value in source_graph.get("mesh_model_ids", []))
     geometry_by_id = {
@@ -1218,7 +1158,7 @@ def _v5_scene_context(
         if _object_id(node) > 0
     }
     model_geometry_ids = dict(source_graph.get("model_geometry_ids", {}))
-    unit_scale = _global_unit_scale(roots)
+    unit_scale = source_unit_scale_cm
     children_by_parent: dict[int, list[int]] = {}
     for child_id, parent_ids_for_child in parents_by_child.items():
         for parent_id in parent_ids_for_child:
@@ -1317,7 +1257,11 @@ def _v5_scene_context(
         for mesh_model_id in sorted(mesh_model_ids):
             mesh_clusters.setdefault(mesh_model_id, []).append(row)
 
-    geometry_domain = _classify_skin_geometry_domain(mesh_clusters)
+    # Every weighted Mesh is rebuilt through the canonical LOCAL_BIND path.
+    # Do not infer the vertex domain from a unit-looking
+    # Transform*TransformLink product; it does not prove that control points
+    # are already in the canonical geometry domain.
+    geometry_domain = "LOCAL_BIND"
     pose_matrices_by_model: dict[int, list[list[float]]] = {}
     for pose in source_graph.get("poses", []):
         for pose_node in (child for child in pose.children if child.name == "PoseNode"):
@@ -1345,6 +1289,7 @@ def _v5_scene_context(
 
     domain_scales: dict[int, float] = {}
     bind_mesh_matrices: dict[int, list[float]] = {}
+    geometry_bind_bake_by_mesh: dict[int, bool] = {}
     canonical_cluster_matrices: dict[int, tuple[list[float], list[float]]] = {}
     canonical_bind_by_model: dict[int, list[float]] = {}
     cluster_domain_scales: dict[int, list[float]] = {}
@@ -1365,15 +1310,6 @@ def _v5_scene_context(
             # exporter placeholder.  It must not turn the Mesh into a
             # skinned route or cause its Model world to be zeroed/baked.
             domain_scales[mesh_model_id] = 1.0
-            continue
-        if geometry_domain == "ALREADY_BAKED":
-            # The Geometry is already in the common scene domain. Keep the
-            # control points untouched; Cluster links are still preserved below
-            # as the fixed bind pose, while Model worlds remain the current pose.
-            domain_scales[mesh_model_id] = 1.0
-            bind_mesh_matrices[mesh_model_id] = _identity_matrix()
-            for cluster in active_clusters:
-                cluster_domain_scales.setdefault(int(cluster["cluster_id"]), []).append(1.0)
             continue
         ratios: list[float] = []
         for cluster in active_clusters:
@@ -1437,20 +1373,52 @@ def _v5_scene_context(
                     raise ValueError(
                         f"Mesh {mesh_model_id} bind matrix disagreement"
                     )
-            bind_mesh_matrices[mesh_model_id] = _multiply_row_major_matrices(
+            bind_axis = _multiply_row_major_matrices(
                 _scale_affine_matrix(
                     first, domain, label=f"Mesh {mesh_model_id} bind matrix"
                 ),
                 axis_conversion,
+            )
+            bind_mesh_matrices[mesh_model_id] = _scale_affine_matrix(
+                bind_axis,
+                unit_factor,
+                label=f"Mesh {mesh_model_id} canonical unit bind matrix",
+            )
+
+    # RISK EXPERIMENT V2: keep the established per-Cluster product which
+    # resolves to one common MeshBind, but always bake that common bind into
+    # Geometry. Skinned Mesh Models are emitted with identity world matrices;
+    # leaving a 2.54 / 0.3937008 bind only in the Cluster makes ordinary
+    # max_positions too small while skinned_max_positions remains correct.
+    for mesh_model_id in bind_mesh_matrices:
+        geometry_bind_bake_by_mesh[mesh_model_id] = True
+
+    # Row-vector FBX bind contract:
+    #
+    #   unbaked Geometry: Transform = MeshBind * inverse(BoneBind)
+    #   baked Geometry:   Transform =            inverse(BoneBind)
+    #
+    # Dropping MeshBind from the unbaked branch removes the authored pose.
+    cluster_geometry_contracts: dict[int, list[tuple[list[float], bool]]] = {}
+    for mesh_model_id, clusters in mesh_clusters.items():
+        geometry_basis = bind_mesh_matrices.get(int(mesh_model_id))
+        if geometry_basis is None:
+            continue
+        geometry_baked = bool(geometry_bind_bake_by_mesh.get(int(mesh_model_id), False))
+        for cluster in clusters:
+            cluster_id = int(cluster.get("cluster_id", 0) or 0)
+            if cluster_id <= 0:
+                continue
+            cluster_geometry_contracts.setdefault(cluster_id, []).append(
+                (list(geometry_basis), geometry_baked)
             )
 
     bind_candidates_by_bone: dict[int, list[list[float]]] = {}
     for cluster_id, cluster in cluster_by_id.items():
         bone_id = int(cluster["bone_model_id"])
         has_positive_influence = int(cluster.get("positive_weight_count", 0) or 0) > 0
-        # TransformLink is the source of truth for the bind pose.  Normalize it
-        # into the same axis/unit domain as the rebuilt geometry, but never
-        # replace it with the current bone Model world.
+        # TransformLink is the source of truth for the bind pose. Normalize it
+        # into the same axis/unit domain as the rebuilt geometry.
         link = _multiply_row_major_matrices(
             cluster["transform_link"], axis_conversion
         )
@@ -1473,14 +1441,42 @@ def _v5_scene_context(
             bind_scale = float(unit_scale) if math.isfinite(float(unit_scale)) and float(unit_scale) > 0.0 else 1.0
         link = _scale_affine_matrix(
             link,
-            bind_scale,
+            bind_scale * unit_factor,
             label=f"Bone {bone_id} canonical bind",
         )
         link = _finite_matrix(link, label=f"Bone {bone_id} canonical bind")
-        inverse = _invert_row_major_matrix(link)
-        if inverse is None:
+        if _invert_row_major_matrix(link) is None:
             raise ValueError(f"Bone {bone_id} canonical bind is not invertible")
-        canonical_cluster_matrices[int(cluster_id)] = (inverse, link)
+        geometry_contracts = cluster_geometry_contracts.get(int(cluster_id), [])
+        if geometry_contracts:
+            geometry_basis, geometry_baked = geometry_contracts[0]
+            for candidate_basis, candidate_baked in geometry_contracts[1:]:
+                if (
+                    candidate_baked != geometry_baked
+                    or not _matrices_match(geometry_basis, candidate_basis)
+                ):
+                    raise ValueError(
+                        f"Cluster {cluster_id} is shared by incompatible Geometry bind contracts"
+                    )
+            inverse_link = _invert_row_major_matrix(link)
+            if inverse_link is None:
+                raise ValueError(
+                    f"Cluster {cluster_id} canonical TransformLink is not invertible"
+                )
+            canonical_transform = (
+                list(inverse_link)
+                if geometry_baked
+                else _multiply_row_major_matrices(
+                    geometry_basis,
+                    inverse_link,
+                )
+            )
+        else:
+            canonical_transform = _identity_matrix()
+        canonical_cluster_matrices[int(cluster_id)] = (
+            canonical_transform,
+            link,
+        )
         if has_positive_influence:
             bind_candidates_by_bone.setdefault(bone_id, []).append(list(link))
 
@@ -1508,7 +1504,7 @@ def _v5_scene_context(
                     pose, label=f"Bone {bone_id} authored bind"
                 )
                 current_scales = _matrix_basis_scales(
-                    canonical_bone_worlds[bone_id],
+                    axis_worlds[bone_id],
                     label=f"Bone {bone_id} current world",
                 )
                 ratios = [
@@ -1536,7 +1532,7 @@ def _v5_scene_context(
                 pose_scale = 1.0
             canonical_bind_by_model[bone_id] = _scale_affine_matrix(
                 pose,
-                pose_scale,
+                pose_scale * unit_factor,
                 label=f"Bone {bone_id} authored bind",
             )
         elif bone_id in canonical_bone_worlds:
@@ -1558,14 +1554,19 @@ def _v5_scene_context(
     }
     return {
         "source_worlds": worlds,
+        "output_unit_worlds": target_worlds,
         "output_worlds": output_worlds,
         "domain_scales": domain_scales,
         "bind_mesh_matrices": bind_mesh_matrices,
+        "geometry_bind_bake_by_mesh": geometry_bind_bake_by_mesh,
         "mesh_clusters": mesh_clusters,
         "cluster_matrices": canonical_cluster_matrices,
         "canonical_bind_by_model": canonical_bind_by_model,
         "skinned_mesh_ids": skinned_mesh_ids,
         "unit_scale": unit_scale,
+        "source_unit_scale_cm": source_unit_scale_cm,
+        "target_unit_scale_cm": target_unit_scale_cm,
+        "unit_factor": unit_factor,
         "geometry_domain": geometry_domain,
         "axis_conversion": axis_conversion,
     }
@@ -2024,7 +2025,110 @@ def _generic_global_settings(
             ("S", ""),
             ("I", value),
         )
+    unit_target = {
+        "UnitScaleFactor": float(FBX_TARGET_UNIT_SCALE_CM),
+        "OriginalUnitScaleFactor": float(FBX_TARGET_UNIT_SCALE_CM),
+    }
+    unit_found: set[str] = set()
+    for property_node in properties.children:
+        name = _property_name(property_node)
+        if name not in unit_target or not property_node.properties:
+            continue
+        property_node.properties[-1] = unit_target[name]
+        if property_node.property_types:
+            property_node.property_types[-1] = "D"
+        unit_found.add(name)
+    for name, value in unit_target.items():
+        if name in unit_found:
+            continue
+        properties.add(
+            "P",
+            ("S", name),
+            ("S", "double"),
+            ("S", "Number"),
+            ("S", ""),
+            ("D", value),
+        )
     return cloned
+
+
+def _validate_generic_unit_conversion(
+    source_roots: list[FbxNode],
+    generic_roots: list[FbxNode],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    """Hard gate proving that the Generic scene owns one global unit conversion."""
+    source_unit_scale_cm, target_unit_scale_cm, expected_factor = (
+        _canonical_unit_conversion(source_roots)
+    )
+    actual_factor = float(context.get("unit_factor", 0.0) or 0.0)
+    tolerance = 1.0e-9
+    if abs(actual_factor - expected_factor) > tolerance * max(1.0, abs(expected_factor)):
+        raise ValueError(
+            "Generic FBX unit validation failed: context factor does not match UnitScaleFactor"
+        )
+    output_unit_scale_cm = float(_global_unit_scale(generic_roots))
+    if abs(output_unit_scale_cm - target_unit_scale_cm) > tolerance:
+        raise ValueError(
+            "Generic FBX unit validation failed: output GlobalSettings is not canonical"
+        )
+
+    source_worlds = context.get("source_worlds")
+    target_worlds = context.get("output_unit_worlds")
+    axis_conversion = context.get("axis_conversion")
+    if not isinstance(source_worlds, dict) or not isinstance(target_worlds, dict):
+        raise ValueError("Generic FBX unit validation is missing Model world matrices")
+    axis_matrix = _finite_matrix(axis_conversion, "Generic unit validation axis matrix")
+    if set(source_worlds) != set(target_worlds):
+        raise ValueError("Generic FBX unit validation Model world coverage mismatch")
+    for model_id, source_world in source_worlds.items():
+        expected_world = _scale_affine_matrix(
+            _multiply_row_major_matrices(source_world, axis_matrix),
+            expected_factor,
+            label=f"Model {model_id} expected canonical unit world",
+        )
+        actual_world = _finite_matrix(
+            target_worlds[model_id],
+            f"Model {model_id} actual canonical unit world",
+        )
+        if not _matrices_match(expected_world, actual_world):
+            raise ValueError(
+                f"Generic FBX unit validation failed for Model {model_id}"
+            )
+
+    bind_mesh_matrices = context.get("bind_mesh_matrices")
+    cluster_matrices = context.get("cluster_matrices")
+    if not isinstance(bind_mesh_matrices, dict) or not isinstance(cluster_matrices, dict):
+        raise ValueError("Generic FBX unit validation is missing Skin bind matrices")
+    for mesh_id, matrix in bind_mesh_matrices.items():
+        _finite_matrix(matrix, f"Mesh {mesh_id} validated canonical bind")
+    for cluster_id, pair in cluster_matrices.items():
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise ValueError(
+                f"Generic FBX unit validation Cluster {cluster_id} has an invalid matrix pair"
+            )
+        transform = _finite_matrix(pair[0], f"Cluster {cluster_id} Transform")
+        link = _finite_matrix(pair[1], f"Cluster {cluster_id} TransformLink")
+        if _invert_row_major_matrix(transform) is None:
+            raise ValueError(
+                f"Generic FBX unit validation Cluster {cluster_id} Transform is not invertible"
+            )
+        if _invert_row_major_matrix(link) is None:
+            raise ValueError(
+                f"Generic FBX unit validation Cluster {cluster_id} TransformLink is not invertible"
+            )
+    return {
+        "schema": "pc-rehd-generic-unit-validation-v1",
+        "status": "PASS",
+        "source_unit_scale_cm": source_unit_scale_cm,
+        "target_unit_scale_cm": target_unit_scale_cm,
+        "unit_factor": expected_factor,
+        "unit_conversion_applied": abs(expected_factor - 1.0) > tolerance,
+        "validated_model_count": len(source_worlds),
+        "validated_bind_mesh_count": len(bind_mesh_matrices),
+        "validated_cluster_count": len(cluster_matrices),
+        "applied_once": True,
+    }
 
 
 def _generic_object_name(node: FbxNode, fallback: str) -> str:
@@ -2318,6 +2422,101 @@ def _extract_geometry_semantics(
         "output_vertex_count": len(output_positions),
         "normal_split": bool(normal_values is not None),
         "uv_channel_count": len(uv_channels),
+    }
+
+
+def _apply_current_pose_inverse_skin_to_geometry_payload(
+    payload: dict[str, Any],
+    *,
+    clusters: list[dict[str, Any]],
+    cluster_matrices: dict[int, tuple[list[float], list[float]]],
+    current_bone_worlds: dict[int, list[float]],
+) -> dict[str, Any]:
+    """Move visible posed Geometry back to bind space without losing pose."""
+    if payload.get("status") != "rebuilt":
+        return {"status": "skipped", "reason": "geometry_not_rebuilt"}
+    vertices = payload.get("vertices")
+    cp_to_output = payload.get("cp_to_output")
+    if not isinstance(vertices, list) or not isinstance(cp_to_output, dict):
+        return {"status": "skipped", "reason": "geometry_rows_unavailable"}
+    source_count = int(payload.get("source_vertex_count", 0) or 0)
+    if source_count <= 0:
+        return {"status": "skipped", "reason": "empty_geometry"}
+
+    accumulated = [[0.0] * 16 for _ in range(source_count)]
+    weight_sums = [0.0] * source_count
+    active_cluster_count = 0
+    for cluster in clusters:
+        cluster_id = int(cluster.get("cluster_id", 0) or 0)
+        bone_id = int(cluster.get("bone_model_id", 0) or 0)
+        canonical = cluster_matrices.get(cluster_id)
+        bone_world = current_bone_worlds.get(bone_id)
+        if canonical is None or bone_world is None:
+            continue
+        deformation = _multiply_row_major_matrices(canonical[0], bone_world)
+        used = False
+        for raw_index, raw_weight in zip(cluster.get("indexes", []), cluster.get("weights", [])):
+            source_index = int(raw_index)
+            weight = float(raw_weight)
+            if source_index < 0 or source_index >= source_count or weight <= 0.0:
+                continue
+            used = True
+            for component in range(16):
+                accumulated[source_index][component] += deformation[component] * weight
+            weight_sums[source_index] += weight
+        if used:
+            active_cluster_count += 1
+    if active_cluster_count <= 0:
+        return {"status": "skipped", "reason": "no_active_clusters"}
+
+    output_inverse: dict[int, list[float]] = {}
+    transformed_source_count = 0
+    max_roundtrip_error = 0.0
+    for source_index, weight_sum in enumerate(weight_sums):
+        if weight_sum <= 1.0e-12:
+            continue
+        deformation = [value / weight_sum for value in accumulated[source_index]]
+        inverse = _invert_row_major_matrix(deformation)
+        if inverse is None:
+            raise ValueError(f"Current-pose inverse Skin matrix is singular at vertex {source_index}")
+        for output_index in cp_to_output.get(source_index, []):
+            output_index = int(output_index)
+            if output_index < 0 or output_index >= len(vertices):
+                raise ValueError("Current-pose inverse Skin output vertex is out of range")
+            visible = [float(value) for value in vertices[output_index][:3]]
+            bind = _transform_position_row_major(visible, inverse)
+            roundtrip = _transform_position_row_major(bind, deformation)
+            max_roundtrip_error = max(
+                max_roundtrip_error,
+                *(abs(roundtrip[axis] - visible[axis]) for axis in range(3)),
+            )
+            vertices[output_index] = bind
+            output_inverse[output_index] = inverse
+        transformed_source_count += 1
+
+    loop_normals = payload.get("loop_normals")
+    faces = payload.get("faces")
+    if isinstance(loop_normals, list) and isinstance(faces, list):
+        corner_index = 0
+        for face in faces:
+            for output_index in face:
+                if corner_index >= len(loop_normals):
+                    break
+                inverse = output_inverse.get(int(output_index))
+                if inverse is not None:
+                    loop_normals[corner_index] = _transform_normal_row_major(
+                        loop_normals[corner_index], inverse
+                    )
+                corner_index += 1
+    if max_roundtrip_error > 0.001:
+        raise ValueError(
+            f"Current-pose inverse Skin roundtrip error is too large: {max_roundtrip_error}"
+        )
+    return {
+        "status": "applied",
+        "active_cluster_count": active_cluster_count,
+        "transformed_source_vertex_count": transformed_source_count,
+        "max_roundtrip_error": max_roundtrip_error,
     }
 
 
@@ -3260,7 +3459,7 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
     source_objects = _first_root(roots, "Objects")
     source_connections = _first_root(roots, "Connections")
     if source_objects is None:
-        return roots, {"safe_rebuilder_status": "passthrough_no_objects"}
+        raise ValueError("Generic FBX rebuild requires an Objects root")
 
     source_graph = _safe_rebuilder_source_graph(roots)
     object_nodes = list(source_graph["object_nodes"])
@@ -3289,6 +3488,12 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
     v5_context = _v5_scene_context(roots, source_graph, parents_by_child)
     output_worlds = dict(v5_context["output_worlds"])
     canonical_bind_by_model = dict(v5_context["canonical_bind_by_model"])
+    # Publish the exact document-level basis used by the rebuild.  All
+    # Geometry/Model/Cluster/Pose passes below belong to this one canonical
+    # Y-up scene domain; no later per-Mesh legacy-axis inference is allowed.
+    axis_conversion = list(
+        v5_context.get("axis_conversion") or _identity_matrix()
+    )
     for mesh_model_id in v5_context["skinned_mesh_ids"]:
         canonical_bind_by_model[int(mesh_model_id)] = _identity_matrix()
 
@@ -3458,16 +3663,9 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
     geometry_output_ids = {
         geometry_id: id_map[geometry_id] for geometry_id in geometry_by_id
     }
-    # Keep the exact per-Geometry normal/axis receipt used by the embedded
-    # Probe. A scene can mix skinned Geometry baked to canonical XYZ with
-    # untouched Max/legacy Geometry, so a scene-wide guess is not sufficient.
-    axis_conversion = v5_context.get("axis_conversion")
-    source_axes_are_canonical = (
-        isinstance(axis_conversion, list)
-        and _matrices_match(axis_conversion, _identity_matrix())
-    )
+    # Match the embedded Probe's Generic contract: every emitted Geometry is
+    # interpreted inside the same rebuilt scene-global Y-up axis domain.
     canonical_normal_geometry_ids: set[int] = set()
-    legacy_normal_geometry_ids: set[int] = set()
     normal_axis_domain_by_geometry_id: dict[str, str] = {}
 
     def record_normal_axis_domain(
@@ -3481,23 +3679,9 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         )
         if output_geometry_id <= 0:
             return
-        # An identity source basis is already canonical. Otherwise only
-        # Geometry that went through an explicit bind/axis bake is canonical;
-        # untouched Geometry remains in the legacy Max basis.
-        baked = (
-            isinstance(applied_matrix, list)
-            and not _matrices_match(applied_matrix, _identity_matrix())
-        )
-        domain = (
-            FBX_NORMAL_AXIS_DOMAIN_CANONICAL
-            if source_axes_are_canonical or baked
-            else FBX_NORMAL_AXIS_DOMAIN_LEGACY
-        )
+        domain = FBX_NORMAL_AXIS_DOMAIN_CANONICAL
         normal_axis_domain_by_geometry_id[str(output_geometry_id)] = domain
-        if domain == FBX_NORMAL_AXIS_DOMAIN_CANONICAL:
-            canonical_normal_geometry_ids.add(output_geometry_id)
-        else:
-            legacy_normal_geometry_ids.add(output_geometry_id)
+        canonical_normal_geometry_ids.add(output_geometry_id)
 
     emitted_geometry_ids: set[int] = set()
     geometry_cp_maps: dict[int, dict[int, list[int]]] = {}
@@ -3512,19 +3696,23 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
             source_geometry = geometry_by_id.get(geometry_id)
             if source_geometry is None or geometry_id in emitted_geometry_ids:
                 continue
-            bind_matrix = (
-                v5_context["bind_mesh_matrices"].get(source_id)
-                if source_id in v5_context["skinned_mesh_ids"]
+            # Bake only pre-bind Geometry domains. Ordinary-sized MeshBind is
+            # preserved by Cluster.Transform, so Geometry must stay untouched.
+            geometry_bind_matrix = (
+                v5_context["bind_mesh_matrices"].get(int(source_id))
+                if v5_context["geometry_bind_bake_by_mesh"].get(
+                    int(source_id), False
+                )
                 else None
             )
             geometry_payload = _extract_geometry_semantics(
                 source_geometry,
-                position_matrix=bind_matrix,
-                normal_matrix=bind_matrix,
+                position_matrix=geometry_bind_matrix,
+                normal_matrix=geometry_bind_matrix,
             )
             record_normal_axis_domain(
                 geometry_id,
-                applied_matrix=bind_matrix,
+                applied_matrix=geometry_bind_matrix,
             )
             generic_objects.children.append(
                 _generic_geometry_node(
@@ -3559,8 +3747,17 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
     for geometry_id, source_geometry in geometry_by_id.items():
         if geometry_id in emitted_geometry_ids:
             continue
-        geometry_payload = _extract_geometry_semantics(source_geometry)
-        record_normal_axis_domain(geometry_id, applied_matrix=None)
+        unlinked_geometry_matrix = _scale_affine_matrix(
+            axis_conversion,
+            float(v5_context["unit_factor"]),
+            label=f"Geometry {geometry_id} canonical unit matrix",
+        )
+        geometry_payload = _extract_geometry_semantics(
+            source_geometry,
+            position_matrix=unlinked_geometry_matrix,
+            normal_matrix=unlinked_geometry_matrix,
+        )
+        record_normal_axis_domain(geometry_id, applied_matrix=unlinked_geometry_matrix)
         generic_objects.children.append(
             _generic_geometry_node(
                 source_geometry,
@@ -3773,7 +3970,10 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         "FBXHeaderExtension": header,
         "GlobalSettings": _generic_global_settings(
             root_by_name.get("GlobalSettings", FbxNode("GlobalSettings")),
-            canonicalize_axes=_generic_axis_signature_is_valid(roots),
+            # The complete semantic rebuild above owns the source-axis
+            # conversion.  Always publish the rebuilt document as canonical
+            # X-right/Y-up/Z-front instead of retaining a producer branch.
+            canonicalize_axes=True,
         ),
         "Definitions": _generic_definitions(generic_objects),
         "Objects": generic_objects,
@@ -3797,6 +3997,7 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         generic_roots.append(FbxNode("Creator", ["Generic FBX Converter"], ["S"], []))
     elif creator.properties:
         creator.properties[0] = "Generic FBX Converter"
+    unit_validation = _validate_generic_unit_conversion(roots, generic_roots, v5_context)
     return generic_roots, {
         "safe_rebuilder_status": "rebuilt",
         "safe_rebuilder_object_count": len(generic_objects.children),
@@ -3810,7 +4011,6 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         "geometry_skip_reasons": geometry_skip_reasons,
         "skin_geometry_domain": v5_context["geometry_domain"],
         "canonical_normal_geometry_ids": sorted(canonical_normal_geometry_ids),
-        "legacy_normal_geometry_ids": sorted(legacy_normal_geometry_ids),
         "normal_axis_domain_by_geometry_id": dict(normal_axis_domain_by_geometry_id),
         "skin_clusters_remapped": skin_clusters_remapped,
         "safe_rebuilder_deformer_count": len(deformer_nodes),
@@ -3823,6 +4023,10 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
             graph_check["dangling_connections"]
         ),
         "safe_rebuilder_id_base": 100000,
+        "source_unit_scale_cm": v5_context["source_unit_scale_cm"],
+        "target_unit_scale_cm": v5_context["target_unit_scale_cm"],
+        "unit_factor": v5_context["unit_factor"],
+        "unit_conversion_validation": unit_validation,
         # Keep the source->canonical basis used by rebuilt Model rows. The
         # downstream Writer can apply its inverse without assuming every Max
         # FBX used the same axis signature.

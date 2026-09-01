@@ -34,22 +34,43 @@ FBX_PROBE_RUNTIME_UNAVAILABLE_STATUS = "runtime_unavailable"
 FBX_PROBE_DATA_ERROR_STATUS = "data_error"
 FBX_PROBE_BRIDGE_RETRY_STATUS = "RUNTIME_RETRY"
 BINARY_FBX_NORMAL_FIDELITY_SCHEMA = "pc-rehd-fbx-corner-normal-fidelity-v1"
-# Normal-space labels are deliberately explicit.  A Generic rebuild may bake
-# the source axis basis into only the skinned Geometry records; the Writer
-# must therefore not infer one normal transform for the whole FBX.
+# Normal-space labels are deliberately explicit. Generic rebuilds emit one
+# canonical scene-wide XYZ basis for every supported DCC route.
 FBX_NORMAL_AXIS_DOMAIN_CANONICAL = "canonical_xyz"
-# EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-# Legacy non-Generic normal-domain label.  Keep only for old receipts while
-# every supported DCC route migrates to the Generic canonical contract.
-FBX_NORMAL_AXIS_DOMAIN_LEGACY = "legacy_max"
 UFBX_BEHAVIOR_CONTRACT_SCHEMA = "pc-rehd-code-x-patched-ufbx-behavior-v1"
 UFBX_BEHAVIOR_FLOAT_DECIMALS = 8
 # MOD's position denominator is authored in the same numeric unit domain as
-# 3ds Max inches.  Blender FBX files normally report centimetres (0.01 m), so
-# Probe converts their already-evaluated world/Max position channels once at
-# the handoff boundary.  The Writer intentionally remains unit-factor-free.
-FBX_MAX_INCH_UNIT_METERS = 0.0254
-BLENDER_FBX_INCH_SCALE_SCHEMA = "pc-rehd-blender-fbx-inch-scale-v1"
+# 3ds Max inches.  Unit conversion is owned by the generic reconstruction
+# layer; Probe does not apply producer-specific (Blender/MAX) factors.
+FBX_TARGET_UNIT_METERS = 0.0254
+FBX_TARGET_UNIT_SCALE_CM = FBX_TARGET_UNIT_METERS * 100.0
+CANONICAL_FBX_PROBE_SCHEMA = "pc-rehd-canonical-fbx-probe-v1"
+CANONICAL_AXIS_DOMAIN = FBX_NORMAL_AXIS_DOMAIN_CANONICAL
+CANONICAL_UNIT_DOMAIN = "max_inches_numeric"
+GENERIC_AXIS_OUTPUT_POLICY = "max_xyz"
+GENERIC_AXIS_TRANSFORM_SCOPE = "scene_global_once"
+DYNAMIC_MOD_FBX_MAPPING_SCHEMA = "pc-rehd-dynamic-mod-fbx-mapping-v1"
+# Transform-scale receipt is separate from the axis-basis receipt.  A basis
+# change is dimensionless; the root scale and the FBX-unit ratio are length
+# authorities and must never be hidden in the 4x4 axis matrices.
+FBX_TRANSFORM_SCALE_SCHEMA = "pc-rehd-fbx-transform-scale-v1"
+# The MOD importer first decodes an on-disk XYZ row into its internal Max
+# scene domain as (x, -z, y). Generic Probe publishes one canonical XYZ scene,
+# so Writer receives this explicit inverse pair instead of guessing a
+# DCC-specific axis route. Unit scale is already owned by Probe and is not
+# embedded in either matrix.
+MOD_TO_CANONICAL_MATRIX = (
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, -1.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+)
+CANONICAL_TO_MOD_MATRIX = (
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, -1.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+)
 _NATIVE_LOADER_ERROR_CODES = frozenset({8, 126, 127, 182, 193, 1114})
 _NATIVE_LOADER_ERROR_MARKERS = (
     "dll load failed",
@@ -216,6 +237,8 @@ def _is_max_generic_rebuild_backend(value: Any) -> bool:
 def _uses_generic_rebuild_backend(value: Any) -> bool:
     return str(value or "").strip().casefold() in GENERIC_REBUILD_BACKENDS
 
+
+# ====== BEGIN ROUTE METADATA (MAX HANDLE / BLENDER UNIT FLAG ONLY) ======
 
 @dataclass(slots=True)
 class BoundingBox:
@@ -574,6 +597,9 @@ def infer_lod_hint(name: str | None) -> int | None:
     return int(match.group(1))
 
 
+# ====== END ROUTE METADATA (MAX HANDLE / BLENDER UNIT FLAG ONLY) ======
+# ====== BEGIN CANONICAL VECTOR / MATRIX MATH ======
+
 def _vec3_to_list(vec: Any) -> list[float]:
     if hasattr(vec, "x"):
         return [round(float(vec.x), 6), round(float(vec.y), 6), round(float(vec.z), 6)]
@@ -796,341 +822,6 @@ def _scene_unit_receipt(scene: Any) -> dict[str, Any]:
     }
 
 
-def _scale_probe_position_rows_to_max_inches(
-    rows: Any,
-    factor: float,
-) -> list[list[float]] | None:
-    """Scale a Probe world/Max vec3 stream into the Max-inch numeric domain."""
-    if not isinstance(rows, list):
-        return None
-    try:
-        converted: list[list[float]] = []
-        for row in rows:
-            if not isinstance(row, (list, tuple)) or len(row) < 3:
-                return None
-            values = [float(row[index]) for index in range(3)]
-            if not all(math.isfinite(value) for value in values):
-                return None
-            converted.append([round(value * factor, 6) for value in values])
-        return converted
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-
-def _scale_blender_bone_matrices_to_max_inches(
-    payload: dict[str, Any],
-    factor: float,
-) -> dict[str, Any]:
-    """Convert Blender bone matrices to the Max-inch numeric domain once.
-
-    The Mesh and bone world rows are emitted by the same Blender FBX scene and
-    therefore must cross the unit boundary together.  We scale absolute world
-    matrices first, then derive each local row from its converted parent world;
-    applying the factor independently to every local row would multiply it at
-    each hierarchy level.
-    """
-    result: dict[str, Any] = {
-        "status": "no_bone_matrices",
-        "fields": [],
-        "world_matrix_count": 0,
-        "local_matrix_count": 0,
-        "applied_once": True,
-    }
-    summary = payload.get("summary")
-    bones = summary.get("bones") if isinstance(summary, dict) else None
-    try:
-        factor_value = float(factor)
-    except (TypeError, ValueError, OverflowError):
-        factor_value = 0.0
-    if not isinstance(bones, list) or not bones:
-        return result
-    if not math.isfinite(factor_value) or factor_value <= 0.0:
-        result["status"] = "invalid_factor"
-        return result
-    result["bone_count"] = len(bones)
-    result["unit_factor"] = factor_value
-    if abs(factor_value - 1.0) <= 1.0e-12:
-        result["status"] = "not_needed"
-        return result
-
-    # A handoff payload is normally fresh, but retain a marker so a diagnostic
-    # caller cannot apply the scene-unit conversion twice to the same bones.
-    existing = summary.get("blender_bone_matrix_scale_transform")
-    if isinstance(existing, dict) and existing.get("schema") == BLENDER_FBX_INCH_SCALE_SCHEMA:
-        result.update(existing)
-        result["status"] = "already_applied"
-        result["applied_once"] = True
-        return result
-
-    converted_world_by_index: dict[int, list[float]] = {}
-    converted_world_by_name: dict[str, list[float]] = {}
-    for index, bone in enumerate(bones):
-        if not isinstance(bone, dict):
-            continue
-        matrix = _flatten_matrix4x4(bone.get("world_matrix"))
-        if len(matrix) != 16:
-            continue
-        try:
-            converted = _scale_affine_matrix(
-                matrix,
-                factor_value,
-                label=f"Blender bone {index} world matrix",
-            )
-        except (TypeError, ValueError, OverflowError):
-            continue
-        bone["world_matrix"] = converted
-        converted_world_by_index[index] = converted
-        name_key = str(bone.get("name", "") or "").strip().casefold()
-        if name_key and name_key not in converted_world_by_name:
-            converted_world_by_name[name_key] = converted
-        result["world_matrix_count"] = int(result["world_matrix_count"]) + 1
-
-    for index, bone in enumerate(bones):
-        if not isinstance(bone, dict):
-            continue
-        world = converted_world_by_index.get(index)
-        if world is None:
-            # If no absolute world is available, preserve the old fallback and
-            # scale the local matrix once rather than dropping the bone row.
-            local = _flatten_matrix4x4(bone.get("local_matrix"))
-            if len(local) != 16:
-                continue
-            try:
-                bone["local_matrix"] = _scale_affine_matrix(
-                    local,
-                    factor_value,
-                    label=f"Blender bone {index} local matrix",
-                )
-            except (TypeError, ValueError, OverflowError):
-                continue
-            result["local_matrix_count"] = int(result["local_matrix_count"]) + 1
-            continue
-
-        parent_name = str(bone.get("parent_name", "") or "").strip().casefold()
-        parent_world = converted_world_by_name.get(parent_name) if parent_name else None
-        if parent_world is None:
-            # Root bones have no parent-relative cancellation; their local row
-            # is the converted absolute row.
-            bone["local_matrix"] = list(world)
-            result["local_matrix_count"] = int(result["local_matrix_count"]) + 1
-            continue
-        inverse_parent = _generic_invert_row_major_matrix(parent_world)
-        if inverse_parent is None:
-            continue
-        bone["local_matrix"] = _generic_multiply_row_major_matrices(
-            world,
-            inverse_parent,
-        )
-        result["local_matrix_count"] = int(result["local_matrix_count"]) + 1
-
-    if int(result["world_matrix_count"]) or int(result["local_matrix_count"]):
-        result["status"] = "applied"
-        result["fields"] = ["summary.bones.world_matrix", "summary.bones.local_matrix"]
-        summary["blender_bone_matrix_scale_transform"] = {
-            "schema": BLENDER_FBX_INCH_SCALE_SCHEMA,
-            "status": "applied",
-            "unit_factor": factor_value,
-            "applied_once": True,
-        }
-    return result
-
-
-def _apply_blender_probe_inch_scale(
-    payload: dict[str, Any],
-    *,
-    backend_kind: Any,
-    fbx_units: dict[str, Any],
-    generic_receipt: dict[str, Any] | None,
-    bone_edit: bool = False,
-) -> dict[str, Any]:
-    """Convert Blender Probe position channels once before Bridge consumers.
-
-    MOD computes its output scale as ``measured_mesh_scale / fbx_scale``.
-    Max exports use inch-valued FBX transforms, while Blender exports report
-    centimetres; the smaller Blender denominator therefore makes MOD output
-    too large.  Convert only the already-evaluated world/Max channels to the
-    Max-inch numeric domain here.  Raw local ``positions`` stay untouched so
-    a later local-to-world fallback cannot apply the unit conversion twice.
-    """
-    # MOD computes its output scale as measured Mesh Scale divided by the
-    # FBX-derived scale. MAX uses inch-valued units, so its larger denominator
-    # produces a smaller MOD scale. Blender uses centimetre-valued units, so
-    # its smaller denominator makes the MOD scale too large. This empirically
-    # confirmed rule converts Blender FBX model scale once into the MAX-inch
-    # numeric domain; the export bridge applies no additional conversion.
-    backend = str(backend_kind or "").strip().lower()
-    receipt: dict[str, Any] = {
-        "schema": BLENDER_FBX_INCH_SCALE_SCHEMA,
-        "status": "disabled",
-        "backend": backend,
-        "source": "probe_handoff_position_channels",
-        "target_unit_meters": FBX_MAX_INCH_UNIT_METERS,
-        "unit_factor": 1.0,
-        "applied_once": True,
-        "bone_edit": bool(bone_edit),
-        "bone_matrix_transform": {"status": "disabled", "applied_once": True},
-    }
-    if backend != "blender_fbx":
-        if isinstance(generic_receipt, dict):
-            generic_receipt["blender_model_scale_transform"] = dict(receipt)
-        return receipt
-
-    if not isinstance(fbx_units, dict):
-        fbx_units = {}
-    unit_status = str(fbx_units.get("status", "") or "").strip().lower()
-    try:
-        source_unit_meters = float(fbx_units.get("unit_meters"))
-    except (TypeError, ValueError, OverflowError):
-        source_unit_meters = 0.0
-    if (
-        unit_status != "reported"
-        or not math.isfinite(source_unit_meters)
-        or source_unit_meters <= 0.0
-    ):
-        receipt.update(
-            {
-                "status": "unavailable",
-                "reason": "missing_or_invalid_fbx_unit_metadata",
-            }
-        )
-        if isinstance(generic_receipt, dict):
-            generic_receipt["blender_model_scale_transform"] = dict(receipt)
-        return receipt
-
-    factor = source_unit_meters / FBX_MAX_INCH_UNIT_METERS
-    if not math.isfinite(factor) or factor <= 0.0:
-        receipt.update({"status": "unavailable", "reason": "invalid_unit_factor"})
-        if isinstance(generic_receipt, dict):
-            generic_receipt["blender_model_scale_transform"] = dict(receipt)
-        return receipt
-
-    receipt.update(
-        {
-            "status": "not_needed" if abs(factor - 1.0) <= 1.0e-12 else "applied",
-            "source_unit_meters": source_unit_meters,
-            "original_unit_meters": fbx_units.get("original_unit_meters"),
-            "unit_factor": factor,
-            "formula": "source_value * (unit_meters / 0.0254)",
-            "fields": [
-                "max_positions",
-                "world_positions",
-                "skinned_positions",
-                "skinned_max_positions",
-                "skinned_world_positions",
-                "binary_skin_unreferenced_max_positions",
-                "fbx_node_to_world_matrix",
-            ],
-        }
-    )
-    if abs(factor - 1.0) <= 1.0e-12:
-        if bone_edit:
-            receipt["bone_matrix_transform"] = {
-                "status": "not_needed",
-                "applied_once": True,
-            }
-        if isinstance(generic_receipt, dict):
-            generic_receipt["blender_model_scale_transform"] = dict(receipt)
-        return receipt
-
-    transformed_mesh_count = 0
-    transformed_fields: set[str] = set()
-    # Handoff contract rows are the single source consumed by both ordinary
-    # MAX-position export and the BONE+MESH skinned-position route.
-    containers: list[list[Any]] = []
-    contract_meshes = payload.get("contract_meshes")
-    if isinstance(contract_meshes, list):
-        containers.append(contract_meshes)
-    summary = payload.get("summary")
-    if isinstance(summary, dict) and isinstance(summary.get("meshes"), list):
-        containers.append(summary["meshes"])
-
-    for container in containers:
-        for mesh in container:
-            if not isinstance(mesh, dict):
-                continue
-            previous = mesh.get("blender_model_scale_transform")
-            if isinstance(previous, dict) and previous.get("schema") == BLENDER_FBX_INCH_SCALE_SCHEMA:
-                continue
-            mesh_changed = False
-            for field in (
-                "max_positions",
-                "world_positions",
-                "skinned_max_positions",
-                "skinned_world_positions",
-                "binary_skin_unreferenced_max_positions",
-            ):
-                rows = mesh.get(field)
-                if not isinstance(rows, list) or not rows:
-                    continue
-                converted = _scale_probe_position_rows_to_max_inches(rows, factor)
-                if converted is None:
-                    continue
-                mesh[field] = converted
-                transformed_fields.add(field)
-                mesh_changed = True
-
-            # ``skinned_positions`` is a world stream only when the Probe
-            # explicitly says it is not local. Local source rows remain in
-            # their authored unit because the node matrix is converted below.
-            if (
-                not _coerce_bool(mesh.get("skinned_is_local"), False)
-                and isinstance(mesh.get("skinned_positions"), list)
-                and mesh.get("skinned_positions")
-            ):
-                converted = _scale_probe_position_rows_to_max_inches(
-                    mesh["skinned_positions"],
-                    factor,
-                )
-                if converted is not None:
-                    mesh["skinned_positions"] = converted
-                    transformed_fields.add("skinned_positions")
-                    mesh_changed = True
-
-            matrix = mesh.get("fbx_node_to_world_matrix")
-            if isinstance(matrix, (list, tuple)) and len(matrix) >= 16:
-                try:
-                    converted_matrix = _scale_affine_matrix(
-                        _flatten_matrix4x4(matrix),
-                        factor,
-                        label="Blender FBX node-to-world matrix",
-                    )
-                except (TypeError, ValueError, OverflowError):
-                    converted_matrix = None
-                if converted_matrix is not None:
-                    mesh["fbx_node_to_world_matrix"] = converted_matrix
-                    transformed_fields.add("fbx_node_to_world_matrix")
-                    mesh_changed = True
-
-            if mesh_changed:
-                transformed_mesh_count += 1
-                mesh["blender_model_scale_transform"] = {
-                    "schema": BLENDER_FBX_INCH_SCALE_SCHEMA,
-                    "status": "applied",
-                    "unit_factor": factor,
-                    "applied_once": True,
-                }
-
-    receipt["transformed_mesh_count"] = transformed_mesh_count
-    receipt["transformed_fields"] = sorted(transformed_fields)
-    if transformed_mesh_count == 0:
-        receipt["status"] = "no_position_channels"
-    if bone_edit:
-        # MOD computes its output scale as measured Mesh Scale divided by the
-        # FBX-derived scale. MAX uses inch-valued transforms, while Blender
-        # bone matrices are reported in centimetre-valued scene units. Leaving
-        # the smaller Blender bone basis unchanged gives the skeleton a
-        # different scale from MAX and makes skinned Mesh positions diverge.
-        # Convert Blender bone matrices once into the MAX-inch numeric domain;
-        # the Writer must not apply another unit conversion.
-        receipt["bone_matrix_transform"] = _scale_blender_bone_matrices_to_max_inches(
-            payload,
-            factor,
-        )
-    if isinstance(generic_receipt, dict):
-        generic_receipt["blender_model_scale_transform"] = dict(receipt)
-    return receipt
-
-
 def _restore_max_space_geometry(
     geometry: dict[str, Any],
     mesh: Any,
@@ -1156,11 +847,9 @@ def _restore_max_space_geometry(
 
 
 def _max_normal_to_re6_game_normal(vec: Any) -> list[float]:
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # Fixed Max-to-game axis swap used by the old direct/UFBX normal lane.
-    # Generic canonical normals must not enter this conversion.
-    xyz = _normal_vec3_to_list(vec)
-    return _normalize_normal_vec3([xyz[0], xyz[2], -xyz[1]])
+    # Generic Probe owns the one scene-level axis conversion. Keep this legacy
+    # API as an identity adapter so no caller can re-apply X,+Z,-Y.
+    return _normalize_normal_vec3(vec)
 
 
 def _fbx_authored_corner_normal_to_max(normal: Any) -> list[float]:
@@ -1176,30 +865,14 @@ def _fbx_authored_corner_normal_to_max(normal: Any) -> list[float]:
 
 
 def _encode_re6_normal_key_from_fbx_corner(normal: Any) -> tuple[int, int, int]:
-    """Return the writer RGB key for one authored FBX polygon-corner normal."""
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # Legacy fixed Max-to-game normal encoding; the Generic normal contract is
-    # the replacement and this helper currently has no live callers.
-    game_normal = _max_normal_to_re6_game_normal(_fbx_authored_corner_normal_to_max(normal))
+    """Return the writer RGB key for one canonical polygon-corner normal."""
+    game_normal = _normalize_normal_vec3(_fbx_authored_corner_normal_to_max(normal))
     return tuple(max(0, min(255, int((axis * 127.0) + 127.0))) for axis in game_normal)
 
 
 def _encode_re6_normal_key_from_fbx_local(normal: Any, node_to_world: Any) -> tuple[int, int, int]:
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # Legacy direct/UFBX fallback that applies a per-Mesh axis path.  The
-    # Generic corner-normal route is the replacement authority.
-    """Return the legacy/UFBX writer key after applying the Mesh node transform.
-
-    AI MAINTENANCE GATE: this compatibility API is consumed by the pure-Python
-    fallback and every ``codex_fbx_probe_accel`` bundle.  Keep it synchronized
-    with those callers when changing FBX normal-space handling.  The strict raw
-    polygon-corner path intentionally uses
-    ``_encode_re6_normal_key_from_fbx_corner()`` instead.
-    """
-    max_normal = _fbx_world_to_max_normal(
-        _transform_normal_row_major(normal, node_to_world)
-    )
-    game_normal = _max_normal_to_re6_game_normal(max_normal)
+    """Return the canonical XYZ normal key without a per-Mesh axis transform."""
+    game_normal = _normalize_normal_vec3(normal)
     return tuple(max(0, min(255, int((axis * 127.0) + 127.0))) for axis in game_normal)
 
 
@@ -1542,6 +1215,9 @@ def _read_binary_fbx_node(
     return _BinaryFbxNode(name=name, properties=properties, children=children), int(end_offset)
 
 
+# ====== END CANONICAL VECTOR / MATRIX MATH ======
+# ====== BEGIN BINARY FBX DOCUMENT READER ======
+
 def _read_binary_fbx_roots(
     path: Path,
     *,
@@ -1552,6 +1228,12 @@ def _read_binary_fbx_roots(
         if Path(path).resolve() != binary_document.path.resolve():
             raise ValueError("Binary FBX document belongs to a different path")
         return binary_document.roots
+    # All real-file binary reads share the canonical Generic document.  This
+    # guard prevents private identity/diagnostic helpers from reopening the
+    # producer's raw bytes behind the public handoff.
+    if Path(path).is_file():
+        canonical_document, _receipt = _generic_memory_document_for_path(path)
+        return canonical_document.roots
     data = path.read_bytes()
     if not data.startswith(_FBX_BINARY_SIGNATURE):
         raise ValueError("FBX is not a supported binary FBX file")
@@ -1631,6 +1313,7 @@ def _binary_fbx_node_child_value(node: _BinaryFbxNode, child_name: str) -> Any:
     return None
 
 
+# ====== END BINARY FBX DOCUMENT READER ======
 # ====== BEGIN GENERIC FBX IN-MEMORY NORMALIZER (MAX + BLENDER) ======
 
 import hashlib
@@ -2157,6 +1840,216 @@ def _identity_matrix() -> list[float]:
     ]
 
 
+def _dynamic_mod_fbx_mapping_receipt() -> dict[str, Any]:
+    """Publish the explicit canonical-XYZ <-> MOD transform contract.
+
+    Axis basis and length scale are intentionally separate.  The importer
+    keeps the matrix 3x3 rows in file order and remaps only the translation;
+    consequently the Bridge must not smuggle a unit/root scale into this
+    dimensionless receipt.
+    """
+    return {
+        "schema": DYNAMIC_MOD_FBX_MAPPING_SCHEMA,
+        "status": "mapped",
+        "source": "re6_mod_import_inverse",
+        "source_domain": CANONICAL_AXIS_DOMAIN,
+        "target_domain": "mod_file",
+        "vector_convention": "row_vector_row_major",
+        "matrix_semantics": "axis_basis_only",
+        "position_mapping": "canonical_to_mod_affine_then_scale",
+        "bone_mapping": "canonical_to_mod_inverse_conjugation",
+        "normal_mapping": "inverse_transpose_of_position_basis",
+        "root_basis_policy": "importer_root_basis_once",
+        "scale_owner": "transform_scale_receipt",
+        "units_baked": False,
+        "mod_to_canonical_matrix": list(MOD_TO_CANONICAL_MATRIX),
+        "canonical_to_mod_matrix": list(CANONICAL_TO_MOD_MATRIX),
+        "applied_once": False,
+    }
+
+
+def _fbx_transform_scale_receipt(
+    payload: dict[str, Any],
+    fbx_units: dict[str, Any],
+    *,
+    backend_kind: Any = "",
+) -> dict[str, Any]:
+    """Publish the measured root/unit scale without altering scene rows.
+
+    Generic reconstruction may bake a producer root scale into Geometry rows.
+    A skipped/header-only Mesh can still carry an old producer Model matrix,
+    but that matrix is not evidence that the *geometry payload* needs the
+    inverse scale.  The root-scale vote is therefore made only over effective
+    geometry rows (``fbx_probe_geometry_required`` and not skipped, or a
+    populated legacy geometry row).  We retain an all-row diagnostic so this
+    distinction remains visible without allowing placeholder rows to select
+    the scale.  A dominant isotropic matrix scale is accepted only when it is
+    present on at least half of the effective geometry rows; otherwise the
+    source-MOD root scale supplied by the bridge is authoritative.
+    """
+    backend = str(backend_kind or "").strip().lower()
+    source_unit = None
+    if isinstance(fbx_units, dict):
+        try:
+            candidate = float(fbx_units.get("unit_meters"))
+            if math.isfinite(candidate) and candidate > 0.0:
+                source_unit = candidate
+        except (TypeError, ValueError, OverflowError):
+            source_unit = None
+    units_baked = False
+    model_scale = payload.get("fbx_model_scale_transform")
+    if isinstance(model_scale, dict):
+        units_baked = str(model_scale.get("status", "") or "").strip().lower() in {
+            "applied",
+            "already_applied",
+            "not_needed",
+        } and backend == "blender_fbx"
+    unit_ratio = 1.0
+    if source_unit is not None and not units_baked:
+        unit_ratio = FBX_TARGET_UNIT_METERS / source_unit
+
+    # ``all_scales`` is diagnostic only.  ``geometry_scales`` is the sole
+    # population allowed to elect the receipt's root scale.
+    all_scales: list[float] = []
+    geometry_scales: list[float] = []
+    excluded_scales: list[float] = []
+    geometry_row_count = 0
+    excluded_row_count = 0
+    geometry_matrix_count = 0
+    excluded_matrix_count = 0
+    exclusion_reasons: dict[str, int] = {}
+
+    def _effective_geometry_row(mesh: dict[str, Any]) -> tuple[bool, str]:
+        """Classify one contract row for root-scale voting.
+
+        Full handoffs publish explicit Stage-A route facts.  Older lightweight
+        callers do not, so a conservative populated-array/count fallback is
+        retained for those rows.  Explicitly skipped rows never vote even when
+        UFBX reports a non-zero placeholder vertex count (e.g. BoundSphere).
+        """
+        has_required = "fbx_probe_geometry_required" in mesh
+        has_skipped = "fbx_probe_geometry_skipped" in mesh
+        if has_required or has_skipped:
+            required = _coerce_bool(mesh.get("fbx_probe_geometry_required"), False)
+            skipped = _coerce_bool(mesh.get("fbx_probe_geometry_skipped"), False)
+            if skipped:
+                return False, str(mesh.get("fbx_probe_skip_reason", "skipped") or "skipped")
+            if required:
+                return True, "required_geometry"
+            return False, str(mesh.get("fbx_probe_skip_reason", "not_required") or "not_required")
+
+        # Legacy/no-route metadata: require actual payload evidence.  Counts
+        # are accepted only when positive and no explicit skip marker exists.
+        for key in (
+            "positions",
+            "max_positions",
+            "skinned_positions",
+            "skinned_max_positions",
+            "skinned_world_positions",
+        ):
+            rows = mesh.get(key)
+            if isinstance(rows, (list, tuple)) and len(rows) > 0:
+                return True, "populated_position_rows"
+        for key in ("vertex_count", "triangle_count", "face_count"):
+            try:
+                if int(mesh.get(key, 0) or 0) > 0:
+                    return True, "positive_geometry_count"
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return False, "no_geometry_payload"
+
+    def _stats(values: list[float]) -> dict[str, Any]:
+        finite = [value for value in values if math.isfinite(value)]
+        if not finite:
+            return {"count": 0}
+        ordered = sorted(finite)
+        middle = len(ordered) // 2
+        median = (
+            ordered[middle]
+            if len(ordered) % 2
+            else (ordered[middle - 1] + ordered[middle]) / 2.0
+        )
+        return {
+            "count": len(ordered),
+            "min": ordered[0],
+            "max": ordered[-1],
+            "median": median,
+        }
+
+    meshes = payload.get("contract_meshes")
+    if isinstance(meshes, list):
+        for mesh in meshes:
+            if not isinstance(mesh, dict):
+                continue
+            is_geometry, reason = _effective_geometry_row(mesh)
+            if is_geometry:
+                geometry_row_count += 1
+            else:
+                excluded_row_count += 1
+                exclusion_reasons[reason] = exclusion_reasons.get(reason, 0) + 1
+            matrix = _flatten_matrix4x4(mesh.get("fbx_node_to_world_matrix"))
+            if len(matrix) != 16:
+                continue
+            rows = [
+                math.sqrt(sum(matrix[offset + axis] ** 2 for axis in range(3)))
+                for offset in (0, 4, 8)
+            ]
+            if min(rows) <= 1.0e-9 or max(rows) / min(rows) > 1.001:
+                continue
+            scale = sum(rows) / 3.0
+            if not math.isfinite(scale):
+                continue
+            if is_geometry:
+                geometry_matrix_count += 1
+                if scale > 1.001:
+                    geometry_scales.append(scale)
+            else:
+                excluded_matrix_count += 1
+                if scale > 1.001:
+                    excluded_scales.append(scale)
+            if scale > 1.001:
+                all_scales.append(scale)
+    root_scale = 1.0
+    root_source = "bridge_source_mod_root_world"
+    # Only effective geometry rows can elect a producer root scale.  If there
+    # are no such rows, or the non-unit vote does not reach the same half-row
+    # quorum as the legacy policy, leave ownership with the Bridge source MOD.
+    if geometry_row_count and len(geometry_scales) * 2 >= geometry_row_count:
+        ordered = sorted(geometry_scales)
+        middle = len(ordered) // 2
+        root_scale = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2.0
+        root_source = "probe_dominant_geometry_mesh_node_scale"
+    geometry_factor = 1.0 / (root_scale * unit_ratio)
+    bone_translation_factor = 1.0 / unit_ratio
+    return {
+        "schema": FBX_TRANSFORM_SCALE_SCHEMA,
+        "status": "reported",
+        "backend": backend,
+        "source_unit_meters": source_unit,
+        "target_unit_meters": FBX_TARGET_UNIT_METERS,
+        "unit_ratio_target_over_source": unit_ratio,
+        "root_scale": root_scale,
+        "root_scale_source": root_source,
+        "root_scale_selection_policy": "effective_geometry_rows_only",
+        "root_scale_geometry_row_count": geometry_row_count,
+        "root_scale_geometry_matrix_count": geometry_matrix_count,
+        "root_scale_geometry_scale_count": len(geometry_scales),
+        "root_scale_excluded_row_count": excluded_row_count,
+        "root_scale_excluded_matrix_count": excluded_matrix_count,
+        "root_scale_excluded_scale_count": len(excluded_scales),
+        "root_scale_all_row_scale_count": len(all_scales),
+        "root_scale_all_row_scale_stats": _stats(all_scales),
+        "root_scale_geometry_scale_stats": _stats(geometry_scales),
+        "root_scale_excluded_scale_stats": _stats(excluded_scales),
+        "root_scale_exclusion_reasons": dict(sorted(exclusion_reasons.items())),
+        "geometry_factor": geometry_factor,
+        "bone_translation_factor": bone_translation_factor,
+        "units_baked": units_baked,
+        "formula": "geometry = canonical / (root_scale * target_unit/source_unit); bone_translation = canonical / (target_unit/source_unit)",
+        "applied_once": False,
+    }
+
+
 def _finite_matrix(value: Any, label: str) -> list[float]:
     if not isinstance(value, list) or len(value) != 16:
         raise ValueError(f"{label} must contain 16 values")
@@ -2296,95 +2189,6 @@ def _matrices_match(left: list[float], right: list[float]) -> bool:
         return False
     magnitude = max(1.0, *(abs(float(value)) for value in left), *(abs(float(value)) for value in right))
     return max(abs(float(left[index]) - float(right[index])) for index in range(16)) <= magnitude * 1.0e-4
-
-
-def _matrix_relative_error(left: list[float], right: list[float]) -> float:
-    left_values = _finite_matrix(left, "left matrix")
-    right_values = _finite_matrix(right, "right matrix")
-    magnitude = max(
-        1.0,
-        *(abs(value) for value in left_values),
-        *(abs(value) for value in right_values),
-    )
-    return max(
-        abs(left_values[index] - right_values[index])
-        for index in range(16)
-    ) / magnitude
-
-
-def _is_unit_rigid_axis_matrix(matrix: list[float]) -> bool:
-    """Return whether a bind only describes an already-baked axis basis."""
-    values = _finite_matrix(matrix, "bind matrix")
-    rows = [values[offset : offset + 3] for offset in (0, 4, 8)]
-    lengths = [math.sqrt(sum(component * component for component in row)) for row in rows]
-    if any(abs(length - 1.0) > 1.0e-3 for length in lengths):
-        return False
-    if math.sqrt(sum(values[index] ** 2 for index in (12, 13, 14))) > 1.0e-3:
-        return False
-    normalized = [
-        [component / length for component in row]
-        for row, length in zip(rows, lengths)
-    ]
-    for left_index in range(3):
-        for right_index in range(left_index + 1, 3):
-            dot = sum(
-                left_component * right_component
-                for left_component, right_component in zip(
-                    normalized[left_index], normalized[right_index]
-                )
-            )
-            if abs(dot) > 1.0e-3:
-                return False
-    determinant = (
-        normalized[0][0]
-        * (
-            normalized[1][1] * normalized[2][2]
-            - normalized[1][2] * normalized[2][1]
-        )
-        - normalized[0][1]
-        * (
-            normalized[1][0] * normalized[2][2]
-            - normalized[1][2] * normalized[2][0]
-        )
-        + normalized[0][2]
-        * (
-            normalized[1][0] * normalized[2][1]
-            - normalized[1][1] * normalized[2][0]
-        )
-    )
-    return abs(abs(determinant) - 1.0) <= 1.0e-3
-
-
-def _classify_skin_geometry_domain(
-    mesh_clusters: dict[int, list[dict[str, Any]]],
-) -> str:
-    """Classify the scene before any Max-specific Skin matrix is reapplied."""
-    votes: list[bool] = []
-    for clusters in mesh_clusters.values():
-        active = [
-            cluster
-            for cluster in clusters
-            if int(cluster.get("positive_weight_count", 0) or 0) > 0
-            and cluster.get("transform") is not None
-            and cluster.get("transform_link") is not None
-        ]
-        if not active:
-            continue
-        candidates = [
-            _generic_multiply_row_major_matrices(
-                cluster["transform"], cluster["transform_link"]
-            )
-            for cluster in active
-        ]
-        first = candidates[0]
-        if any(_matrix_relative_error(first, candidate) > 1.0e-4 for candidate in candidates[1:]):
-            return "MIXED"
-        votes.append(_is_unit_rigid_axis_matrix(first))
-    if votes and all(votes):
-        return "ALREADY_BAKED"
-    if votes and not any(votes):
-        return "LOCAL_BIND"
-    return "MIXED"
 
 
 _PRODUCER_TRANSFORM_PROPERTIES = {
@@ -2717,6 +2521,23 @@ def _global_unit_scale(roots: list[FbxNode]) -> float:
     return 1.0
 
 
+def _canonical_unit_conversion(roots: list[FbxNode]) -> tuple[float, float, float]:
+    """Return source cm/unit, target cm/unit, and source-to-target numeric factor."""
+    source_unit_scale_cm = float(_global_unit_scale(roots))
+    target_unit_scale_cm = float(FBX_TARGET_UNIT_SCALE_CM)
+    if (
+        not math.isfinite(source_unit_scale_cm)
+        or source_unit_scale_cm <= 0.0
+        or not math.isfinite(target_unit_scale_cm)
+        or target_unit_scale_cm <= 0.0
+    ):
+        raise ValueError("Generic FBX unit conversion has an invalid unit declaration")
+    unit_factor = source_unit_scale_cm / target_unit_scale_cm
+    if not math.isfinite(unit_factor) or unit_factor <= 0.0:
+        raise ValueError("Generic FBX unit conversion produced an invalid factor")
+    return source_unit_scale_cm, target_unit_scale_cm, unit_factor
+
+
 def _generic_axis_conversion_matrix(roots: list[FbxNode]) -> list[float]:
     """Map source storage coordinates to the converter's X/Y/Z target axes."""
     signature = _axis_signature(roots)
@@ -2770,9 +2591,20 @@ def _v5_scene_context(
     parent_ids = dict(source_graph.get("model_parent_ids", {}))
     worlds = _source_model_world_matrices(model_nodes, parent_ids)
     axis_conversion = _generic_axis_conversion_matrix(roots)
-    target_worlds = {
+    source_unit_scale_cm, target_unit_scale_cm, unit_factor = (
+        _canonical_unit_conversion(roots)
+    )
+    axis_worlds = {
         model_id: _generic_multiply_row_major_matrices(world, axis_conversion)
         for model_id, world in worlds.items()
+    }
+    target_worlds = {
+        model_id: _scale_affine_matrix(
+            axis_world,
+            unit_factor,
+            label=f"Model {model_id} canonical unit world",
+        )
+        for model_id, axis_world in axis_worlds.items()
     }
     mesh_ids = set(int(value) for value in source_graph.get("mesh_model_ids", []))
     geometry_by_id = {
@@ -2781,7 +2613,7 @@ def _v5_scene_context(
         if _object_id(node) > 0
     }
     model_geometry_ids = dict(source_graph.get("model_geometry_ids", {}))
-    unit_scale = _global_unit_scale(roots)
+    unit_scale = source_unit_scale_cm
     children_by_parent: dict[int, list[int]] = {}
     for child_id, parent_ids_for_child in parents_by_child.items():
         for parent_id in parent_ids_for_child:
@@ -2880,7 +2712,11 @@ def _v5_scene_context(
         for mesh_model_id in sorted(mesh_model_ids):
             mesh_clusters.setdefault(mesh_model_id, []).append(row)
 
-    geometry_domain = _classify_skin_geometry_domain(mesh_clusters)
+    # Every weighted Mesh is rebuilt through the canonical LOCAL_BIND path.
+    # Do not infer the vertex domain from a unit-looking
+    # Transform*TransformLink product; that does not prove that control
+    # points are already in the canonical geometry domain.
+    geometry_domain = "LOCAL_BIND"
     pose_matrices_by_model: dict[int, list[list[float]]] = {}
     for pose in source_graph.get("poses", []):
         for pose_node in (child for child in pose.children if child.name == "PoseNode"):
@@ -2908,6 +2744,7 @@ def _v5_scene_context(
 
     domain_scales: dict[int, float] = {}
     bind_mesh_matrices: dict[int, list[float]] = {}
+    geometry_bind_bake_by_mesh: dict[int, bool] = {}
     canonical_cluster_matrices: dict[int, tuple[list[float], list[float]]] = {}
     canonical_bind_by_model: dict[int, list[float]] = {}
     cluster_domain_scales: dict[int, list[float]] = {}
@@ -2928,15 +2765,6 @@ def _v5_scene_context(
             # exporter placeholder.  It must not turn the Mesh into a
             # skinned route or cause its Model world to be zeroed/baked.
             domain_scales[mesh_model_id] = 1.0
-            continue
-        if geometry_domain == "ALREADY_BAKED":
-            # The Geometry is already in the common scene domain. Keep the
-            # control points untouched; Cluster links are still preserved below
-            # as the fixed bind pose, while Model worlds remain the current pose.
-            domain_scales[mesh_model_id] = 1.0
-            bind_mesh_matrices[mesh_model_id] = _identity_matrix()
-            for cluster in active_clusters:
-                cluster_domain_scales.setdefault(int(cluster["cluster_id"]), []).append(1.0)
             continue
         ratios: list[float] = []
         for cluster in active_clusters:
@@ -3000,20 +2828,52 @@ def _v5_scene_context(
                     raise ValueError(
                         f"Mesh {mesh_model_id} bind matrix disagreement"
                     )
-            bind_mesh_matrices[mesh_model_id] = _generic_multiply_row_major_matrices(
+            bind_axis = _generic_multiply_row_major_matrices(
                 _scale_affine_matrix(
                     first, domain, label=f"Mesh {mesh_model_id} bind matrix"
                 ),
                 axis_conversion,
+            )
+            bind_mesh_matrices[mesh_model_id] = _scale_affine_matrix(
+                bind_axis,
+                unit_factor,
+                label=f"Mesh {mesh_model_id} canonical unit bind matrix",
+            )
+
+    # RISK EXPERIMENT V2: keep the established per-Cluster product which
+    # resolves to one common MeshBind, but always bake that common bind into
+    # Geometry. Skinned Mesh Models are emitted with identity world matrices;
+    # leaving a 2.54 / 0.3937008 bind only in the Cluster makes ordinary
+    # max_positions too small while skinned_max_positions remains correct.
+    for mesh_model_id in bind_mesh_matrices:
+        geometry_bind_bake_by_mesh[mesh_model_id] = True
+
+    # Row-vector FBX bind contract:
+    #
+    #   unbaked Geometry: Transform = MeshBind * inverse(BoneBind)
+    #   baked Geometry:   Transform =            inverse(BoneBind)
+    #
+    # Dropping MeshBind from the unbaked branch removes the authored pose.
+    cluster_geometry_contracts: dict[int, list[tuple[list[float], bool]]] = {}
+    for mesh_model_id, clusters in mesh_clusters.items():
+        geometry_basis = bind_mesh_matrices.get(int(mesh_model_id))
+        if geometry_basis is None:
+            continue
+        geometry_baked = bool(geometry_bind_bake_by_mesh.get(int(mesh_model_id), False))
+        for cluster in clusters:
+            cluster_id = int(cluster.get("cluster_id", 0) or 0)
+            if cluster_id <= 0:
+                continue
+            cluster_geometry_contracts.setdefault(cluster_id, []).append(
+                (list(geometry_basis), geometry_baked)
             )
 
     bind_candidates_by_bone: dict[int, list[list[float]]] = {}
     for cluster_id, cluster in cluster_by_id.items():
         bone_id = int(cluster["bone_model_id"])
         has_positive_influence = int(cluster.get("positive_weight_count", 0) or 0) > 0
-        # TransformLink is the source of truth for the bind pose.  Normalize it
-        # into the same axis/unit domain as the rebuilt geometry, but never
-        # replace it with the current bone Model world.
+        # TransformLink is the source of truth for the bind pose. Normalize it
+        # into the same axis/unit domain as the rebuilt geometry.
         link = _generic_multiply_row_major_matrices(
             cluster["transform_link"], axis_conversion
         )
@@ -3036,14 +2896,42 @@ def _v5_scene_context(
             bind_scale = float(unit_scale) if math.isfinite(float(unit_scale)) and float(unit_scale) > 0.0 else 1.0
         link = _scale_affine_matrix(
             link,
-            bind_scale,
+            bind_scale * unit_factor,
             label=f"Bone {bone_id} canonical bind",
         )
         link = _finite_matrix(link, label=f"Bone {bone_id} canonical bind")
-        inverse = _generic_invert_row_major_matrix(link)
-        if inverse is None:
+        if _generic_invert_row_major_matrix(link) is None:
             raise ValueError(f"Bone {bone_id} canonical bind is not invertible")
-        canonical_cluster_matrices[int(cluster_id)] = (inverse, link)
+        geometry_contracts = cluster_geometry_contracts.get(int(cluster_id), [])
+        if geometry_contracts:
+            geometry_basis, geometry_baked = geometry_contracts[0]
+            for candidate_basis, candidate_baked in geometry_contracts[1:]:
+                if (
+                    candidate_baked != geometry_baked
+                    or not _matrices_match(geometry_basis, candidate_basis)
+                ):
+                    raise ValueError(
+                        f"Cluster {cluster_id} is shared by incompatible Geometry bind contracts"
+                    )
+            inverse_link = _invert_row_major_matrix(link)
+            if inverse_link is None:
+                raise ValueError(
+                    f"Cluster {cluster_id} canonical TransformLink is not invertible"
+                )
+            canonical_transform = (
+                list(inverse_link)
+                if geometry_baked
+                else _generic_multiply_row_major_matrices(
+                    geometry_basis,
+                    inverse_link,
+                )
+            )
+        else:
+            canonical_transform = _identity_matrix()
+        canonical_cluster_matrices[int(cluster_id)] = (
+            canonical_transform,
+            link,
+        )
         if has_positive_influence:
             bind_candidates_by_bone.setdefault(bone_id, []).append(list(link))
 
@@ -3071,7 +2959,7 @@ def _v5_scene_context(
                     pose, label=f"Bone {bone_id} authored bind"
                 )
                 current_scales = _matrix_basis_scales(
-                    canonical_bone_worlds[bone_id],
+                    axis_worlds[bone_id],
                     label=f"Bone {bone_id} current world",
                 )
                 ratios = [
@@ -3099,7 +2987,7 @@ def _v5_scene_context(
                 pose_scale = 1.0
             canonical_bind_by_model[bone_id] = _scale_affine_matrix(
                 pose,
-                pose_scale,
+                pose_scale * unit_factor,
                 label=f"Bone {bone_id} authored bind",
             )
         elif bone_id in canonical_bone_worlds:
@@ -3121,14 +3009,19 @@ def _v5_scene_context(
     }
     return {
         "source_worlds": worlds,
+        "output_unit_worlds": target_worlds,
         "output_worlds": output_worlds,
         "domain_scales": domain_scales,
         "bind_mesh_matrices": bind_mesh_matrices,
+        "geometry_bind_bake_by_mesh": geometry_bind_bake_by_mesh,
         "mesh_clusters": mesh_clusters,
         "cluster_matrices": canonical_cluster_matrices,
         "canonical_bind_by_model": canonical_bind_by_model,
         "skinned_mesh_ids": skinned_mesh_ids,
         "unit_scale": unit_scale,
+        "source_unit_scale_cm": source_unit_scale_cm,
+        "target_unit_scale_cm": target_unit_scale_cm,
+        "unit_factor": unit_factor,
         "geometry_domain": geometry_domain,
         "axis_conversion": axis_conversion,
     }
@@ -3574,7 +3467,110 @@ def _generic_global_settings(
             ("S", ""),
             ("I", value),
         )
+    unit_target = {
+        "UnitScaleFactor": float(FBX_TARGET_UNIT_SCALE_CM),
+        "OriginalUnitScaleFactor": float(FBX_TARGET_UNIT_SCALE_CM),
+    }
+    unit_found: set[str] = set()
+    for property_node in properties.children:
+        name = _property_name(property_node)
+        if name not in unit_target or not property_node.properties:
+            continue
+        property_node.properties[-1] = unit_target[name]
+        if property_node.property_types:
+            property_node.property_types[-1] = "D"
+        unit_found.add(name)
+    for name, value in unit_target.items():
+        if name in unit_found:
+            continue
+        properties.add(
+            "P",
+            ("S", name),
+            ("S", "double"),
+            ("S", "Number"),
+            ("S", ""),
+            ("D", value),
+        )
     return cloned
+
+
+def _validate_generic_unit_conversion(
+    source_roots: list[FbxNode],
+    generic_roots: list[FbxNode],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    """Hard gate proving that the Generic scene owns one global unit conversion."""
+    source_unit_scale_cm, target_unit_scale_cm, expected_factor = (
+        _canonical_unit_conversion(source_roots)
+    )
+    actual_factor = float(context.get("unit_factor", 0.0) or 0.0)
+    tolerance = 1.0e-9
+    if abs(actual_factor - expected_factor) > tolerance * max(1.0, abs(expected_factor)):
+        raise ValueError(
+            "Generic FBX unit validation failed: context factor does not match UnitScaleFactor"
+        )
+    output_unit_scale_cm = float(_global_unit_scale(generic_roots))
+    if abs(output_unit_scale_cm - target_unit_scale_cm) > tolerance:
+        raise ValueError(
+            "Generic FBX unit validation failed: output GlobalSettings is not canonical"
+        )
+
+    source_worlds = context.get("source_worlds")
+    target_worlds = context.get("output_unit_worlds")
+    axis_conversion = context.get("axis_conversion")
+    if not isinstance(source_worlds, dict) or not isinstance(target_worlds, dict):
+        raise ValueError("Generic FBX unit validation is missing Model world matrices")
+    axis_matrix = _finite_matrix(axis_conversion, "Generic unit validation axis matrix")
+    if set(source_worlds) != set(target_worlds):
+        raise ValueError("Generic FBX unit validation Model world coverage mismatch")
+    for model_id, source_world in source_worlds.items():
+        expected_world = _scale_affine_matrix(
+            _generic_multiply_row_major_matrices(source_world, axis_matrix),
+            expected_factor,
+            label=f"Model {model_id} expected canonical unit world",
+        )
+        actual_world = _finite_matrix(
+            target_worlds[model_id],
+            f"Model {model_id} actual canonical unit world",
+        )
+        if not _matrices_match(expected_world, actual_world):
+            raise ValueError(
+                f"Generic FBX unit validation failed for Model {model_id}"
+            )
+
+    bind_mesh_matrices = context.get("bind_mesh_matrices")
+    cluster_matrices = context.get("cluster_matrices")
+    if not isinstance(bind_mesh_matrices, dict) or not isinstance(cluster_matrices, dict):
+        raise ValueError("Generic FBX unit validation is missing Skin bind matrices")
+    for mesh_id, matrix in bind_mesh_matrices.items():
+        _finite_matrix(matrix, f"Mesh {mesh_id} validated canonical bind")
+    for cluster_id, pair in cluster_matrices.items():
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise ValueError(
+                f"Generic FBX unit validation Cluster {cluster_id} has an invalid matrix pair"
+            )
+        transform = _finite_matrix(pair[0], f"Cluster {cluster_id} Transform")
+        link = _finite_matrix(pair[1], f"Cluster {cluster_id} TransformLink")
+        if _generic_invert_row_major_matrix(transform) is None:
+            raise ValueError(
+                f"Generic FBX unit validation Cluster {cluster_id} Transform is not invertible"
+            )
+        if _generic_invert_row_major_matrix(link) is None:
+            raise ValueError(
+                f"Generic FBX unit validation Cluster {cluster_id} TransformLink is not invertible"
+            )
+    return {
+        "schema": "pc-rehd-generic-unit-validation-v1",
+        "status": "PASS",
+        "source_unit_scale_cm": source_unit_scale_cm,
+        "target_unit_scale_cm": target_unit_scale_cm,
+        "unit_factor": expected_factor,
+        "unit_conversion_applied": abs(expected_factor - 1.0) > tolerance,
+        "validated_model_count": len(source_worlds),
+        "validated_bind_mesh_count": len(bind_mesh_matrices),
+        "validated_cluster_count": len(cluster_matrices),
+        "applied_once": True,
+    }
 
 
 def _generic_object_name(node: FbxNode, fallback: str) -> str:
@@ -3868,6 +3864,101 @@ def _extract_geometry_semantics(
         "output_vertex_count": len(output_positions),
         "normal_split": bool(normal_values is not None),
         "uv_channel_count": len(uv_channels),
+    }
+
+
+def _apply_current_pose_inverse_skin_to_geometry_payload(
+    payload: dict[str, Any],
+    *,
+    clusters: list[dict[str, Any]],
+    cluster_matrices: dict[int, tuple[list[float], list[float]]],
+    current_bone_worlds: dict[int, list[float]],
+) -> dict[str, Any]:
+    """Move visible posed Geometry back to bind space without losing pose."""
+    if payload.get("status") != "rebuilt":
+        return {"status": "skipped", "reason": "geometry_not_rebuilt"}
+    vertices = payload.get("vertices")
+    cp_to_output = payload.get("cp_to_output")
+    if not isinstance(vertices, list) or not isinstance(cp_to_output, dict):
+        return {"status": "skipped", "reason": "geometry_rows_unavailable"}
+    source_count = int(payload.get("source_vertex_count", 0) or 0)
+    if source_count <= 0:
+        return {"status": "skipped", "reason": "empty_geometry"}
+
+    accumulated = [[0.0] * 16 for _ in range(source_count)]
+    weight_sums = [0.0] * source_count
+    active_cluster_count = 0
+    for cluster in clusters:
+        cluster_id = int(cluster.get("cluster_id", 0) or 0)
+        bone_id = int(cluster.get("bone_model_id", 0) or 0)
+        canonical = cluster_matrices.get(cluster_id)
+        bone_world = current_bone_worlds.get(bone_id)
+        if canonical is None or bone_world is None:
+            continue
+        deformation = _generic_multiply_row_major_matrices(canonical[0], bone_world)
+        used = False
+        for raw_index, raw_weight in zip(cluster.get("indexes", []), cluster.get("weights", [])):
+            source_index = int(raw_index)
+            weight = float(raw_weight)
+            if source_index < 0 or source_index >= source_count or weight <= 0.0:
+                continue
+            used = True
+            for component in range(16):
+                accumulated[source_index][component] += deformation[component] * weight
+            weight_sums[source_index] += weight
+        if used:
+            active_cluster_count += 1
+    if active_cluster_count <= 0:
+        return {"status": "skipped", "reason": "no_active_clusters"}
+
+    output_inverse: dict[int, list[float]] = {}
+    transformed_source_count = 0
+    max_roundtrip_error = 0.0
+    for source_index, weight_sum in enumerate(weight_sums):
+        if weight_sum <= 1.0e-12:
+            continue
+        deformation = [value / weight_sum for value in accumulated[source_index]]
+        inverse = _generic_invert_row_major_matrix(deformation)
+        if inverse is None:
+            raise ValueError(f"Current-pose inverse Skin matrix is singular at vertex {source_index}")
+        for output_index in cp_to_output.get(source_index, []):
+            output_index = int(output_index)
+            if output_index < 0 or output_index >= len(vertices):
+                raise ValueError("Current-pose inverse Skin output vertex is out of range")
+            visible = [float(value) for value in vertices[output_index][:3]]
+            bind = _generic_transform_position_row_major(visible, inverse)
+            roundtrip = _generic_transform_position_row_major(bind, deformation)
+            max_roundtrip_error = max(
+                max_roundtrip_error,
+                *(abs(roundtrip[axis] - visible[axis]) for axis in range(3)),
+            )
+            vertices[output_index] = bind
+            output_inverse[output_index] = inverse
+        transformed_source_count += 1
+
+    loop_normals = payload.get("loop_normals")
+    faces = payload.get("faces")
+    if isinstance(loop_normals, list) and isinstance(faces, list):
+        corner_index = 0
+        for face in faces:
+            for output_index in face:
+                if corner_index >= len(loop_normals):
+                    break
+                inverse = output_inverse.get(int(output_index))
+                if inverse is not None:
+                    loop_normals[corner_index] = _generic_transform_normal_row_major(
+                        loop_normals[corner_index], inverse
+                    )
+                corner_index += 1
+    if max_roundtrip_error > 0.001:
+        raise ValueError(
+            f"Current-pose inverse Skin roundtrip error is too large: {max_roundtrip_error}"
+        )
+    return {
+        "status": "applied",
+        "active_cluster_count": active_cluster_count,
+        "transformed_source_vertex_count": transformed_source_count,
+        "max_roundtrip_error": max_roundtrip_error,
     }
 
 
@@ -4810,7 +4901,7 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
     source_objects = _first_root(roots, "Objects")
     source_connections = _first_root(roots, "Connections")
     if source_objects is None:
-        return roots, {"safe_rebuilder_status": "passthrough_no_objects"}
+        raise ValueError("Generic FBX rebuild requires an Objects root")
 
     source_graph = _safe_rebuilder_source_graph(roots)
     object_nodes = list(source_graph["object_nodes"])
@@ -4839,6 +4930,13 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
     v5_context = _v5_scene_context(roots, source_graph, parents_by_child)
     output_worlds = dict(v5_context["output_worlds"])
     canonical_bind_by_model = dict(v5_context["canonical_bind_by_model"])
+    # Reuse the exact document-level basis computed by the V5 context when
+    # publishing the Generic receipt.  The old rebuild path referenced
+    # ``axis_conversion`` without carrying it out of that context, which made
+    # every supported MAX/Blender handoff fail with a runtime NameError.
+    axis_conversion = list(
+        v5_context.get("axis_conversion") or _identity_matrix()
+    )
     for mesh_model_id in v5_context["skinned_mesh_ids"]:
         canonical_bind_by_model[int(mesh_model_id)] = _identity_matrix()
 
@@ -5012,13 +5110,7 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
     # Record the actual domain of each emitted Geometry instead of relying on
     # the scene-wide Skin classification (a file can contain both skinned and
     # unskinned/placeholder Meshes).
-    axis_conversion = v5_context.get("axis_conversion")
-    source_axes_are_canonical = (
-        isinstance(axis_conversion, list)
-        and _matrices_match(axis_conversion, _identity_matrix())
-    )
     canonical_normal_geometry_ids: set[int] = set()
-    legacy_normal_geometry_ids: set[int] = set()
     normal_axis_domain_by_geometry_id: dict[str, str] = {}
 
     def record_normal_axis_domain(
@@ -5032,23 +5124,12 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         )
         if output_geometry_id <= 0:
             return
-        # An identity source basis is already canonical.  Otherwise only a
-        # Geometry that went through the explicit bind/axis bake is canonical;
-        # untouched Geometry remains in the legacy Max basis.
-        baked = (
-            isinstance(applied_matrix, list)
-            and not _matrices_match(applied_matrix, _identity_matrix())
-        )
-        domain = (
-            FBX_NORMAL_AXIS_DOMAIN_CANONICAL
-            if source_axes_are_canonical or baked
-            else FBX_NORMAL_AXIS_DOMAIN_LEGACY
-        )
+        # Generic reconstruction applies the document axis conversion once at
+        # the scene boundary. Every emitted Geometry therefore belongs to the
+        # same canonical XYZ normal domain, including unlinked/placeholders.
+        domain = FBX_NORMAL_AXIS_DOMAIN_CANONICAL
         normal_axis_domain_by_geometry_id[str(output_geometry_id)] = domain
-        if domain == FBX_NORMAL_AXIS_DOMAIN_CANONICAL:
-            canonical_normal_geometry_ids.add(output_geometry_id)
-        else:
-            legacy_normal_geometry_ids.add(output_geometry_id)
+        canonical_normal_geometry_ids.add(output_geometry_id)
 
     emitted_geometry_ids: set[int] = set()
     geometry_cp_maps: dict[int, dict[int, list[int]]] = {}
@@ -5063,19 +5144,23 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
             source_geometry = geometry_by_id.get(geometry_id)
             if source_geometry is None or geometry_id in emitted_geometry_ids:
                 continue
-            bind_matrix = (
-                v5_context["bind_mesh_matrices"].get(source_id)
-                if source_id in v5_context["skinned_mesh_ids"]
+            # Bake only pre-bind Geometry domains. Ordinary-sized MeshBind is
+            # preserved by Cluster.Transform, so Geometry must stay untouched.
+            geometry_bind_matrix = (
+                v5_context["bind_mesh_matrices"].get(int(source_id))
+                if v5_context["geometry_bind_bake_by_mesh"].get(
+                    int(source_id), False
+                )
                 else None
             )
             geometry_payload = _extract_geometry_semantics(
                 source_geometry,
-                position_matrix=bind_matrix,
-                normal_matrix=bind_matrix,
+                position_matrix=geometry_bind_matrix,
+                normal_matrix=geometry_bind_matrix,
             )
             record_normal_axis_domain(
                 geometry_id,
-                applied_matrix=bind_matrix,
+                applied_matrix=geometry_bind_matrix,
             )
             generic_objects.children.append(
                 _generic_geometry_node(
@@ -5110,8 +5195,20 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
     for geometry_id, source_geometry in geometry_by_id.items():
         if geometry_id in emitted_geometry_ids:
             continue
-        geometry_payload = _extract_geometry_semantics(source_geometry)
-        record_normal_axis_domain(geometry_id, applied_matrix=None)
+        unlinked_geometry_matrix = _scale_affine_matrix(
+            axis_conversion,
+            float(v5_context["unit_factor"]),
+            label=f"Geometry {geometry_id} canonical unit matrix",
+        )
+        geometry_payload = _extract_geometry_semantics(
+            source_geometry,
+            position_matrix=unlinked_geometry_matrix,
+            normal_matrix=unlinked_geometry_matrix,
+        )
+        record_normal_axis_domain(
+            geometry_id,
+            applied_matrix=unlinked_geometry_matrix,
+        )
         generic_objects.children.append(
             _generic_geometry_node(
                 source_geometry,
@@ -5324,7 +5421,11 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         "FBXHeaderExtension": header,
         "GlobalSettings": _generic_global_settings(
             root_by_name.get("GlobalSettings", FbxNode("GlobalSettings")),
-            canonicalize_axes=_generic_axis_signature_is_valid(roots),
+            # A Generic document always publishes the canonical axis contract.
+            # The matrix conversion above is identity when a malformed source
+            # lacks a valid signature; it must not reopen a producer-specific
+            # axis path later in Probe or Bridge.
+            canonicalize_axes=True,
         ),
         "Definitions": _generic_definitions(generic_objects),
         "Objects": generic_objects,
@@ -5348,6 +5449,11 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         generic_roots.append(FbxNode("Creator", ["Generic FBX Converter"], ["S"], []))
     elif creator.properties:
         creator.properties[0] = "Generic FBX Converter"
+    unit_validation = _validate_generic_unit_conversion(
+        roots,
+        generic_roots,
+        v5_context,
+    )
     return generic_roots, {
         "safe_rebuilder_status": "rebuilt",
         "safe_rebuilder_object_count": len(generic_objects.children),
@@ -5361,7 +5467,6 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         "geometry_skip_reasons": geometry_skip_reasons,
         "skin_geometry_domain": v5_context["geometry_domain"],
         "canonical_normal_geometry_ids": sorted(canonical_normal_geometry_ids),
-        "legacy_normal_geometry_ids": sorted(legacy_normal_geometry_ids),
         "normal_axis_domain_by_geometry_id": dict(normal_axis_domain_by_geometry_id),
         "skin_clusters_remapped": skin_clusters_remapped,
         "safe_rebuilder_deformer_count": len(deformer_nodes),
@@ -5374,6 +5479,10 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
             graph_check["dangling_connections"]
         ),
         "safe_rebuilder_id_base": 100000,
+        "source_unit_scale_cm": v5_context["source_unit_scale_cm"],
+        "target_unit_scale_cm": v5_context["target_unit_scale_cm"],
+        "unit_factor": v5_context["unit_factor"],
+        "unit_conversion_validation": unit_validation,
         # Keep the source->canonical basis used by the rebuilt Model rows.  The
         # Writer must apply its inverse to bone matrices before entering the
         # historical MOD/Max matrix domain; storing it here avoids assuming
@@ -5438,40 +5547,31 @@ _GENERIC_FBX_MEMORY_CACHE: dict[str, tuple[int, int, _BinaryFbxDocument, dict[st
 
 def _generic_prepare_fbx_bytes(source: Path) -> tuple[bytes, dict[str, Any]]:
     raw_bytes = source.read_bytes()
-    try:
-        version, roots, footer_id = read_fbx(raw_bytes, include_footer_id=True)
-        normalization = normalize_generic_tree(roots)
-        rebuilt_roots, rebuild_receipt = _safe_rebuild_generic_scene(roots)
-        normalization.update(rebuild_receipt)
-        normalized_bytes = _generic_encode_fbx_bytes(
-            version,
-            rebuilt_roots,
-            footer_id=footer_id,
-        )
-        # Parse the generated bytes before exposing them to UFBX/Probe.
-        read_fbx(normalized_bytes)
-        return normalized_bytes, {
-            "status": "normalized",
-            "source_size": len(raw_bytes),
-            "output_size": len(normalized_bytes),
-            # Generic output is a single canonical Y-up scene.  The source
-            # axis basis is applied once while rebuilding the scene; the MOD
-            # writer must consume these canonical rows without a per-Mesh
-            # second rotation.
-            "fbx_axis_output_policy": "max_xyz",
-            "axis_transform_contract": "scene_global_once",
-            "normalization": normalization,
-        }
-    except Exception as exc:
-        # Generic normalization is an enhancement lane.  Preserve the source
-        # bytes for unsupported/corrupt input so the existing Probe error path
-        # remains authoritative instead of inventing an empty FBX.
-        return raw_bytes, {
-            "status": "fallback",
-            "source_size": len(raw_bytes),
-            "output_size": len(raw_bytes),
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+    # ====== GENERIC REBUILD ONLY ======
+    # A failed rebuild is a hard Probe error. Returning raw bytes here would
+    # silently revive the retired direct-UFBX/producer-axis path.
+    version, roots, footer_id = read_fbx(raw_bytes, include_footer_id=True)
+    normalization = normalize_generic_tree(roots)
+    rebuilt_roots, rebuild_receipt = _safe_rebuild_generic_scene(roots)
+    normalization.update(rebuild_receipt)
+    normalized_bytes = _generic_encode_fbx_bytes(
+        version,
+        rebuilt_roots,
+        footer_id=footer_id,
+    )
+    # Parse the generated bytes before exposing them to UFBX/Probe.
+    read_fbx(normalized_bytes)
+    return normalized_bytes, {
+        "status": "normalized",
+        "source_size": len(raw_bytes),
+        "output_size": len(normalized_bytes),
+        "fbx_axis_output_policy": GENERIC_AXIS_OUTPUT_POLICY,
+        "axis_transform_contract": GENERIC_AXIS_TRANSFORM_SCOPE,
+        "canonical_probe_schema": CANONICAL_FBX_PROBE_SCHEMA,
+        "canonical_axis_domain": CANONICAL_AXIS_DOMAIN,
+        "canonical_unit_domain": CANONICAL_UNIT_DOMAIN,
+        "normalization": normalization,
+    }
 
 
 def _generic_memory_document_for_path(
@@ -5484,8 +5584,10 @@ def _generic_memory_document_for_path(
     if cached is not None:
         cached_size, cached_mtime, document, receipt = cached
         if cached_size == int(stat.st_size) and cached_mtime == int(stat.st_mtime_ns):
-            return document, dict(receipt)
+            checked_receipt = _require_canonical_generic_receipt(receipt)
+            return document, checked_receipt
     normalized_bytes, receipt = _generic_prepare_fbx_bytes(source)
+    checked_receipt = _require_canonical_generic_receipt(receipt)
     # Keep large geometry arrays lazy; the generic pass already completed its
     # own read, and Probe decodes only arrays consumed by the selected stage.
     document = _build_binary_fbx_document(
@@ -5497,10 +5599,37 @@ def _generic_memory_document_for_path(
         int(stat.st_size),
         int(stat.st_mtime_ns),
         document,
-        dict(receipt),
+        dict(checked_receipt),
     )
-    return document, dict(receipt)
+    return document, checked_receipt
+
+
+def _require_canonical_generic_receipt(receipt: Any) -> dict[str, Any]:
+    """Validate the one Generic-to-canonical contract at the loader boundary."""
+    if not isinstance(receipt, dict):
+        raise RuntimeError("Generic FBX normalization receipt is missing")
+    status = str(receipt.get("status", "") or "").strip().lower()
+    policy = str(receipt.get("fbx_axis_output_policy", "") or "").strip().lower()
+    scope = str(receipt.get("axis_transform_contract", "") or "").strip().lower()
+    schema = str(receipt.get("canonical_probe_schema", "") or "").strip()
+    axis_domain = str(receipt.get("canonical_axis_domain", "") or "").strip().lower()
+    unit_domain = str(receipt.get("canonical_unit_domain", "") or "").strip().lower()
+    if (
+        status != "normalized"
+        or policy != GENERIC_AXIS_OUTPUT_POLICY
+        or scope != GENERIC_AXIS_TRANSFORM_SCOPE
+        or schema != CANONICAL_FBX_PROBE_SCHEMA
+        or axis_domain != CANONICAL_AXIS_DOMAIN
+        or unit_domain != CANONICAL_UNIT_DOMAIN
+    ):
+        detail = str(receipt.get("error", "") or status or "invalid_receipt")
+        raise RuntimeError(
+            "Generic FBX normalization is mandatory for MAX/Blender exports: "
+            f"{detail}"
+        )
+    return dict(receipt)
 # ====== END GENERIC FBX IN-MEMORY NORMALIZER (MAX + BLENDER) ======
+# ====== BEGIN CANONICAL SCENE / SKIN EXTRACTION ======
 
 
 def _clean_binary_fbx_object_name(value: Any) -> str:
@@ -6185,8 +6314,12 @@ def _binary_fbx_mesh_model_identity_queues(
 
 def extract_fbx_route_model_observations(path: str | Path) -> list[dict[str, Any]]:
     """Return route-marked FBX Model facts without making export decisions."""
-
-    _queues, observations = _binary_fbx_model_identity_context(Path(path))
+    fbx_path = Path(path).resolve()
+    binary_document, _receipt = _generic_memory_document_for_path(fbx_path)
+    _queues, observations = _binary_fbx_model_identity_context(
+        fbx_path,
+        binary_document=binary_document,
+    )
     return observations
 
 
@@ -6475,33 +6608,6 @@ def _row_major_matrices_match(left: list[float], right: list[float]) -> bool:
     return max(abs(left[index] - right[index]) for index in range(16)) <= (magnitude * 0.00001)
 
 
-def _world_to_max_axis_matrix(mesh_world: list[float]) -> list[float] | None:
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # This per-Mesh FBX-helper inverse belongs to the old direct/UFBX fallback.
-    # Generic requests use one file-level canonical axis transform instead.
-    """Extract only the FBX axis basis from a Mesh bind matrix.
-
-    Importer-generated FBX stores Max Z-up to FBX Y-up on the Mesh helper,
-    while a Max-exported FBX normally has an identity axis basis.  The Skin
-    result is world-space, so remove only that basis before handing positions
-    to the Max-coordinate MOD encoder; mesh scale must remain in the result.
-    """
-    if len(mesh_world) != 16:
-        return None
-    axis = [0.0] * 16
-    for row in range(3):
-        row_offset = row * 4
-        length = math.sqrt(
-            sum(mesh_world[row_offset + column] * mesh_world[row_offset + column] for column in range(3))
-        )
-        if length <= 0.000000000001:
-            return None
-        for column in range(3):
-            axis[row_offset + column] = mesh_world[row_offset + column] / length
-    axis[15] = 1.0
-    return _invert_row_major_matrix(axis)
-
-
 def _shared_cluster_prebind(bindings: list[dict[str, Any]]) -> list[float] | None:
     """Return a common Cluster bind basis only when every Cluster agrees."""
     if not bindings:
@@ -6714,6 +6820,10 @@ def _build_binary_fbx_skin_evaluation_context(
     context: dict[str, Any] = {
         "schema": FBX_BINARY_SKIN_EVALUATION_SCHEMA,
         "status": graph_status,
+        "axis_domain": FBX_NORMAL_AXIS_DOMAIN_CANONICAL,
+        "unit_domain": "max_inches_numeric",
+        "evaluation_policy": "fbx_standard_mesh_bind_inverse_bone_bind_current_bone",
+        "global_axis_domain_requested": bool(use_global_axis_domain),
         "meshes": {},
     }
     if graph_status != "ok":
@@ -6777,14 +6887,10 @@ def _build_binary_fbx_skin_evaluation_context(
         # XYZ/Y-up domain.  Never infer an axis helper from this Mesh's own
         # rotation/scale: that would turn authored transforms into per-Mesh
         # axis conversions and rotate Skin with each object.
-        mesh_world_to_max = (
-            _identity_matrix()
-            if use_global_axis_domain and mesh_world is not None
-            # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-            # Non-Generic per-Mesh axis fallback; Generic always takes the
-            # identity branch above after its scene-wide normalization.
-            else (_world_to_max_axis_matrix(mesh_world) if mesh_world is not None else None)
-        )
+        # Generic normalization owns the only axis conversion at file scope.
+        # A Mesh transform is authored placement (including scale), never an
+        # axis-conversion source.  Keep the post-normalization basis identity.
+        mesh_world_to_max = _identity_matrix() if mesh_world is not None else None
         if mesh_node is None or mesh is None or mesh_world is None or mesh_world_to_max is None or not source_positions:
             context["meshes"][mesh_key] = {
                 "status": "missing_mesh_node_or_geometry",
@@ -6818,7 +6924,7 @@ def _build_binary_fbx_skin_evaluation_context(
                 {
                     **cluster,
                     "bone_world": bone_world,
-                    "max_prebind": _multiply_row_major_matrices(transform, transform_link),
+                    "max_prebind": transform,
                 }
             )
         if not bindings:
@@ -6829,94 +6935,26 @@ def _build_binary_fbx_skin_evaluation_context(
             }
             continue
 
+        # Generic publishes Transform = inverse(BoneBind), so the row-vector
+        # deformation matrix is Transform * BoneCurrent.
+        mode = "fbx_bone_space_transform_current_bone"
         world_to_max = mesh_world_to_max
         unweighted_source_matrix = mesh_world
-        if all(_row_major_matrices_match(binding["max_prebind"], mesh_world) for binding in bindings):
-            mode = "max_cluster_prebind"
-            deformation_matrices = [
-                _multiply_row_major_matrices(binding["transform"], binding["bone_world"])
-                for binding in bindings
-            ]
-        elif all(_row_major_matrices_match(binding["transform"], mesh_world) for binding in bindings):
-            mode = "standard_cluster_bind"
-            deformation_matrices = []
-            for binding in bindings:
-                inverse_link = _invert_row_major_matrix(binding["transform_link"])
-                if inverse_link is None:
-                    deformation_matrices = []
-                    break
-                deformation_matrices.append(
-                    _multiply_row_major_matrices(
-                        _multiply_row_major_matrices(binding["transform"], inverse_link),
-                        binding["bone_world"],
-                    )
+        deformation_matrices: list[list[float]] = []
+        for binding in bindings:
+            deformation_matrices.append(
+                _multiply_row_major_matrices(
+                    binding["transform"],
+                    binding["bone_world"],
                 )
-            if not deformation_matrices:
-                context["meshes"][mesh_key] = {
-                    "status": "non_invertible_cluster_link",
-                    "mesh_name": mesh_name,
-                    "mesh_model_id": _int_or_default(model_id_text, 0),
-                }
-                continue
-        elif (
-            (armature_bind := _shared_cluster_prebind(bindings)) is not None
-            and (
-                use_global_axis_domain
-                # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-                # Legacy direct/UFBX Armature-basis fallback.
-                or (armature_world_to_max := _world_to_max_axis_matrix(armature_bind)) is not None
             )
-        ):
-            # Blender writes the common Armature bind basis to Transform x
-            # TransformLink while its Mesh node remains in export space.  At
-            # rest Transform x TransformLink restores that basis; at the
-            # current pose Transform x BoneWorld is the corresponding LBS map.
-            mode = "blender_armature_cluster_bind"
-            deformation_matrices = [
-                _multiply_row_major_matrices(binding["transform"], binding["bone_world"])
-                for binding in bindings
-            ]
-            world_to_max = (
-                _identity_matrix()
-                if use_global_axis_domain
-                else armature_world_to_max
-            )
-            unweighted_source_matrix = armature_bind
-        else:
-            # Receipt Meshes must remain writable even when one valid Cluster
-            # uses a mixed bind convention.  Resolve each Cluster using the
-            # exact convention when it matches; otherwise preserve the FBX
-            # TransformLink relation (standard bind) and fall back to the Max
-            # prebind relation only when that link cannot be inverted.  This
-            # is a calculable FBX result, never a source-MOD copy decision.
-            mode = "mixed_cluster_bind_fallback"
-            deformation_matrices = []
-            fallback_binding_count = 0
-            for binding in bindings:
-                if _row_major_matrices_match(binding["max_prebind"], mesh_world):
-                    deformation_matrices.append(
-                        _multiply_row_major_matrices(
-                            binding["transform"], binding["bone_world"]
-                        )
-                    )
-                    continue
-                inverse_link = _invert_row_major_matrix(binding["transform_link"])
-                if inverse_link is not None:
-                    deformation_matrices.append(
-                        _multiply_row_major_matrices(
-                            _multiply_row_major_matrices(
-                                binding["transform"], inverse_link
-                            ),
-                            binding["bone_world"],
-                        )
-                    )
-                else:
-                    fallback_binding_count += 1
-                    deformation_matrices.append(
-                        _multiply_row_major_matrices(
-                            binding["transform"], binding["bone_world"]
-                        )
-                    )
+        if len(deformation_matrices) != len(bindings):
+            context["meshes"][mesh_key] = {
+                "status": "non_invertible_transform_link",
+                "mesh_name": mesh_name,
+                "mesh_model_id": _int_or_default(model_id_text, 0),
+            }
+            continue
 
         source_count = len(source_positions)
         accumulated = [[0.0] * 16 for _ in range(source_count)]
@@ -6954,11 +6992,6 @@ def _build_binary_fbx_skin_evaluation_context(
             "geometry_fingerprint": str(
                 clusters[0].get("geometry_fingerprint", "") if clusters else ""
                 or ""
-            ),
-            **(
-                {"fallback_binding_count": fallback_binding_count}
-                if mode == "mixed_cluster_bind_fallback"
-                else {}
             ),
         }
     return context
@@ -7767,9 +7800,10 @@ def _apply_binary_fbx_skin_pose_channels(
     if len(_safe_list(getattr(mesh, "skin_deformers", None))) < 1:
         geometry.setdefault("fbx_skin_pose_evaluation_status", "not_skinned")
         return geometry
-    if _get_mesh_skinned_vec3_rows(mesh, "skinned_position", "skinned_positions"):
-        geometry["fbx_skin_pose_evaluation_status"] = "ufbx_runtime_evaluated"
-        return geometry
+    # Do not let native UFBX rows short-circuit the canonical Skin evaluator.
+    # Native and substitute runtimes must consume the same Generic binary
+    # Cluster data.  UFBX rows remain an input fallback only when the canonical
+    # evaluator has no usable entry for this mesh.
     node_name = str(getattr(instance_node, "name", "") or "")
     mesh_pose = None
     if isinstance(skin_context, dict):
@@ -7813,7 +7847,22 @@ def _apply_binary_fbx_skin_pose_channels(
                             mesh_pose = fingerprint_matches[0]
     if not isinstance(mesh_pose, dict) or mesh_pose.get("status") != "binary_cluster_evaluated":
         status = mesh_pose.get("status") if isinstance(mesh_pose, dict) else "binary_cluster_evaluation_unavailable"
-        geometry["fbx_skin_pose_evaluation_status"] = str(status)
+        # Weightless placeholder Skin/Cluster records are valid no-op data.
+        # A real weighted Skin must never silently fall back to native UFBX
+        # rows or source geometry after the Generic boundary.
+        has_positive_weight = any(
+            isinstance(weight, (int, float))
+            and math.isfinite(float(weight))
+            and float(weight) > 0.0
+            for deformer in _safe_list(getattr(mesh, "skin_deformers", None))
+            for cluster in _safe_list(getattr(deformer, "clusters", None))
+            for weight in _safe_list(getattr(cluster, "weights", None))
+        )
+        if has_positive_weight:
+            raise ValueError(
+                f"Canonical Generic Skin evaluation unavailable for mesh {node_name!r}: {status}"
+            )
+        geometry["fbx_skin_pose_evaluation_status"] = "not_skinned_weightless_placeholder"
         return geometry
 
     source_matrices = mesh_pose.get("source_matrices")
@@ -7831,8 +7880,9 @@ def _apply_binary_fbx_skin_pose_channels(
         or len(source_indices) != len(positions)
         or len(source_positions) != len(source_matrices)
     ):
-        geometry["fbx_skin_pose_evaluation_status"] = "binary_cluster_evaluation_unaligned_geometry"
-        return geometry
+        raise ValueError(
+            f"Canonical Generic Skin geometry is unaligned for mesh {node_name!r}"
+        )
 
     evaluated_world_positions: list[list[float]] = []
     evaluated_max_positions: list[list[float]] = []
@@ -7843,11 +7893,13 @@ def _apply_binary_fbx_skin_pose_channels(
         try:
             source_index = int(source_index_value)
         except (TypeError, ValueError, OverflowError):
-            geometry["fbx_skin_pose_evaluation_status"] = "binary_cluster_evaluation_invalid_source_index"
-            return geometry
+            raise ValueError(
+                f"Canonical Generic Skin source index is invalid for mesh {node_name!r}"
+            )
         if source_index < 0 or source_index >= len(source_matrices):
-            geometry["fbx_skin_pose_evaluation_status"] = "binary_cluster_evaluation_missing_source_matrix"
-            return geometry
+            raise ValueError(
+                f"Canonical Generic Skin source matrix is missing for mesh {node_name!r}"
+            )
         referenced_source_indices.add(source_index)
         matrix = source_matrices[source_index]
         world_position = _transform_position_row_major(positions[export_index], matrix)
@@ -7900,50 +7952,10 @@ def _infer_effective_skinned_is_local(
     node_to_world: Any,
     raw_positions: Any = None,
 ) -> bool:
-    if skinned_is_local_hint:
-        return True
-    if node_to_world is None:
-        return skinned_is_local_hint
-    has_max_positions = isinstance(raw_max_positions, list)
-    has_raw_positions = isinstance(raw_positions, list)
-    if (not has_max_positions and not has_raw_positions) or not isinstance(skinned_positions, list):
-        return skinned_is_local_hint
-    reference_count = len(raw_max_positions) if has_max_positions else len(raw_positions)
-    row_count = min(reference_count, len(skinned_positions))
-    if row_count <= 0:
-        return skinned_is_local_hint
-
-    sample_limit = min(row_count, 32)
-    sample_step = max(1, row_count // sample_limit)
-    local_error = 0.0
-    world_error = 0.0
-    used = 0
-    prepared_transform = _prepare_row_major_transform(node_to_world)
-    for row_index in range(0, row_count, sample_step):
-        raw_max = (
-            raw_max_positions[row_index]
-            if has_max_positions
-            else _transform_position_row_major(raw_positions[row_index], prepared_transform)
-        )
-        skinned_pos = skinned_positions[row_index]
-        local_candidate = _fbx_world_to_max_vec3(
-            _transform_position_row_major(skinned_pos, prepared_transform)
-        )
-        world_candidate = _fbx_world_to_max_vec3(skinned_pos)
-        local_error += _distance_sq_vec3(local_candidate, raw_max)
-        world_error += _distance_sq_vec3(world_candidate, raw_max)
-        used += 1
-        if used >= sample_limit:
-            break
-    if used <= 0:
-        return skinned_is_local_hint
-
-    # Some ufbx builds expose posed rows as object-local even when the flag says otherwise.
-    # Compare both interpretations against the raw mesh's transformed max-space rows and
-    # keep the one that stays in the same coordinate regime.
-    if local_error < world_error:
-        return True
-    return skinned_is_local_hint
+    # The Generic document defines the row domain once.  Do not sample values
+    # and guess local/world semantics per Mesh: that made native and substitute
+    # UFBX builds choose different Skin paths for identical input.
+    return bool(skinned_is_local_hint)
 
 
 def _build_skinned_pose_output_channels(
@@ -8414,17 +8426,9 @@ def _extract_mesh_geometry_from_binary_corner_layers(
         node_to_world = getattr(instance_node, "node_to_world", None)
         prepared_transform = _prepare_row_major_transform(node_to_world)
         node_world_matrix = _binary_fbx_matrix(_flatten_matrix4x4(node_to_world))
-        world_to_max_matrix = (
-            _identity_matrix()
-            if use_global_axis_domain and node_world_matrix is not None
-            # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-            # Legacy per-Mesh axis removal for direct/non-Generic extraction.
-            else (
-                _world_to_max_axis_matrix(node_world_matrix)
-                if node_world_matrix is not None
-                else None
-            )
-        )
+        # The Generic layer has already normalized the complete FBX once at
+        # file scope.  Never derive an axis conversion from this Mesh matrix.
+        world_to_max_matrix = _identity_matrix() if node_world_matrix is not None else None
 
         first_corner_by_position = [-1 for _ in range(len(positions_src))]
         for corner_index, position_index in enumerate(geom_indices):
@@ -8545,9 +8549,7 @@ def _extract_mesh_geometry_from_binary_corner_layers(
                 "output_triangle_count": len(out_face_indices) // 3,
                 "normal_split_vertex_count": 0,
                 "normal_space": "fbx_authored_corner_no_mesh_node_transform",
-                # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-                # Diagnostic label for the non-Generic per-Mesh axis route.
-                "position_mode": "binary_fbx_node_axis_to_max",
+                "position_mode": "binary_fbx_scene_global_canonical_xyz",
             }
         )
         return {
@@ -8697,25 +8699,11 @@ def _extract_mesh_geometry(
     vertex_map: dict[tuple[int, Any, tuple[int, int, int]], int] = {}
     node_to_world = getattr(instance_node, "node_to_world", None)
     prepared_transform = _prepare_row_major_transform(node_to_world)
-    # Keep the compatibility/fallback extractor on the exact same position
-    # chain as the strict corner reader. A Mesh node may carry the exporter
-    # axis basis (for example the imported Max-Z-up <-> FBX-Y-up helper) in
-    # addition to its real scale/translation. Applying only node_to_world
-    # leaves rows in FBX world axes; applying the inverse of the normalized
-    # node basis removes only that helper basis while retaining scale and
-    # placement in the Max/MOD lane.
+    # Keep the compatibility extractor on the same canonical position chain
+    # as the strict corner reader.  The node matrix is authored placement;
+    # Generic's file-level normalization, not this Mesh, owns axis policy.
     node_world_matrix = _binary_fbx_matrix(_flatten_matrix4x4(node_to_world))
-    world_to_max_matrix = (
-        _identity_matrix()
-        if use_global_axis_domain and node_world_matrix is not None
-        # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-        # Legacy per-Mesh axis removal for direct/non-Generic extraction.
-        else (
-            _world_to_max_axis_matrix(node_world_matrix)
-            if node_world_matrix is not None
-            else None
-        )
-    )
+    world_to_max_matrix = _identity_matrix() if node_world_matrix is not None else None
     default_uv_channel = uv_channels[0] if uv_channels else None
 
     for face_begin, face_size in faces:
@@ -8879,6 +8867,9 @@ def _extract_mesh_geometry(
     }
     return geometry
 
+
+# ====== END CANONICAL SCENE / SKIN EXTRACTION ======
+# ====== BEGIN PUBLIC PROBE HANDOFF / RECEIPTS ======
 
 def parse_bone_id_from_name(bone_name: str | None, default_value: int | None = None) -> int | None:
     """Read the RE6 bone ID from the stable ``b_<parent>_<id>`` prefix.
@@ -9076,22 +9067,26 @@ def _extract_skin_summary(mesh: Any, *, source_vertex_indices: list[int] | None 
 def _require_scene(
     path: str | Path,
     *,
-    use_generic_normalizer: bool = False,
+    use_generic_normalizer: bool = True,
     backend_kind: Any = "",
 ) -> tuple[Path, Any]:
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # False is retained for diagnostics and unsupported legacy callers; the
-    # supported DCC export handoff enables Generic explicitly.
+    # ========================================================================
+    # CANONICAL INPUT BOUNDARY
+    # ========================================================================
+    # Every real FBX is normalized in memory before any UFBX/binary scene read.
+    # ``backend_kind`` is metadata only; it can select the Blender unit receipt
+    # and MAX RouteHandle identity parsing, never a second geometry path.
     fbx_path = Path(path).resolve()
-    # Keep the safety gate at the loader boundary too. The flag is an
-    # internal optimization hint; it is never sufficient to select the
-    # Generic lane without an explicit supported DCC backend identity.
-    use_generic_normalizer = bool(
-        use_generic_normalizer and _uses_generic_rebuild_backend(backend_kind)
-    )
+    # Synthetic paths are used by runtime self-tests; real files always use
+    # Generic regardless of the caller's producer label or option value.  Keep
+    # this invariant explicit: no caller can reopen a producer FBX through the
+    # retired direct-UFBX path by passing ``use_generic_normalizer=False``.
+    is_real_fbx_file = fbx_path.is_file()
+    if is_real_fbx_file:
+        use_generic_normalizer = True
     # Runtime self-tests and diagnostics intentionally use synthetic paths.
     # Keep their old loader behavior; real FBX requests are handled below.
-    if not fbx_path.is_file():
+    if not is_real_fbx_file:
         if ufbx is None:
             return fbx_path, ufbx_missed_substitute(fbx_path)
         try:
@@ -9108,20 +9103,12 @@ def _require_scene(
     if use_generic_normalizer:
         try:
             document, generic_receipt = _generic_memory_document_for_path(fbx_path)
-        except Exception:
-            # The Generic lane is an optional DCC enhancement. If its
-            # binary preparation/parser cannot produce an in-memory document,
-            # return to the existing direct loader so UFBX keeps its normal
-            # data-error/runtime-failure classification instead of leaking a
-            # Generic parser exception.
-            # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-            # This direct-loader fallback is retained only for old/diagnostic
-            # callers and is a deletion candidate after Generic is mandatory.
-            return _require_scene(
-                fbx_path,
-                use_generic_normalizer=False,
-                backend_kind=backend_kind,
-            )
+        except Exception as exc:
+            # MAX and Blender exports are Generic-only. Never reopen the raw
+            # direct/UFBX axis path after normalization fails.
+            raise RuntimeError(
+                f"Generic FBX normalization failed for {backend_kind}: {exc}"
+            ) from exc
         normalized_bytes = document.data
         if ufbx is not None:
             load_memory = getattr(ufbx, "load_memory", None)
@@ -9297,30 +9284,27 @@ def _summarize_scene(
 
 
 def summarize_fbx(path: str | Path) -> dict[str, Any]:
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # Public legacy/diagnostic API: it intentionally invokes the direct loader
-    # and is not the export handoff used by supported DCC routes.
-    fbx_path, scene = _require_scene(path)
-    summary = _summarize_scene(
-        scene,
-        fbx_path=str(fbx_path),
-        binary_model_queues=_binary_fbx_mesh_model_identity_queues(fbx_path),
+    # Public summary uses the exact same Generic-backed handoff as export.
+    payload = probe_fbx_handoff(path, probe_mode="full")
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        raise RuntimeError("Canonical FBX Probe returned no summary")
+    result = dict(summary)
+    result["generic_fbx_normalization"] = dict(
+        payload.get("generic_fbx_normalization", {})
     )
-    summary["fbx_axes"] = _scene_axis_receipt(scene)
-    summary["fbx_units"] = _scene_unit_receipt(scene)
-    return summary
+    result["fbx_axis_output_policy"] = "max_xyz"
+    result["fbx_axis_transform_scope"] = "scene_global_once"
+    result["canonical_axis_domain"] = FBX_NORMAL_AXIS_DOMAIN_CANONICAL
+    result["canonical_unit_domain"] = "max_inches_numeric"
+    return result
 
 
 def _generic_normal_axis_domain_for_geometry(
     generic_normalization: Any,
     binary_identity: dict[str, Any] | None,
 ) -> str:
-    """Resolve the normal basis for one emitted Generic Geometry ID.
-
-    The receipt is deliberately the only cross-stage authority.  If an old
-    caller has no per-Geometry entry, return an empty value so the Bridge can
-    retain its established policy instead of guessing from FBX axes alone.
-    """
+    """Return the canonical normal domain for a validated Generic Geometry."""
     if not isinstance(generic_normalization, dict):
         return ""
     if str(generic_normalization.get("status", "") or "").strip().lower() != "normalized":
@@ -9340,11 +9324,8 @@ def _generic_normal_axis_domain_for_geometry(
             by_geometry.get(str(geometry_id), by_geometry.get(geometry_id, ""))
             or ""
         ).strip().lower()
-        if domain in {
-            FBX_NORMAL_AXIS_DOMAIN_CANONICAL,
-            FBX_NORMAL_AXIS_DOMAIN_LEGACY,
-        }:
-            return domain
+        if domain:
+            return FBX_NORMAL_AXIS_DOMAIN_CANONICAL
     canonical_ids = {
         _int_or_default(value, 0)
         for value in normalization.get("canonical_normal_geometry_ids", [])
@@ -9352,14 +9333,9 @@ def _generic_normal_axis_domain_for_geometry(
     }
     if geometry_id in canonical_ids:
         return FBX_NORMAL_AXIS_DOMAIN_CANONICAL
-    legacy_ids = {
-        _int_or_default(value, 0)
-        for value in normalization.get("legacy_normal_geometry_ids", [])
-        if _int_or_default(value, 0) > 0
-    }
-    if geometry_id in legacy_ids:
-        return FBX_NORMAL_AXIS_DOMAIN_LEGACY
-    return ""
+    # Validated Generic output has one scene-global axis domain. A missing
+    # historical per-Geometry marker cannot reactivate the legacy normal path.
+    return FBX_NORMAL_AXIS_DOMAIN_CANONICAL
 
 
 def _build_probe_contract_mesh_row(
@@ -9400,13 +9376,15 @@ def _build_probe_contract_mesh_row(
         )
         geometry_normal_fidelity["normal_axis_domain"] = normal_axis_domain
     max_position_rows = geometry.get("max_positions")
-    # Position conversion does not depend on normal fidelity.  A fallback
-    # geometry extraction still has a valid node-transformed position lane;
-    # dropping it here forced the Bridge to rebuild the lane with a different
-    # axis path and could lose the FBX node basis.  Keep exact and fallback
-    # position rows alike; normal_fidelity remains the authority marker for
-    # authored normal data.
-    publish_max_positions = isinstance(max_position_rows, list) and bool(max_position_rows)
+    if not isinstance(max_position_rows, list):
+        max_position_rows = []
+    skinned_max_position_rows = geometry.get("skinned_max_positions")
+    if not isinstance(skinned_max_position_rows, list):
+        skinned_max_position_rows = []
+    # These are the two stable position authorities exposed to the Bridge:
+    # ordinary export consumes max_positions, while bone-edit export consumes
+    # skinned_max_positions.  Both are already canonical and are always
+    # present, even when a header-only row has no geometry payload.
     row: dict[str, Any] = {
         "node_name": node_name,
         "mesh_name": mesh_name,
@@ -9416,13 +9394,9 @@ def _build_probe_contract_mesh_row(
         "lod_hint": infer_lod_hint(node_name) or infer_lod_hint(mesh_name),
         "material_names": material_names,
         "positions": geometry.get("positions", []),
-        **(
-            {"max_positions": max_position_rows}
-            if publish_max_positions
-            else {}
-        ),
+        "max_positions": max_position_rows,
         "skinned_positions": geometry.get("skinned_positions", []),
-        "skinned_max_positions": geometry.get("skinned_max_positions", []),
+        "skinned_max_positions": skinned_max_position_rows,
         "skinned_world_positions": geometry.get("skinned_world_positions", []),
         "normals": geometry.get("normals", []),
         "max_normals": geometry.get("max_normals", []),
@@ -9454,6 +9428,8 @@ def _build_probe_contract_mesh_row(
         "normal_fidelity": geometry_normal_fidelity,
         "vertex_count": geometry.get("vertex_count", 0),
         "triangle_count": geometry.get("triangle_count", 0),
+        "position_domain": CANONICAL_AXIS_DOMAIN,
+        "position_unit_domain": CANONICAL_UNIT_DOMAIN,
     }
     if normal_axis_domain:
         row["fbx_normal_axis_domain"] = normal_axis_domain
@@ -9531,29 +9507,12 @@ def _extract_scene_mesh_contracts(
 
 
 def extract_fbx_mesh_contracts(path: str | Path) -> list[dict[str, Any]]:
-    # EXPIRED_AXIS_COMPAT_PATH: DELETE_AFTER_GENERIC_ONLY
-    # Legacy public contract API: it calls the direct loader/extractor and is
-    # not the Generic-backed export handoff used by supported DCC routes.
-    fbx_path, scene = _require_scene(path)
-    binary_document = _build_binary_fbx_document(fbx_path)
-    skin_context = _build_binary_fbx_skin_evaluation_context(
-        fbx_path,
-        scene,
-        binary_document=binary_document,
-    )
-    return _extract_scene_mesh_contracts(
-        scene,
-        skin_context=skin_context,
-        binary_model_queues=_binary_fbx_mesh_model_identity_queues(
-            fbx_path,
-            binary_document=binary_document,
-        ),
-        binary_corner_context=_build_binary_fbx_corner_geometry_context(
-            fbx_path,
-            binary_document=binary_document,
-        ),
-        binary_document=binary_document,
-    )
+    # Auxiliary callers must not bypass the canonical scene handoff.
+    payload = probe_fbx_handoff(path, probe_mode="full")
+    contracts = payload.get("contract_meshes")
+    if not isinstance(contracts, list):
+        raise RuntimeError("Canonical FBX Probe returned no mesh contracts")
+    return contracts
 
 
 def _build_probe_stage_a_plan(
@@ -9805,13 +9764,9 @@ def _probe_scene_handoff(
     stage_a_plan: dict[str, Any] | None = None,
     generic_normalization: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    # The embedded Generic rebuild emits one canonical Y-up scene. This flag
-    # is request-scoped; direct non-export callers keep their existing path.
-    use_global_axis_domain = (
-        isinstance(generic_normalization, dict)
-        and str(generic_normalization.get("status", "") or "").strip().lower()
-        == "normalized"
-    )
+    # The scene has already crossed the mandatory Generic boundary.  There is
+    # no producer- or caller-specific axis branch after this point.
+    use_global_axis_domain = True
     mesh_summaries: list[dict[str, Any]] = []
     contract_meshes: list[dict[str, Any]] = []
     route_receipt_rows: list[dict[str, Any]] = []
@@ -10190,6 +10145,13 @@ def _probe_scene_handoff(
             for mesh in contract_meshes
             if isinstance(mesh, dict) and isinstance(mesh.get("normal_fidelity"), dict)
         ],
+        "canonical_probe_schema": CANONICAL_FBX_PROBE_SCHEMA,
+        "canonical_axis_domain": CANONICAL_AXIS_DOMAIN,
+        "canonical_unit_domain": CANONICAL_UNIT_DOMAIN,
+        "fbx_axis_output_policy": GENERIC_AXIS_OUTPUT_POLICY,
+        "fbx_axis_transform_scope": GENERIC_AXIS_TRANSFORM_SCOPE,
+        "bone_matrix_axis_domain": CANONICAL_AXIS_DOMAIN,
+        "transform_stage": "generic_memory_to_canonical_domain",
     }
     if isinstance(max_snapshot, dict):
         payload["compare"] = compare_fbx_to_max_snapshot(summary, max_snapshot)
@@ -10207,12 +10169,12 @@ def probe_fbx_handoff(
     route_hints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_route_hints = _normalize_probe_route_hints(route_hints)
-    # Both supported DCC routes use the same in-memory Generic reconstruction
-    # before Probe consumes the scene. Unknown/direct callers retain the old
-    # reader path.
-    use_generic_normalizer = _uses_generic_rebuild_backend(
-        normalized_route_hints.get("backend_kind")
-    )
+    # ====== ONE GENERIC HANDOFF ======
+    # Producer labels are retained only for the two explicit policy facts:
+    # Blender's fixed unit conversion and MAX RouteHandle identity. Every
+    # actual FBX, including direct/unknown callers, uses the same in-memory
+    # Generic document and the same canonical parser below.
+    use_generic_normalizer = True
     fbx_path, scene = _require_scene(
         path,
         use_generic_normalizer=use_generic_normalizer,
@@ -10220,14 +10182,7 @@ def probe_fbx_handoff(
     )
     # The export handoff starts with a structural tree only.  Large FBX arrays
     # are decoded lazily when the Stage B target actually consumes them.
-    if use_generic_normalizer:
-        binary_document, generic_receipt = _generic_memory_document_for_path(fbx_path)
-    else:
-        binary_document = _build_binary_fbx_document(
-            fbx_path,
-            decode_array_names=frozenset(),
-        )
-        generic_receipt = {"status": "disabled", "reason": "non_generic_backend"}
+    binary_document, generic_receipt = _generic_memory_document_for_path(fbx_path)
     normalized_target_handles = {
         _int_or_default(value, 0)
         for value in (target_handles or set())
@@ -10270,7 +10225,7 @@ def probe_fbx_handoff(
         target_handles=normalized_target_handles,
         target_names=normalized_target_names,
         target_slots=normalized_target_slots,
-        route_hints=route_hints,
+        route_hints=normalized_route_hints,
     )
     # Stage A is the sole route authority.  Only its exact-geometry entries
     # are allowed to open the expensive Skin and corner-attribute readers.
@@ -10321,7 +10276,7 @@ def probe_fbx_handoff(
         target_handles=normalized_target_handles,
         target_names=normalized_target_names,
         target_slots=normalized_target_slots,
-        route_hints=route_hints,
+        route_hints=normalized_route_hints,
         stage_a_plan=stage_a_plan,
         generic_normalization=generic_receipt,
     )
@@ -10394,18 +10349,17 @@ def probe_fbx_handoff(
         payload["probe_route_receipt"] = route_receipt
     fbx_axes = _scene_axis_receipt(scene)
     fbx_units = _scene_unit_receipt(scene)
-    # All downstream Writer branches receive the same already-converted
-    # position contract.  Keep this one scene-level unit boundary here so
-    # ordinary MAX positions and BONE+MESH Skin positions cannot diverge.
-    fbx_model_scale_transform = _apply_blender_probe_inch_scale(
-        payload,
-        backend_kind=normalized_route_hints.get("backend_kind"),
-        fbx_units=fbx_units,
-        generic_receipt=generic_receipt,
-        # Bones Edit requests the full scene handoff; only that Blender route
-        # needs its bone matrices moved into the same Max-inch domain as Mesh.
-        bone_edit=(str(probe_mode or "full").strip().casefold() == "full"),
-    )
+    # Producer-specific Blender scaling was retired.  Generic reconstruction
+    # owns the unit boundary; this receipt is diagnostic only and never mutates
+    # geometry, skin, bone, or node-matrix rows.
+    fbx_model_scale_transform = {
+        "schema": FBX_TRANSFORM_SCALE_SCHEMA,
+        "status": "not_applied",
+        "backend": str(normalized_route_hints.get("backend_kind") or "").strip().lower(),
+        "source": "generic_fbx_reconstruction",
+        "unit_factor": 1.0,
+        "applied_once": False,
+    }
     payload["fbx_axes"] = fbx_axes
     payload["fbx_units"] = fbx_units
     payload["summary"]["fbx_axes"] = fbx_axes
@@ -10414,36 +10368,31 @@ def probe_fbx_handoff(
     payload["summary"]["fbx_model_scale_transform"] = dict(
         fbx_model_scale_transform
     )
+    transform_scale = _fbx_transform_scale_receipt(
+        payload,
+        fbx_units,
+        backend_kind=normalized_route_hints.get("backend_kind"),
+    )
+    payload["fbx_transform_scale_receipt"] = transform_scale
+    payload["summary"]["fbx_transform_scale_receipt"] = dict(transform_scale)
     payload["generic_fbx_normalization"] = generic_receipt
-    if (
-        isinstance(generic_receipt, dict)
-        and str(generic_receipt.get("status", "") or "").strip().lower()
-        == "normalized"
-    ):
-        # Publish the scene-wide writer policy at the Probe boundary as well
-        # as inside the nested Generic receipt.  The Bridge can therefore
-        # consume one explicit XYZ declaration without inspecting internals.
-        generic_axis_policy = str(
-            generic_receipt.get("fbx_axis_output_policy", "") or ""
-        ).strip().lower()
-        if generic_axis_policy:
-            payload["fbx_axis_output_policy"] = generic_axis_policy
-        payload["fbx_axis_transform_scope"] = "scene_global_once"
-        # The rebuilt bone Models are emitted in the same canonical XYZ domain
-        # as the rebuilt Geometry.  The Bridge adapts their translation into
-        # its legacy internal matrix representation exactly once before write.
-        payload["bone_matrix_axis_domain"] = FBX_NORMAL_AXIS_DOMAIN_CANONICAL
-        normalization = generic_receipt.get("normalization")
-        if not isinstance(normalization, dict):
-            normalization = generic_receipt
-        inverse_axis = normalization.get("canonical_to_source_axis_matrix")
-        if (
-            isinstance(inverse_axis, list)
-            and len(inverse_axis) >= 16
-            and all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in inverse_axis[:16])
-        ):
-            payload["bone_matrix_axis_inverse"] = [float(value) for value in inverse_axis[:16]]
-        payload["transform_stage"] = "Generic_to_mod_transform_code"
+    # Publish the canonical writer contract unconditionally.  A normalized
+    # receipt is mandatory above; there is no disabled/legacy axis fallback.
+    payload["fbx_axis_output_policy"] = GENERIC_AXIS_OUTPUT_POLICY
+    payload["fbx_axis_transform_scope"] = GENERIC_AXIS_TRANSFORM_SCOPE
+    payload["canonical_probe_schema"] = CANONICAL_FBX_PROBE_SCHEMA
+    payload["canonical_axis_domain"] = CANONICAL_AXIS_DOMAIN
+    payload["canonical_unit_domain"] = CANONICAL_UNIT_DOMAIN
+    payload["bone_matrix_axis_domain"] = CANONICAL_AXIS_DOMAIN
+    payload["transform_stage"] = "generic_memory_to_canonical_domain"
+    dynamic_mapping = _dynamic_mod_fbx_mapping_receipt()
+    payload["dynamic_mod_fbx_mapping_receipt"] = dynamic_mapping
+    payload["mod_to_canonical_matrix"] = list(
+        dynamic_mapping["mod_to_canonical_matrix"]
+    )
+    payload["canonical_to_mod_matrix"] = list(
+        dynamic_mapping["canonical_to_mod_matrix"]
+    )
     return payload
 
 
@@ -10537,8 +10486,8 @@ _UFBX_MESH_EXACT_CONTRACT_FIELDS = frozenset(
 
 def build_ufbx_behavior_contract(path: str | Path) -> dict[str, Any]:
     """Build a compact, deterministic receipt over every FBX value used by RE6."""
-    fbx_path, scene = _require_scene(path)
-    handoff = _probe_scene_handoff(scene, fbx_path=str(fbx_path))
+    fbx_path = Path(path).resolve()
+    handoff = probe_fbx_handoff(fbx_path, probe_mode="full")
     summary = dict(handoff.get("summary", {}))
     mesh_receipts: list[dict[str, Any]] = []
     for ordinal, mesh in enumerate(handoff.get("contract_meshes", [])):
@@ -10588,7 +10537,9 @@ def build_ufbx_behavior_contract(path: str | Path) -> dict[str, Any]:
             "patch": str(getattr(ufbx, "__codex_patch__", "") or ""),
         },
         "stats": _ufbx_contract_normalize(summary.get("stats", {})),
-        "fbx_axes": _ufbx_contract_normalize(_scene_axis_receipt(scene)),
+        "fbx_axes": _ufbx_contract_normalize(
+            handoff.get("fbx_axes", summary.get("fbx_axes", {}))
+        ),
         "meshes": mesh_receipts,
         "materials": _ufbx_contract_normalize(summary.get("materials", [])),
         "bones": bone_receipts,
@@ -10848,6 +10799,8 @@ def main(argv: list[str] | None = None) -> int:
         print(runtime_json_dumps_text(summary, pretty=args.pretty))
     return 0
 
+
+# ====== END PUBLIC PROBE HANDOFF / RECEIPTS ======
 
 if __name__ == "__main__":
     raise SystemExit(main())
