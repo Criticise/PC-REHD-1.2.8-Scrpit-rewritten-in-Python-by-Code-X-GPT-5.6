@@ -49,6 +49,12 @@ CANONICAL_AXIS_DOMAIN = FBX_NORMAL_AXIS_DOMAIN_CANONICAL
 CANONICAL_UNIT_DOMAIN = "max_inches_numeric"
 GENERIC_AXIS_OUTPUT_POLICY = "max_xyz"
 GENERIC_AXIS_TRANSFORM_SCOPE = "scene_global_once"
+# Keep the embedded Probe's generic rebuild receipt names aligned with the
+# standalone Generic FBX Converter.  These are aliases, not a second transform
+# path; the scene is still canonicalized exactly once.
+FBX_AXIS_OUTPUT_POLICY = GENERIC_AXIS_OUTPUT_POLICY
+FBX_AXIS_TRANSFORM_CONTRACT = GENERIC_AXIS_TRANSFORM_SCOPE
+FBX_CANONICALIZATION_POLICY = "alpha_full_canonical_or_fail_v1"
 DYNAMIC_MOD_FBX_MAPPING_SCHEMA = "pc-rehd-dynamic-mod-fbx-mapping-v1"
 # Transform-scale receipt is separate from the axis-basis receipt.  A basis
 # change is dimensionless; the root scale and the FBX-unit ratio are length
@@ -71,6 +77,41 @@ CANONICAL_TO_MOD_MATRIX = (
     0.0, 1.0, 0.0, 0.0,
     0.0, 0.0, 0.0, 1.0,
 )
+
+_ALPHA_SPATIAL_TOKENS = (
+    "matrix", "transform", "translation", "rotation", "scaling",
+    "position", "pivot", "axis", "quaternion", "euler", "geometric",
+)
+
+
+def _node_has_unverified_spatial_semantics(node: FbxNode) -> bool:
+    """Reject unknown cloned records that could still carry source-space data."""
+    if node.name.casefold() in {
+        "animationcurve", "animationcurvenode", "constraint", "character",
+        "controlset", "layerelementtangent", "layerelementbinormal",
+    }:
+        return True
+    if node.name == "P" and node.properties:
+        name = str(node.properties[0] or "").casefold()
+        if any(token in name for token in _ALPHA_SPATIAL_TOKENS):
+            return True
+    return any(_node_has_unverified_spatial_semantics(child) for child in node.children)
+
+
+_ALPHA_SAFE_CLONED_OBJECT_NAMES = {
+    "Material", "Texture", "Video", "Implementation", "BindingTable",
+    "BindingOperator", "SelectionNode", "SelectionSet",
+}
+
+
+def _guard_alpha_cloned_object(node: FbxNode) -> None:
+    if node.name in _ALPHA_SAFE_CLONED_OBJECT_NAMES:
+        return
+    if _node_has_unverified_spatial_semantics(node):
+        raise ValueError(
+            "ALPHA_UNVERIFIED: object "
+            f"{node.name}/{_node_type(node) or '<unknown>'} contains source-space semantics"
+        )
 _NATIVE_LOADER_ERROR_CODES = frozenset({8, 126, 127, 182, 193, 1114})
 _NATIVE_LOADER_ERROR_MARKERS = (
     "dll load failed",
@@ -2357,6 +2398,20 @@ def _source_model_local_matrix(source: FbxNode) -> list[float]:
     return list(_source_model_local_parts(source)["matrix"])
 
 
+def _source_geometric_matrix(source: FbxNode) -> list[float]:
+    """Return Geometry-local Geometric TRS in the source row-vector domain."""
+    translation = _model_property_vector(
+        source, "GeometricTranslation", 3, [0.0, 0.0, 0.0]
+    )
+    rotation = _model_property_vector(
+        source, "GeometricRotation", 3, [0.0, 0.0, 0.0]
+    )
+    scale = _model_property_vector(
+        source, "GeometricScaling", 3, [1.0, 1.0, 1.0]
+    )
+    return _local_trs_matrix(translation, rotation, scale)
+
+
 def _orthonormalize_rotation_rows(rows: list[list[float]]) -> list[list[float]]:
     first = list(rows[0][:3])
     first_length = math.sqrt(sum(value * value for value in first))
@@ -2588,6 +2643,18 @@ def _v5_scene_context(
     """Derive V5 bind/domain data from the source FBX graph alone."""
     model_nodes = list(source_graph.get("models", []))
     objects_by_id = dict(source_graph.get("objects_by_id", {}))
+    source_cluster_ids = {
+        _object_id(node)
+        for node in source_graph.get("deformers", [])
+        if _node_type(node).casefold() == "cluster" and _object_id(node) > 0
+    }
+    source_associate_cluster_ids = {
+        _object_id(node)
+        for node in source_graph.get("deformers", [])
+        if _node_type(node).casefold() == "cluster"
+        and _object_id(node) > 0
+        and isinstance(_child_value(node, "TransformAssociateModel"), list)
+    }
     parent_ids = dict(source_graph.get("model_parent_ids", {}))
     worlds = _source_model_world_matrices(model_nodes, parent_ids)
     axis_conversion = _generic_axis_conversion_matrix(roots)
@@ -2644,20 +2711,22 @@ def _v5_scene_context(
                 and _node_type(objects_by_id[child_id]).casefold() == "limbnode"
             ]
         bone_ids = sorted(set(int(value) for value in bone_ids))
+        cluster_neighbors = set(parents_by_child.get(cluster_id, [])) | set(
+            children_by_parent.get(cluster_id, [])
+        )
         skin_ids = [
-            parent_id
-            for parent_id in parents_by_child.get(cluster_id, [])
-            if objects_by_id.get(parent_id) is not None
-            and objects_by_id[parent_id].name == "Deformer"
-            and _node_type(objects_by_id[parent_id]).casefold() == "skin"
+            object_id
+            for object_id in cluster_neighbors
+            if objects_by_id.get(object_id) is not None
+            and objects_by_id[object_id].name == "Deformer"
+            and _node_type(objects_by_id[object_id]).casefold() == "skin"
         ]
         geometry_ids: set[int] = set()
         for skin_id in skin_ids:
-            geometry_ids.update(
-                int(parent_id)
-                for parent_id in parents_by_child.get(skin_id, [])
-                if parent_id in geometry_by_id
+            skin_neighbors = set(parents_by_child.get(skin_id, [])) | set(
+                children_by_parent.get(skin_id, [])
             )
+            geometry_ids.update(int(value) for value in skin_neighbors if value in geometry_by_id)
         if not geometry_ids:
             geometry_ids.update(
                 int(parent_id)
@@ -2666,21 +2735,23 @@ def _v5_scene_context(
             )
         mesh_model_ids: set[int] = set()
         for geometry_id in geometry_ids:
-            mesh_model_ids.update(
-                int(parent_id)
-                for parent_id in parents_by_child.get(geometry_id, [])
-                if parent_id in mesh_ids
+            geometry_neighbors = set(parents_by_child.get(geometry_id, [])) | set(
+                children_by_parent.get(geometry_id, [])
             )
+            mesh_model_ids.update(int(value) for value in geometry_neighbors if value in mesh_ids)
         if len(bone_ids) != 1 or not mesh_model_ids:
             continue
         raw_indexes = _child_value(cluster, "Indexes")
         raw_weights = _child_value(cluster, "Weights")
         raw_transform = _child_value(cluster, "Transform")
         raw_link = _child_value(cluster, "TransformLink")
-        if raw_indexes is None and raw_weights is None:
-            # Some exporters leave connected, but weightless, placeholder
-            # Clusters in the scene. They have no skin influence to normalize.
-            continue
+        # A connected, weightless Cluster is still part of the Skin binding
+        # graph. Normalize it with an empty influence list instead of letting
+        # the writer fall back to the source-space matrices.
+        if raw_indexes is None:
+            raw_indexes = []
+        if raw_weights is None:
+            raw_weights = []
         if (
             not isinstance(raw_indexes, list)
             or not isinstance(raw_weights, list)
@@ -2707,6 +2778,14 @@ def _v5_scene_context(
             "positive_weight_count": positive_weight_count,
             "transform": transform,
             "transform_link": link,
+            "transform_associate": (
+                _finite_matrix(
+                    _child_value(cluster, "TransformAssociateModel"),
+                    f"Cluster {cluster_id} TransformAssociateModel",
+                )
+                if isinstance(_child_value(cluster, "TransformAssociateModel"), list)
+                else None
+            ),
         }
         cluster_by_id[cluster_id] = row
         for mesh_model_id in sorted(mesh_model_ids):
@@ -2714,8 +2793,8 @@ def _v5_scene_context(
 
     # Every weighted Mesh is rebuilt through the canonical LOCAL_BIND path.
     # Do not infer the vertex domain from a unit-looking
-    # Transform*TransformLink product; that does not prove that control
-    # points are already in the canonical geometry domain.
+    # Transform*TransformLink product; it does not prove that control points
+    # are already in the canonical geometry domain.
     geometry_domain = "LOCAL_BIND"
     pose_matrices_by_model: dict[int, list[list[float]]] = {}
     for pose in source_graph.get("poses", []):
@@ -2746,6 +2825,7 @@ def _v5_scene_context(
     bind_mesh_matrices: dict[int, list[float]] = {}
     geometry_bind_bake_by_mesh: dict[int, bool] = {}
     canonical_cluster_matrices: dict[int, tuple[list[float], list[float]]] = {}
+    canonical_associate_matrices: dict[int, list[float]] = {}
     canonical_bind_by_model: dict[int, list[float]] = {}
     cluster_domain_scales: dict[int, list[float]] = {}
     for mesh_model_id in sorted(mesh_ids):
@@ -2805,7 +2885,7 @@ def _v5_scene_context(
         else:
             domain = 1.0
         domain_scales[mesh_model_id] = float(domain)
-        for cluster in active_clusters:
+        for cluster in clusters:
             cluster_domain_scales.setdefault(int(cluster["cluster_id"]), []).append(float(domain))
         candidates: list[list[float]] = []
         for cluster in active_clusters:
@@ -2913,7 +2993,7 @@ def _v5_scene_context(
                     raise ValueError(
                         f"Cluster {cluster_id} is shared by incompatible Geometry bind contracts"
                     )
-            inverse_link = _invert_row_major_matrix(link)
+            inverse_link = _generic_invert_row_major_matrix(link)
             if inverse_link is None:
                 raise ValueError(
                     f"Cluster {cluster_id} canonical TransformLink is not invertible"
@@ -2932,6 +3012,13 @@ def _v5_scene_context(
             canonical_transform,
             link,
         )
+        associate = cluster.get("transform_associate")
+        if associate is not None:
+            canonical_associate_matrices[int(cluster_id)] = _scale_affine_matrix(
+                _generic_multiply_row_major_matrices(associate, axis_conversion),
+                unit_factor,
+                label=f"Cluster {cluster_id} canonical TransformAssociateModel",
+            )
         if has_positive_influence:
             bind_candidates_by_bone.setdefault(bone_id, []).append(list(link))
 
@@ -3009,6 +3096,8 @@ def _v5_scene_context(
     }
     return {
         "source_worlds": worlds,
+        "source_cluster_ids": source_cluster_ids,
+        "source_associate_cluster_ids": source_associate_cluster_ids,
         "output_unit_worlds": target_worlds,
         "output_worlds": output_worlds,
         "domain_scales": domain_scales,
@@ -3016,6 +3105,7 @@ def _v5_scene_context(
         "geometry_bind_bake_by_mesh": geometry_bind_bake_by_mesh,
         "mesh_clusters": mesh_clusters,
         "cluster_matrices": canonical_cluster_matrices,
+        "associate_matrices": canonical_associate_matrices,
         "canonical_bind_by_model": canonical_bind_by_model,
         "skinned_mesh_ids": skinned_mesh_ids,
         "unit_scale": unit_scale,
@@ -3379,9 +3469,23 @@ def normalize_generic_tree(roots: list[FbxNode]) -> dict[str, Any]:
     """Apply document-level cleanup before the dedicated semantic rebuild."""
     removed = _remove_max_metadata(roots)
     _set_creator(roots)
+    axis_conversion = _generic_axis_conversion_matrix(roots)
     return {
         "removed_max_metadata": removed,
         "axis_policy": "normalize_to_xyz_axes",
+        # This is a document-level conversion, matching the embedded Probe
+        # contract.  Consumers must treat the resulting scene as canonical
+        # XYZ/Y-up and skip any later per-Mesh axis inference.
+        "fbx_axis_output_policy": FBX_AXIS_OUTPUT_POLICY,
+        "axis_transform_contract": FBX_AXIS_TRANSFORM_CONTRACT,
+        "canonicalization_policy": FBX_CANONICALIZATION_POLICY,
+        "use_global_axis_domain": True,
+        "source_axis_signature": _axis_signature(roots) or [],
+        "axis_conversion_matrix": list(axis_conversion),
+        "canonical_to_source_axis_matrix": (
+            _generic_invert_row_major_matrix(axis_conversion)
+            or _identity_matrix()
+        ),
         "scene_policy": "binary_semantic_safe_rebuilder",
         "geometry_rebuilt_count": 0,
         "geometry_skipped_count": 0,
@@ -3542,6 +3646,20 @@ def _validate_generic_unit_conversion(
     cluster_matrices = context.get("cluster_matrices")
     if not isinstance(bind_mesh_matrices, dict) or not isinstance(cluster_matrices, dict):
         raise ValueError("Generic FBX unit validation is missing Skin bind matrices")
+    source_cluster_ids = set(context.get("source_cluster_ids", set()))
+    if set(cluster_matrices) != source_cluster_ids:
+        missing = sorted(source_cluster_ids - set(cluster_matrices))
+        extra = sorted(set(cluster_matrices) - source_cluster_ids)
+        raise ValueError(
+            "Generic FBX unit validation Cluster coverage mismatch: "
+            f"missing={missing[:8]}, extra={extra[:8]}"
+        )
+    associate_matrices = context.get("associate_matrices")
+    source_associate_ids = set(context.get("source_associate_cluster_ids", set()))
+    if not isinstance(associate_matrices, dict) or set(associate_matrices) != source_associate_ids:
+        raise ValueError(
+            "Generic FBX unit validation TransformAssociateModel coverage mismatch"
+        )
     for mesh_id, matrix in bind_mesh_matrices.items():
         _finite_matrix(matrix, f"Mesh {mesh_id} validated canonical bind")
     for cluster_id, pair in cluster_matrices.items():
@@ -3623,6 +3741,11 @@ def _copy_semantic_properties(
         excluded = {"MaxHandle"} if excluded_names is None else excluded_names
         if _property_name(property_node) in excluded:
             continue
+        property_name = _property_name(property_node)
+        if any(token in property_name.casefold() for token in _ALPHA_SPATIAL_TOKENS):
+            raise ValueError(
+                f"ALPHA_UNVERIFIED: {source.name} property {property_name!r} carries unmapped spatial semantics"
+            )
         properties.children.append(
             FbxNode(
                 "P",
@@ -3663,6 +3786,32 @@ def _extract_geometry_semantics(
         positions = []
     if not positions:
         return {"status": "header_only", "reason": "geometry_with_invalid_positions", "cp_to_output": {}}
+    if isinstance(raw_indices, list) and not raw_indices:
+        output_positions = []
+        for position in positions:
+            row = list(position)
+            if position_matrix is not None:
+                row = _generic_transform_position_row_major(row, position_matrix)
+            output_positions.append(row)
+        return {
+            "status": "rebuilt",
+            "reason": "canonical_point_geometry",
+            "vertices": output_positions,
+            "faces": [],
+            "loop_normals": [],
+            "tangents": [],
+            "binormals": [],
+            "uv_channels": [],
+            "colors": [],
+            "edges": [],
+            "materials": [],
+            "cp_to_output": {index: [index] for index in range(len(output_positions))},
+            "source_vertex_count": len(output_positions),
+            "output_vertex_count": len(output_positions),
+            "normal_split": False,
+            "uv_channel_count": 0,
+            "preserve_point_uv": True,
+        }
     try:
         source_indices, source_faces, corner_faces = _decode_polygon_corners(
             raw_indices,
@@ -3703,6 +3852,42 @@ def _extract_geometry_semantics(
             return {
                 "status": "header_only",
                 "reason": f"invalid_normal_layer:{exc}",
+                "cp_to_output": {},
+            }
+
+    vector_layers: dict[str, list[tuple[float, ...]] | None] = {
+        "LayerElementTangent": None,
+        "LayerElementBinormal": None,
+    }
+    vector_specs = {
+        "LayerElementTangent": ("Tangents", "TangentsIndex"),
+        "LayerElementBinormal": ("Binormals", "BinormalsIndex"),
+    }
+    for layer_name, (value_child, index_child) in vector_specs.items():
+        nodes = [child for child in source.children if child.name == layer_name]
+        if len(nodes) > 1:
+            return {
+                "status": "header_only",
+                "reason": f"ambiguous_{layer_name.casefold()}",
+                "cp_to_output": {},
+            }
+        if not nodes:
+            continue
+        try:
+            vector_layers[layer_name] = _decode_corner_layer(
+                nodes[0],
+                value_child=value_child,
+                index_child=index_child,
+                tuple_size=3,
+                source_indices=source_indices,
+                corner_faces=corner_faces,
+                face_count=len(source_faces),
+                position_count=len(positions),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            return {
+                "status": "header_only",
+                "reason": f"invalid_{layer_name.casefold()}:{exc}",
                 "cp_to_output": {},
             }
 
@@ -3781,6 +3966,8 @@ def _extract_geometry_semantics(
     output_positions: list[list[float]] = []
     output_faces: list[list[int]] = []
     corner_normals: list[list[float]] = []
+    corner_tangents: list[list[float]] = []
+    corner_binormals: list[list[float]] = []
     corner_uvs: list[list[list[float]]] = [[] for _ in uv_values]
     cp_to_output: dict[int, list[int]] = {index: [] for index in range(len(positions))}
     corner_output: list[int] = []
@@ -3809,6 +3996,16 @@ def _extract_geometry_semantics(
             if normal_matrix is not None:
                 normal = _generic_transform_normal_row_major(normal, normal_matrix)
             corner_normals.append(normal)
+        for layer_name, output_rows in (
+            ("LayerElementTangent", corner_tangents),
+            ("LayerElementBinormal", corner_binormals),
+        ):
+            rows = vector_layers.get(layer_name)
+            if rows is not None:
+                vector = list(rows[corner_index][:3])
+                if normal_matrix is not None:
+                    vector = _generic_transform_normal_row_major(vector, normal_matrix)
+                output_rows.append(vector)
         for channel_index, channel in enumerate(uv_values):
             corner_uvs[channel_index].append([float(value) for value in channel[corner_index][:2]])
         corner_output.append(output_index)
@@ -3849,6 +4046,8 @@ def _extract_geometry_semantics(
         "vertices": output_positions,
         "faces": output_faces,
         "loop_normals": corner_normals if normal_values is not None else [],
+        "tangents": corner_tangents if vector_layers["LayerElementTangent"] is not None else [],
+        "binormals": corner_binormals if vector_layers["LayerElementBinormal"] is not None else [],
         "uv_channels": uv_channels,
         "colors": colors,
         "edges": edges,
@@ -4134,10 +4333,10 @@ def _generic_model_node(
         translation, rotation, scale = _matrix_to_trs(
             transform, label=f"Model {name} local matrix"
         )
-    except (TypeError, ValueError, OverflowError):
-        translation = _model_property_vector(source, "Lcl Translation", 3, [0.0, 0.0, 0.0])
-        rotation = _model_property_vector(source, "Lcl Rotation", 3, [0.0, 0.0, 0.0])
-        scale = _model_property_vector(source, "Lcl Scaling", 3, [1.0, 1.0, 1.0])
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"Alpha canonical Model {object_id} matrix cannot be decomposed: {exc}"
+        ) from exc
     semantic_properties = _copy_semantic_properties(
         source, excluded_names=_PRODUCER_TRANSFORM_PROPERTIES
     )
@@ -4361,6 +4560,8 @@ def _generic_geometry_node(
         "Edges",
         "LayerElementSmoothing",
         "LayerElementNormal",
+        "LayerElementTangent",
+        "LayerElementBinormal",
         "LayerElementUV",
         "LayerElementColor",
         "LayerElementMaterial",
@@ -4371,6 +4572,10 @@ def _generic_geometry_node(
         for child in source.children:
             if child.name in generated_children:
                 continue
+            if _node_has_unverified_spatial_semantics(child):
+                raise ValueError(
+                    f"Alpha canonical Geometry {object_id} contains unverified spatial child {child.name}"
+                )
             cloned = _clone_generic_node(
                 child,
                 strip_max_metadata=True,
@@ -4379,12 +4584,24 @@ def _generic_geometry_node(
                 geometry.children.append(cloned)
 
     if payload.get("status") != "rebuilt":
-        preserve_unknown_children()
-        return geometry
+        raw_vertices = _child_value(source, "Vertices")
+        raw_polygon_indices = _child_value(source, "PolygonVertexIndex")
+        # Empty structural Geometry is a valid placeholder used by the MOD
+        # contract. It has no source-space vertex payload to mix with the
+        # rebuilt scene, so keep only non-spatial metadata for that case.
+        if not raw_vertices and not raw_polygon_indices:
+            preserve_unknown_children()
+            return geometry
+        raise ValueError(
+            f"ALPHA_UNVERIFIED: Geometry {object_id} cannot be fully canonicalized: "
+            f"{payload.get('reason', 'unknown reason')}"
+        )
 
     vertices = payload.get("vertices", [])
     faces = payload.get("faces", [])
     normals = payload.get("loop_normals", [])
+    tangents = payload.get("tangents", [])
+    binormals = payload.get("binormals", [])
     uv_channels = payload.get("uv_channels", [])
     colors = payload.get("colors", [])
     materials = payload.get("materials", [])
@@ -4412,11 +4629,37 @@ def _generic_geometry_node(
             "Normals",
             ("d", [float(component) for row in normals for component in row[:3]]),
         )
+    for layer_name, value_name, rows in (
+        ("LayerElementTangent", "Tangents", tangents),
+        ("LayerElementBinormal", "Binormals", binormals),
+    ):
+        if isinstance(rows, list) and len(rows) == sum(len(face) for face in faces):
+            layer = geometry.add(layer_name, ("I", 0))
+            layer.add("Version", ("I", 101))
+            layer.add("Name", ("S", ""))
+            layer.add("MappingInformationType", ("S", "ByPolygonVertex"))
+            layer.add("ReferenceInformationType", ("S", "Direct"))
+            layer.add(
+                value_name,
+                ("d", [float(component) for row in rows for component in row[:3]]),
+            )
     source_uv_nodes = [
         child for child in source.children if child.name == "LayerElementUV"
     ]
     uv_nodes_by_index: dict[int, FbxNode] = {}
     uv_node_order: list[tuple[int, FbxNode]] = []
+    if payload.get("preserve_point_uv"):
+        for channel_index, source_uv in enumerate(source_uv_nodes):
+            typed_index = (
+                int(source_uv.properties[0])
+                if source_uv.properties and isinstance(source_uv.properties[0], int)
+                else channel_index
+            )
+            cloned_uv = _clone_generic_node(source_uv, strip_max_metadata=True)
+            if cloned_uv is not None:
+                geometry.children.append(cloned_uv)
+                uv_nodes_by_index[typed_index] = cloned_uv
+                uv_node_order.append((typed_index, cloned_uv))
     for channel_index, channel in enumerate(uv_channels):
         if not isinstance(channel, dict):
             continue
@@ -4500,6 +4743,8 @@ def _generic_geometry_node(
     generated_layer_types = {
         "LayerElementSmoothing",
         "LayerElementNormal",
+        "LayerElementTangent",
+        "LayerElementBinormal",
         "LayerElementUV",
         "LayerElementColor",
         "LayerElementMaterial",
@@ -4508,6 +4753,10 @@ def _generic_geometry_node(
         ("LayerElementSmoothing", 0): True,
         ("LayerElementNormal", 0): isinstance(normals, list)
         and len(normals) == sum(len(face) for face in faces),
+        ("LayerElementTangent", 0): isinstance(tangents, list)
+        and len(tangents) == sum(len(face) for face in faces),
+        ("LayerElementBinormal", 0): isinstance(binormals, list)
+        and len(binormals) == sum(len(face) for face in faces),
     }
     generated_bindings.update(
         {
@@ -4546,6 +4795,10 @@ def _generic_geometry_node(
         )
         for source_layer_element in source_layer.children:
             if source_layer_element.name != "LayerElement":
+                if _node_has_unverified_spatial_semantics(source_layer_element):
+                    raise ValueError(
+                        f"Alpha canonical Geometry {object_id} contains unverified spatial layer {source_layer_element.name}"
+                    )
                 cloned = _clone_generic_node(
                     source_layer_element,
                     strip_max_metadata=True,
@@ -4555,6 +4808,10 @@ def _generic_geometry_node(
                 continue
             layer_type = str(_child_value(source_layer_element, "Type") or "")
             if layer_type not in generated_layer_types:
+                if _node_has_unverified_spatial_semantics(source_layer_element):
+                    raise ValueError(
+                        f"Alpha canonical Geometry {object_id} contains unverified spatial layer {layer_type or '<missing>'}"
+                    )
                 cloned = _clone_generic_node(
                     source_layer_element,
                     strip_max_metadata=True,
@@ -4585,6 +4842,10 @@ def _generic_geometry_node(
     ]
     if generated_bindings.get(("LayerElementNormal", 0)):
         fallback_order.append(("LayerElementNormal", 0))
+    if generated_bindings.get(("LayerElementTangent", 0)):
+        fallback_order.append(("LayerElementTangent", 0))
+    if generated_bindings.get(("LayerElementBinormal", 0)):
+        fallback_order.append(("LayerElementBinormal", 0))
     fallback_order.extend(("LayerElementUV", typed_index) for typed_index, _node in uv_node_order)
     fallback_order.extend(
         ("LayerElementColor", color_index) for color_index, _color in enumerate(colors)
@@ -4709,6 +4970,7 @@ def _generic_deformer_node(
     *,
     index_map: dict[int, list[int]] | None = None,
     canonical_matrices: tuple[list[float], list[float]] | None = None,
+    canonical_associate_matrix: list[float] | None = None,
 ) -> FbxNode:
     """Write a fresh Skin/Cluster node from its semantic arrays."""
     deformer_type = _node_type(source) or "Deformer"
@@ -4742,6 +5004,10 @@ def _generic_deformer_node(
             accuracy = 50.0
         node.add("Link_DeformAcuracy", ("D", accuracy))
     elif normalized_type == "cluster":
+        if canonical_matrices is None:
+            raise ValueError(
+                f"ALPHA_UNVERIFIED: Cluster {object_id} has no canonical matrix contract"
+            )
         version = _child_value(source, "Version")
         try:
             version = int(version) if version is not None else 100
@@ -4778,11 +5044,7 @@ def _generic_deformer_node(
         node.add("Indexes", ("i", indexes))
         node.add("Weights", ("d", weights))
         for child_name in ("Transform", "TransformLink"):
-            matrix = (
-                canonical_matrices[0 if child_name == "Transform" else 1]
-                if canonical_matrices is not None
-                else _child_value(source, child_name)
-            )
+            matrix = canonical_matrices[0 if child_name == "Transform" else 1]
             values = []
             if isinstance(matrix, list):
                 try:
@@ -4790,6 +5052,17 @@ def _generic_deformer_node(
                 except (TypeError, ValueError, OverflowError):
                     values = []
             node.add(child_name, ("d", values))
+        if canonical_associate_matrix is not None:
+            node.add(
+                "TransformAssociateModel",
+                ("d", [float(value) for value in canonical_associate_matrix]),
+            )
+        elif _child_node(source, "TransformAssociateModel") is not None:
+            # Alpha policy: a spatial child may not be silently copied from
+            # the source domain. The caller must provide its canonical form.
+            raise ValueError(
+                f"Cluster {object_id} TransformAssociateModel has no canonical mapping"
+            )
     else:
         # Unknown deformer kinds are outside the Skin contract; keep only the
         # authored Properties70 values so they remain identifiable without
@@ -4830,17 +5103,18 @@ def _generic_pose_node(
     valid_nodes: list[tuple[int, list[float]]] = []
     for pose_node in (child for child in source.children if child.name == "PoseNode"):
         source_node = _child_node(pose_node, "Node")
-        matrix_node = _child_node(pose_node, "Matrix")
-        if source_node is None or not source_node.properties or matrix_node is None:
-            continue
+        if source_node is None or not source_node.properties:
+            raise ValueError("ALPHA_UNVERIFIED: PoseNode has no valid Model reference")
         try:
             source_model_id = int(source_node.properties[0])
-            matrix = [float(value) for value in (matrix_node.properties[0] if matrix_node.properties else [])]
         except (TypeError, ValueError, OverflowError):
-            continue
+            raise ValueError("ALPHA_UNVERIFIED: PoseNode Model reference is invalid")
         output_model_id = id_map.get(source_model_id)
-        if canonical_bind_matrices and source_model_id in canonical_bind_matrices:
-            matrix = list(canonical_bind_matrices[source_model_id])
+        if canonical_bind_matrices is None or source_model_id not in canonical_bind_matrices:
+            raise ValueError(
+                f"Alpha canonical PoseNode {source_model_id} has no canonical matrix"
+            )
+        matrix = list(canonical_bind_matrices[source_model_id])
         if output_model_id is None or len(matrix) != 16 or not all(math.isfinite(value) for value in matrix):
             continue
         valid_nodes.append((output_model_id, matrix))
@@ -4930,15 +5204,19 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
     v5_context = _v5_scene_context(roots, source_graph, parents_by_child)
     output_worlds = dict(v5_context["output_worlds"])
     canonical_bind_by_model = dict(v5_context["canonical_bind_by_model"])
-    # Reuse the exact document-level basis computed by the V5 context when
-    # publishing the Generic receipt.  The old rebuild path referenced
-    # ``axis_conversion`` without carrying it out of that context, which made
-    # every supported MAX/Blender handoff fail with a runtime NameError.
+    # Publish the exact document-level basis used by the rebuild.  All
+    # Geometry/Model/Cluster/Pose passes below belong to this one canonical
+    # Y-up scene domain; no later per-Mesh legacy-axis inference is allowed.
     axis_conversion = list(
         v5_context.get("axis_conversion") or _identity_matrix()
     )
     for mesh_model_id in v5_context["skinned_mesh_ids"]:
         canonical_bind_by_model[int(mesh_model_id)] = _identity_matrix()
+    # Every PoseNode must be written in the rebuilt scene domain. Bones retain
+    # their authoritative bind matrices above; structural and unskinned Models
+    # use their canonical output world instead of a source Pose fallback.
+    for model_id, world in output_worlds.items():
+        canonical_bind_by_model.setdefault(int(model_id), list(world))
 
     id_map: dict[int, int] = {}
     next_id = 100000
@@ -5027,6 +5305,7 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
     for source in object_nodes:
         if source.name in {"Model", "Geometry", "NodeAttribute", "Deformer", "Pose"}:
             continue
+        _guard_alpha_cloned_object(source)
         cloned = _clone_generic_node(source, id_map=id_map, strip_max_metadata=True)
         if cloned is not None:
             generic_objects.children.append(cloned)
@@ -5106,10 +5385,8 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
     geometry_output_ids = {
         geometry_id: id_map[geometry_id] for geometry_id in geometry_by_id
     }
-    # Generic_to_mod_transform_code consumes these IDs later in the Writer.
-    # Record the actual domain of each emitted Geometry instead of relying on
-    # the scene-wide Skin classification (a file can contain both skinned and
-    # unskinned/placeholder Meshes).
+    # Match the embedded Probe's Generic contract: every emitted Geometry is
+    # interpreted inside the same rebuilt scene-global Y-up axis domain.
     canonical_normal_geometry_ids: set[int] = set()
     normal_axis_domain_by_geometry_id: dict[str, str] = {}
 
@@ -5124,9 +5401,6 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         )
         if output_geometry_id <= 0:
             return
-        # Generic reconstruction applies the document axis conversion once at
-        # the scene boundary. Every emitted Geometry therefore belongs to the
-        # same canonical XYZ normal domain, including unlinked/placeholders.
         domain = FBX_NORMAL_AXIS_DOMAIN_CANONICAL
         normal_axis_domain_by_geometry_id[str(output_geometry_id)] = domain
         canonical_normal_geometry_ids.add(output_geometry_id)
@@ -5153,14 +5427,21 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
                 )
                 else None
             )
+            geometric_matrix = _source_geometric_matrix(source_model)
+            if geometry_bind_matrix is not None:
+                geometry_position_matrix = _generic_multiply_row_major_matrices(
+                    geometric_matrix, geometry_bind_matrix
+                )
+            else:
+                geometry_position_matrix = geometric_matrix
             geometry_payload = _extract_geometry_semantics(
                 source_geometry,
-                position_matrix=geometry_bind_matrix,
-                normal_matrix=geometry_bind_matrix,
+                position_matrix=geometry_position_matrix,
+                normal_matrix=geometry_position_matrix,
             )
             record_normal_axis_domain(
                 geometry_id,
-                applied_matrix=geometry_bind_matrix,
+                applied_matrix=geometry_position_matrix,
             )
             generic_objects.children.append(
                 _generic_geometry_node(
@@ -5205,10 +5486,7 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
             position_matrix=unlinked_geometry_matrix,
             normal_matrix=unlinked_geometry_matrix,
         )
-        record_normal_axis_domain(
-            geometry_id,
-            applied_matrix=unlinked_geometry_matrix,
-        )
+        record_normal_axis_domain(geometry_id, applied_matrix=unlinked_geometry_matrix)
         generic_objects.children.append(
             _generic_geometry_node(
                 source_geometry,
@@ -5262,12 +5540,22 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
             if _node_type(source).casefold() == "cluster"
             else None
         )
+        if _node_type(source).casefold() == "cluster" and canonical_matrices is None:
+            raise ValueError(
+                f"ALPHA_UNVERIFIED: Cluster {source_id} is connected to the rebuilt scene but has no canonical matrix"
+            )
+        canonical_associate_matrix = (
+            v5_context.get("associate_matrices", {}).get(source_id)
+            if _node_type(source).casefold() == "cluster"
+            else None
+        )
         generic_objects.children.append(
             _generic_deformer_node(
                 source,
                 id_map[source_id],
                 index_map=index_map,
                 canonical_matrices=canonical_matrices,
+                canonical_associate_matrix=canonical_associate_matrix,
             )
         )
         emitted_object_ids.add(source_id)
@@ -5292,6 +5580,7 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         source_id = _object_id(source)
         if source.name in {"Model", "Geometry", "NodeAttribute", "Deformer", "Pose"} or source_id in emitted_object_ids:
             continue
+        _guard_alpha_cloned_object(source)
         cloned = _clone_generic_node(source, id_map=id_map, strip_max_metadata=True)
         if cloned is not None:
             generic_objects.children.append(cloned)
@@ -5421,10 +5710,9 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         "FBXHeaderExtension": header,
         "GlobalSettings": _generic_global_settings(
             root_by_name.get("GlobalSettings", FbxNode("GlobalSettings")),
-            # A Generic document always publishes the canonical axis contract.
-            # The matrix conversion above is identity when a malformed source
-            # lacks a valid signature; it must not reopen a producer-specific
-            # axis path later in Probe or Bridge.
+            # The complete semantic rebuild above owns the source-axis
+            # conversion.  Always publish the rebuilt document as canonical
+            # X-right/Y-up/Z-front instead of retaining a producer branch.
             canonicalize_axes=True,
         ),
         "Definitions": _generic_definitions(generic_objects),
@@ -5435,12 +5723,14 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         if name in root_replacements:
             generic_roots.append(root_replacements[name])
         elif name in root_by_name:
+            _guard_alpha_cloned_object(root_by_name[name])
             cloned = _clone_generic_node(root_by_name[name])
             if cloned is not None:
                 generic_roots.append(cloned)
     for source_root in roots:
         if source_root.name in preferred_order or source_root.name == "Creator":
             continue
+        _guard_alpha_cloned_object(source_root)
         cloned = _clone_generic_node(source_root)
         if cloned is not None:
             generic_roots.append(cloned)
@@ -5449,13 +5739,10 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         generic_roots.append(FbxNode("Creator", ["Generic FBX Converter"], ["S"], []))
     elif creator.properties:
         creator.properties[0] = "Generic FBX Converter"
-    unit_validation = _validate_generic_unit_conversion(
-        roots,
-        generic_roots,
-        v5_context,
-    )
+    unit_validation = _validate_generic_unit_conversion(roots, generic_roots, v5_context)
     return generic_roots, {
         "safe_rebuilder_status": "rebuilt",
+        "canonicalization_policy": FBX_CANONICALIZATION_POLICY,
         "safe_rebuilder_object_count": len(generic_objects.children),
         "safe_rebuilder_model_count": len(model_nodes),
         "safe_rebuilder_mesh_count": len(mesh_model_ids) + len(other_mesh_placeholder_ids),
@@ -5483,10 +5770,9 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         "target_unit_scale_cm": v5_context["target_unit_scale_cm"],
         "unit_factor": v5_context["unit_factor"],
         "unit_conversion_validation": unit_validation,
-        # Keep the source->canonical basis used by the rebuilt Model rows.  The
-        # Writer must apply its inverse to bone matrices before entering the
-        # historical MOD/Max matrix domain; storing it here avoids assuming
-        # every Max FBX used the same axis signature.
+        # Keep the source->canonical basis used by rebuilt Model rows. The
+        # downstream Writer can apply its inverse without assuming every Max
+        # FBX used the same axis signature.
         "source_axis_signature": _axis_signature(roots) or [],
         "axis_conversion_matrix": list(axis_conversion),
         "canonical_to_source_axis_matrix": (
