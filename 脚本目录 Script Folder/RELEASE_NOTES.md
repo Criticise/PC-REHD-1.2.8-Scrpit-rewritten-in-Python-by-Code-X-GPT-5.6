@@ -1,3 +1,9 @@
+### **🚨 Urgent Compatibility Notice**
+
+**Compatibility has changed!** The current workflow uses a Generic FBX based on 3ds Max scale units. As a result, models imported through the old Blender workflow and models imported through the current workflow can differ by a factor of **2.54**. Models created with the old workflow should be imported into Blender again, imported with the scale set to **2.54×**, checked until they match the intended reference size, and then exported again. This prevents the exported model from becoming offset.
+
+**We also do not know how to make this perfect; there is no going back.**
+
 - Added Scaling Mode
 - Added RE6 MOD scanning
 - Fixed MAX Export UV Map 2
