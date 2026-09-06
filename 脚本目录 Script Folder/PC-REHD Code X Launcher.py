@@ -432,17 +432,35 @@ def validate_response(
 
 
 def receive_ipc_bytes(connection: socket.socket, size: int) -> bytes:
-    remaining = int(size)
-    parts: list[bytes] = []
-    while remaining:
-        chunk = connection.recv(remaining)
-        if not chunk:
-            raise ProtocolError(
-                "IPC connection closed before the message was complete"
-            )
-        parts.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(parts)
+    expected = int(size)
+    if expected < 0:
+        raise ProtocolError("IPC message size cannot be negative")
+    # Fill one reusable buffer so fragmented TCP reads do not create a list of
+    # temporary byte strings before the final payload is decoded.
+    buffer = bytearray(expected)
+    view = memoryview(buffer)
+    offset = 0
+    try:
+        while offset < expected:
+            received = connection.recv_into(view[offset:], expected - offset)
+            if not received:
+                raise ProtocolError(
+                    "IPC connection closed before the message was complete"
+                )
+            offset += received
+    finally:
+        view.release()
+    return bytes(buffer)
+
+
+def _set_ipc_low_latency(connection: socket.socket) -> None:
+    """Avoid Nagle delays for the small request/receipt IPC frames."""
+    try:
+        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        # Some test doubles and non-TCP socket implementations do not expose
+        # this option; their transport remains fully compatible.
+        pass
 
 
 def send_ipc_message(
@@ -481,6 +499,9 @@ _MAX_BACKGROUND_EXECUTION_CONTROL_KEY = "__pc_rehd_max_background_execution"
 _MAX_QUEUE_RETAIN_UNTIL_IDLE_CONTROL_KEY = "__pc_rehd_max_queue_retain_until_idle"
 MAX_OPERATION_QUEUE_RETAIN_SECONDS = 12 * 60 * 60
 MAX_AGENT_DEFER_RETRY_MS = 250
+# Terminal receipts are signalled by an Event; this short fallback poll only
+# covers socket disconnect/deadline checks while Max is executing a command.
+MAX_AGENT_TERMINAL_POLL_SECONDS = 0.005
 
 
 class CommandAccess(str, Enum):
@@ -2810,6 +2831,7 @@ class _WriterProcessWorker:
     evidence_sink: Any | None = None
     ready: bool = False
     busy: bool = False
+    source_revision: dict[str, str] = field(default_factory=dict)
 
 
 SAMPLE_KEEP_GROUPS = 3
@@ -15403,6 +15425,7 @@ class PidIpcClient:
             self._active_sockets[record.operation_id] = sock
         try:
             try:
+                _set_ipc_low_latency(sock)
                 sock.settimeout(remaining_deadline_seconds(record.deadline_epoch_ms))
                 send_operation_ipc_message(sock, request)
                 response = receive_operation_ipc_message(sock)
@@ -27027,6 +27050,7 @@ class PymxsAgent:
 
     def _handle_connection(self, connection: socket.socket) -> None:
         with connection:
+            _set_ipc_low_latency(connection)
             connection.settimeout(5.0)
             request: dict[str, Any] = {}
             try:
@@ -27105,7 +27129,7 @@ class PymxsAgent:
     ) -> dict[str, Any]:
         import select
 
-        while not pending.event.wait(0.05):
+        while not pending.event.wait(MAX_AGENT_TERMINAL_POLL_SECONDS):
             if self.stop_event.is_set():
                 break
             try:
@@ -33705,15 +33729,23 @@ _NODE_MAP_HEADER_FIELDS = (
 
 
 def _read_exact(connection, size):
-    remaining = int(size)
-    chunks = []
-    while remaining:
-        chunk = connection.recv(remaining)
-        if not chunk:
-            raise ConnectionError("connection closed before message completed")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
+    expected = int(size)
+    if expected < 0:
+        raise ValueError("message size cannot be negative")
+    # Keep one receive buffer for large scene/export receipts.  This avoids
+    # allocating and joining one temporary bytes object per TCP fragment.
+    buffer = bytearray(expected)
+    view = memoryview(buffer)
+    offset = 0
+    try:
+        while offset < expected:
+            received = connection.recv_into(view[offset:], expected - offset)
+            if not received:
+                raise ConnectionError("connection closed before message completed")
+            offset += received
+    finally:
+        view.release()
+    return bytes(buffer)
 
 
 def _receive(connection):
@@ -40278,6 +40310,10 @@ class _BlenderWorker:
 
     def _handle_connection(self, connection):
         with connection:
+            try:
+                connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             connection.settimeout(20.0)
             try:
                 request = _receive(connection)
@@ -40652,7 +40688,7 @@ class _BlenderRescue:
         self._replace_worker(force=True)
         if not bpy.app.timers.is_registered(self._tick):
             bpy.app.timers.register(
-                self._tick, first_interval=0.05, persistent=True
+                self._tick, first_interval=0.02, persistent=True
             )
         return self
 
@@ -40680,6 +40716,10 @@ class _BlenderRescue:
 
     def _handle_connection(self, connection):
         with connection:
+            try:
+                connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             connection.settimeout(12.0)
             try:
                 request = _receive(connection)
@@ -40888,7 +40928,7 @@ class _BlenderRescue:
         worker = self.worker
         if worker is None or not worker.is_live():
             self._replace_worker(force=False)
-        return 0.20
+        return 0.02
 
     def stop(self):
         if self.stopping.is_set():
@@ -41268,7 +41308,9 @@ def _wait_blender_agent_descriptor(
             return descriptor
         if time.monotonic() >= deadline or not _pid_is_alive(pid):
             return None
-        time.sleep(0.05)
+        # Descriptor publication is the startup/recovery handshake.  A 10 ms
+        # retry keeps reconnect latency bounded without busy-spinning.
+        time.sleep(0.01)
 
 
 def _blender_mcp_port_candidates(pid: int) -> tuple[int, ...]:
@@ -41322,6 +41364,7 @@ def _blender_mcp_request(
         ("127.0.0.1", int(port)),
         timeout=max(0.2, min(float(timeout), 1.0)),
     ) as connection:
+        _set_ipc_low_latency(connection)
         connection.settimeout(max(0.2, float(timeout)))
         connection.sendall(body)
         response = bytearray()
@@ -42048,6 +42091,7 @@ def _request_blender_agent(
             ("127.0.0.1", int(descriptor.get("port", 0) or 0)),
             timeout=max(0.2, min(float(timeout), 2.0)),
         )
+        _set_ipc_low_latency(connection)
         connection.settimeout(max(0.2, float(timeout)))
     except (ConnectionError, OSError, TimeoutError) as exc:
         _emit_blender_ipc_trace(
@@ -51501,10 +51545,81 @@ def _clear_writer_process_evidence_memory(process_id: int) -> None:
         _WRITER_PROCESS_EVIDENCE_MEMORY.pop(int(process_id or 0), None)
 
 
+def _current_writer_source_revision() -> dict[str, str]:
+    """Read current source identity for reuse admission, never a release allowlist."""
+    return {
+        # Launcher identity excludes editable messages, just as its READY receipt does.
+        name: (
+            _launcher_source_sha256(path.read_bytes())
+            if name == "launcher"
+            else hashlib.sha256(path.read_bytes()).hexdigest().upper()
+        )
+        for name, path in (
+            ("launcher", LAUNCHER_SOURCE_PATH),
+            ("writer", WRITER_PATH),
+            ("probe", FBX_PROBE_PATH),
+            ("bootstrap", BOOTSTRAP_PATH),
+            ("compatibility", COMPATIBILITY_PATH),
+        )
+    }
+
+
+def _loaded_writer_source_revision(writer: Any, probe: Any) -> dict[str, str]:
+    revision = {"launcher": LAUNCHER_SOURCE_SHA256}
+    for name, module in (
+        ("writer", writer),
+        ("probe", probe),
+        ("bootstrap", sys.modules.get("codex_python_runtime_bootstrap")),
+        ("compatibility", sys.modules.get("codex_re6_scene_compatibility")),
+    ):
+        revision[name] = str(getattr(module, "__codex_source_sha256__", "") or "").upper()
+    return revision
+
+
+def _require_writer_source_revision(
+    worker: _WriterProcessWorker,
+    expected: dict[str, str],
+) -> None:
+    loaded = dict(worker.source_revision) if isinstance(worker.source_revision, Mapping) else {}
+    if loaded == expected:
+        return
+    worker.ready = False
+    error = RuntimeError("Writer source revision changed; replace the idle process before export")
+    error._pc_rehd_writer_preload_failure = True
+    error._pc_rehd_writer_preload_details = {
+        "schema": WRITER_PRELOAD_FAILURE_SCHEMA,
+        "safe_to_retry": True,
+        "write_request_sent": False,
+        "worker_pid": int(worker.process.pid or 0),
+        "reason": "source_revision_changed",
+        "loaded_revision": loaded,
+        "current_revision": dict(expected),
+    }
+    raise error
+
+
+def _watch_writer_launcher_exit() -> None:
+    import multiprocessing
+
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        return
+
+    def wait_for_parent() -> None:
+        # The inherited sentinel identifies this exact parent, not a reused PID.
+        parent.join()
+        os._exit(72)
+
+    threading.Thread(
+        target=wait_for_parent, name="WriterLauncherLifetime", daemon=True,
+    ).start()
+
+
 def _writer_process_entry(connection: Any, evidence_sink: Any | None = None) -> None:
     """Own Writer imports and CPU-heavy MOD work outside the Tk process."""
     global _WRITER_PROCESS_EVIDENCE_SINK
     _WRITER_PROCESS_EVIDENCE_SINK = evidence_sink
+    _watch_writer_launcher_exit()
     process_id = os.getpid()
     _set_current_windows_process_priority(WINDOWS_BELOW_NORMAL_PRIORITY_CLASS)
     writer: Any | None = None
@@ -51513,6 +51628,7 @@ def _writer_process_entry(connection: Any, evidence_sink: Any | None = None) -> 
     export_runtime: dict[str, Any] = {}
     preload_error = ""
     request_sequence = 0
+    export_gc_token: Any | None = None
     _write_writer_process_evidence(process_id, "preload_started")
     try:
         _write_writer_process_evidence(process_id, "preload_runtime_started")
@@ -51608,6 +51724,7 @@ def _writer_process_entry(connection: Any, evidence_sink: Any | None = None) -> 
                             "status": "PASS" if not preload_error else "FAIL",
                             "process_id": os.getpid(),
                             "source_sha256": writer_source_sha,
+                            "source_revision": _loaded_writer_source_revision(writer, writer_probe),
                             "export_runtime": dict(export_runtime),
                             "fbx_probe_runtime": dict(probe_runtime),
                             "fbx_probe_identity": bool(
@@ -51822,6 +51939,8 @@ def _writer_process_entry(connection: Any, evidence_sink: Any | None = None) -> 
                 continue
             request_sequence += 1
             request_id = str(request.get("request_id", "") or "")
+            if writer_probe is not None:
+                export_gc_token = writer_probe._export_gc_begin()
             _write_writer_process_evidence(
                 process_id,
                 "run_started",
@@ -51888,6 +52007,14 @@ def _writer_process_entry(connection: Any, evidence_sink: Any | None = None) -> 
                     }
                 )
                 _clear_writer_process_evidence_memory(process_id)
+            finally:
+                if export_gc_token is not None:
+                    token, export_gc_token = export_gc_token, None
+                    # Both success and failure replies have been sent. Clear
+                    # request caches before collecting in this idle boundary.
+                    writer_probe._export_gc_finish(
+                        token, cleanup=getattr(writer, "_release_export_memory", None),
+                    )
     except BaseException:
         _write_writer_process_evidence(
             process_id,
@@ -51896,6 +52023,10 @@ def _writer_process_entry(connection: Any, evidence_sink: Any | None = None) -> 
         )
         raise
     finally:
+        if export_gc_token is not None and writer_probe is not None:
+            writer_probe._export_gc_finish(
+                export_gc_token, cleanup=getattr(writer, "_release_export_memory", None),
+            )
         try:
             connection.close()
         except Exception:
@@ -51912,7 +52043,9 @@ def _run_writer_process_transport_smoke() -> dict[str, Any]:
         target=_writer_process_entry,
         args=(child_connection, evidence_sink),
         name=f"{APP_NAME}-WriterSmoke",
-        daemon=True,
+        # The writer may run Probe's bounded Geometry process pool.  A
+        # daemon process cannot create child processes on Python/Windows.
+        daemon=False,
     )
     try:
         process.start()
@@ -56313,6 +56446,10 @@ class LauncherApp:
         self._main_ui_scaling_layout_cache: dict[str, dict[str, Any]] = dict(
             self.launcher_state.get("main_ui_scaling_layout_cache", {})
         )
+        # Endpoint measurements depend on the active layout topology, not on
+        # the transient window dimensions. Reuse them across resize releases
+        # so a drag does not rerun four full Tk measurement stages each time.
+        self._main_ui_scaling_snapshot_cache: dict[str, MainUiScalingSnapshot] = {}
         self._main_ui_scaling_reflow = False
         # Every delayed scaling callback belongs to one generation. Tk can
         # dispatch a callback that was already dequeued even after
@@ -56329,6 +56466,7 @@ class LauncherApp:
         self._main_ui_scaling_transaction_pending_viewport = False
         self._main_ui_scaling_transaction_target_size: tuple[int, int] | None = None
         self._main_ui_scaling_committed_content_size: tuple[int, int] | None = None
+        self._main_ui_scaling_committed_signature: tuple[str, bool] | None = None
         self._main_ui_scaling_containment_active = False
         self._main_ui_grid_metrics: dict[Any, dict[str, Any]] = {}
         self._ui_text_measure_cache: dict[tuple[Any, ...], int] = {}
@@ -56484,6 +56622,7 @@ class LauncherApp:
         # causing a second Writer process to be spawned.
         self._writer_warmup_gate = threading.Lock()
         self._writer_processes: dict[int, _WriterProcessWorker] = {}
+        self._writer_pool_shutting_down = False
         self._importer_warmup_lock = threading.Lock()
         self._importer_warmup_started = False
         self._importer_warmup_ready = False
@@ -61117,6 +61256,7 @@ class LauncherApp:
             )
             return
         self._manual_restart_in_progress = True
+        self._shutdown_writer_process()
         for restart_button in (
             getattr(self, "restart_script_button", None),
             getattr(self, "compact_restart_script_button", None),
@@ -61325,7 +61465,18 @@ class LauncherApp:
             except (self.tk.TclError, TypeError, ValueError):
                 return
             if bool(getattr(self, "_scaling_mode_enabled", False)):
-                self._schedule_main_ui_scaling_reflow(width, height)
+                # This callback is already deferred until the native resize
+                # gesture has gone idle.  Run the coalesced scaling pass here
+                # instead of adding a second 60 ms timer before reflow.
+                if (width, height) != self._main_ui_scaling_applied_size:
+                    self._apply_main_ui_scaling_policy(
+                        window_width=width,
+                        window_height=height,
+                        resize_only=True,
+                    )
+                    width = max(1, int(self.root.winfo_width()))
+                    height = max(1, int(self.root.winfo_height()))
+                self._schedule_blender_hierarchy_message_position()
             else:
                 self._refresh_main_viewport_layout(
                     window_width=width, window_height=height
@@ -61430,7 +61581,7 @@ class LauncherApp:
             self._main_ui_scaling_pending_size = None
 
     def _schedule_main_ui_scaling_reflow(
-        self, width: int, height: int, *, delay_ms: int = 180
+        self, width: int, height: int, *, delay_ms: int = 60
     ) -> None:
         """Coalesce resize events and run one layout pass after the gesture ends."""
         self._main_ui_scaling_pending_size = (
@@ -61472,6 +61623,7 @@ class LauncherApp:
             self._apply_main_ui_scaling_policy(
                 window_width=actual_size[0],
                 window_height=actual_size[1],
+                resize_only=True,
             )
             self._schedule_blender_hierarchy_message_position()
             self._schedule_launcher_tile_follow()
@@ -62160,27 +62312,34 @@ class LauncherApp:
             return
         try:
             layout = style.layout(source)
-            if layout:
+            if layout and style.layout(variant) != layout:
                 style.layout(variant, layout)
         except self.tk.TclError:
             pass
         try:
-            base_options = dict(style.configure(source) or {})
-            if base_options:
-                style.configure(variant, **base_options)
+            # A base reset followed by overrides schedules two style changes
+            # even when the final metrics are unchanged. Compare final Tcl
+            # values so tuple fonts/padding match Tk's list representation.
+            options = dict(style.configure(source) or {})
+            options.update(overrides or {})
+            current = dict(style.configure(variant) or {})
+            changed = {
+                key: value
+                for key, value in options.items()
+                if not self.root.tk.call(
+                    "string", "equal", current.get(key, ""), value
+                )
+            }
+            if changed:
+                style.configure(variant, **changed)
         except (self.tk.TclError, TypeError, ValueError):
             pass
         try:
             base_map = dict(style.map(source) or {})
-            if base_map:
+            if base_map and dict(style.map(variant) or {}) != base_map:
                 style.map(variant, **base_map)
         except (self.tk.TclError, TypeError, ValueError):
             pass
-        if overrides:
-            try:
-                style.configure(variant, **dict(overrides))
-            except (self.tk.TclError, TypeError, ValueError):
-                pass
 
     def _apply_main_ui_style_scope(self) -> None:
         """Attach scaled styles to Launcher descendants only, never to Toplevels."""
@@ -62665,23 +62824,81 @@ class LauncherApp:
             image.put(border, to=(0, 0, checkbox_size, checkbox_size))
             image.put(fill, to=(1, 1, checkbox_size - 1, checkbox_size - 1))
             if checked:
-                check_pixels = (
-                    (3, 8), (4, 9), (5, 10), (6, 9), (7, 8),
-                    (8, 7), (9, 6), (10, 5), (11, 4), (12, 3),
-                )
-                for x, y in check_pixels:
-                    scaled_x = int(round(x * checkbox_size / 16))
-                    scaled_y = int(round(y * checkbox_size / 16))
-                    check_span = max(1, int(round(2 * checkbox_size / 16)))
-                    image.put(
-                        check_color,
-                        to=(
-                            scaled_x,
-                            scaled_y,
-                            min(checkbox_size, scaled_x + check_span),
-                            min(checkbox_size, scaled_y + check_span),
-                        ),
+                # Render the tick with coverage sampling instead of hard
+                # 2x2 pixel blocks.  The indicator is only 11-16 px wide, so
+                # a 4x supersample is cheap and removes the visible staircase
+                # at the two diagonal joins.
+                def rgb(color: str) -> tuple[int, int, int]:
+                    return tuple(
+                        max(0, min(255, int(round(channel / 257.0))))
+                        for channel in self.root.winfo_rgb(color)
                     )
+
+                def distance_to_segment(
+                    px: float,
+                    py: float,
+                    ax: float,
+                    ay: float,
+                    bx: float,
+                    by: float,
+                ) -> float:
+                    dx = bx - ax
+                    dy = by - ay
+                    length_sq = dx * dx + dy * dy
+                    if length_sq <= 0.0:
+                        return math.hypot(px - ax, py - ay)
+                    projection = ((px - ax) * dx + (py - ay) * dy) / length_sq
+                    projection = max(0.0, min(1.0, projection))
+                    return math.hypot(
+                        px - (ax + projection * dx),
+                        py - (ay + projection * dy),
+                    )
+
+                def blend(
+                    base: tuple[int, int, int],
+                    overlay: tuple[int, int, int],
+                    coverage: float,
+                ) -> str:
+                    return "#" + "".join(
+                        f"{int(round(source + (target - source) * coverage)):02x}"
+                        for source, target in zip(base, overlay)
+                    )
+
+                scale = float(checkbox_size) / 16.0
+                tick_points = (
+                    (3.0 * scale, 8.0 * scale),
+                    (5.5 * scale, 10.5 * scale),
+                    (12.5 * scale, 3.5 * scale),
+                )
+                stroke_radius = max(0.72, 1.05 * scale)
+                sample_count = 4
+                base_rgb = rgb(fill)
+                check_rgb = rgb(check_color)
+                for pixel_y in range(1, checkbox_size - 1):
+                    for pixel_x in range(1, checkbox_size - 1):
+                        covered = 0
+                        for sample_y in range(sample_count):
+                            sample_py = pixel_y + (sample_y + 0.5) / sample_count
+                            for sample_x in range(sample_count):
+                                sample_px = pixel_x + (sample_x + 0.5) / sample_count
+                                if any(
+                                    distance_to_segment(
+                                        sample_px,
+                                        sample_py,
+                                        start[0],
+                                        start[1],
+                                        end[0],
+                                        end[1],
+                                    )
+                                    <= stroke_radius
+                                    for start, end in zip(tick_points, tick_points[1:])
+                                ):
+                                    covered += 1
+                        if covered:
+                            image.put(
+                                blend(base_rgb, check_rgb, covered / float(sample_count * sample_count)),
+                                to=(pixel_x, pixel_y, pixel_x + 1, pixel_y + 1),
+                            )
             return image
 
         indicator_name = (
@@ -63770,9 +63987,12 @@ class LauncherApp:
                 getattr(button, "_pc_rehd_static_panel", None)
                 or self.colors["panel"]
             )
+            render_signature = (width, height, panel, border, fill)
+            if getattr(button, "_pc_rehd_last_render_signature", None) == render_signature:
+                return
             button.configure(background=panel)
             button.delete("all")
-            image_signature = (width, height, panel, border, fill)
+            image_signature = render_signature
             image_cache = getattr(
                 self, "_compact_floating_button_image_cache", None
             )
@@ -63907,6 +64127,7 @@ class LauncherApp:
                     anchor="center",
                     justify="center",
                 )
+            setattr(button, "_pc_rehd_last_render_signature", render_signature)
         except (TypeError, ValueError, self.tk.TclError):
             return
 
@@ -63916,8 +64137,9 @@ class LauncherApp:
         *,
         on_activate: Callable[[], None] | None = None,
     ) -> None:
-        def redraw_state(name: str, value: bool) -> None:
-            setattr(button, name, bool(value))
+        def redraw_state(**updates: bool) -> None:
+            for name, value in updates.items():
+                setattr(button, name, bool(value))
             self._draw_compact_floating_ball_button(button)
 
         def activate(_event: Any = None) -> str:
@@ -63929,7 +64151,7 @@ class LauncherApp:
             return "break"
 
         def release(event: Any) -> str:
-            redraw_state("_pc_rehd_pressed", False)
+            redraw_state(_pc_rehd_pressed=False)
             try:
                 inside = (
                     0 <= int(event.x) < int(button.winfo_width())
@@ -63946,14 +64168,13 @@ class LauncherApp:
         )
         button.bind(
             "<Enter>",
-            lambda _event: redraw_state("_pc_rehd_hovered", True),
+            lambda _event: redraw_state(_pc_rehd_hovered=True),
             add="+",
         )
         button.bind(
             "<Leave>",
-            lambda _event: (
-                redraw_state("_pc_rehd_hovered", False),
-                redraw_state("_pc_rehd_pressed", False),
+            lambda _event: redraw_state(
+                _pc_rehd_hovered=False, _pc_rehd_pressed=False
             ),
             add="+",
         )
@@ -63961,19 +64182,19 @@ class LauncherApp:
             "<ButtonPress-1>",
             lambda _event: (
                 button.focus_set(),
-                redraw_state("_pc_rehd_pressed", True),
+                redraw_state(_pc_rehd_pressed=True),
             ),
             add="+",
         )
         button.bind("<ButtonRelease-1>", release, add="+")
         button.bind(
             "<FocusIn>",
-            lambda _event: redraw_state("_pc_rehd_focused", True),
+            lambda _event: redraw_state(_pc_rehd_focused=True),
             add="+",
         )
         button.bind(
             "<FocusOut>",
-            lambda _event: redraw_state("_pc_rehd_focused", False),
+            lambda _event: redraw_state(_pc_rehd_focused=False),
             add="+",
         )
         button.bind("<Return>", activate, add="+")
@@ -65814,15 +66035,22 @@ class LauncherApp:
                 pass
         return width
 
-    def _sync_toolbar_region_geometry(self) -> None:
-        """Keep backend controls and the action stack in independent regions."""
+    def _sync_toolbar_region_geometry(self, *, flush_layout: bool = True) -> None:
+        """Keep backend controls and the action stack in independent regions.
+
+        Scaling endpoint stages already flush the root before entering this
+        helper.  Callers in that hot path can skip the two nested child idle
+        passes while the default preserves the settled geometry contract for
+        event-driven callers.
+        """
         toolbar = getattr(self, "toolbar", None)
         process_area = getattr(self, "toolbar_process_area", None)
         action_area = getattr(self, "toolbar_action_area", None)
         if toolbar is None or process_area is None or action_area is None:
             return
         try:
-            process_area.update_idletasks()
+            if flush_layout:
+                process_area.update_idletasks()
             current_width = max(
                 1,
                 int(process_area.winfo_reqwidth()),
@@ -65915,7 +66143,8 @@ class LauncherApp:
             return
 
         try:
-            action_area.update_idletasks()
+            if flush_layout:
+                action_area.update_idletasks()
             action_width = max(
                 1,
                 int(action_area.winfo_reqwidth()),
@@ -73079,6 +73308,7 @@ class LauncherApp:
         spacing_scale: float,
         widget_scale: float,
         font_scale: float,
+        reuse_current_metrics: bool = False,
     ) -> MainUiScalingMeasurement:
         """Apply one hidden endpoint and return its settled Tk bounds."""
         self._main_ui_layout_scale = max(
@@ -73086,19 +73316,20 @@ class LauncherApp:
             min(MAIN_WINDOW_SCALING_MAX_SCALE, float(spacing_scale)),
         )
         self._main_layout_cache.clear()
-        self._apply_main_ui_widget_scale(widget_scale)
-        self._apply_main_ui_font_scale(font_scale)
-        self._apply_main_ui_action_button_fill_policy()
+        if not reuse_current_metrics:
+            self._apply_main_ui_widget_scale(widget_scale)
+            self._apply_main_ui_font_scale(font_scale)
+            self._apply_main_ui_action_button_fill_policy()
         self._main_layout_cache.clear()
         self._main_viewport_layout_signature = None
         self.root.update_idletasks()
-        self._sync_toolbar_region_geometry()
+        self._sync_toolbar_region_geometry(flush_layout=False)
         self._position_content_after_toolbar(flush_layout=False)
         self._reflow_left_sections(flush_layout=False)
         # Reflow can resize the responsive right panel after it has measured
         # the current root width.  Recompute the toolbar once more so a page
         # switch cannot retain the Advanced page's old action-column width.
-        self._sync_toolbar_region_geometry()
+        self._sync_toolbar_region_geometry(flush_layout=False)
         self.root.update_idletasks()
         content_width, content_height = self._fit_main_window_to_content(
             flush_layout=False,
@@ -73110,6 +73341,17 @@ class LauncherApp:
         self, width: int, height: int
     ) -> MainUiScalingSnapshot:
         """Measure the four fixed stage endpoints on Tk's owning thread."""
+        snapshot_key = self._main_ui_scaling_layout_signature()
+        cached_snapshot = self._main_ui_scaling_snapshot_cache.get(snapshot_key)
+        if cached_snapshot is not None:
+            return MainUiScalingSnapshot(
+                target_width=width,
+                target_height=height,
+                baseline=cached_snapshot.baseline,
+                spacing_floor=cached_snapshot.spacing_floor,
+                widget_floor=cached_snapshot.widget_floor,
+                font_floor=cached_snapshot.font_floor,
+            )
         original_factors = (
             self._main_ui_spacing_scale_factor(),
             self._main_ui_scale_factor(),
@@ -73152,7 +73394,7 @@ class LauncherApp:
             raise
         finally:
             self._main_ui_scaling_measurement_active = previous_measurement_state
-        return MainUiScalingSnapshot(
+        snapshot = MainUiScalingSnapshot(
             target_width=width,
             target_height=height,
             baseline=measurements[0],
@@ -73160,6 +73402,8 @@ class LauncherApp:
             widget_floor=measurements[2],
             font_floor=measurements[3],
         )
+        self._main_ui_scaling_snapshot_cache[snapshot_key] = snapshot
+        return snapshot
 
     def _commit_main_ui_scaling_snapshot(
         self,
@@ -73168,12 +73412,14 @@ class LauncherApp:
         width: int,
         height: int,
         fit_window: bool = False,
+        reuse_current_layout: bool = False,
     ) -> None:
         """Apply final factors once, optionally fit, then publish one layout."""
         measurement = self._layout_main_ui_scaling_stage(
             spacing_scale=float(result["spacing_scale"]),
             widget_scale=float(result["widget_scale"]),
             font_scale=float(result["font_scale"]),
+            reuse_current_metrics=reuse_current_layout,
         )
         content_width = int(measurement.width)
         content_height = int(measurement.height)
@@ -73232,6 +73478,10 @@ class LauncherApp:
             content_width,
             content_height,
         )
+        self._main_ui_scaling_committed_signature = (
+            self._main_ui_scaling_layout_signature(),
+            bool(getattr(self, "_theme_dark", False)),
+        )
         self._enforce_scaling_main_page_minimum(content_width, content_height)
         self._persist_main_ui_scaling_layout_cache(final_width, final_height)
 
@@ -73242,6 +73492,7 @@ class LauncherApp:
         window_height: int | None = None,
         force_reset: bool = False,
         auto_fit: bool = False,
+        resize_only: bool = False,
     ) -> None:
         """Measure fixed endpoints, solve once, and publish one scaled frame."""
         if bool(getattr(self, "_main_ui_scaling_reflow", False)):
@@ -73343,16 +73594,45 @@ class LauncherApp:
         self._main_ui_scaling_reflow = True
         try:
             with self._main_ui_scaling_transaction(width, height):
+                layout_signature = self._main_ui_scaling_layout_signature()
+                measurements_cached = (
+                    replay_cached_result
+                    or layout_signature in self._main_ui_scaling_snapshot_cache
+                )
                 if replay_cached_result:
                     result = cached_result
                 else:
                     snapshot = self._measure_main_ui_scaling_snapshot(width, height)
                     result = _solve_main_ui_scaling_snapshot(snapshot)
+                current_factors = (
+                    self._main_ui_spacing_scale_factor(),
+                    self._main_ui_scale_factor(),
+                    self._main_ui_font_scale_factor(),
+                )
+                result_factors = (
+                    float(result["spacing_scale"]),
+                    float(result["widget_scale"]),
+                    float(result["font_scale"]),
+                )
+                reuse_current_layout = bool(
+                    resize_only
+                    and not auto_fit
+                    and not force_reset
+                    and measurements_cached
+                    and getattr(self, "_main_ui_scaling_applied_size", None)
+                    is not None
+                    and self._main_ui_scaling_committed_signature
+                    == (layout_signature, bool(getattr(self, "_theme_dark", False)))
+                    and (width, height)
+                    == (int(self.root.winfo_width()), int(self.root.winfo_height()))
+                    and current_factors == result_factors
+                )
                 self._commit_main_ui_scaling_snapshot(
                     result,
                     width=width,
                     height=height,
                     fit_window=bool(auto_fit),
+                    reuse_current_layout=reuse_current_layout,
                 )
         finally:
             self._main_ui_scaling_reflow = False
@@ -89288,15 +89568,17 @@ class LauncherApp:
             not self._priority_background_callback_queue.empty()
             or not self._background_callback_queue.empty()
         )
-        if (
-            self._runtime_services_started
-            or self.busy_count > 0
-            or not self._priority_background_callback_queue.empty()
-            or not self._background_callback_queue.empty()
-        ):
-            self._schedule_background_callback_pump(
-                delay_ms=1 if runnable_backlog else 16
-            )
+        # Do not wake Tk every 16 ms just because runtime services are alive.
+        # Worker completion enqueues are already serviced on the next scheduled
+        # tick; use a short cadence while work is active and back off sharply
+        # when the queues are empty.  This removes a permanent ~62 Hz idle
+        # callback stream while keeping normal completion latency low.
+        if runnable_backlog:
+            self._schedule_background_callback_pump(delay_ms=1)
+        elif self.busy_count > 0:
+            self._schedule_background_callback_pump(delay_ms=32)
+        elif self._runtime_services_started:
+            self._schedule_background_callback_pump(delay_ms=100)
 
     def _run_background(
         self,
@@ -89386,6 +89668,7 @@ class LauncherApp:
     ) -> None:
         process = worker.process
         connection = worker.connection
+        worker.ready = False
         if graceful and self._writer_worker_is_alive(worker):
             try:
                 message_id = uuid.uuid4().hex
@@ -89410,6 +89693,12 @@ class LauncherApp:
             process.join(timeout=1.0)
         except Exception:
             pass
+        if self._writer_worker_is_alive(worker):
+            try:
+                process.kill()
+                process.join(timeout=1.0)
+            except Exception:
+                pass
         process_id = int(process.pid or 0)
         _consume_writer_process_evidence(
             process_id,
@@ -89426,6 +89715,12 @@ class LauncherApp:
     def _spawn_writer_worker_locked(self) -> _WriterProcessWorker:
         import multiprocessing
 
+        if (
+            getattr(self, "_writer_pool_shutting_down", False)
+            or getattr(self, "_close_in_progress", False)
+            or getattr(self, "_manual_restart_in_progress", False)
+        ):
+            raise RuntimeError("Launcher is closing; no new Writer may start")
         context = multiprocessing.get_context("spawn")
         parent_connection, child_connection = context.Pipe(duplex=True)
         evidence_sink = context.SimpleQueue()
@@ -89433,7 +89728,9 @@ class LauncherApp:
             target=_writer_process_entry,
             args=(child_connection, evidence_sink),
             name=f"{APP_NAME}-Writer",
-            daemon=True,
+            # Probe can safely fan out pure Geometry extraction from this
+            # writer process; daemon workers are forbidden from spawning.
+            daemon=False,
         )
         try:
             process.start()
@@ -89473,6 +89770,12 @@ class LauncherApp:
         dead_workers: list[_WriterProcessWorker] = []
         selected: _WriterProcessWorker | None = None
         with self._writer_pool_lock:
+            if (
+                getattr(self, "_writer_pool_shutting_down", False)
+                or getattr(self, "_close_in_progress", False)
+                or getattr(self, "_manual_restart_in_progress", False)
+            ):
+                raise RuntimeError("Launcher is closing; export admission is closed")
             for process_id, worker in list(self._writer_processes.items()):
                 if not self._writer_worker_is_alive(worker):
                     self._writer_processes.pop(process_id, None)
@@ -89536,6 +89839,7 @@ class LauncherApp:
         process = worker.process
         connection = worker.connection
         if worker.ready and self._writer_worker_is_alive(worker):
+            _require_writer_source_revision(worker, _current_writer_source_revision())
             return process, connection
 
         message_id = uuid.uuid4().hex
@@ -89639,6 +89943,9 @@ class LauncherApp:
             evidence_sink=worker.evidence_sink,
             evidence_payload=preload_evidence if isinstance(preload_evidence, Mapping) else None,
         )
+        source_revision = result.get("source_revision")
+        worker.source_revision = dict(source_revision) if isinstance(source_revision, Mapping) else {}
+        _require_writer_source_revision(worker, _current_writer_source_revision())
         worker.ready = True
         return process, connection
 
@@ -89885,6 +90192,7 @@ class LauncherApp:
 
     def _shutdown_writer_process(self) -> None:
         with self._writer_pool_lock:
+            self._writer_pool_shutting_down = True
             workers = [
                 (worker, not worker.busy)
                 for worker in self._writer_processes.values()
@@ -93485,7 +93793,24 @@ class LauncherApp:
 
     def _on_filter_variable_changed(self) -> None:
         if not bool(getattr(self, "_suspend_filter_refresh", False)):
-            self._refresh_scene_tree()
+            pending = getattr(self, "_scene_filter_refresh_after", None)
+            if pending is not None:
+                try:
+                    self.root.after_cancel(pending)
+                except self.tk.TclError:
+                    pass
+            try:
+                self._scene_filter_refresh_after = self.root.after(
+                    140, self._run_debounced_scene_tree_refresh
+                )
+            except self.tk.TclError:
+                self._scene_filter_refresh_after = None
+
+    def _run_debounced_scene_tree_refresh(self) -> None:
+        self._scene_filter_refresh_after = None
+        if bool(getattr(self, "_suspend_filter_refresh", False)):
+            return
+        self._refresh_scene_tree()
 
     def _refresh_scene_tree(self) -> None:
         if not hasattr(self, "scene_tree") or self.scene_tree is None:
@@ -98114,6 +98439,7 @@ class LauncherApp:
         # state reflects the latest reset or restored state, never a stale undo.
         self._window_size_reset_snapshot = None
         self._close_in_progress = True
+        self._shutdown_writer_process()
         self._dispose_github_update_title_click_surface()
         self._hide_rename_selection_notice()
         self._hide_mesh_rename_failure_notice()

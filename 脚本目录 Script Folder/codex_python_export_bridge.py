@@ -20,9 +20,9 @@ import tempfile
 import threading
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor
+from collections import OrderedDict
 from datetime import datetime
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, Callable
 
@@ -73,7 +73,49 @@ DEFERRED_UV_RISK_SCHEMA = "pc-rehd-code-x-deferred-uv-risk-v1"
 DEFERRED_UV_RISK_COUNTDOWN_SECONDS = 3
 DEFERRED_UV_RISK_RECEIPT_KEEP_COUNT = 32
 DEFERRED_UV_RISK_ACTIVATION_TIMEOUT_SECONDS = 120.0
+
+
+# ====== BEGIN EXPORT GC DEFERRED CLEANUP ======
+def _release_export_memory() -> None:
+    _LEGACY_COMPACTED_RECOVERY_MEMORY_CACHE.clear()
+    for module_name, probe in tuple(sys.modules.items()):
+        if (
+            module_name == "codex_fbx_probe"
+            or module_name.startswith("pc_rehd_code_x_writer_probe_")
+        ):
+            cache = getattr(probe, "_GENERIC_FBX_MEMORY_CACHE", None)
+            if isinstance(cache, dict):
+                cache.clear()
+
+
+def _defer_export_gc(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        probe = _try_load_fbx_probe_module()
+        token = probe._export_gc_begin()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            # In the reusable Writer this is nested inside its result-send
+            # scope. Direct callers collect after the file/log is complete.
+            probe._export_gc_finish(token, cleanup=_release_export_memory)
+    return wrapped
+
+
+# ====== END EXPORT GC DEFERRED CLEANUP ======
 _LEGACY_COMPACTED_RECOVERY_MEMORY_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+# Last semantic-payload scheduling receipt.  The Writer is single-threaded for
+# all layout/ID work; this small receipt only describes the isolated payload
+# packing fan-out and is copied into the human-readable export log.
+_LAST_SEMANTIC_PARALLEL_STATS: dict[str, Any] = {
+    "mode": "serial",
+    "requested_workers": 1,
+    "selected_workers": 1,
+    "task_count": 0,
+    "vertex_count": 0,
+    "elapsed_seconds": 0.0,
+    "attempts": [],
+}
 MEMORY_EXPORT_SAMPLE_RE = re.compile(
     r"^(?P<stem>(?:import|export)_pid[1-9]\d*_[0-9a-f]{32})\.(?P<ext>fbx|txt)$",
     re.IGNORECASE,
@@ -1537,7 +1579,11 @@ def _aggregate_skin_weights_by_bone(raw_bones: Any, raw_weights: Any) -> tuple[d
         totals[bone_id] += weight_value
     total_weight = sum(totals.values())
     if total_weight > 0.000001:
-        totals = {bone_id: weight_value / total_weight for bone_id, weight_value in totals.items()}
+        # Normalize in place to avoid allocating a second dictionary for every
+        # vertex comparison/ordering call.  Dict insertion order is preserved,
+        # so tie and source-slot behavior remain identical.
+        for bone_id in totals:
+            totals[bone_id] /= total_weight
     return totals, first_seen_order
 
 
@@ -1548,11 +1594,24 @@ def _skin_rows_are_semantically_equal(
     right_weights: Any,
     *,
     tolerance: float,
+    left_summary: tuple[dict[int, float], list[int]] | None = None,
+    right_summary: tuple[dict[int, float], list[int]] | None = None,
 ) -> bool:
-    left_totals, _ = _aggregate_skin_weights_by_bone(left_bones, left_weights)
-    right_totals, _ = _aggregate_skin_weights_by_bone(right_bones, right_weights)
-    all_bones = set(left_totals) | set(right_totals)
-    return all(abs(left_totals.get(bone_id, 0.0) - right_totals.get(bone_id, 0.0)) <= tolerance for bone_id in all_bones)
+    if left_summary is None:
+        left_totals, _ = _aggregate_skin_weights_by_bone(left_bones, left_weights)
+    else:
+        left_totals, _ = left_summary
+    if right_summary is None:
+        right_totals, _ = _aggregate_skin_weights_by_bone(right_bones, right_weights)
+    else:
+        right_totals, _ = right_summary
+    for bone_id, left_weight in left_totals.items():
+        if not abs(left_weight - right_totals.get(bone_id, 0.0)) <= tolerance:
+            return False
+    for bone_id, right_weight in right_totals.items():
+        if bone_id not in left_totals and not abs(right_weight) <= tolerance:
+            return False
+    return True
 
 
 IMPORTER_LEGACY4_SKIN_VIEW_FVFS = {
@@ -1668,21 +1727,26 @@ def _order_scene_skin_by_source_slots(
     source_bones: Any,
     *,
     slot_limit: int,
+    scene_summary: tuple[dict[int, float], list[int]] | None = None,
+    source_rank: dict[int, int] | None = None,
 ) -> tuple[list[int], list[float]]:
-    scene_totals, scene_order = _aggregate_skin_weights_by_bone(scene_bones, scene_weights)
+    if scene_summary is None:
+        scene_totals, scene_order = _aggregate_skin_weights_by_bone(scene_bones, scene_weights)
+    else:
+        scene_totals, scene_order = scene_summary
     if not scene_totals or slot_limit <= 0:
         return [], []
 
-    source_order: list[int] = []
-    if isinstance(source_bones, list):
-        for raw_bone in source_bones:
-            if not isinstance(raw_bone, int):
-                continue
-            bone_id = _clamp_byte(raw_bone)
-            if bone_id not in source_order:
-                source_order.append(bone_id)
+    if source_rank is None:
+        source_rank = {}
+        if isinstance(source_bones, list):
+            for raw_bone in source_bones:
+                if not isinstance(raw_bone, int):
+                    continue
+                bone_id = _clamp_byte(raw_bone)
+                if bone_id not in source_rank:
+                    source_rank[bone_id] = len(source_rank)
 
-    source_rank = {bone_id: index for index, bone_id in enumerate(source_order)}
     scene_rank = {bone_id: index for index, bone_id in enumerate(scene_order)}
     selected_bones = sorted(
         scene_totals,
@@ -1701,15 +1765,18 @@ def _order_scene_skin_by_source_slots(
     # slots before truncation can keep a weak Skin Wrap influence and discard a
     # stronger bone that the legacy exporter correctly retained.
     ordered_bones: list[int] = []
-    for bone_id in source_order:
-        if bone_id in selected_set and bone_id not in ordered_bones:
+    for bone_id in source_rank:
+        if bone_id in selected_set:
             ordered_bones.append(bone_id)
+            selected_set.remove(bone_id)
     for bone_id in scene_order:
-        if bone_id in selected_set and bone_id not in ordered_bones:
+        if bone_id in selected_set:
             ordered_bones.append(bone_id)
+            selected_set.remove(bone_id)
     for bone_id in selected_bones:
-        if bone_id not in ordered_bones:
-                ordered_bones.append(bone_id)
+        if bone_id in selected_set:
+            ordered_bones.append(bone_id)
+            selected_set.remove(bone_id)
     ordered_weights = [scene_totals[bone_id] for bone_id in ordered_bones]
     total_weight = sum(ordered_weights)
     if total_weight > 0.000001:
@@ -2530,6 +2597,10 @@ def build_export_tangent_array(mesh: dict[str, Any], fvf: int) -> list[list[floa
     vertex_count = _get_semantic_vertex_count(mesh)
     tangents = [[0.0, 0.0, 0.0] for _ in range(vertex_count)]
     uses_world_short_remap = _mesh_uses_world_short_remap(mesh, fvf)
+    # Resolve a referenced vertex once, retaining the original first-use error
+    # order and skipping unreferenced vertices just as the face loop did.
+    write_positions: list[list[float] | None] = [None] * vertex_count
+    write_uvs: list[list[float] | None] = [None] * vertex_count
 
     for face_index in range(0, len(face_indices), 3):
         if face_index + 2 >= len(face_indices):
@@ -2539,24 +2610,26 @@ def build_export_tangent_array(mesh: dict[str, Any], fvf: int) -> list[list[floa
         i3 = face_indices[face_index + 2]
         if not (0 <= i1 < vertex_count and 0 <= i2 < vertex_count and 0 <= i3 < vertex_count):
             continue
-        if uses_world_short_remap:
-            p1 = _get_world_remapped_short_position(world_positions, positions, i1, remap_scale, remap_offset)
-            p2 = _get_world_remapped_short_position(world_positions, positions, i2, remap_scale, remap_offset)
-            p3 = _get_world_remapped_short_position(world_positions, positions, i3, remap_scale, remap_offset)
-        else:
-            p1 = _get_short_position_write_pos(positions, i1, mesh_scale)
-            p2 = _get_short_position_write_pos(positions, i2, mesh_scale)
-            p3 = _get_short_position_write_pos(positions, i3, mesh_scale)
-        uv1 = _coerce_vec2(uvs[i1] if i1 < len(uvs) else None)
-        uv2 = _coerce_vec2(uvs[i2] if i2 < len(uvs) else None)
-        uv3 = _coerce_vec2(uvs[i3] if i3 < len(uvs) else None)
+        for vertex_index in (i1, i2, i3):
+            if write_positions[vertex_index] is None:
+                write_positions[vertex_index] = (
+                    _get_world_remapped_short_position(
+                        world_positions, positions, vertex_index, remap_scale, remap_offset
+                    )
+                    if uses_world_short_remap
+                    else _get_short_position_write_pos(positions, vertex_index, mesh_scale)
+                )
+        for vertex_index in (i1, i2, i3):
+            if write_uvs[vertex_index] is None:
+                uv = _coerce_vec2(uvs[vertex_index] if vertex_index < len(uvs) else None)
+                write_uvs[vertex_index] = [uv[0], 1.0 - uv[1]]
         face_tangent = _calc_triangle_tangent(
-            p1,
-            p2,
-            p3,
-            [uv1[0], 1.0 - uv1[1]],
-            [uv2[0], 1.0 - uv2[1]],
-            [uv3[0], 1.0 - uv3[1]],
+            write_positions[i1],
+            write_positions[i2],
+            write_positions[i3],
+            write_uvs[i1],
+            write_uvs[i2],
+            write_uvs[i3],
         )
         if _is_near_zero_vec(face_tangent):
             continue
@@ -2651,6 +2724,64 @@ def _a320_opaque_tangent_binormal_source_matches_output(source_vertex: bytes, ou
     )
 
 
+class _SemanticVertexBuffer:
+    """Contiguous vertex storage with the old indexed patching interface."""
+
+    __slots__ = ("_buffer", "_stride", "_count", "_written", "_formats_checked")
+
+    def __init__(self, count: int, stride: int) -> None:
+        self._buffer = bytearray(count * stride)
+        self._stride = stride
+        self._count = count
+        self._written = 0
+        self._formats_checked: set[str] = set()
+
+    def __len__(self) -> int:
+        return self._written
+
+    def append(self, packed: bytes | bytearray | memoryview) -> None:
+        view = memoryview(packed)
+        if len(view) != self._stride or self._written >= self._count:
+            raise ValueError("Packed vertex payload length does not match the declared stride")
+        start = self._written * self._stride
+        self._buffer[start : start + self._stride] = view
+        self._written += 1
+
+    def pack(self, fmt: str, *values: Any) -> None:
+        if self._written >= self._count:
+            raise ValueError("Packed vertex payload exceeds the declared vertex count")
+        if fmt not in self._formats_checked and struct.calcsize(fmt) != self._stride:
+            raise ValueError("Packed vertex payload length does not match the declared stride")
+        self._formats_checked.add(fmt)
+        start = self._written * self._stride
+        struct.pack_into(fmt, self._buffer, start, *values)
+        self._written += 1
+
+    def __getitem__(self, index: int) -> memoryview:
+        if index < 0:
+            index += self._written
+        if index < 0 or index >= self._written:
+            raise IndexError(index)
+        start = index * self._stride
+        return memoryview(self._buffer)[start : start + self._stride]
+
+    def __setitem__(self, index: int, value: bytes | bytearray | memoryview) -> None:
+        if index < 0:
+            index += self._written
+        if index < 0 or index >= self._written:
+            raise IndexError(index)
+        view = memoryview(value)
+        if len(view) != self._stride:
+            raise ValueError("Patched vertex payload length does not match the declared stride")
+        start = index * self._stride
+        self._buffer[start : start + self._stride] = view
+
+    def to_bytes(self) -> bytes:
+        if self._written != self._count:
+            raise ValueError("Semantic mesh vertex payload count does not match vert_count")
+        return bytes(self._buffer)
+
+
 def _build_source_backed_geometry_overlay_payload(
     mesh: dict[str, Any],
     *,
@@ -2736,18 +2867,19 @@ def _build_source_backed_geometry_overlay_payload(
     primary_uv_offset = PRIMARY_HALF_UV_OFFSET_BY_FVF.get(fvf)
     secondary_uv_offset = SECONDARY_HALF_UV_OFFSET_BY_FVF.get(fvf)
 
-    vertex_chunks: list[bytes] = []
+    vertex_chunks = _SemanticVertexBuffer(vertex_count, vertex_stride)
     for index, source_row_hex in enumerate(source_rows):
         try:
-            source_row = bytes.fromhex(str(source_row_hex or ""))
-        except ValueError as exc:
+            source_row = source_row_hex if isinstance(source_row_hex, (bytes, bytearray, memoryview)) else bytes.fromhex(str(source_row_hex or ""))
+        except (TypeError, ValueError) as exc:
             raise ValueError(f"Source-backed geometry overlay row {index} is not valid hex") from exc
         if len(source_row) != vertex_stride:
             raise ValueError(
                 f"Source-backed geometry overlay row {index} has {len(source_row)} bytes, "
                 f"expected {vertex_stride}"
             )
-        patched = bytearray(source_row)
+        vertex_chunks.append(source_row)
+        patched = vertex_chunks[index]
 
         if fvf in SHORT_POSITION_FVFS:
             if uses_world_short_remap:
@@ -2797,15 +2929,13 @@ def _build_source_backed_geometry_overlay_payload(
             write_uv2 = _get_write_uv_from_channel(mesh, "uv2s", index, fallback_uv)
             struct.pack_into("<ee", patched, secondary_uv_offset, write_uv2[0], write_uv2[1])
 
-        vertex_chunks.append(bytes(patched))
-
     return {
         "header_fvf": normalized_header_fvf,
         "writer_fvf": normalized_writer_fvf,
         "vertex_stride": vertex_stride,
         "vert_count": vertex_count,
         "face_count": len(face_indices),
-        "vertex_bytes": b"".join(vertex_chunks),
+        "vertex_bytes": vertex_chunks.to_bytes(),
         "face_bytes": _pack_face_indices(face_indices) if max(face_indices) <= UINT16_FACE_INDEX_MAX else b"",
         "face_indices": face_indices,
         "geometry_write_mode": UNSKINNED_MESH_EDIT_EXPORT_MODE,
@@ -2854,6 +2984,9 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
     )
     tangents = mesh.get("tangents") if isinstance(mesh.get("tangents"), list) else []
     uvs = mesh.get("uvs") if isinstance(mesh.get("uvs"), list) else []
+    uv2s = mesh.get("uv2s") if isinstance(mesh.get("uv2s"), list) else []
+    uv3s = mesh.get("uv3s") if isinstance(mesh.get("uv3s"), list) else []
+    uv4s = mesh.get("uv4s") if isinstance(mesh.get("uv4s"), list) else []
     raw_bones_rows = _get_authoritative_skin_bone_rows(mesh)
     raw_weight_rows = _get_authoritative_skin_weight_rows(mesh)
     has_frozen_probe_skin = _get_bones_plus_mesh_final_geometry_authority(mesh) is not None
@@ -2879,17 +3012,20 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
     tangent_array = tangents if tangents else build_export_tangent_array(mesh, fvf)
     uses_world_short_remap = _mesh_uses_world_short_remap(mesh, fvf)
 
-    vertex_chunks: list[bytes] = []
+    # Keep one contiguous output allocation while preserving the indexed patch
+    # interface used by the source-field fidelity passes below.
+    vertex_chunks = _SemanticVertexBuffer(vertex_count, vertex_stride)
     for index in range(vertex_count):
-        uv = _coerce_vec2(_get_semantic_row(mesh, "uvs", index), (0.0, 0.0))
+        uv = _coerce_vec2(uvs[index] if index < len(uvs) else None, (0.0, 0.0))
         write_uv = [
             _clamp_half_float(uv[0]),
             _clamp_half_float(1.0 - uv[1]),
         ]
-        write_uv2 = _get_write_uv_from_channel(mesh, "uv2s", index, uv)
+        uv2 = _coerce_vec2(uv2s[index] if index < len(uv2s) else None, (uv[0], uv[1]))
+        write_uv2 = [_clamp_half_float(uv2[0]), _clamp_half_float(1.0 - uv2[1])]
         normal_vec = validated_normals[index]
-        raw_bones = _get_semantic_row({"rows": raw_bones_rows}, "rows", index)
-        raw_weights = _get_semantic_row({"rows": raw_weight_rows}, "rows", index)
+        raw_bones = raw_bones_rows[index] if index < len(raw_bones_rows) else None
+        raw_weights = raw_weight_rows[index] if index < len(raw_weight_rows) else None
         if not isinstance(raw_bones, list):
             raw_bones = []
         if not isinstance(raw_weights, list):
@@ -2907,119 +3043,105 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
                 max(0, min(65535, int(round(uv[0] * 65535.0)))),
                 max(0, min(65535, int(round(uv[1] * 65535.0)))),
             )
-            vertex_chunks.append(
-                struct.pack(
-                    "<fff4B2H",
-                    float_pos[0],
-                    float_pos[1],
-                    float_pos[2],
-                    *normal_bytes,
-                    uv_u16[0],
-                    uv_u16[1],
-                )
+            vertex_chunks.pack(
+                "<fff4B2H",
+                float_pos[0],
+                float_pos[1],
+                float_pos[2],
+                *normal_bytes,
+                uv_u16[0],
+                uv_u16[1],
             )
             continue
 
         if fvf == 0x207D6037:
             float_pos = _get_float_position_write_pos(positions, index, mesh_scale)
             normal_bytes = _encode_normal_bytes(normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<fff4B2el",
-                    float_pos[0],
-                    float_pos[1],
-                    float_pos[2],
-                    *normal_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                    0,
-                )
+            vertex_chunks.pack(
+                "<fff4B2el",
+                float_pos[0],
+                float_pos[1],
+                float_pos[2],
+                *normal_bytes,
+                write_uv[0],
+                write_uv[1],
+                0,
             )
             continue
 
         if fvf == 0xD8297028:
             float_pos = _get_float_position_write_pos(positions, index, mesh_scale)
             normal_bytes = _encode_normal_bytes(normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<fff4Bl2e",
-                    float_pos[0],
-                    float_pos[1],
-                    float_pos[2],
-                    *normal_bytes,
-                    0,
-                    write_uv[0],
-                    write_uv[1],
-                )
+            vertex_chunks.pack(
+                "<fff4Bl2e",
+                float_pos[0],
+                float_pos[1],
+                float_pos[2],
+                *normal_bytes,
+                0,
+                write_uv[0],
+                write_uv[1],
             )
             continue
 
         if fvf in {0xD1A47038, 0xC66FA03A}:
             float_pos = _get_float_position_write_pos(positions, index, mesh_scale)
             normal_bytes = _encode_normal_bytes(normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<fff4B2e2e",
-                    float_pos[0],
-                    float_pos[1],
-                    float_pos[2],
-                    *normal_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                    write_uv2[0],
-                    write_uv2[1],
-                )
+            vertex_chunks.pack(
+                "<fff4B2e2e",
+                float_pos[0],
+                float_pos[1],
+                float_pos[2],
+                *normal_bytes,
+                write_uv[0],
+                write_uv[1],
+                write_uv2[0],
+                write_uv2[1],
             )
             continue
 
         if fvf in {0xB0983013, 0xB0983014}:
             short_pos = _get_short_position_write_pos(positions, index, mesh_scale)
             bone_1 = _clamp_byte(raw_bones[0]) if raw_bones else 0
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhBBee",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    bone_1,
-                    0,
-                    write_uv[0],
-                    write_uv[1],
-                )
+            vertex_chunks.pack(
+                "<hhhBBee",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                bone_1,
+                0,
+                write_uv[0],
+                write_uv[1],
             )
             continue
 
         if fvf in {0xDB7DA014, 0xB6681034}:
             short_pos = _get_short_position_write_pos(positions, index, mesh_scale)
             normal_bytes = _encode_normal_bytes(normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B2e",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    26470,
-                    *normal_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                )
+            vertex_chunks.pack(
+                "<hhhh4B2e",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                26470,
+                *normal_bytes,
+                write_uv[0],
+                write_uv[1],
             )
             continue
 
         if fvf == 0xB6681034:
             short_pos = _get_short_position_write_pos(positions, index, mesh_scale)
             normal_bytes = _encode_normal_bytes(normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B2e",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    26470,
-                    *normal_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                )
+            vertex_chunks.pack(
+                "<hhhh4B2e",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                26470,
+                *normal_bytes,
+                write_uv[0],
+                write_uv[1],
             )
             continue
 
@@ -3030,19 +3152,17 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             tangent_bytes = _encode_pc_rehd_128_or_fallback_tangent_bytes(
                 fvf, normal_vec, short_pos=short_pos, write_uv=write_uv, fallback_policy="position_uv"
             )
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhBB8Bee",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    bone_1,
-                    0,
-                    *normal_bytes,
-                    *tangent_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                )
+            vertex_chunks.pack(
+                "<hhhBB8Bee",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                bone_1,
+                0,
+                *normal_bytes,
+                *tangent_bytes,
+                write_uv[0],
+                write_uv[1],
             )
             continue
 
@@ -3051,20 +3171,18 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             bone_1 = _clamp_byte(raw_bones[0]) if raw_bones else 0
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_bytes = _encode_short_position_uv_tangent_bytes(short_pos, write_uv)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhH4B4B2e2e",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    bone_1,
-                    *normal_bytes,
-                    *tangent_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                    write_uv2[0],
-                    write_uv2[1],
-                )
+            vertex_chunks.pack(
+                "<hhhH4B4B2e2e",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                bone_1,
+                *normal_bytes,
+                *tangent_bytes,
+                write_uv[0],
+                write_uv[1],
+                write_uv2[0],
+                write_uv2[1],
             )
             continue
 
@@ -3075,20 +3193,18 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             tangent_bytes = _encode_pc_rehd_128_or_fallback_tangent_bytes(
                 fvf, normal_vec, short_pos=short_pos, write_uv=write_uv, fallback_policy="position_uv"
             )
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh8B4e",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weight_1 * 32767.0),
-                    *normal_bytes,
-                    *tangent_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                    float(bone_1),
-                    float(bone_2),
-                )
+            vertex_chunks.pack(
+                "<hhhh8B4e",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weight_1 * 32767.0),
+                *normal_bytes,
+                *tangent_bytes,
+                write_uv[0],
+                write_uv[1],
+                float(bone_1),
+                float(bone_2),
             )
             continue
 
@@ -3097,22 +3213,20 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             bone_1, bone_2, weight_1, _ = build_legacy2_skin_from_rows(raw_bones, raw_weights, single_full_weight=False)
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_bytes = _encode_short_position_uv_tangent_bytes(short_pos, write_uv)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B4B2eHH2e",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weight_1 * 32767.0),
-                    *normal_bytes,
-                    *tangent_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                    int(max(0, bone_1)),
-                    int(max(0, bone_2)),
-                    write_uv2[0],
-                    write_uv2[1],
-                )
+            vertex_chunks.pack(
+                "<hhhh4B4B2eHH2e",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weight_1 * 32767.0),
+                *normal_bytes,
+                *tangent_bytes,
+                write_uv[0],
+                write_uv[1],
+                int(max(0, bone_1)),
+                int(max(0, bone_2)),
+                write_uv2[0],
+                write_uv2[1],
             )
             continue
 
@@ -3122,22 +3236,20 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_vec = tangent_array[index] if index < len(tangent_array) else [0.0, 0.0, 0.0]
             tangent_bytes = _encode_tangent_bytes(tangent_vec, normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh8B2e4B",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(bone_1),
-                    *normal_bytes,
-                    *tangent_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                    87,
-                    87,
-                    87,
-                    255,
-                )
+            vertex_chunks.pack(
+                "<hhhh8B2e4B",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(bone_1),
+                *normal_bytes,
+                *tangent_bytes,
+                write_uv[0],
+                write_uv[1],
+                87,
+                87,
+                87,
+                255,
             )
             continue
 
@@ -3146,20 +3258,18 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             bone_1 = _clamp_byte(raw_bones[0]) if raw_bones else 0
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_bytes = _encode_short_position_uv_tangent_bytes(short_pos, write_uv)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhH4B4B2e2e",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    bone_1,
-                    *normal_bytes,
-                    *tangent_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                    write_uv2[0],
-                    write_uv2[1],
-                )
+            vertex_chunks.pack(
+                "<hhhH4B4B2e2e",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                bone_1,
+                *normal_bytes,
+                *tangent_bytes,
+                write_uv[0],
+                write_uv[1],
+                write_uv2[0],
+                write_uv2[1],
             )
             continue
 
@@ -3170,21 +3280,19 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             tangent_bytes = _encode_pc_rehd_128_or_fallback_tangent_bytes(
                 fvf, normal_vec, short_pos=short_pos, write_uv=write_uv, fallback_policy="position_uv"
             )
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh8B4el",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weight_1 * 32767.0),
-                    *normal_bytes,
-                    *tangent_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                    float(bone_1),
-                    float(bone_2),
-                    -10197916,
-                )
+            vertex_chunks.pack(
+                "<hhhh8B4el",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weight_1 * 32767.0),
+                *normal_bytes,
+                *tangent_bytes,
+                write_uv[0],
+                write_uv[1],
+                float(bone_1),
+                float(bone_2),
+                -10197916,
             )
             continue
 
@@ -3193,22 +3301,20 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             bone_1, bone_2, weight_1, _ = build_legacy2_skin_from_rows(raw_bones, raw_weights, single_full_weight=True)
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_bytes = _encode_short_position_uv_tangent_bytes(short_pos, write_uv)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B4B2eHH2e",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weight_1 * 32767.0),
-                    *normal_bytes,
-                    *tangent_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                    bone_1,
-                    bone_2,
-                    write_uv2[0],
-                    write_uv2[1],
-                )
+            vertex_chunks.pack(
+                "<hhhh4B4B2eHH2e",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weight_1 * 32767.0),
+                *normal_bytes,
+                *tangent_bytes,
+                write_uv[0],
+                write_uv[1],
+                bone_1,
+                bone_2,
+                write_uv2[0],
+                write_uv2[1],
             )
             continue
 
@@ -3217,24 +3323,22 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_vec = tangent_array[index] if index < len(tangent_array) else [0.0, 0.0, 0.0]
             tangent_bytes = _encode_tangent_bytes(tangent_vec, normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhH4B4B4B2e2e",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    0,
-                    *normal_bytes,
-                    *tangent_bytes,
-                    0,
-                    0,
-                    0,
-                    0,
-                    write_uv[0],
-                    write_uv[1],
-                    write_uv2[0],
-                    write_uv2[1],
-                )
+            vertex_chunks.pack(
+                "<hhhH4B4B4B2e2e",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                0,
+                *normal_bytes,
+                *tangent_bytes,
+                0,
+                0,
+                0,
+                0,
+                write_uv[0],
+                write_uv[1],
+                write_uv2[0],
+                write_uv2[1],
             )
             continue
 
@@ -3243,28 +3347,26 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_vec = tangent_array[index] if index < len(tangent_array) else [0.0, 0.0, 0.0]
             tangent_bytes = _encode_tangent_bytes(tangent_vec, normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhH4B4B4B2e2e4B",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    0,
-                    *normal_bytes,
-                    *tangent_bytes,
-                    0,
-                    0,
-                    0,
-                    0,
-                    write_uv[0],
-                    write_uv[1],
-                    write_uv2[0],
-                    write_uv2[1],
-                    87,
-                    87,
-                    87,
-                    255,
-                )
+            vertex_chunks.pack(
+                "<hhhH4B4B4B2e2e4B",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                0,
+                *normal_bytes,
+                *tangent_bytes,
+                0,
+                0,
+                0,
+                0,
+                write_uv[0],
+                write_uv[1],
+                write_uv2[0],
+                write_uv2[1],
+                87,
+                87,
+                87,
+                255,
             )
             continue
 
@@ -3276,24 +3378,22 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             tangent_bytes = _encode_pc_rehd_128_or_fallback_tangent_bytes(
                 fvf, normal_vec, short_pos=short_pos, write_uv=write_uv, fallback_policy="position_uv"
             )
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh8B4B4e",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weights4[0] * 32767.0),
-                    *normal_bytes,
-                    *tangent_bytes,
-                    _clamp_byte(bones4[0]),
-                    _clamp_byte(bones4[1]),
-                    _clamp_byte(bones4[2]),
-                    _clamp_byte(bones4[3]),
-                    write_uv[0],
-                    write_uv[1],
-                    weights4[1],
-                    weights4[2],
-                )
+            vertex_chunks.pack(
+                "<hhhh8B4B4e",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weights4[0] * 32767.0),
+                *normal_bytes,
+                *tangent_bytes,
+                _clamp_byte(bones4[0]),
+                _clamp_byte(bones4[1]),
+                _clamp_byte(bones4[2]),
+                _clamp_byte(bones4[3]),
+                write_uv[0],
+                write_uv[1],
+                weights4[1],
+                weights4[2],
             )
             continue
 
@@ -3302,24 +3402,22 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_vec = tangent_array[index] if index < len(tangent_array) else [0.0, 0.0, 0.0]
             tangent_bytes = _encode_tangent_bytes(tangent_vec, normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhH4B4B4B2e2e",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    0,
-                    *normal_bytes,
-                    *tangent_bytes,
-                    0,
-                    0,
-                    0,
-                    0,
-                    write_uv[0],
-                    write_uv[1],
-                    write_uv2[0],
-                    write_uv2[1],
-                )
+            vertex_chunks.pack(
+                "<hhhH4B4B4B2e2e",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                0,
+                *normal_bytes,
+                *tangent_bytes,
+                0,
+                0,
+                0,
+                0,
+                write_uv[0],
+                write_uv[1],
+                write_uv2[0],
+                write_uv2[1],
             )
             continue
 
@@ -3330,23 +3428,21 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             tangent_bytes = _encode_pc_rehd_128_or_fallback_tangent_bytes(
                 fvf, normal_vec, short_pos=short_pos, write_uv=write_uv, fallback_policy="position_uv"
             )
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhBB8B2el2el",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    bone_1,
-                    0,
-                    *normal_bytes,
-                    *tangent_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                    0,
-                    write_uv2[0],
-                    write_uv2[1],
-                    0,
-                )
+            vertex_chunks.pack(
+                "<hhhBB8B2el2el",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                bone_1,
+                0,
+                *normal_bytes,
+                *tangent_bytes,
+                write_uv[0],
+                write_uv[1],
+                0,
+                write_uv2[0],
+                write_uv2[1],
+                0,
             )
             continue
 
@@ -3355,28 +3451,26 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_vec = tangent_array[index] if index < len(tangent_array) else [0.0, 0.0, 0.0]
             tangent_bytes = _encode_tangent_bytes(tangent_vec, normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhH4B4B4B2e2e4B",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    0,
-                    *normal_bytes,
-                    *tangent_bytes,
-                    0,
-                    0,
-                    0,
-                    0,
-                    write_uv[0],
-                    write_uv[1],
-                    write_uv2[0],
-                    write_uv2[1],
-                    87,
-                    87,
-                    87,
-                    255,
-                )
+            vertex_chunks.pack(
+                "<hhhH4B4B4B2e2e4B",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                0,
+                *normal_bytes,
+                *tangent_bytes,
+                0,
+                0,
+                0,
+                0,
+                write_uv[0],
+                write_uv[1],
+                write_uv2[0],
+                write_uv2[1],
+                87,
+                87,
+                87,
+                255,
             )
             continue
 
@@ -3386,24 +3480,22 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_vec = tangent_array[index] if index < len(tangent_array) else [0.0, 0.0, 0.0]
             tangent_bytes = _encode_tangent_bytes(tangent_vec, normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B4B4B2e2e",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weights4[0] * 32767.0),
-                    *normal_bytes,
-                    *tangent_bytes,
-                    _clamp_byte(bones4[0]),
-                    _clamp_byte(bones4[1]),
-                    _clamp_byte(bones4[2]),
-                    _clamp_byte(bones4[3]),
-                    write_uv[0],
-                    write_uv[1],
-                    weights4[1],
-                    weights4[2],
-                )
+            vertex_chunks.pack(
+                "<hhhh4B4B4B2e2e",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weights4[0] * 32767.0),
+                *normal_bytes,
+                *tangent_bytes,
+                _clamp_byte(bones4[0]),
+                _clamp_byte(bones4[1]),
+                _clamp_byte(bones4[2]),
+                _clamp_byte(bones4[3]),
+                write_uv[0],
+                write_uv[1],
+                weights4[1],
+                weights4[2],
             )
             continue
 
@@ -3413,28 +3505,26 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_vec = tangent_array[index] if index < len(tangent_array) else [0.0, 0.0, 0.0]
             tangent_bytes = _encode_tangent_bytes(tangent_vec, normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B4B4B2e2e4B",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weights4[0] * 32767.0),
-                    *normal_bytes,
-                    *tangent_bytes,
-                    _clamp_byte(bones4[0]),
-                    _clamp_byte(bones4[1]),
-                    _clamp_byte(bones4[2]),
-                    _clamp_byte(bones4[3]),
-                    write_uv[0],
-                    write_uv[1],
-                    weights4[1],
-                    weights4[2],
-                    87,
-                    87,
-                    87,
-                    255,
-                )
+            vertex_chunks.pack(
+                "<hhhh4B4B4B2e2e4B",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weights4[0] * 32767.0),
+                *normal_bytes,
+                *tangent_bytes,
+                _clamp_byte(bones4[0]),
+                _clamp_byte(bones4[1]),
+                _clamp_byte(bones4[2]),
+                _clamp_byte(bones4[3]),
+                write_uv[0],
+                write_uv[1],
+                weights4[1],
+                weights4[2],
+                87,
+                87,
+                87,
+                255,
             )
             continue
 
@@ -3444,19 +3534,17 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             tangent_bytes = _encode_pc_rehd_128_or_fallback_tangent_bytes(
                 fvf, normal_vec, fallback_policy="axis_cross"
             )
-            vertex_chunks.append(
-                struct.pack(
-                    "<fff4B4B2e2e",
-                    float_pos[0],
-                    float_pos[1],
-                    float_pos[2],
-                    *normal_bytes,
-                    *tangent_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                    write_uv2[0],
-                    write_uv2[1],
-                )
+            vertex_chunks.pack(
+                "<fff4B4B2e2e",
+                float_pos[0],
+                float_pos[1],
+                float_pos[2],
+                *normal_bytes,
+                *tangent_bytes,
+                write_uv[0],
+                write_uv[1],
+                write_uv2[0],
+                write_uv2[1],
             )
             continue
 
@@ -3465,34 +3553,32 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             bones8, weights8, _ = build_legacy8_skin_from_rows(raw_bones, raw_weights)
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_bytes = _encode_short_position_uv_tangent_bytes(short_pos, write_uv)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B4B8B2e2e4B2e",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weights8[0] * 32767.0),
-                    *normal_bytes,
-                    _clamp_byte(weights8[1] * 255.0),
-                    _clamp_byte(weights8[2] * 255.0),
-                    _clamp_byte(weights8[3] * 255.0),
-                    _clamp_byte(weights8[4] * 255.0),
-                    _clamp_byte(bones8[0]),
-                    _clamp_byte(bones8[1]),
-                    _clamp_byte(bones8[2]),
-                    _clamp_byte(bones8[3]),
-                    _clamp_byte(bones8[4]),
-                    _clamp_byte(bones8[5]),
-                    _clamp_byte(bones8[6]),
-                    _clamp_byte(bones8[7]),
-                    write_uv[0],
-                    write_uv[1],
-                    weights8[5],
-                    weights8[6],
-                    *tangent_bytes,
-                    write_uv2[0],
-                    write_uv2[1],
-                )
+            vertex_chunks.pack(
+                "<hhhh4B4B8B2e2e4B2e",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weights8[0] * 32767.0),
+                *normal_bytes,
+                _clamp_byte(weights8[1] * 255.0),
+                _clamp_byte(weights8[2] * 255.0),
+                _clamp_byte(weights8[3] * 255.0),
+                _clamp_byte(weights8[4] * 255.0),
+                _clamp_byte(bones8[0]),
+                _clamp_byte(bones8[1]),
+                _clamp_byte(bones8[2]),
+                _clamp_byte(bones8[3]),
+                _clamp_byte(bones8[4]),
+                _clamp_byte(bones8[5]),
+                _clamp_byte(bones8[6]),
+                _clamp_byte(bones8[7]),
+                write_uv[0],
+                write_uv[1],
+                weights8[5],
+                weights8[6],
+                *tangent_bytes,
+                write_uv2[0],
+                write_uv2[1],
             )
             continue
 
@@ -3502,36 +3588,34 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_vec = tangent_array[index] if index < len(tangent_array) else [0.0, 0.0, 0.0]
             tangent_bytes = _encode_tangent_bytes(tangent_vec, normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B4B8B2e2e4B4B",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weights8[0] * 32767.0),
-                    *normal_bytes,
-                    _clamp_byte(weights8[1] * 255.0),
-                    _clamp_byte(weights8[2] * 255.0),
-                    _clamp_byte(weights8[3] * 255.0),
-                    _clamp_byte(weights8[4] * 255.0),
-                    _clamp_byte(bones8[0]),
-                    _clamp_byte(bones8[1]),
-                    _clamp_byte(bones8[2]),
-                    _clamp_byte(bones8[3]),
-                    _clamp_byte(bones8[4]),
-                    _clamp_byte(bones8[5]),
-                    _clamp_byte(bones8[6]),
-                    _clamp_byte(bones8[7]),
-                    write_uv[0],
-                    write_uv[1],
-                    weights8[5],
-                    weights8[6],
-                    *tangent_bytes,
-                    87,
-                    87,
-                    87,
-                    255,
-                )
+            vertex_chunks.pack(
+                "<hhhh4B4B8B2e2e4B4B",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weights8[0] * 32767.0),
+                *normal_bytes,
+                _clamp_byte(weights8[1] * 255.0),
+                _clamp_byte(weights8[2] * 255.0),
+                _clamp_byte(weights8[3] * 255.0),
+                _clamp_byte(weights8[4] * 255.0),
+                _clamp_byte(bones8[0]),
+                _clamp_byte(bones8[1]),
+                _clamp_byte(bones8[2]),
+                _clamp_byte(bones8[3]),
+                _clamp_byte(bones8[4]),
+                _clamp_byte(bones8[5]),
+                _clamp_byte(bones8[6]),
+                _clamp_byte(bones8[7]),
+                write_uv[0],
+                write_uv[1],
+                weights8[5],
+                weights8[6],
+                *tangent_bytes,
+                87,
+                87,
+                87,
+                255,
             )
             continue
 
@@ -3541,20 +3625,18 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             tangent_bytes = _encode_pc_rehd_128_or_fallback_tangent_bytes(
                 fvf, normal_vec, fallback_policy="axis_cross"
             )
-            vertex_chunks.append(
-                struct.pack(
-                    "<fff4B4B2e2el",
-                    float_pos[0],
-                    float_pos[1],
-                    float_pos[2],
-                    *normal_bytes,
-                    *tangent_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                    write_uv2[0],
-                    write_uv2[1],
-                    0,
-                )
+            vertex_chunks.pack(
+                "<fff4B4B2e2el",
+                float_pos[0],
+                float_pos[1],
+                float_pos[2],
+                *normal_bytes,
+                *tangent_bytes,
+                write_uv[0],
+                write_uv[1],
+                write_uv2[0],
+                write_uv2[1],
+                0,
             )
             continue
 
@@ -3564,20 +3646,18 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             tangent_bytes = _encode_pc_rehd_128_or_fallback_tangent_bytes(
                 fvf, normal_vec, fallback_policy="axis_cross"
             )
-            vertex_chunks.append(
-                struct.pack(
-                    "<fff4B4B2e2el",
-                    float_pos[0],
-                    float_pos[1],
-                    float_pos[2],
-                    *normal_bytes,
-                    *tangent_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                    write_uv2[0],
-                    write_uv2[1],
-                    255,
-                )
+            vertex_chunks.pack(
+                "<fff4B4B2e2el",
+                float_pos[0],
+                float_pos[1],
+                float_pos[2],
+                *normal_bytes,
+                *tangent_bytes,
+                write_uv[0],
+                write_uv[1],
+                write_uv2[0],
+                write_uv2[1],
+                255,
             )
             continue
 
@@ -3587,24 +3667,22 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_vec = tangent_array[index] if index < len(tangent_array) else [0.0, 0.0, 0.0]
             tangent_bytes = _encode_tangent_bytes(tangent_vec, normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B4B4B2e2e",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weights4[0] * 32767.0),
-                    *normal_bytes,
-                    *tangent_bytes,
-                    _clamp_byte(bones4[0]),
-                    _clamp_byte(bones4[1]),
-                    _clamp_byte(bones4[2]),
-                    _clamp_byte(bones4[3]),
-                    write_uv[0],
-                    write_uv[1],
-                    weights4[1],
-                    weights4[2],
-                )
+            vertex_chunks.pack(
+                "<hhhh4B4B4B2e2e",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weights4[0] * 32767.0),
+                *normal_bytes,
+                *tangent_bytes,
+                _clamp_byte(bones4[0]),
+                _clamp_byte(bones4[1]),
+                _clamp_byte(bones4[2]),
+                _clamp_byte(bones4[3]),
+                write_uv[0],
+                write_uv[1],
+                weights4[1],
+                weights4[2],
             )
             continue
 
@@ -3614,28 +3692,26 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_vec = tangent_array[index] if index < len(tangent_array) else [0.0, 0.0, 0.0]
             tangent_bytes = _encode_tangent_bytes(tangent_vec, normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B4B4B2e2e4B",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weights4[0] * 32767.0),
-                    *normal_bytes,
-                    *tangent_bytes,
-                    _clamp_byte(bones4[0]),
-                    _clamp_byte(bones4[1]),
-                    _clamp_byte(bones4[2]),
-                    _clamp_byte(bones4[3]),
-                    write_uv[0],
-                    write_uv[1],
-                    weights4[1],
-                    weights4[2],
-                    87,
-                    87,
-                    87,
-                    255,
-                )
+            vertex_chunks.pack(
+                "<hhhh4B4B4B2e2e4B",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weights4[0] * 32767.0),
+                *normal_bytes,
+                *tangent_bytes,
+                _clamp_byte(bones4[0]),
+                _clamp_byte(bones4[1]),
+                _clamp_byte(bones4[2]),
+                _clamp_byte(bones4[3]),
+                write_uv[0],
+                write_uv[1],
+                weights4[1],
+                weights4[2],
+                87,
+                87,
+                87,
+                255,
             )
             continue
 
@@ -3659,32 +3735,30 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             tangent_bytes = _encode_pc_rehd_128_or_fallback_tangent_bytes(
                 fvf, normal_vec, short_pos=short_pos, write_uv=write_uv, fallback_policy="position_uv"
             )
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B4B8B2e2h4B",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(top_weights[0] * 32767.0),
-                    *normal_bytes,
-                    _clamp_byte(top_weights[1] * 255.0),
-                    _clamp_byte(top_weights[2] * 255.0),
-                    _clamp_byte(top_weights[3] * 255.0),
-                    0,
-                    _clamp_byte(top_bones[0]),
-                    _clamp_byte(top_bones[1]),
-                    _clamp_byte(top_bones[2]),
-                    _clamp_byte(top_bones[3]),
-                    _clamp_byte(top_bones[0]),
-                    _clamp_byte(top_bones[0]),
-                    _clamp_byte(top_bones[0]),
-                    _clamp_byte(top_bones[0]),
-                    write_uv[0],
-                    write_uv[1],
-                    0,
-                    0,
-                    *tangent_bytes,
-                )
+            vertex_chunks.pack(
+                "<hhhh4B4B8B2e2h4B",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(top_weights[0] * 32767.0),
+                *normal_bytes,
+                _clamp_byte(top_weights[1] * 255.0),
+                _clamp_byte(top_weights[2] * 255.0),
+                _clamp_byte(top_weights[3] * 255.0),
+                0,
+                _clamp_byte(top_bones[0]),
+                _clamp_byte(top_bones[1]),
+                _clamp_byte(top_bones[2]),
+                _clamp_byte(top_bones[3]),
+                _clamp_byte(top_bones[0]),
+                _clamp_byte(top_bones[0]),
+                _clamp_byte(top_bones[0]),
+                _clamp_byte(top_bones[0]),
+                write_uv[0],
+                write_uv[1],
+                0,
+                0,
+                *tangent_bytes,
             )
             continue
 
@@ -3695,28 +3769,26 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             tangent_bytes = _encode_pc_rehd_128_or_fallback_tangent_bytes(
                 fvf, normal_vec, short_pos=short_pos, write_uv=write_uv, fallback_policy="position_uv"
             )
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh8B4B4el2el",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weights4[0] * 32767.0),
-                    *normal_bytes,
-                    *tangent_bytes,
-                    _clamp_byte(bones4[0]),
-                    _clamp_byte(bones4[1]),
-                    _clamp_byte(bones4[2]),
-                    _clamp_byte(bones4[3]),
-                    write_uv[0],
-                    write_uv[1],
-                    weights4[1],
-                    weights4[2],
-                    0,
-                    write_uv2[0],
-                    write_uv2[1],
-                    0,
-                )
+            vertex_chunks.pack(
+                "<hhhh8B4B4el2el",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weights4[0] * 32767.0),
+                *normal_bytes,
+                *tangent_bytes,
+                _clamp_byte(bones4[0]),
+                _clamp_byte(bones4[1]),
+                _clamp_byte(bones4[2]),
+                _clamp_byte(bones4[3]),
+                write_uv[0],
+                write_uv[1],
+                weights4[1],
+                weights4[2],
+                0,
+                write_uv2[0],
+                write_uv2[1],
+                0,
             )
             continue
 
@@ -3725,34 +3797,32 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             bones8, weights8, _ = build_legacy8_skin_from_rows(raw_bones, raw_weights)
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_bytes = _encode_short_position_uv_tangent_bytes(short_pos, write_uv)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B4B8B2e2e4B2e",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weights8[0] * 32767.0),
-                    *normal_bytes,
-                    _clamp_byte(weights8[1] * 255.0),
-                    _clamp_byte(weights8[2] * 255.0),
-                    _clamp_byte(weights8[3] * 255.0),
-                    _clamp_byte(weights8[4] * 255.0),
-                    _clamp_byte(bones8[0]),
-                    _clamp_byte(bones8[1]),
-                    _clamp_byte(bones8[2]),
-                    _clamp_byte(bones8[3]),
-                    _clamp_byte(bones8[4]),
-                    _clamp_byte(bones8[5]),
-                    _clamp_byte(bones8[6]),
-                    _clamp_byte(bones8[7]),
-                    write_uv[0],
-                    write_uv[1],
-                    weights8[5],
-                    weights8[6],
-                    *tangent_bytes,
-                    write_uv2[0],
-                    write_uv2[1],
-                )
+            vertex_chunks.pack(
+                "<hhhh4B4B8B2e2e4B2e",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weights8[0] * 32767.0),
+                *normal_bytes,
+                _clamp_byte(weights8[1] * 255.0),
+                _clamp_byte(weights8[2] * 255.0),
+                _clamp_byte(weights8[3] * 255.0),
+                _clamp_byte(weights8[4] * 255.0),
+                _clamp_byte(bones8[0]),
+                _clamp_byte(bones8[1]),
+                _clamp_byte(bones8[2]),
+                _clamp_byte(bones8[3]),
+                _clamp_byte(bones8[4]),
+                _clamp_byte(bones8[5]),
+                _clamp_byte(bones8[6]),
+                _clamp_byte(bones8[7]),
+                write_uv[0],
+                write_uv[1],
+                weights8[5],
+                weights8[6],
+                *tangent_bytes,
+                write_uv2[0],
+                write_uv2[1],
             )
             continue
 
@@ -3762,61 +3832,59 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             normal_bytes = _encode_normal_bytes(normal_vec)
             tangent_vec = tangent_array[index] if index < len(tangent_array) else [0.0, 0.0, 0.0]
             tangent_bytes = _encode_tangent_bytes(tangent_vec, normal_vec)
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B4B8B2e2e4B4B",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weights8[0] * 32767.0),
-                    *normal_bytes,
-                    _clamp_byte(weights8[1] * 255.0),
-                    _clamp_byte(weights8[2] * 255.0),
-                    _clamp_byte(weights8[3] * 255.0),
-                    _clamp_byte(weights8[4] * 255.0),
-                    _clamp_byte(bones8[0]),
-                    _clamp_byte(bones8[1]),
-                    _clamp_byte(bones8[2]),
-                    _clamp_byte(bones8[3]),
-                    _clamp_byte(bones8[4]),
-                    _clamp_byte(bones8[5]),
-                    _clamp_byte(bones8[6]),
-                    _clamp_byte(bones8[7]),
-                    write_uv[0],
-                    write_uv[1],
-                    weights8[5],
-                    weights8[6],
-                    *tangent_bytes,
-                    87,
-                    87,
-                    87,
-                    255,
-                )
+            vertex_chunks.pack(
+                "<hhhh4B4B8B2e2e4B4B",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weights8[0] * 32767.0),
+                *normal_bytes,
+                _clamp_byte(weights8[1] * 255.0),
+                _clamp_byte(weights8[2] * 255.0),
+                _clamp_byte(weights8[3] * 255.0),
+                _clamp_byte(weights8[4] * 255.0),
+                _clamp_byte(bones8[0]),
+                _clamp_byte(bones8[1]),
+                _clamp_byte(bones8[2]),
+                _clamp_byte(bones8[3]),
+                _clamp_byte(bones8[4]),
+                _clamp_byte(bones8[5]),
+                _clamp_byte(bones8[6]),
+                _clamp_byte(bones8[7]),
+                write_uv[0],
+                write_uv[1],
+                weights8[5],
+                weights8[6],
+                *tangent_bytes,
+                87,
+                87,
+                87,
+                255,
             )
             continue
 
         if fvf == 0x63B6C02F:
             float_pos = _get_float_position_write_pos(positions, index, mesh_scale)
             normal_bytes = _encode_normal_bytes(normal_vec)
-            write_uv3 = _get_write_uv_from_channel(mesh, "uv3s", index, uv)
-            write_uv4 = _get_write_uv_from_channel(mesh, "uv4s", index, uv)
-            vertex_chunks.append(
-                struct.pack(
-                    "<fff2e4B2e2e2el",
-                    float_pos[0],
-                    float_pos[1],
-                    float_pos[2],
-                    write_uv2[0],
-                    write_uv2[1],
-                    *normal_bytes,
-                    write_uv[0],
-                    write_uv[1],
-                    write_uv3[0],
-                    write_uv3[1],
-                    write_uv4[0],
-                    write_uv4[1],
-                    255,
-                )
+            uv3 = _coerce_vec2(uv3s[index] if index < len(uv3s) else None, (uv[0], uv[1]))
+            write_uv3 = [_clamp_half_float(uv3[0]), _clamp_half_float(1.0 - uv3[1])]
+            uv4 = _coerce_vec2(uv4s[index] if index < len(uv4s) else None, (uv[0], uv[1]))
+            write_uv4 = [_clamp_half_float(uv4[0]), _clamp_half_float(1.0 - uv4[1])]
+            vertex_chunks.pack(
+                "<fff2e4B2e2e2el",
+                float_pos[0],
+                float_pos[1],
+                float_pos[2],
+                write_uv2[0],
+                write_uv2[1],
+                *normal_bytes,
+                write_uv[0],
+                write_uv[1],
+                write_uv3[0],
+                write_uv3[1],
+                write_uv4[0],
+                write_uv4[1],
+                255,
             )
             continue
 
@@ -3827,39 +3895,37 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             tangent_bytes = _encode_pc_rehd_128_or_fallback_tangent_bytes(
                 fvf, normal_vec, short_pos=short_pos, write_uv=write_uv, fallback_policy="position_uv"
             )
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B4B8B2e2e4Bl2el",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weights4[0] * 32767.0),
-                    normal_bytes[0],
-                    normal_bytes[1],
-                    normal_bytes[2],
-                    255,
-                    _clamp_byte(weights4[1] * 255.0),
-                    _clamp_byte(weights4[2] * 255.0),
-                    _clamp_byte(weights4[3] * 255.0),
-                    0,
-                    _clamp_byte(bones4[0]),
-                    _clamp_byte(bones4[1]),
-                    _clamp_byte(bones4[2]),
-                    _clamp_byte(bones4[3]),
-                    _clamp_byte(bones4[0]),
-                    _clamp_byte(bones4[0]),
-                    _clamp_byte(bones4[0]),
-                    _clamp_byte(bones4[0]),
-                    write_uv[0],
-                    write_uv[1],
-                    0.0,
-                    0.0,
-                    *tangent_bytes,
-                    0,
-                    write_uv2[0],
-                    write_uv2[1],
-                    0,
-                )
+            vertex_chunks.pack(
+                "<hhhh4B4B8B2e2e4Bl2el",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weights4[0] * 32767.0),
+                normal_bytes[0],
+                normal_bytes[1],
+                normal_bytes[2],
+                255,
+                _clamp_byte(weights4[1] * 255.0),
+                _clamp_byte(weights4[2] * 255.0),
+                _clamp_byte(weights4[3] * 255.0),
+                0,
+                _clamp_byte(bones4[0]),
+                _clamp_byte(bones4[1]),
+                _clamp_byte(bones4[2]),
+                _clamp_byte(bones4[3]),
+                _clamp_byte(bones4[0]),
+                _clamp_byte(bones4[0]),
+                _clamp_byte(bones4[0]),
+                _clamp_byte(bones4[0]),
+                write_uv[0],
+                write_uv[1],
+                0.0,
+                0.0,
+                *tangent_bytes,
+                0,
+                write_uv2[0],
+                write_uv2[1],
+                0,
             )
             continue
 
@@ -3870,57 +3936,66 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
             tangent_bytes = _encode_pc_rehd_128_or_fallback_tangent_bytes(
                 fvf, normal_vec, short_pos=short_pos, write_uv=write_uv, fallback_policy="position_uv"
             )
-            vertex_chunks.append(
-                struct.pack(
-                    "<hhhh4B4B4B4e9l",
-                    _clamp_short(short_pos[0]),
-                    _clamp_short(short_pos[1]),
-                    _clamp_short(short_pos[2]),
-                    _clamp_short(weights4[0] * 32767.0),
-                    normal_bytes[0],
-                    normal_bytes[1],
-                    normal_bytes[2],
-                    255,
-                    *tangent_bytes,
-                    _clamp_byte(bones4[0]),
-                    _clamp_byte(bones4[1]),
-                    _clamp_byte(bones4[2]),
-                    _clamp_byte(bones4[3]),
-                    write_uv[0],
-                    write_uv[1],
-                    weights4[1],
-                    weights4[2],
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    -1292733006,
-                    1974661749,
-                    242,
-                )
+            vertex_chunks.pack(
+                "<hhhh4B4B4B4e9l",
+                _clamp_short(short_pos[0]),
+                _clamp_short(short_pos[1]),
+                _clamp_short(short_pos[2]),
+                _clamp_short(weights4[0] * 32767.0),
+                normal_bytes[0],
+                normal_bytes[1],
+                normal_bytes[2],
+                255,
+                *tangent_bytes,
+                _clamp_byte(bones4[0]),
+                _clamp_byte(bones4[1]),
+                _clamp_byte(bones4[2]),
+                _clamp_byte(bones4[3]),
+                write_uv[0],
+                write_uv[1],
+                weights4[1],
+                weights4[2],
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                -1292733006,
+                1974661749,
+                242,
             )
             continue
 
         raise NotImplementedError(f"Semantic export packer not yet implemented for FVF 0x{fvf:08X}")
 
     source_uv2_field_rows = mesh.get("source_uv2_field_hex_rows")
+
+    def _coerce_preserved_bytes(value: Any) -> bytes | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, (bytearray, memoryview)):
+            return bytes(value)
+        try:
+            return bytes.fromhex(str(value))
+        except (TypeError, ValueError):
+            return None
+
     uv2_offset = SECONDARY_HALF_UV_OFFSET_BY_FVF.get(fvf)
     if isinstance(source_uv2_field_rows, list) and uv2_offset is not None:
         for vertex_index in range(min(len(vertex_chunks), len(source_uv2_field_rows))):
             source_uv2_hex = source_uv2_field_rows[vertex_index]
-            if source_uv2_hex in {None, ""}:
+            if source_uv2_hex is None or source_uv2_hex == "":
                 continue
-            try:
-                source_uv2 = bytes.fromhex(str(source_uv2_hex))
-            except ValueError:
+            source_uv2 = _coerce_preserved_bytes(source_uv2_hex)
+            if source_uv2 is None:
                 continue
-            patched_vertex = bytearray(vertex_chunks[vertex_index])
+            patched_vertex = vertex_chunks[vertex_index]
             if len(source_uv2) != 4 or uv2_offset + 4 > len(patched_vertex):
                 continue
             patched_vertex[uv2_offset : uv2_offset + 4] = source_uv2
-            vertex_chunks[vertex_index] = bytes(patched_vertex)
 
     normal_fidelity = mesh.get("normal_fidelity")
     strict_fbx_corner_rows = (
@@ -3940,34 +4015,30 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
     if isinstance(source_normal_field_rows, list) and normal_offset is not None:
         for vertex_index in range(min(len(vertex_chunks), len(source_normal_field_rows))):
             source_normal_hex = source_normal_field_rows[vertex_index]
-            if source_normal_hex in {None, ""}:
+            if source_normal_hex is None or source_normal_hex == "":
                 continue
-            try:
-                source_normal = bytes.fromhex(str(source_normal_hex))
-            except ValueError:
+            source_normal = _coerce_preserved_bytes(source_normal_hex)
+            if source_normal is None:
                 continue
-            patched_vertex = bytearray(vertex_chunks[vertex_index])
+            patched_vertex = vertex_chunks[vertex_index]
             if len(source_normal) != 4 or normal_offset + 4 > len(patched_vertex):
                 continue
             patched_vertex[normal_offset : normal_offset + 4] = source_normal
-            vertex_chunks[vertex_index] = bytes(patched_vertex)
 
     source_a320_opaque_vertex_rows = mesh.get("source_a320_opaque_vertex_hex_rows")
     if fvf in A320_OPAQUE_TANGENT_BINORMAL_FVFS and isinstance(source_a320_opaque_vertex_rows, list):
         field_start, field_end = A320_OPAQUE_TANGENT_BINORMAL_RANGE
         for vertex_index in range(min(len(vertex_chunks), len(source_a320_opaque_vertex_rows))):
             source_vertex_hex = source_a320_opaque_vertex_rows[vertex_index]
-            if source_vertex_hex in {None, ""}:
+            if source_vertex_hex is None or source_vertex_hex == "":
                 continue
-            try:
-                source_vertex = bytes.fromhex(str(source_vertex_hex))
-            except ValueError:
+            source_vertex = _coerce_preserved_bytes(source_vertex_hex)
+            if source_vertex is None:
                 continue
-            patched_vertex = bytearray(vertex_chunks[vertex_index])
+            patched_vertex = vertex_chunks[vertex_index]
             if not _a320_opaque_tangent_binormal_source_matches_output(source_vertex, patched_vertex):
                 continue
             patched_vertex[field_start:field_end] = source_vertex[field_start:field_end]
-            vertex_chunks[vertex_index] = bytes(patched_vertex)
 
     # BONE+MESH owns the source MOD binding even when Probe supplied an exact
     # FBX corner table.  The old strict-corner guard disabled byte restoration
@@ -3996,26 +4067,30 @@ def build_semantic_mesh_payload(mesh: dict[str, Any], *, default_fvf: str | int 
     )
     if isinstance(source_skin_field_rows, list):
         skin_ranges = SOURCE_SKIN_FIELD_RANGES_BY_FVF.get(fvf, ())
+        validated_fields: list[bytes] = []
         for vertex_index in range(min(len(vertex_chunks), len(source_skin_field_rows))):
             field_row = source_skin_field_rows[vertex_index]
             if not isinstance(field_row, list) or len(field_row) != len(skin_ranges):
                 continue
-            patched_vertex = bytearray(vertex_chunks[vertex_index])
+            patched_vertex = vertex_chunks[vertex_index]
             valid_row = True
+            validated_fields.clear()
             for field_index, (field_start, field_end) in enumerate(skin_ranges):
-                try:
-                    source_field = bytes.fromhex(str(field_row[field_index] or ""))
-                except ValueError:
+                source_field = _coerce_preserved_bytes(field_row[field_index])
+                if source_field is None:
                     valid_row = False
                     break
                 if len(source_field) != (field_end - field_start) or field_end > len(patched_vertex):
                     valid_row = False
                     break
-                patched_vertex[field_start:field_end] = source_field
+                validated_fields.append(source_field)
             if valid_row:
-                vertex_chunks[vertex_index] = bytes(patched_vertex)
+                # Preserve the old all-or-nothing row semantics: malformed
+                # rows must not leave a partially restored Skin field behind.
+                for (field_start, field_end), source_field in zip(skin_ranges, validated_fields):
+                    patched_vertex[field_start:field_end] = source_field
 
-    vertex_bytes = b"".join(vertex_chunks)
+    vertex_bytes = vertex_chunks.to_bytes()
     if vertex_count > 0 and len(vertex_bytes) != (vertex_count * vertex_stride):
         raise ValueError("Semantic mesh vertex payload length does not match vert_count * stride")
     if any(index < 0 or index >= vertex_count for index in face_indices):
@@ -4062,6 +4137,34 @@ def _has_semantic_mesh_payload(contract_mesh: dict[str, Any]) -> bool:
     return False
 
 
+_SEMANTIC_WORKER_UNUSED_FIELDS = frozenset({
+    "source_vertex_indices",
+    "binary_skin_unreferenced_source_indices",
+    "binary_skin_unreferenced_max_positions",
+    "fbx_export_corner_indices",
+    "fbx_geom_face_indices",
+    "fbx_export_face_indices",
+    "raw_fbx_uvs_before_half_safe",
+    "skinned_positions",
+    "skinned_world_positions",
+})
+
+
+def _compact_semantic_worker_task(task: dict[str, Any]) -> dict[str, Any]:
+    """Omit completed routing arrays only from the worker's serialized view."""
+    mesh = task["contract_mesh"]
+    omitted = _SEMANTIC_WORKER_UNUSED_FIELDS
+    # Raw/local positions participate only in the implicit vertex-count fallback;
+    # all actual position writes use the separate selected Probe authority.
+    if _int_or_default(mesh.get("vert_count"), 0) > 0:
+        omitted = omitted | {"positions", "world_positions"}
+    return {
+        "source_slot": task["source_slot"],
+        "default_fvf": task.get("default_fvf"),
+        "contract_mesh": {key: value for key, value in mesh.items() if key not in omitted},
+    }
+
+
 def _build_semantic_payload_task(task: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     source_slot = int(task["source_slot"])
     payload = build_semantic_mesh_payload(
@@ -4089,10 +4192,9 @@ def _resolve_semantic_payload_max_workers(max_workers: int | None = None) -> int
         return env_workers
 
     cpu_count = os.cpu_count() or 2
-    # A Writer already runs in its own process. Keep the per-export fan-out
-    # bounded so one large export cannot create eight additional Python
-    # interpreters and compete with Max/Launcher memory.
-    return max(1, min(4, cpu_count - 1))
+    # Auto mode lets the workload tuner choose up to eight workers. An
+    # explicit argument or environment value still overrides this ceiling.
+    return max(1, min(8, cpu_count - 1 if cpu_count > 1 else 1))
 
 
 def _resolve_semantic_payload_parallel_override(parallel_override: bool | None = None) -> bool | None:
@@ -4107,6 +4209,32 @@ def _resolve_semantic_payload_parallel_override(parallel_override: bool | None =
     return None
 
 
+def _auto_tune_semantic_workers(task_count: int, total_vertex_count: int) -> tuple[int, list[dict[str, Any]]]:
+    """Pick a bounded fan-out from workload size and record considered lanes.
+
+    Payloads are large Python objects, so launching one process per mesh is
+    counterproductive.  The scheduler uses CPU and estimated data volume to
+    cap workers, while retaining an auditable list of the candidate lanes it
+    considered for the export TXT receipt.
+    """
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    upper = max(1, min(8, cpu_count - 1 if cpu_count > 1 else 1, int(task_count)))
+    if total_vertex_count < 20_000:
+        selected = 1
+    elif total_vertex_count < 100_000:
+        selected = min(2, upper)
+    elif total_vertex_count < 400_000:
+        selected = min(4, upper)
+    else:
+        selected = upper
+    attempts = [
+        {"workers": workers, "eligible": workers <= upper,
+         "score": round(float(total_vertex_count) / max(1, workers), 3)}
+        for workers in sorted({1, min(2, upper), min(4, upper), upper})
+    ]
+    return selected, attempts
+
+
 def _prebuild_semantic_payloads(
     source_mesh_headers: list[dict[str, Any]],
     contract_meshes: dict[int, dict[str, Any]],
@@ -4114,7 +4242,10 @@ def _prebuild_semantic_payloads(
     ignored_slots: set[int] | None = None,
     parallel_override: bool | None = None,
     max_workers: int | None = None,
+    partition_cache: dict | None = None,
 ) -> dict[int, dict[str, Any]]:
+    global _LAST_SEMANTIC_PARALLEL_STATS
+    started_at = time.perf_counter()
     skip_slots = ignored_slots or set()
     tasks: list[dict[str, Any]] = []
     total_vertex_count = 0
@@ -4149,15 +4280,26 @@ def _prebuild_semantic_payloads(
         )
 
     if len(tasks) <= 0:
+        _LAST_SEMANTIC_PARALLEL_STATS = {
+            "mode": "serial", "requested_workers": 1, "selected_workers": 1,
+            "task_count": 0, "vertex_count": total_vertex_count,
+            "elapsed_seconds": 0.0, "attempts": [],
+        }
         return {}
 
-    fallback_tasks = [
-        task for task in tasks if _mesh_allows_source_geometry_fallback(task["contract_mesh"])
-    ]
-    required_tasks = [task for task in tasks if task not in fallback_tasks]
+    fallback_tasks = []
+    required_tasks = []
+    for task in tasks:
+        target = fallback_tasks if _mesh_allows_source_geometry_fallback(task["contract_mesh"]) else required_tasks
+        target.append(task)
     parallel_mode = _resolve_semantic_payload_parallel_override(parallel_override)
-    worker_count = _resolve_semantic_payload_max_workers(max_workers=max_workers)
-    worker_count = min(worker_count, len(required_tasks))
+    requested_workers = _resolve_semantic_payload_max_workers(max_workers=max_workers)
+    tuned_workers, attempts = _auto_tune_semantic_workers(
+        len(required_tasks), sum(int(task["vertex_count"]) for task in required_tasks)
+    )
+    if parallel_mode is True:
+        tuned_workers = max(1, min(len(required_tasks), requested_workers))
+    worker_count = min(requested_workers, tuned_workers, len(required_tasks))
     use_parallel = (
         worker_count > 1
         and len(required_tasks) > 1
@@ -4171,14 +4313,24 @@ def _prebuild_semantic_payloads(
     )
 
     payloads: dict[int, dict[str, Any]] = {}
+    parallel_error = ""
+    execution_stats: dict[str, Any] = {}
+    execution_started_at = time.perf_counter()
     if use_parallel:
-        try:
-            with ProcessPoolExecutor(max_workers=worker_count) as executor:
-                payloads.update(dict(executor.map(_build_semantic_payload_task, required_tasks)))
-        except Exception:
-            payloads.update(dict(_build_semantic_payload_task(task) for task in required_tasks))
+        parallel_runtime = _try_load_fbx_probe_module()
+        for source_slot, payload in parallel_runtime._iter_process_results(
+            _build_semantic_payload_task,
+            [_compact_semantic_worker_task(task) for task in required_tasks],
+            max_workers=worker_count, stats=execution_stats,
+        ):
+            payloads[source_slot] = payload
     else:
         payloads.update(dict(_build_semantic_payload_task(task) for task in required_tasks))
+    observed_elapsed = round(time.perf_counter() - execution_started_at, 6)
+    for attempt in attempts:
+        if int(attempt.get("workers", 0) or 0) == int(worker_count if use_parallel else 1):
+            attempt["observed_elapsed_seconds"] = observed_elapsed
+            attempt["status"] = "error" if parallel_error else "complete"
 
     for task in fallback_tasks:
         try:
@@ -4190,10 +4342,11 @@ def _prebuild_semantic_payloads(
             if any(index < 0 or index >= vertex_count for index in face_indices):
                 raise ValueError("semantic payload face index is outside its vertex table")
             if _int_or_default(payload.get("vert_count"), 0) > MESH_HEADER_VERTEX_COUNT_MAX:
-                _partition_modified_mesh_payload_for_re6_slots(
+                _plan_modified_mesh_partition(
                     bytes(payload.get("vertex_bytes", b"")),
                     face_indices,
                     _int_or_default(payload.get("vertex_stride"), 0),
+                    partition_cache=partition_cache,
                 )
             payloads[source_slot] = payload
         except Exception as exc:
@@ -4205,6 +4358,19 @@ def _prebuild_semantic_payloads(
                 )
             else:
                 _mark_mesh_source_passthrough(task["contract_mesh"], reason)
+    _LAST_SEMANTIC_PARALLEL_STATS = {
+        **execution_stats,
+        "mode": ("process_pool_fallback" if parallel_error else ("process_pool" if use_parallel else "serial")),
+        "selection": "workload_heuristic",
+        "requested_workers": int(requested_workers),
+        "selected_workers": int(worker_count if use_parallel else 1),
+        "task_count": len(required_tasks),
+        "fallback_task_count": len(fallback_tasks),
+        "vertex_count": sum(int(task["vertex_count"]) for task in required_tasks),
+        "elapsed_seconds": round(time.perf_counter() - started_at, 6),
+        "error": parallel_error,
+        "attempts": attempts,
+    }
     return payloads
 
 
@@ -4516,10 +4682,33 @@ def write_progress(
     _atomic_write_bytes(target, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
 
 
+_PRESERVED_EXPORT_FIELD_KEYS = frozenset({
+    "source_uv2_field_hex_rows",
+    "source_normal_field_hex_rows",
+    "source_skin_field_hex_rows",
+    "source_a320_opaque_vertex_hex_rows",
+    "source_backed_geometry_vertex_hex_rows",
+})
+
+
+def _export_job_json_value(value: Any, *, preserved_field: bool = False) -> Any:
+    """Keep the historical hex representation only at the JSON file boundary."""
+    if preserved_field and isinstance(value, (bytes, bytearray, memoryview)):
+        return value.hex()
+    if isinstance(value, dict):
+        return {
+            key: _export_job_json_value(item, preserved_field=preserved_field or key in _PRESERVED_EXPORT_FIELD_KEYS)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_export_job_json_value(item, preserved_field=preserved_field) for item in value]
+    return value
+
+
 def write_job_file(path: str | Path, job: dict[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    runtime_write_json_file(target, job, pretty=True)
+    runtime_write_json_file(target, _export_job_json_value(job), pretty=True)
 
 
 def _coerce_export_header_mode(value: Any, default: int = 1) -> int:
@@ -5052,13 +5241,13 @@ def _unpack_face_indices(face_bytes: bytes) -> list[int]:
         raise ValueError("Face bytes must be an even number of bytes")
     if len(face_bytes) <= 0:
         return []
-    return list(struct.unpack("<" + ("H" * (len(face_bytes) // 2)), face_bytes))
+    return list(struct.unpack(f"<{len(face_bytes) // 2}H", face_bytes))
 
 
 def _pack_face_indices(face_indices: list[int]) -> bytes:
     if len(face_indices) <= 0:
         return b""
-    return struct.pack("<" + ("H" * len(face_indices)), *face_indices)
+    return struct.pack(f"<{len(face_indices)}H", *face_indices)
 
 
 def _face_index_bounds(face_bytes: bytes) -> tuple[int, int] | None:
@@ -5068,12 +5257,14 @@ def _face_index_bounds(face_bytes: bytes) -> tuple[int, int] | None:
     return min(indices), max(indices)
 
 
-def _infer_face_index_mode(mesh_header: dict[str, Any], face_bytes: bytes) -> str:
+def _infer_face_index_mode(
+    mesh_header: dict[str, Any], face_bytes: bytes, *, face_indices: list[int] | None = None,
+) -> str:
     vert_count = _int_or_default(mesh_header.get("vert_count"), 0)
     vert_start = _int_or_default(mesh_header.get("vert_start"), 0)
     if vert_count <= 0 or len(face_bytes) <= 0:
         return "local"
-    indices = _unpack_face_indices(face_bytes)
+    indices = _unpack_face_indices(face_bytes) if face_indices is None else face_indices
     if not indices:
         return "local"
 
@@ -8760,8 +8951,11 @@ def _try_load_fbx_probe_module() -> Any | None:
         if parent_text not in sys.path:
             sys.path.insert(0, parent_text)
         try:
+            # Direct callers use the canonical name. Launcher-loaded versions
+            # retain their exact source identity in the parallel transport.
+            sys.modules.pop("codex_fbx_probe", None)
             spec = importlib.util.spec_from_file_location(
-                "_pc_rehd_codex_fbx_probe_runtime",
+                "codex_fbx_probe",
                 expected_path,
             )
             if spec is None or spec.loader is None:
@@ -12220,8 +12414,7 @@ def _read_source_mod_vertex_skin_truth_rows(
             else _read_mod_bone_tables(mod_file)
         ).get("bone_map_rows", []),
     )
-    face_bytes = _get_source_face_bytes(mod_file, source_mesh_header)
-    face_index_mode = _infer_face_index_mode(source_mesh_header, face_bytes)
+    face_bytes, face_index_mode = _get_source_face_data(mod_file, source_mesh_header)
     vertex_blob = _get_effective_mesh_vertex_bytes(mod_file, source_mesh_header, face_index_mode=face_index_mode)
     vert_count = _int_or_default(source_mesh_header.get("vert_count"), 0)
     vert_stride = _int_or_default(source_mesh_header.get("vert_stride"), 0)
@@ -12347,6 +12540,7 @@ def _encode_global_bones_for_source_mesh(
     shared_bone_map_rows: list[list[int]],
     source_bone_count: int,
     allow_source_palette_mutation: bool = False,
+    palette_index: dict[int, int] | None = None,
 ) -> list[int]:
     validated_global_bones: list[int] = []
     for raw_bone_id in ordered_global_bones:
@@ -12364,14 +12558,10 @@ def _encode_global_bones_for_source_mesh(
     if not source_palette_rows:
         raise ValueError("Ordinary Skin export requires a mesh-local palette but the source Mesh has no palette rows")
 
-    global_to_local_slot: dict[int, int] = {}
-    for row_index, palette_row in enumerate(source_palette_rows):
-        if not isinstance(palette_row, list):
-            continue
-        for value_index, raw_bone_id in enumerate(palette_row):
-            bone_id = _int_or_default(raw_bone_id, -1)
-            if 0 <= bone_id <= 255 and bone_id not in global_to_local_slot:
-                global_to_local_slot[bone_id] = (row_index * 8) + value_index
+    global_to_local_slot = (
+        dict(palette_index) if palette_index is not None
+        else _index_source_bone_palette(source_palette_rows)
+    )
 
     source_slot_bones = source_row.get("source_slot_bones", [])
     source_mod_slot_values = source_row.get("source_mod_slot_values", [])
@@ -12409,6 +12599,9 @@ def _encode_global_bones_for_source_mesh(
                     palette_row[value_index] = bone_id
                     shared_row[value_index] = bone_id
                     global_to_local_slot[bone_id] = candidate_slot
+                    if palette_index is not None:
+                        palette_index.clear()
+                        palette_index.update(_index_source_bone_palette(source_palette_rows))
                     local_slot = candidate_slot
                     break
                 if local_slot is not None:
@@ -12419,6 +12612,19 @@ def _encode_global_bones_for_source_mesh(
             )
         encoded_slots.append(int(local_slot))
     return encoded_slots
+
+
+def _index_source_bone_palette(source_palette_rows: list[list[int]]) -> dict[int, int]:
+    global_to_local_slot: dict[int, int] = {}
+    for row_index, palette_row in enumerate(source_palette_rows):
+        if not isinstance(palette_row, list):
+            continue
+        for value_index, raw_bone_id in enumerate(palette_row):
+            bone_id = _int_or_default(raw_bone_id, -1)
+            if 0 <= bone_id <= 255 and bone_id not in global_to_local_slot:
+                global_to_local_slot[bone_id] = (row_index * 8) + value_index
+
+    return global_to_local_slot
 
 
 def _apply_ordinary_export_source_ordered_skin_contract(
@@ -12541,20 +12747,45 @@ def _apply_ordinary_export_source_ordered_skin_contract(
             else:
                 continue
 
-        face_bytes = _get_source_face_bytes(mod_file, source_mesh_header)
-        face_index_mode = _infer_face_index_mode(source_mesh_header, face_bytes)
+        face_bytes, face_index_mode = _get_source_face_data(mod_file, source_mesh_header)
         source_vertex_blob = _get_effective_mesh_vertex_bytes(mod_file, source_mesh_header, face_index_mode=face_index_mode)
         source_stride = _int_or_default(source_mesh_header.get("vert_stride"), 0)
+        source_field_offsets = [
+            slice(start, end).indices(source_stride)[:2]
+            for start, end in skin_ranges
+        ] if source_stride > 0 else []
         source_palette_rows = _read_source_mesh_bone_map_rows(source_mesh_header, source_bone_map_rows)
+        palette_index = _index_source_bone_palette(source_palette_rows)
+        allow_source_palette_mutation = _job_uses_bone_edit(job, contract)
+        # Ordinary export keeps this palette fixed. If every selected Bone is
+        # already present, palette fitting only returns copies of these rows.
+        fixed_palette_ids = None if allow_source_palette_mutation else frozenset(
+            _int_or_default(value, -1)
+            for palette_row in source_palette_rows
+            if isinstance(palette_row, list)
+            for value in palette_row[:8]
+        )
         weight_limit = max(1, WEIGHT_LIMIT_BY_FVF.get(source_fvf, 0))
         tolerance = _ordinary_skin_compare_tolerance(source_fvf)
 
         ordered_bone_rows: list[list[int]] = []
         ordered_weight_rows: list[list[float]] = []
-        source_skin_field_hex_rows: list[list[str] | None] = []
+        # Despite the historical ``*_hex_rows`` key name, retain packed source
+        # fields as bytes throughout the export chain.  The writer accepts both
+        # bytes and legacy hex strings, while avoiding per-field hex expansion
+        # and a later bytes.fromhex() reconstruction.
+        source_skin_field_hex_rows: list[list[bytes] | None] = []
         unchanged_rows = 0
         changed_rows = 0
         restored_zero_weight_fallback_rows = 0
+        # Adjacent split corners can share a source vertex.  Keep only the last
+        # comparison view so repeated corners reuse it without retaining a
+        # second set of per-source lists for the whole mesh.
+        cached_source_index = -1
+        cached_compare: tuple[list[int], list[float]] | None = None
+        cached_compare_summary: tuple[dict[int, float], list[int]] | None = None
+        cached_rank_source_index = -1
+        cached_source_rank: dict[int, int] | None = None
         for export_index in range(export_row_count):
             source_index = _int_or_default(source_vertex_indices[export_index], -1)
             scene_bones = scene_bone_rows[export_index] if export_index < len(scene_bone_rows) else []
@@ -12585,10 +12816,23 @@ def _apply_ordinary_export_source_ordered_skin_contract(
                 if restored_zero_weight_fallback:
                     unchanged = True
                 else:
-                    compare_bones, compare_weights = _ordinary_source_skin_compare_view(
-                        source_fvf,
-                        source_bones,
-                        source_weights,
+                    if source_index != cached_source_index or cached_compare is None:
+                        cached_compare = _ordinary_source_skin_compare_view(
+                            source_fvf,
+                            source_bones,
+                            source_weights,
+                        )
+                        cached_compare_summary = _aggregate_skin_weights_by_bone(
+                            *cached_compare,
+                        )
+                        cached_source_index = source_index
+                    compare_bones, compare_weights = cached_compare
+                    # Build the scene summary once for this row.  The same
+                    # normalized totals are reused by ordering if cross-MOD
+                    # remapping leaves the row unchanged.
+                    scene_summary = _aggregate_skin_weights_by_bone(
+                        scene_bones,
+                        scene_weights,
                     )
                     unchanged = _skin_rows_are_semantically_equal(
                         scene_bones,
@@ -12596,7 +12840,11 @@ def _apply_ordinary_export_source_ordered_skin_contract(
                         compare_bones,
                         compare_weights,
                         tolerance=tolerance,
+                        left_summary=scene_summary,
+                        right_summary=cached_compare_summary,
                     )
+            if source_owns_skin_fields or restored_zero_weight_fallback:
+                scene_summary = None
             if unchanged:
                 unchanged_rows += 1
                 if restored_zero_weight_fallback:
@@ -12606,8 +12854,10 @@ def _apply_ordinary_export_source_ordered_skin_contract(
                 ordered_weight_rows.append([_float_or_default(value, 0.0) for value in source_weights])
                 vertex_offset = source_index * source_stride
                 if source_stride > 0 and vertex_offset + source_stride <= len(source_vertex_blob):
-                    source_vertex = source_vertex_blob[vertex_offset : vertex_offset + source_stride]
-                    source_skin_field_hex_rows.append([source_vertex[start:end].hex() for start, end in skin_ranges])
+                    source_skin_field_hex_rows.append([
+                        source_vertex_blob[vertex_offset + start : vertex_offset + end]
+                        for start, end in source_field_offsets
+                    ])
                 else:
                     source_skin_field_hex_rows.append(None)
                 continue
@@ -12627,27 +12877,53 @@ def _apply_ordinary_export_source_ordered_skin_contract(
                     vertex_index=export_index,
                 )
             )
+            if (
+                scene_summary is None
+                or compatibility_scene_bones != scene_bones
+                or compatibility_scene_weights != scene_weights
+            ):
+                ordering_summary = _aggregate_skin_weights_by_bone(
+                    compatibility_scene_bones,
+                    compatibility_scene_weights,
+                )
+            else:
+                ordering_summary = scene_summary
+            if source_index != cached_rank_source_index or cached_source_rank is None:
+                cached_source_rank = {}
+                if isinstance(source_bones, list):
+                    for raw_bone in source_bones:
+                        if not isinstance(raw_bone, int):
+                            continue
+                        bone_id = _clamp_byte(raw_bone)
+                        if bone_id not in cached_source_rank:
+                            cached_source_rank[bone_id] = len(cached_source_rank)
+                cached_rank_source_index = source_index
             ordered_global_bones, ordered_weights = _order_scene_skin_by_source_slots(
                 compatibility_scene_bones,
                 compatibility_scene_weights,
                 source_bones,
                 slot_limit=weight_limit,
+                scene_summary=ordering_summary,
+                source_rank=cached_source_rank,
             )
-            ordered_global_bones, ordered_weights = (
-                fit_cross_mod_skin_row_to_source_palette(
-                    ordered_global_bones,
-                    ordered_weights,
-                    source_bones,
-                    source_palette_rows,
-                    parent_by_bone=parent_by_bone,
-                    receipt=compatibility_receipt,
-                    affected_vertices=affected_vertices,
-                    affected_meshes=affected_meshes,
-                    mesh_slot=source_slot,
-                    scene_node=str(mesh.get("scene_node", "") or ""),
-                    vertex_index=export_index,
+            if fixed_palette_ids is None or any(
+                bone_id not in fixed_palette_ids for bone_id in ordered_global_bones
+            ):
+                ordered_global_bones, ordered_weights = (
+                    fit_cross_mod_skin_row_to_source_palette(
+                        ordered_global_bones,
+                        ordered_weights,
+                        source_bones,
+                        source_palette_rows,
+                        parent_by_bone=parent_by_bone,
+                        receipt=compatibility_receipt,
+                        affected_vertices=affected_vertices,
+                        affected_meshes=affected_meshes,
+                        mesh_slot=source_slot,
+                        scene_node=str(mesh.get("scene_node", "") or ""),
+                        vertex_index=export_index,
+                    )
                 )
-            )
             ordered_bone_rows.append(
                 _encode_global_bones_for_source_mesh(
                     ordered_global_bones,
@@ -12656,7 +12932,8 @@ def _apply_ordinary_export_source_ordered_skin_contract(
                     source_mesh_header=source_mesh_header,
                     shared_bone_map_rows=source_bone_map_rows,
                     source_bone_count=source_bone_count,
-                    allow_source_palette_mutation=_job_uses_bone_edit(job, contract),
+                    allow_source_palette_mutation=allow_source_palette_mutation,
+                    palette_index=palette_index,
                 )
             )
             ordered_weight_rows.append(ordered_weights)
@@ -13373,8 +13650,7 @@ def _read_source_vertex_local_slot_rows(mod_file: dict[str, Any], mesh_header: d
     # caller that decides whether to write it is restricted to the 1.2.8 set.
     if fvf not in BONE_EDIT_MESH_LOCAL_BINDING_FVFS:
         return []
-    face_bytes = _get_source_face_bytes(mod_file, mesh_header)
-    face_index_mode = _infer_face_index_mode(mesh_header, face_bytes)
+    face_bytes, face_index_mode = _get_source_face_data(mod_file, mesh_header)
     vertex_bytes = _get_effective_mesh_vertex_bytes(mod_file, mesh_header, face_index_mode=face_index_mode)
     vert_count = _int_or_default(mesh_header.get("vert_count"), 0)
     vert_stride = _int_or_default(mesh_header.get("vert_stride"), 0)
@@ -16165,6 +16441,58 @@ def _apply_fbx_final_position_transform_layer(
     frozen authority). Node placement and axes are already resolved by Probe.
     """
     meshes = _ensure_contract_meshes(job, contract)
+    # Ordinary source-backed fallback exports have no FBX geometry to map.
+    # Do not mask the original Probe status with a secondary "mapping missing"
+    # error; live FBX and Bones+Mesh routes remain strict below.
+    handoff_status = (
+        str(fbx_handoff.get("status", "") or "").strip().lower()
+        if isinstance(fbx_handoff, dict)
+        else ""
+    )
+    bones_plus_mesh = _job_uses_bones_plus_mesh_pose_route(job, contract)
+    has_live_fbx_mesh = any(
+        isinstance(mesh, dict)
+        and str(mesh.get("lane", "") or "").strip().lower() == "modify"
+        and not _mesh_uses_source_geometry(mesh)
+        for mesh in meshes
+    )
+    if (
+        handoff_status in {"not_required", "source_fallback"}
+        and not _job_uses_bone_edit(job, contract)
+        and not has_live_fbx_mesh
+    ):
+        dynamic_receipt = {
+            "schema": DYNAMIC_MOD_FBX_MAPPING_SCHEMA,
+            "status": "not_required",
+            "source": "no_fbx_geometry",
+            "source_domain": FBX_NORMAL_AXIS_DOMAIN_CANONICAL,
+            "target_domain": "mod_file",
+            "vector_convention": "row_vector_row_major",
+            "matrix_semantics": "axis_basis_only",
+            "scale_owner": FBX_CANONICAL_POSITION_SCALE_OWNER,
+            "units_baked": False,
+            "applied_once": False,
+        }
+        receipt = {
+            "schema": FBX_FINAL_POSITION_TRANSFORM_SCHEMA,
+            "status": "not_required",
+            "route": "ordinary",
+            "backend": str(job.get("fbx_backend_kind", "") or "").strip().lower(),
+            "axis_handling": "none",
+            "scale_owner": FBX_CANONICAL_POSITION_SCALE_OWNER,
+            "dynamic_mod_fbx_mapping": copy.deepcopy(dynamic_receipt),
+            "applied_mesh_slots": [],
+            "skipped": [{"reason": "no_fbx_geometry", "handoff_status": handoff_status}],
+            "applied_once": True,
+        }
+        job["dynamic_mod_fbx_mapping_receipt"] = copy.deepcopy(dynamic_receipt)
+        contract["dynamic_mod_fbx_mapping_receipt"] = copy.deepcopy(dynamic_receipt)
+        job["fbx_final_position_transform_receipt"] = copy.deepcopy(receipt)
+        contract["fbx_final_position_transform_receipt"] = copy.deepcopy(receipt)
+        if isinstance(fbx_handoff, dict):
+            fbx_handoff["dynamic_mod_fbx_mapping_receipt"] = copy.deepcopy(dynamic_receipt)
+            fbx_handoff["fbx_final_position_transform_receipt"] = copy.deepcopy(receipt)
+        return receipt
     dynamic_mapping = _build_dynamic_mod_fbx_mapping(job, contract, fbx_handoff)
     canonical_handoff, canonical_details = _fbx_canonical_handoff_status(fbx_handoff)
     dynamic_receipt = copy.deepcopy(dynamic_mapping)
@@ -16595,7 +16923,7 @@ def _try_collect_fbx_handoff(job: dict[str, Any], source_mesh_headers: list[dict
                 "Current FBX Probe lacks the mandatory Generic handoff API"
             )
     except Exception as exc:
-        if isinstance(exc, (ImportError, ModuleNotFoundError)) or _as_bool(
+        if getattr(exc, "export_blocking", False) or isinstance(exc, (ImportError, ModuleNotFoundError)) or _as_bool(
             getattr(exc, "runtime_retryable", False),
             False,
         ):
@@ -17183,8 +17511,7 @@ def _preserve_source_secondary_uvs_missing_from_fbx(
         if len(source_vertex_indices) != output_count:
             continue
 
-        face_bytes = _get_source_face_bytes(source_mod_file, source_mesh_header)
-        face_index_mode = _infer_face_index_mode(source_mesh_header, face_bytes)
+        face_bytes, face_index_mode = _get_source_face_data(source_mod_file, source_mesh_header)
         source_vertex_blob = _get_effective_mesh_vertex_bytes(
             source_mod_file,
             source_mesh_header,
@@ -17196,7 +17523,7 @@ def _preserve_source_secondary_uvs_missing_from_fbx(
         if len(source_vertex_blob) < source_vert_count * vertex_stride:
             continue
 
-        source_uv2_rows: list[str | None] = []
+        source_uv2_rows: list[bytes | None] = []
         mesh_preserved_count = 0
         for export_index, source_vertex_index in enumerate(source_vertex_indices):
             existing_uv2 = (
@@ -17211,7 +17538,7 @@ def _preserve_source_secondary_uvs_missing_from_fbx(
             source_index = _int_or_default(source_vertex_index, -1)
             if 0 <= source_index < source_vert_count:
                 source_offset = (source_index * vertex_stride) + uv2_offset
-                source_uv2_rows.append(source_vertex_blob[source_offset : source_offset + 4].hex())
+                source_uv2_rows.append(source_vertex_blob[source_offset : source_offset + 4])
                 mesh_preserved_count += 1
                 continue
 
@@ -17280,8 +17607,7 @@ def _preserve_semantically_unchanged_source_normal_bytes(
         if len(source_vertex_indices) != output_count:
             continue
 
-        face_bytes = _get_source_face_bytes(source_mod_file, source_mesh_header)
-        face_index_mode = _infer_face_index_mode(source_mesh_header, face_bytes)
+        face_bytes, face_index_mode = _get_source_face_data(source_mod_file, source_mesh_header)
         source_vertex_blob = _get_effective_mesh_vertex_bytes(
             source_mod_file,
             source_mesh_header,
@@ -17293,7 +17619,7 @@ def _preserve_semantically_unchanged_source_normal_bytes(
         if len(source_vertex_blob) < source_vert_count * vertex_stride:
             continue
 
-        source_normal_rows: list[str | None] = []
+        source_normal_rows: list[bytes | None] = []
         mesh_preserved_count = 0
         for export_index, source_vertex_index in enumerate(source_vertex_indices):
             source_index = _int_or_default(source_vertex_index, -1)
@@ -17306,7 +17632,7 @@ def _preserve_semantically_unchanged_source_normal_bytes(
             export_normal = _get_semantic_game_normal(mesh, export_index)
             semantic_error = max(abs(source_normal[axis] - export_normal[axis]) for axis in range(3))
             if semantic_error <= SOURCE_NORMAL_SEMANTIC_TOLERANCE:
-                source_normal_rows.append(source_normal_bytes.hex())
+                source_normal_rows.append(source_normal_bytes)
                 mesh_preserved_count += 1
             else:
                 source_normal_rows.append(None)
@@ -17355,8 +17681,7 @@ def _preserve_source_a320_opaque_tangent_binormal_bytes(
         ):
             continue
 
-        face_bytes = _get_source_face_bytes(source_mod_file, source_mesh_header)
-        face_index_mode = _infer_face_index_mode(source_mesh_header, face_bytes)
+        face_bytes, face_index_mode = _get_source_face_data(source_mod_file, source_mesh_header)
         source_face_indices = _unpack_face_indices(face_bytes)
         if face_index_mode == "global":
             source_vert_start = _int_or_default(source_mesh_header.get("vert_start"), 0)
@@ -17375,7 +17700,7 @@ def _preserve_source_a320_opaque_tangent_binormal_bytes(
         if len(source_vertex_blob) < source_vert_count * vertex_stride:
             continue
         source_rows = [
-            source_vertex_blob[index * vertex_stride : (index + 1) * vertex_stride].hex()
+            source_vertex_blob[index * vertex_stride : (index + 1) * vertex_stride]
             for index in range(source_vert_count)
         ]
         if len(source_rows) != output_count:
@@ -17428,8 +17753,7 @@ def _preserve_unchanged_source_uvs_before_half_safe(
         if any(_int_or_default(value, -1) != index for index, value in enumerate(source_vertex_indices)):
             continue
 
-        face_bytes = _get_source_face_bytes(source_mod_file, source_mesh_header)
-        face_index_mode = _infer_face_index_mode(source_mesh_header, face_bytes)
+        face_bytes, face_index_mode = _get_source_face_data(source_mod_file, source_mesh_header)
         source_vertex_blob = _get_effective_mesh_vertex_bytes(
             source_mod_file,
             source_mesh_header,
@@ -21661,11 +21985,66 @@ def _build_contract_mesh_index(contract: dict[str, Any]) -> dict[int, dict[str, 
     return indexed
 
 
+def _source_read_batch(mod_file: dict[str, Any]) -> dict[str, Any] | None:
+    batch = mod_file.get("_source_read_batch")
+    data = mod_file["bytes"]
+    if not isinstance(batch, dict) or type(data) is not bytes:
+        return None
+    if batch.get("data") is not data:
+        batch.clear()
+        batch.update(data=data, ranges=OrderedDict(), modes={}, size=0)
+    return batch
+
+
+def _read_source_range(mod_file: dict[str, Any], start: int, end: int) -> bytes:
+    batch = _source_read_batch(mod_file)
+    if batch is None:
+        return bytes(mod_file["bytes"][start:end])
+    ranges = batch["ranges"]
+    key = (start, end)
+    cached = ranges.get(key)
+    if cached is not None:
+        ranges.move_to_end(key)
+        return cached
+    value = bytes(mod_file["bytes"][start:end])
+    # Preserve bytes API semantics, with a bounded request-local working set.
+    budget = 16 * 1024 * 1024
+    if len(value) <= budget:
+        while ranges and (batch["size"] + len(value) > budget or len(ranges) >= 128):
+            _old_key, old_value = ranges.popitem(last=False)
+            batch["size"] -= len(old_value)
+        ranges[key] = value
+        batch["size"] += len(value)
+    return value
+
+
+def _get_source_face_data(
+    mod_file: dict[str, Any], mesh_header: dict[str, Any],
+) -> tuple[bytes, str]:
+    face_bytes = _get_source_face_bytes(mod_file, mesh_header)
+    batch = _source_read_batch(mod_file)
+    if batch is None:
+        return face_bytes, _infer_face_index_mode(mesh_header, face_bytes)
+    key = (
+        int(mod_file["header"]["ptr_triangle"]),
+        int(mesh_header["face_start"]), int(mesh_header["face_count"]),
+        *(_int_or_default(mesh_header.get(field), 0)
+          for field in ("vert_start", "vert_count", "min_index", "max_index")),
+    )
+    mode = batch["modes"].get(key)
+    if mode is None:
+        mode = _infer_face_index_mode(mesh_header, face_bytes)
+        if len(batch["modes"]) >= 4096:
+            batch["modes"].clear()
+        batch["modes"][key] = mode
+    return face_bytes, mode
+
+
 def _get_source_vertex_bytes(mod_file: dict[str, Any], mesh_header: dict[str, Any]) -> bytes:
     start = int(mod_file["header"]["ptr_vertex"]) + int(mesh_header["vert_base"])
     length = int(mesh_header["vert_count"]) * int(mesh_header["vert_stride"])
     end = start + max(0, length)
-    return bytes(mod_file["bytes"][start:end])
+    return _read_source_range(mod_file, start, end)
 
 
 def _get_effective_mesh_vertex_bytes(
@@ -21681,7 +22060,7 @@ def _get_effective_mesh_vertex_bytes(
         start += vert_start * vert_stride
     length = int(mesh_header["vert_count"]) * vert_stride
     end = start + max(0, length)
-    return bytes(mod_file["bytes"][start:end])
+    return _read_source_range(mod_file, start, end)
 
 
 def _stage_source_backed_geometry_overlay_rows(
@@ -21776,8 +22155,7 @@ def _stage_source_backed_geometry_overlay_rows(
             if invalid_indices:
                 raise ValueError(f"new or unmapped vertices: {invalid_indices[:16]}")
 
-            face_bytes = _get_source_face_bytes(source_mod_file, source_header)
-            face_index_mode = _infer_face_index_mode(source_header, face_bytes)
+            face_bytes, face_index_mode = _get_source_face_data(source_mod_file, source_header)
             source_vertex_blob = _get_effective_mesh_vertex_bytes(
                 source_mod_file,
                 source_header,
@@ -21790,7 +22168,7 @@ def _stage_source_backed_geometry_overlay_rows(
                 )
 
             mesh["source_backed_geometry_vertex_hex_rows"] = [
-                source_vertex_blob[index * source_stride : (index + 1) * source_stride].hex()
+                source_vertex_blob[index * source_stride : (index + 1) * source_stride]
                 for index in mapped_indices
             ]
             mesh["source_backed_geometry_source_vertex_count"] = source_vert_count
@@ -21827,12 +22205,11 @@ def _get_source_face_bytes(mod_file: dict[str, Any], mesh_header: dict[str, Any]
     start = int(mod_file["header"]["ptr_triangle"]) + (int(mesh_header["face_start"]) * 2)
     length = int(mesh_header["face_count"]) * 2
     end = start + max(0, length)
-    return bytes(mod_file["bytes"][start:end])
+    return _read_source_range(mod_file, start, end)
 
 
 def _read_source_short_position_rows(mod_file: dict[str, Any], mesh_header: dict[str, Any]) -> list[list[int]]:
-    face_bytes = _get_source_face_bytes(mod_file, mesh_header)
-    face_index_mode = _infer_face_index_mode(mesh_header, face_bytes)
+    face_bytes, face_index_mode = _get_source_face_data(mod_file, mesh_header)
     vertex_bytes = _get_effective_mesh_vertex_bytes(mod_file, mesh_header, face_index_mode=face_index_mode)
     vert_count = _int_or_default(mesh_header.get("vert_count"), 0)
     vert_stride = _int_or_default(mesh_header.get("vert_stride"), 0)
@@ -22119,12 +22496,13 @@ def _auto_split_cdxm_display_map_matches(expected_map: Any, actual_map: Any) -> 
     return expected == actual and all(value > 0 for value in expected)
 
 
-def _partition_modified_mesh_payload_for_re6_slots(
+def _plan_modified_mesh_partition(
     vertex_bytes: bytes,
     face_indices: list[int],
     vertex_stride: int,
     *,
     max_vertices: int = MESH_HEADER_VERTEX_COUNT_MAX,
+    partition_cache: dict | None = None,
 ) -> list[dict[str, Any]]:
     stride = int(vertex_stride)
     limit = int(max_vertices)
@@ -22137,6 +22515,9 @@ def _partition_modified_mesh_payload_for_re6_slots(
 
     source_vertex_count = len(vertex_bytes) // stride
     indices = [int(index) for index in face_indices]
+    cache_key = (source_vertex_count, limit, tuple(indices)) if partition_cache is not None else None
+    if partition_cache is not None and cache_key in partition_cache:
+        return partition_cache[cache_key][0]
     if len(indices) % 3 != 0:
         raise ValueError("Oversized Mesh face indices are not a complete triangle list")
     if any(index < 0 or index >= source_vertex_count for index in indices):
@@ -22198,6 +22579,43 @@ def _partition_modified_mesh_payload_for_re6_slots(
     if source_vertex_count > 0 and not any(chunk["source_vertex_indices"] for chunk in chunks):
         raise ValueError("Oversized Mesh split produced no vertex records")
 
+    for chunk in chunks:
+        del chunk["source_to_local"]
+    if partition_cache is not None:
+        # Count retained integer references conservatively, including the key.
+        # A large request must not retain every Mesh's topology until writing.
+        estimated_bytes = 40 * (len(indices) + sum(
+            len(chunk["source_vertex_indices"]) + len(chunk["face_indices"])
+            + len(chunk["source_triangle_ordinals"])
+            for chunk in chunks
+        )) + 1024 * len(chunks)
+        budget = 32 * 1024 * 1024
+        if estimated_bytes <= budget:
+            retained_bytes = sum(entry[1] for entry in partition_cache.values())
+            while partition_cache and retained_bytes + estimated_bytes > budget:
+                _old_chunks, old_size = partition_cache.pop(next(iter(partition_cache)))
+                retained_bytes -= old_size
+            partition_cache[cache_key] = (chunks, estimated_bytes)
+    return chunks
+
+
+def _partition_modified_mesh_payload_for_re6_slots(
+    vertex_bytes: bytes,
+    face_indices: list[int],
+    vertex_stride: int,
+    *,
+    max_vertices: int = MESH_HEADER_VERTEX_COUNT_MAX,
+    partition_cache: dict | None = None,
+) -> list[dict[str, Any]]:
+    # Cache topology only: final normal patching may replace the packed bytes
+    # between capacity planning and the actual writer split.
+    chunks = _plan_modified_mesh_partition(
+        vertex_bytes, face_indices, vertex_stride,
+        max_vertices=max_vertices, partition_cache=partition_cache,
+    )
+    stride = int(vertex_stride)
+    limit = int(max_vertices)
+    source_vertex_count = len(vertex_bytes) // stride
     output: list[dict[str, Any]] = []
     for chunk in chunks:
         source_vertex_indices = list(chunk["source_vertex_indices"])
@@ -22227,7 +22645,7 @@ def _partition_modified_mesh_payload_for_re6_slots(
         for chunk in output
         for ordinal in chunk["source_triangle_ordinals"]
     ]
-    if sorted(emitted_triangle_ordinals) != list(range(len(indices) // 3)):
+    if sorted(emitted_triangle_ordinals) != list(range(len(face_indices) // 3)):
         raise ValueError("Oversized Mesh split lost or duplicated an original triangle occurrence")
     emitted_source_vertices = {
         source_index
@@ -22243,6 +22661,7 @@ def _expand_oversized_modified_mesh_records(
     output_records: list[dict[str, Any]],
     *,
     source_mesh_count: int,
+    partition_cache: dict | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     primary_records: list[dict[str, Any]] = []
     appended_records: list[dict[str, Any]] = []
@@ -22266,6 +22685,7 @@ def _expand_oversized_modified_mesh_records(
             bytes(record.get("vertex_bytes", b"")),
             [int(index) for index in face_indices],
             _int_or_default(output_mesh_header.get("vert_stride"), 0),
+            partition_cache=partition_cache,
         )
         if len(pieces) < 2:
             raise ValueError("Oversized Mesh did not produce multiple physical Mesh slots")
@@ -22443,6 +22863,7 @@ def _enforce_output_mesh_count_capacity(
     semantic_payloads: dict[int, dict[str, Any]],
     *,
     source_mesh_count: int,
+    partition_cache: dict | None = None,
 ) -> dict[str, Any]:
     remaining_records = MOD_MESH_SLOT_MAX - int(source_mesh_count)
     if remaining_records < 0:
@@ -22480,10 +22901,11 @@ def _enforce_output_mesh_count_capacity(
         piece_count = 1
         if _int_or_default(payload.get("vert_count"), 0) > MESH_HEADER_VERTEX_COUNT_MAX:
             piece_count = len(
-                _partition_modified_mesh_payload_for_re6_slots(
+                _plan_modified_mesh_partition(
                     bytes(payload.get("vertex_bytes", b"")),
                     [int(index) for index in payload.get("face_indices", [])],
                     _int_or_default(payload.get("vertex_stride"), 0),
+                    partition_cache=partition_cache,
                 )
             )
         is_source_missing = _as_bool(mesh.get("source_missing_append"), False)
@@ -23729,16 +24151,19 @@ def _build_mod_rewrite_layout(mod_file: dict[str, Any], job: dict[str, Any], con
             "source_to_output_slot": source_to_output_slot,
         }
 
+    partition_cache: dict = {}
     semantic_payloads = _prebuild_semantic_payloads(
         source_mesh_headers,
         contract_meshes,
         ignored_slots=header_only_slots,
+        partition_cache=partition_cache,
     )
     mesh_count_capacity = _enforce_output_mesh_count_capacity(
         job,
         contract_meshes,
         semantic_payloads,
         source_mesh_count=len(source_mesh_headers),
+        partition_cache=partition_cache,
     )
     job["_writer_semantic_payloads_by_source_slot"] = semantic_payloads
 
@@ -23788,7 +24213,9 @@ def _build_mod_rewrite_layout(mod_file: dict[str, Any], job: dict[str, Any], con
         mesh_is_modified = False
         face_bytes = _get_source_face_bytes(mod_file, source_mesh_header)
         face_indices = _unpack_face_indices(face_bytes)
-        source_face_index_mode = _infer_face_index_mode(source_mesh_header, face_bytes)
+        source_face_index_mode = _infer_face_index_mode(
+            source_mesh_header, face_bytes, face_indices=face_indices,
+        )
         vertex_bytes = _get_effective_mesh_vertex_bytes(
             mod_file,
             source_mesh_header,
@@ -24035,7 +24462,9 @@ def _build_mod_rewrite_layout(mod_file: dict[str, Any], job: dict[str, Any], con
     output_records, auto_split_meshes = _expand_oversized_modified_mesh_records(
         output_records,
         source_mesh_count=len(source_mesh_headers),
+        partition_cache=partition_cache,
     )
+    partition_cache.clear()
 
     append_summary_by_key = {
         str(summary.get("append_key", "") or ""): summary
@@ -24366,15 +24795,11 @@ def _build_rewritten_mod_bytes(mod_file: dict[str, Any], rewritten_layout: dict[
     face_blob: bytes = rewritten_layout.get("face_blob", b"")
     tail_bytes: bytes = rewritten_layout.get("tail_bytes", b"")
 
-    return (
-        _pack_header(output_header)
-        + pre_mesh_bytes
-        + b"".join(_pack_mesh_header(mesh_header) for mesh_header in output_mesh_headers)
-        + mesh_gap_bytes
-        + vertex_blob
-        + face_blob
-        + tail_bytes
-    )
+    return b"".join((
+        _pack_header(output_header), pre_mesh_bytes,
+        b"".join(_pack_mesh_header(mesh_header) for mesh_header in output_mesh_headers),
+        mesh_gap_bytes, vertex_blob, face_blob, tail_bytes,
+    ))
 
 
 def _build_bone_edit_passthrough_layout(mod_file: dict[str, Any]) -> dict[str, Any]:
@@ -24432,10 +24857,7 @@ def _resolve_bone_edit_effective_vertex_blob_offset(
     vert_count = _int_or_default(source_mesh_header.get("vert_count"), 0)
     if vert_stride <= 0 or vert_count <= 0:
         raise ValueError("Bones+Mesh source Mesh has no writable vertex range")
-    face_index_mode = _infer_face_index_mode(
-        source_mesh_header,
-        _get_source_face_bytes(mod_file, source_mesh_header),
-    )
+    face_bytes, face_index_mode = _get_source_face_data(mod_file, source_mesh_header)
     vertex_blob_offset = _int_or_default(source_mesh_header.get("vert_base"), 0)
     if face_index_mode == "global":
         vertex_blob_offset += _int_or_default(source_mesh_header.get("vert_start"), 0) * vert_stride
@@ -24719,18 +25141,12 @@ def _build_bone_edit_mod_bytes(
     output_header["ptr_triangle"] = ptr_triangle
     output_header["end_size"] = end_size
 
-    output_bytes = (
-        _pack_header(output_header)
-        + prefix_bytes
-        + (bone_blob if output_bone_count > 0 else b"")
-        + bone_map_blob
-        + mat_bytes
-        + mesh_table_bytes
-        + mesh_gap_bytes
-        + vertex_blob
-        + face_blob
-        + tail_bytes
-    )
+    output_bytes = b"".join((
+        _pack_header(output_header), prefix_bytes,
+        bone_blob if output_bone_count > 0 else b"",
+        bone_map_blob, mat_bytes, mesh_table_bytes, mesh_gap_bytes,
+        vertex_blob, face_blob, tail_bytes,
+    ))
     return output_bytes, output_header
 
 
@@ -25416,7 +25832,7 @@ def _run_ordinary_skin_round_trip_regression_guard() -> dict[str, Any]:
             failures.append("production_call_mutant: output decoder lost the palette-resolved bone")
         prepared_0cb_mesh = prepared_0cb.get("meshes", [])[0]
         if (
-            prepared_0cb_mesh.get("source_skin_field_hex_rows") != [[source_0cb[6:8].hex()]]
+            prepared_0cb_mesh.get("source_skin_field_hex_rows") != [[bytes(source_0cb[6:8])]]
             or _int_or_default(prepared_0cb_mesh.get("ordinary_skin_contract", {}).get("unchanged_rows"), 0) != 1
         ):
             failures.append("production_call_mutant: no-Skin 0CB import did not preserve its static source bytes")
@@ -28208,6 +28624,16 @@ def _memory_export_probe_log(fbx_handoff: Any) -> dict[str, Any]:
             if isinstance(mesh, dict) and isinstance(mesh.get("normal_fidelity"), dict)
         ]
     probe_stage = handoff.get("probe_stage") if isinstance(handoff.get("probe_stage"), dict) else {}
+    generic_normalization = (
+        handoff.get("generic_fbx_normalization")
+        if isinstance(handoff.get("generic_fbx_normalization"), dict)
+        else {}
+    )
+    generic_parallel = (
+        generic_normalization.get("normalization", {}).get("generic_parallel", {})
+        if isinstance(generic_normalization.get("normalization"), dict)
+        else generic_normalization.get("generic_parallel", {})
+    )
     probe_route_receipt = (
         handoff.get("probe_route_receipt")
         if isinstance(handoff.get("probe_route_receipt"), dict)
@@ -28240,6 +28666,7 @@ def _memory_export_probe_log(fbx_handoff: Any) -> dict[str, Any]:
             1 for row in normal_fidelity_rows if str(row.get("status", "") or "") == "fallback"
         ),
         "probe_stage": dict(probe_stage),
+        "generic_parallel": dict(generic_parallel) if isinstance(generic_parallel, dict) else {},
         "route_receipt_schema": str(probe_route_receipt.get("schema", "") or ""),
         "route_receipt_rows": probe_route_rows,
         "route_receipt_count": len(probe_route_rows),
@@ -28366,6 +28793,7 @@ def _build_memory_export_txt(
         row for row in probe.get("normal_fidelity", []) if isinstance(row, dict)
     ]
     probe_stage = probe.get("probe_stage") if isinstance(probe.get("probe_stage"), dict) else {}
+    probe_parallel = probe.get("generic_parallel") if isinstance(probe.get("generic_parallel"), dict) else {}
     probe_route_rows = [
         row for row in probe.get("route_receipt_rows", []) if isinstance(row, dict)
     ]
@@ -28429,6 +28857,7 @@ def _build_memory_export_txt(
         if isinstance(timing_payload.get("phases"), dict)
         else {}
     )
+    semantic_parallel = payload.get("semantic_parallel") if isinstance(payload.get("semantic_parallel"), dict) else {}
     check_source_receipt = payload.get("check_source") if isinstance(payload.get("check_source"), dict) else {}
     if not check_source_receipt and isinstance(request.get("check_source_receipt"), dict):
         check_source_receipt = dict(request["check_source_receipt"])
@@ -28727,6 +29156,37 @@ def _build_memory_export_txt(
                 for name, seconds in sorted(timing_phases.items())
             ),
             "",
+            "[PARALLEL]",
+            "EXPORT_GC_POLICY=after_export_delivery",
+            "EXPORT_GC_AUTOMATIC_CYCLIC_GC=disabled_during_export",
+            f"MODE={_export_log_scalar(semantic_parallel.get('mode'))}",
+            f"SELECTION={_export_log_scalar(semantic_parallel.get('selection'))}",
+            f"REQUESTED_WORKERS={_int_or_default(semantic_parallel.get('requested_workers'), 1)}",
+            f"SELECTED_WORKERS={_int_or_default(semantic_parallel.get('selected_workers'), 1)}",
+            f"TASK_COUNT={_int_or_default(semantic_parallel.get('task_count'), 0)}",
+            f"FALLBACK_TASK_COUNT={_int_or_default(semantic_parallel.get('fallback_task_count'), 0)}",
+            f"VERTEX_COUNT={_int_or_default(semantic_parallel.get('vertex_count'), 0)}",
+            f"PAYLOAD_SECONDS={_float_or_default(semantic_parallel.get('elapsed_seconds'), 0.0):.6f}",
+            f"ERROR={_export_log_scalar(semantic_parallel.get('error'))}",
+            f"TRANSPORT={_export_log_scalar(semantic_parallel.get('transport'))}",
+            f"WORKER_PIDS={_export_log_scalar(semantic_parallel.get('worker_pids'))}",
+            f"COMPLETED_TASKS={_int_or_default(semantic_parallel.get('completed_tasks'), 0)}",
+            f"STARTUP_SECONDS={_float_or_default(semantic_parallel.get('startup_seconds'), 0.0):.6f}",
+            f"CLEANUP_SECONDS={_float_or_default(semantic_parallel.get('cleanup_seconds'), 0.0):.6f}",
+            f"PROBE_MODE={_export_log_scalar(probe_parallel.get('mode'))}",
+            f"PROBE_SELECTED_WORKERS={_int_or_default(probe_parallel.get('selected_workers'), 1)}",
+            f"PROBE_TASK_COUNT={_int_or_default(probe_parallel.get('task_count'), 0)}",
+            f"PROBE_SECONDS={_float_or_default(probe_parallel.get('elapsed_seconds'), 0.0):.6f}",
+            f"PROBE_TRANSPORT={_export_log_scalar(probe_parallel.get('transport'))}",
+            f"PROBE_WORKER_PIDS={_export_log_scalar(probe_parallel.get('worker_pids'))}",
+            f"PROBE_COMPLETED_TASKS={_int_or_default(probe_parallel.get('completed_tasks'), 0)}",
+            f"PROBE_STARTUP_SECONDS={_float_or_default(probe_parallel.get('startup_seconds'), 0.0):.6f}",
+            f"PROBE_CLEANUP_SECONDS={_float_or_default(probe_parallel.get('cleanup_seconds'), 0.0):.6f}",
+            "ATTEMPTS=" + " | ".join(
+                f"workers:{_int_or_default(row.get('workers'), 0)};eligible:{_export_log_scalar(row.get('eligible'))};score:{_float_or_default(row.get('score'), 0.0):.3f};observed_seconds:{_float_or_default(row.get('observed_elapsed_seconds'), 0.0):.6f};status:{_export_log_scalar(row.get('status'))}"
+                for row in semantic_parallel.get('attempts', []) if isinstance(row, dict)
+            ),
+            "",
             "[ERROR]",
             f"TYPE={type(error).__name__ if error is not None else ''}",
             f"DETAIL={_export_log_scalar(error)}",
@@ -28746,8 +29206,8 @@ def _write_memory_export_txt_log(
     error: BaseException | None = None,
 ) -> tuple[str, str]:
     options = request.get("export_options") if isinstance(request.get("export_options"), dict) else {}
-    if error is None and not _as_bool(options.get("log_mode"), False):
-        return "", ""
+    # Every completed export receives one receipt so worker tuning is
+    # inspectable even when the optional legacy log_mode flag is disabled.
     try:
         target = _memory_export_log_target(request)
         _atomic_write_bytes(target, _build_memory_export_txt(request, result=result, error=error).encode("utf-8-sig"))
@@ -32995,6 +33455,7 @@ def _run_memory_export_impl(
         _advance_export_bug_receipt(bug_control, "source_contract")
     source_mod_file = read_mod_file(source_mod, data=source_mod_bytes)
     del source_mod_bytes
+    source_mod_file["_source_read_batch"] = {}
     source_mesh_headers = source_mod_file["mesh_headers"]
     # Decode the source BoneMap once for this export request.  The context is
     # passed through the live preparation adapter and is never retained after
@@ -33166,7 +33627,7 @@ def _run_memory_export_impl(
         )
         job["fbx_axis_log"] = fbx_axis_log
         contract["fbx_axis_log"] = fbx_axis_log
-    elif not bone_edit_enabled:
+    elif not bone_edit_enabled and not needs_fbx_handoff:
         fbx_handoff = {"status": "not_required", "contract_meshes": []}
     _record_timing_phase(
         timing,
@@ -33300,6 +33761,7 @@ def _run_memory_export_impl(
         )
     except FileExistsError:
         return output_collision_receipt()
+    source_mod_file.pop("_source_read_batch", None)
     _record_timing_phase(
         timing,
         "mod_write_seconds",
@@ -33420,6 +33882,7 @@ def _run_memory_export_impl(
         "uv_risk": uv_risk,
         "check_source": dict(check_source_receipt),
         "fbx_probe_log": _memory_export_probe_log(fbx_handoff),
+        "semantic_parallel": copy.deepcopy(_LAST_SEMANTIC_PARALLEL_STATS),
         "fbx_axis_log": dict(job.get("fbx_axis_log", {})),
         "memory_contract": {
             "authority": scene_backend["authority"],
@@ -33502,6 +33965,11 @@ def run_memory_export(request: dict[str, Any]) -> dict[str, Any]:
         finally:
             if writer_entered:
                 _leave_writer_main_operation()
+
+
+# Keep cyclic GC off every export-chain call, including callers that invoke
+# this module directly.  Ordinary reference-counted releases remain active.
+run_memory_export = _defer_export_gc(run_memory_export)
 
 
 def _run_output_path_mutex_regression_guard() -> dict[str, Any]:

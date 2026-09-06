@@ -1,17 +1,401 @@
 from __future__ import annotations
 
 import argparse
+import gc
+import sys
+
+if __name__ == "__main__" and "--parallel-worker" in sys.argv:
+    gc.disable()
 import hashlib
 import json
 import math
+import os
 import re
 import struct
 import sys
+import time
 import traceback
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
+
+# ====== BEGIN BOUNDED PARALLEL WORKER TRANSPORT ======
+
+import contextlib
+import importlib.util
+import queue
+import pickle
+import subprocess
+import threading
+
+
+# ====== BEGIN EXPORT GC DEFERRED CLEANUP ======
+# Nested calls share the outer delivery boundary.  Cleanup is synchronous
+# after delivery, never a GC thread competing with the next Python stage.
+_EXPORT_GC_LOCK = threading.RLock()
+_EXPORT_GC_STACK = []
+_LAST_EXPORT_GC_STATS = {}
+
+
+def _export_gc_begin():
+    _EXPORT_GC_LOCK.acquire()
+    token = {"was_enabled": gc.isenabled()}
+    if not _EXPORT_GC_STACK:
+        gc.disable()
+    _EXPORT_GC_STACK.append(token)
+    return token
+
+
+def _export_gc_finish(token, *, cleanup=None):
+    global _LAST_EXPORT_GC_STATS
+    if not _EXPORT_GC_STACK or _EXPORT_GC_STACK[-1] is not token:
+        raise RuntimeError("Export GC scopes must finish in their owning thread/order")
+    try:
+        if len(_EXPORT_GC_STACK) == 1:
+            started = time.perf_counter()
+            try:
+                if cleanup is not None:
+                    cleanup()
+                collected = gc.collect()
+                _LAST_EXPORT_GC_STATS = {
+                    "policy": "after_export_delivery",
+                    "collected": collected,
+                    "cleanup_seconds": round(time.perf_counter() - started, 6),
+                }
+            finally:
+                if token["was_enabled"]:
+                    gc.enable()
+    finally:
+        _EXPORT_GC_STACK.pop()
+        _EXPORT_GC_LOCK.release()
+
+
+# ====== END EXPORT GC DEFERRED CLEANUP ======
+
+
+class ParallelExecutionError(RuntimeError):
+    export_blocking = True
+
+
+def _parallel_read_exact(stream, size):
+    chunks = bytearray(size)
+    view = memoryview(chunks)
+    offset = 0
+    while offset < size:
+        count = stream.readinto(view[offset:])
+        if not count:
+            raise EOFError("Parallel worker pipe closed before the packet completed")
+        offset += count
+    return chunks
+
+
+def _parallel_read_packet(stream):
+    size = struct.unpack("<Q", _parallel_read_exact(stream, 8))[0]
+    return pickle.loads(_parallel_read_exact(stream, size))
+
+
+def _parallel_write_packet(stream, packet):
+    data = pickle.dumps(packet, protocol=pickle.HIGHEST_PROTOCOL)
+    stream.write(struct.pack("<Q", len(data)))
+    stream.write(data)
+    stream.flush()
+
+
+def _parallel_source_spec(worker):
+    module = sys.modules[worker.__module__]
+    path = Path(module.__file__).resolve()
+    source = path.read_bytes()
+    digest = hashlib.sha256(source).hexdigest().upper()
+    loaded_digest = getattr(module, "__codex_source_sha256__", digest)
+    if str(loaded_digest).upper() != digest:
+        raise ParallelExecutionError(f"Parallel source changed after loading: {path}")
+    return {
+        "name": module.__name__, "path": str(path), "source": source,
+        "sha256": digest, "function": worker.__name__,
+        "fast_load": bool(getattr(module, "__codex_trusted_runtime_fast_load__", False)),
+    }
+
+
+def _parallel_load_worker(spec):
+    path = Path(spec["path"])
+    source = spec["source"]
+    if hashlib.sha256(source).hexdigest().upper() != spec["sha256"]:
+        raise RuntimeError("Parallel worker source fingerprint mismatch")
+    sys.path.insert(0, str(path.parent))
+    module_spec = importlib.util.spec_from_file_location(spec["name"], path)
+    module = importlib.util.module_from_spec(module_spec)
+    module.__codex_source_sha256__ = spec["sha256"]
+    module.__codex_trusted_runtime_fast_load__ = spec["fast_load"]
+    module.__codex_parallel_source_load__ = True
+    # Install the exact defining name before unpickling FbxNode/task objects.
+    sys.modules[spec["name"]] = module
+    exec(compile(source, str(path), "exec"), module.__dict__)
+    return getattr(module, spec["function"])
+
+
+def _parallel_watch_parent(parent_pid):
+    if sys.platform != "win32":
+        while os.getppid() == parent_pid:
+            time.sleep(1.0)
+        os._exit(72)
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel.OpenProcess(0x00100000, False, parent_pid)
+    if not handle:
+        os._exit(72)
+    result = kernel.WaitForSingleObject(handle, 0xFFFFFFFF)
+    kernel.CloseHandle(handle)
+    if result == 0:
+        os._exit(72)
+
+
+def _parallel_worker_main(parent_pid):
+    # pythonw has no sys.stdin/stdout wrappers even when pipe handles exist.
+    incoming = os.fdopen(0, "rb", closefd=False)
+    outgoing = os.fdopen(1, "wb", closefd=False)
+    diagnostics = os.fdopen(2, "w", encoding="utf-8", errors="replace", closefd=False)
+    sys.stderr = diagnostics
+    sys.stdout = diagnostics
+    threading.Thread(target=_parallel_watch_parent, args=(parent_pid,), daemon=True).start()
+    gc.disable()
+    try:
+        worker = _parallel_load_worker(_parallel_read_packet(incoming))
+        _parallel_write_packet(outgoing, {
+            "kind": "ready", "pid": os.getpid(), "gc_deferred": not gc.isenabled(),
+        })
+        while True:
+            packet = _parallel_read_packet(incoming)
+            if packet is None:
+                return 0
+            index, task = packet
+            started = time.perf_counter()
+            result = worker(task)
+            _parallel_write_packet(outgoing, {
+                "kind": "result", "index": index, "value": result,
+                "compute_seconds": time.perf_counter() - started,
+            })
+            del packet, task, result
+    except BaseException as exc:
+        try:
+            _parallel_write_packet(outgoing, {
+                "kind": "error", "type": type(exc).__name__, "error": str(exc),
+                "traceback": traceback.format_exc()[-12000:],
+            })
+        except (OSError, EOFError):
+            pass
+        return 1
+
+
+def _parallel_exchange(worker_id, process, source_spec, inbox, outbox):
+    try:
+        _parallel_write_packet(process.stdin, source_spec)
+        reply = _parallel_read_packet(process.stdout)
+        outbox.put((worker_id, reply))
+        if reply.get("kind") != "ready":
+            return
+        while True:
+            task = inbox.get()
+            _parallel_write_packet(process.stdin, task)
+            if task is None:
+                return
+            reply = _parallel_read_packet(process.stdout)
+            outbox.put((worker_id, reply))
+            if reply.get("kind") != "result":
+                return
+            del task, reply
+    except BaseException as exc:
+        outbox.put((worker_id, {
+            "kind": "error", "type": type(exc).__name__, "error": str(exc),
+        }))
+    finally:
+        for stream in (process.stdin, process.stdout):
+            with contextlib.suppress(OSError):
+                stream.close()
+
+
+def _parallel_stderr_reader(stream, messages):
+    try:
+        while block := stream.read(4096):
+            messages.append(block.decode("utf-8", errors="replace"))
+            if len(messages) > 4:
+                del messages[0]
+    finally:
+        stream.close()
+
+
+def _iter_process_results(worker, tasks, *, max_workers, stats=None,
+                         startup_timeout=60.0, task_timeout=120.0):
+    """Preserve input order; at most one submitted task per worker is buffered.
+
+    Each pipe has one I/O thread in the parent. The controller never blocks on
+    a large pipe write or a multiprocessing Queue feeder, including cleanup.
+    Worker failures are fatal to this batch; no source-geometry/serial fallback.
+    """
+    if not tasks:
+        return
+    stats = stats if stats is not None else {}
+    try:
+        source_spec = _parallel_source_spec(worker)
+    except Exception as exc:
+        raise ParallelExecutionError(
+            f"Parallel source preparation: {type(exc).__name__}: {exc}") from exc
+    worker_count = max(1, min(int(max_workers), len(tasks)))
+    stats.update(transport="dedicated_process_pipes_v1", worker_pids=[],
+                 completed_tasks=0, status="starting", source_module=source_spec["name"],
+                 source_sha256=source_spec["sha256"], task_compute_seconds=0.0,
+                 worker_gc_policy="disabled_until_os_process_release")
+    started = time.perf_counter()
+    outbox = queue.Queue()
+    workers = []
+    completed = False
+    active = {}
+    ready_results = {}
+    try:
+        for worker_id in range(worker_count):
+            command = [sys.executable, "-B", "-s", str(Path(__file__).resolve()),
+                       "--parallel-worker", str(os.getpid())]
+            process = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, creationflags=(
+                    subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
+            )
+            inbox = queue.Queue(maxsize=1)
+            messages = []
+            thread = threading.Thread(target=_parallel_exchange,
+                args=(worker_id, process, source_spec, inbox, outbox), daemon=True)
+            reader = threading.Thread(target=_parallel_stderr_reader,
+                args=(process.stderr, messages), daemon=True)
+            workers.append((process, inbox, thread, reader, messages))
+            stats["worker_pids"].append(process.pid)
+            reader.start()
+            thread.start()
+
+        def receive(deadline):
+            while True:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    raise ParallelExecutionError(
+                        f"Parallel {worker.__name__} timed out; "
+                        f"pids={stats['worker_pids']}, completed={stats['completed_tasks']}")
+                try:
+                    worker_id, reply = outbox.get(timeout=min(0.2, remaining))
+                except queue.Empty:
+                    for process, _inbox, _thread, _reader, messages in workers:
+                        if process.poll() is not None:
+                            raise ParallelExecutionError(
+                                f"Parallel worker PID {process.pid} exited ({process.returncode}); "
+                                + "".join(messages)[-12000:])
+                    continue
+                if reply.get("kind") == "error":
+                    raise ParallelExecutionError(
+                        f"Parallel {worker.__name__} PID {workers[worker_id][0].pid}: "
+                        f"{reply.get('type')}: {reply.get('error')}\n{reply.get('traceback', '')}")
+                return worker_id, reply
+
+        waiting = set(range(worker_count))
+        while waiting:
+            worker_id, reply = receive(started + startup_timeout)
+            if reply.get("kind") != "ready" or worker_id not in waiting:
+                raise ParallelExecutionError("Invalid parallel worker startup receipt")
+            if reply.get("gc_deferred") is not True:
+                raise ParallelExecutionError("Parallel worker did not defer cyclic GC")
+            waiting.remove(worker_id)
+        stats["startup_seconds"] = round(time.perf_counter() - started, 6)
+        stats["status"] = "running"
+
+        def dispatch(worker_id, index):
+            active[worker_id] = (index, time.perf_counter() + task_timeout)
+            workers[worker_id][1].put_nowait((index, tasks[index]))
+
+        for index in range(worker_count):
+            dispatch(index, index)
+        submitted = worker_count
+        yielded = 0
+        while yielded < len(tasks):
+            if yielded not in ready_results:
+                worker_id, reply = receive(min(deadline for _index, deadline in active.values()))
+                index, _deadline = active.pop(worker_id)
+                if reply.get("kind") != "result" or reply.get("index") != index:
+                    raise ParallelExecutionError("Parallel worker returned the wrong task identity")
+                stats["completed_tasks"] += 1
+                stats["task_compute_seconds"] += float(reply.get("compute_seconds", 0.0))
+                ready_results[index] = (worker_id, reply["value"])
+                del reply
+            while yielded in ready_results:
+                worker_id, result = ready_results.pop(yielded)
+                # The scene consumer closes immediately after its last next().
+                # The batch is complete before yielding that final result.
+                if yielded + 1 == len(tasks):
+                    completed = True
+                    stats["status"] = "complete"
+                yield result
+                del result
+                yielded += 1
+                if submitted < len(tasks):
+                    dispatch(worker_id, submitted)
+                    submitted += 1
+        completed = True
+        stats["status"] = "complete"
+    except BaseException as exc:
+        if not (completed and isinstance(exc, GeneratorExit)):
+            stats["status"] = "cancelled" if isinstance(exc, GeneratorExit) else "error"
+            stats["error"] = f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, Exception) and not isinstance(exc, ParallelExecutionError):
+            raise ParallelExecutionError(
+                f"Parallel {worker.__name__}: {type(exc).__name__}: {exc}") from exc
+        raise
+    finally:
+        cleanup_started = time.perf_counter()
+        for process, inbox, _thread, _reader, _messages in workers:
+            with contextlib.suppress(queue.Full):
+                inbox.put_nowait(None)
+            if not completed and process.poll() is None:
+                with contextlib.suppress(OSError):
+                    process.kill()
+        deadline = time.perf_counter() + 3.0
+        for process, _inbox, _thread, _reader, _messages in workers:
+            try:
+                process.wait(timeout=max(0.0, deadline - time.perf_counter()))
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    process.kill()
+        deadline = time.perf_counter() + 2.0
+        for process, _inbox, thread, reader, _messages in workers:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=max(0.0, deadline - time.perf_counter()))
+            if thread.ident is not None:
+                thread.join(timeout=max(0.0, deadline - time.perf_counter()))
+            else:
+                process.stdin.close()
+                process.stdout.close()
+            if reader.ident is not None:
+                reader.join(timeout=max(0.0, deadline - time.perf_counter()))
+            else:
+                process.stderr.close()
+        stats["cleanup_seconds"] = round(time.perf_counter() - cleanup_started, 6)
+        stats["elapsed_seconds"] = round(time.perf_counter() - started, 6)
+        stats["worker_exitcodes"] = [p.poll() for p, *_rest in workers]
+        if completed and (any(code != 0 for code in stats["worker_exitcodes"])
+                          or any(t.is_alive() or r.is_alive() for _p, _i, t, r, _m in workers)):
+            stats["status"] = "error"
+            raise ParallelExecutionError(f"Parallel workers did not close cleanly: {stats['worker_exitcodes']}")
+
+
+if (__name__ == "__main__" and not globals().get("__codex_parallel_source_load__")
+        and len(sys.argv) == 3 and sys.argv[1] == "--parallel-worker"):
+    # Packets are flushed before returning.  These isolated compute workers
+    # own no files/transactions; OS teardown avoids an interpreter GC scan
+    # while the parent is still exporting subsequent stages.
+    os._exit(_parallel_worker_main(int(sys.argv[2])))
+
+# ====== END BOUNDED PARALLEL WORKER TRANSPORT ======
 
 from codex_python_runtime_bootstrap import (
     runtime_json_dumps_text,
@@ -55,6 +439,12 @@ GENERIC_AXIS_TRANSFORM_SCOPE = "scene_global_once"
 FBX_AXIS_OUTPUT_POLICY = GENERIC_AXIS_OUTPUT_POLICY
 FBX_AXIS_TRANSFORM_CONTRACT = GENERIC_AXIS_TRANSFORM_SCOPE
 FBX_CANONICALIZATION_POLICY = "alpha_full_canonical_or_fail_v1"
+_LAST_GENERIC_PARALLEL_STATS: dict[str, Any] = {
+    "mode": "serial",
+    "selected_workers": 1,
+    "task_count": 0,
+    "elapsed_seconds": 0.0,
+}
 DYNAMIC_MOD_FBX_MAPPING_SCHEMA = "pc-rehd-dynamic-mod-fbx-mapping-v1"
 # Transform-scale receipt is separate from the axis-basis receipt.  A basis
 # change is dimensionless; the root scale and the FBX-unit ratio are length
@@ -1096,7 +1486,7 @@ class _BinaryFbxLazyArray:
         if len(raw_value) != expected_size:
             raise ValueError("Binary FBX array byte count does not match its element count")
         self.decoded = list(
-            struct.unpack("<" + item_format * int(self.value_count), raw_value)
+            struct.unpack(f"<{int(self.value_count)}{item_format}", raw_value)
         )
         return self.decoded
 
@@ -1464,7 +1854,7 @@ def _read_property(data: bytes, offset: int) -> tuple[Any, int, str]:
         raise ValueError("Binary FBX array byte count does not match its element count")
     if not count:
         return [], offset, kind
-    return list(struct.unpack("<" + item_fmt * int(count), raw)), offset, kind
+    return list(struct.unpack(f"<{int(count)}{item_fmt}", raw)), offset, kind
 
 
 def _read_node(data: bytes, offset: int, *, version: int) -> tuple[FbxNode | None, int]:
@@ -1564,7 +1954,7 @@ def _property_bytes(kind: str, value: Any) -> bytes:
             return bytes(int(item) & 0xFF for item in value)
         if not value:
             return b""
-        return struct.pack("<" + item_fmt * len(value), *value)
+        return struct.pack(f"<{len(value)}{item_fmt}", *value)
     raise ValueError(f"Unsupported FBX property type {kind!r}")
 
 
@@ -1601,7 +1991,7 @@ def _encode_node(node: FbxNode, start_offset: int, *, version: int, is_last: boo
         header = struct.pack("<QQQB", cursor, len(node.properties), len(property_blob), len(name))
     else:
         header = struct.pack("<IIIB", cursor, len(node.properties), len(property_blob), len(name))
-    return header + name + property_blob + b"".join(child_blobs)
+    return b"".join((header, name, property_blob, *child_blobs))
 
 
 # ---------------------------------------------------------------------------
@@ -2143,11 +2533,13 @@ def _generic_invert_row_major_matrix(matrix: list[float]) -> list[float] | None:
     return [work[row][column] for row in range(4) for column in range(4, 8)]
 
 
-def _generic_transform_position_row_major(row: Any, matrix: list[float]) -> list[float]:
-    values = list(row)
+def _generic_transform_position_values_prevalidated(
+    values: Any,
+    matrix: list[float],
+) -> list[float]:
+    """Transform one position with a matrix already validated for this Geometry."""
     if len(values) < 3:
         raise ValueError("Position row must contain three values")
-    matrix = _finite_matrix(matrix, "position matrix")
     x, y, z = (float(values[0]), float(values[1]), float(values[2]))
     return [
         (x * matrix[0]) + (y * matrix[4]) + (z * matrix[8]) + matrix[12],
@@ -2156,11 +2548,8 @@ def _generic_transform_position_row_major(row: Any, matrix: list[float]) -> list
     ]
 
 
-def _generic_transform_normal_row_major(row: Any, matrix: list[float]) -> list[float]:
-    values = list(row)
-    if len(values) < 3:
-        raise ValueError("Normal row must contain three values")
-    matrix = _finite_matrix(matrix, "normal matrix")
+def _generic_prepare_normal_transform(matrix: list[float]) -> tuple[bool, tuple[float, ...]]:
+    """Cache fixed 3x3 inverse coefficients from a validated normal matrix."""
     a00, a01, a02 = matrix[0], matrix[1], matrix[2]
     a10, a11, a12 = matrix[4], matrix[5], matrix[6]
     a20, a21, a22 = matrix[8], matrix[9], matrix[10]
@@ -2168,35 +2557,72 @@ def _generic_transform_normal_row_major(row: Any, matrix: list[float]) -> list[f
     c01 = (a12 * a20) - (a10 * a22)
     c02 = (a10 * a21) - (a11 * a20)
     determinant = (a00 * c00) + (a01 * c01) + (a02 * c02)
-    x, y, z = (float(values[0]), float(values[1]), float(values[2]))
     if abs(determinant) <= 1.0e-12:
+        return False, (
+            a00, a01, a02,
+            a10, a11, a12,
+            a20, a21, a22,
+        )
+    inverse_det = 1.0 / determinant
+    return True, (
+        c00 * inverse_det,
+        ((a02 * a21) - (a01 * a22)) * inverse_det,
+        ((a01 * a12) - (a02 * a11)) * inverse_det,
+        c01 * inverse_det,
+        ((a00 * a22) - (a02 * a20)) * inverse_det,
+        ((a02 * a10) - (a00 * a12)) * inverse_det,
+        c02 * inverse_det,
+        ((a01 * a20) - (a00 * a21)) * inverse_det,
+        ((a00 * a11) - (a01 * a10)) * inverse_det,
+    )
+
+
+def _generic_transform_normal_values_prevalidated(
+    values: Any,
+    prepared: tuple[bool, tuple[float, ...]],
+) -> list[float]:
+    """Transform one normal using coefficients prepared for this Geometry."""
+    if len(values) < 3:
+        raise ValueError("Normal row must contain three values")
+    inverse, coefficients = prepared
+    a00, a01, a02, a10, a11, a12, a20, a21, a22 = coefficients
+    x, y, z = (float(values[0]), float(values[1]), float(values[2]))
+    if not inverse:
         transformed = [
             (x * a00) + (y * a10) + (z * a20),
             (x * a01) + (y * a11) + (z * a21),
             (x * a02) + (y * a12) + (z * a22),
         ]
     else:
-        inverse_det = 1.0 / determinant
-        normal = (
-            c00 * inverse_det,
-            ((a02 * a21) - (a01 * a22)) * inverse_det,
-            ((a01 * a12) - (a02 * a11)) * inverse_det,
-            c01 * inverse_det,
-            ((a00 * a22) - (a02 * a20)) * inverse_det,
-            ((a02 * a10) - (a00 * a12)) * inverse_det,
-            c02 * inverse_det,
-            ((a01 * a20) - (a00 * a21)) * inverse_det,
-            ((a00 * a11) - (a01 * a10)) * inverse_det,
-        )
         transformed = [
-            (normal[0] * x) + (normal[1] * y) + (normal[2] * z),
-            (normal[3] * x) + (normal[4] * y) + (normal[5] * z),
-            (normal[6] * x) + (normal[7] * y) + (normal[8] * z),
+            (a00 * x) + (a01 * y) + (a02 * z),
+            (a10 * x) + (a11 * y) + (a12 * z),
+            (a20 * x) + (a21 * y) + (a22 * z),
         ]
     length = math.sqrt(sum(value * value for value in transformed))
     if length <= 1.0e-12:
         return [0.0, 0.0, 1.0]
     return [value / length for value in transformed]
+
+
+def _generic_transform_position_row_major(row: Any, matrix: list[float]) -> list[float]:
+    values = list(row)
+    if len(values) < 3:
+        raise ValueError("Position row must contain three values")
+    return _generic_transform_position_values_prevalidated(
+        values,
+        _finite_matrix(matrix, "position matrix"),
+    )
+
+
+def _generic_transform_normal_row_major(row: Any, matrix: list[float]) -> list[float]:
+    values = list(row)
+    if len(values) < 3:
+        raise ValueError("Normal row must contain three values")
+    return _generic_transform_normal_values_prevalidated(
+        values,
+        _generic_prepare_normal_transform(_finite_matrix(matrix, "normal matrix")),
+    )
 
 
 def _matrix_basis_mean_scale(matrix: Any, *, label: str) -> float:
@@ -3787,11 +4213,19 @@ def _extract_geometry_semantics(
     if not positions:
         return {"status": "header_only", "reason": "geometry_with_invalid_positions", "cp_to_output": {}}
     if isinstance(raw_indices, list) and not raw_indices:
+        prepared_position_matrix = (
+            _finite_matrix(position_matrix, "position matrix")
+            if position_matrix is not None
+            else None
+        )
         output_positions = []
         for position in positions:
             row = list(position)
-            if position_matrix is not None:
-                row = _generic_transform_position_row_major(row, position_matrix)
+            if prepared_position_matrix is not None:
+                row = _generic_transform_position_values_prevalidated(
+                    row,
+                    prepared_position_matrix,
+                )
             output_positions.append(row)
         return {
             "status": "rebuilt",
@@ -3963,6 +4397,19 @@ def _extract_geometry_semantics(
                 "cp_to_output": {},
             }
 
+    # Prepare only after layer validation, preserving header-only error returns.
+    prepared_position_matrix = (
+        _finite_matrix(position_matrix, "position matrix")
+        if position_matrix is not None and source_indices
+        else None
+    )
+    prepared_normal_matrix = (
+        _generic_prepare_normal_transform(_finite_matrix(normal_matrix, "normal matrix"))
+        if normal_matrix is not None and source_indices and (
+            normal_values is not None or any(rows is not None for rows in vector_layers.values())
+        )
+        else None
+    )
     output_positions: list[list[float]] = []
     output_faces: list[list[int]] = []
     corner_normals: list[list[float]] = []
@@ -3987,14 +4434,20 @@ def _extract_geometry_semantics(
             output_index = len(output_positions)
             key_to_output[key] = output_index
             position = list(positions[source_index])
-            if position_matrix is not None:
-                position = _generic_transform_position_row_major(position, position_matrix)
+            if prepared_position_matrix is not None:
+                position = _generic_transform_position_values_prevalidated(
+                    position,
+                    prepared_position_matrix,
+                )
             output_positions.append(position)
             cp_to_output[source_index].append(output_index)
         if normal_row is not None:
             normal = list(normal_row)
-            if normal_matrix is not None:
-                normal = _generic_transform_normal_row_major(normal, normal_matrix)
+            if prepared_normal_matrix is not None:
+                normal = _generic_transform_normal_values_prevalidated(
+                    normal,
+                    prepared_normal_matrix,
+                )
             corner_normals.append(normal)
         for layer_name, output_rows in (
             ("LayerElementTangent", corner_tangents),
@@ -4003,8 +4456,11 @@ def _extract_geometry_semantics(
             rows = vector_layers.get(layer_name)
             if rows is not None:
                 vector = list(rows[corner_index][:3])
-                if normal_matrix is not None:
-                    vector = _generic_transform_normal_row_major(vector, normal_matrix)
+                if prepared_normal_matrix is not None:
+                    vector = _generic_transform_normal_values_prevalidated(
+                        vector,
+                        prepared_normal_matrix,
+                    )
                 output_rows.append(vector)
         for channel_index, channel in enumerate(uv_values):
             corner_uvs[channel_index].append([float(value) for value in channel[corner_index][:2]])
@@ -4064,6 +4520,71 @@ def _extract_geometry_semantics(
         "normal_split": bool(normal_values is not None),
         "uv_channel_count": len(uv_channels),
     }
+
+
+def _generic_geometry_semantics_worker(
+    task: tuple[int, FbxNode, list[float] | None, list[float] | None],
+) -> tuple[int, dict[str, Any]]:
+    """Extract one Geometry payload in a worker without touching scene state."""
+    source_id, source_geometry, position_matrix, normal_matrix = task
+    payload = _extract_geometry_semantics(
+        source_geometry,
+        position_matrix=position_matrix,
+        normal_matrix=normal_matrix,
+    )
+    return int(source_id), payload
+
+
+def _iter_generic_geometry_payloads(
+    tasks: list[tuple[int, FbxNode, list[float] | None, list[float] | None]],
+) -> Generator[tuple[int, dict[str, Any]], None, None]:
+    """Yield Geometry payloads in source order with bounded process IPC."""
+    global _LAST_GENERIC_PARALLEL_STATS
+    started_at = time.perf_counter()
+    corner_counts: list[int] = []
+    for _source_id, source_geometry, _position_matrix, _normal_matrix in tasks:
+        indices = _child_value(source_geometry, "PolygonVertexIndex")
+        corner_counts.append(len(indices) if isinstance(indices, list) else 0)
+    requested_workers = _int_or_default(os.environ.get("GENERIC_FBX_WORKERS"), 0)
+    substantial_tasks = sum(count >= 20_000 for count in corner_counts)
+    cpu_count = os.cpu_count() or 1
+    max_workers = max(
+        1,
+        min(len(tasks), requested_workers or substantial_tasks, cpu_count, 8),
+    )
+    if (
+        os.environ.get("GENERIC_FBX_PARALLEL", "1") == "0"
+        or max_workers < 2
+        or sum(corner_counts) < 100_000
+        or substantial_tasks < 2
+    ):
+        _LAST_GENERIC_PARALLEL_STATS = {
+            "mode": "serial",
+            "selected_workers": 1,
+            "task_count": len(tasks),
+            "elapsed_seconds": 0.0,
+        }
+        try:
+            for task in tasks:
+                result = _generic_geometry_semantics_worker(task)
+                yield result
+        finally:
+            _LAST_GENERIC_PARALLEL_STATS["elapsed_seconds"] = round(time.perf_counter() - started_at, 6)
+        return
+
+    _LAST_GENERIC_PARALLEL_STATS = {
+        "mode": "process_pool",
+        "selected_workers": max_workers,
+        "task_count": len(tasks),
+        "elapsed_seconds": 0.0,
+    }
+    try:
+        yield from _iter_process_results(
+            _generic_geometry_semantics_worker, tasks,
+            max_workers=max_workers, stats=_LAST_GENERIC_PARALLEL_STATS,
+        )
+    finally:
+        _LAST_GENERIC_PARALLEL_STATS["elapsed_seconds"] = round(time.perf_counter() - started_at, 6)
 
 
 def _apply_current_pose_inverse_skin_to_geometry_payload(
@@ -5411,45 +5932,93 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
     geometry_header_only_count = 0
     geometry_skip_reasons: list[str] = []
     skin_clusters_remapped = 0
+    # Geometry decoding is pure once matrices and IDs are known. Prepare all
+    # unique tasks first, then merge payloads in the exact source-use order.
+    geometry_tasks: list[tuple[int, FbxNode, list[float] | None, list[float] | None]] = []
+    geometry_task_ids: set[int] = set()
+    geometry_task_matrices: dict[int, tuple[list[float] | None, list[float] | None]] = {}
     for source_id in sorted(mesh_model_ids):
         source_model = model_by_id[source_id]
-        model_name = model_names.get(source_id, "Mesh")
         for geometry_id in model_geometry_ids.get(source_id, []):
             source_geometry = geometry_by_id.get(geometry_id)
-            if source_geometry is None or geometry_id in emitted_geometry_ids:
+            if source_geometry is None or geometry_id in geometry_task_ids:
                 continue
-            # Bake only pre-bind Geometry domains. Ordinary-sized MeshBind is
-            # preserved by Cluster.Transform, so Geometry must stay untouched.
             geometry_bind_matrix = (
                 v5_context["bind_mesh_matrices"].get(int(source_id))
-                if v5_context["geometry_bind_bake_by_mesh"].get(
-                    int(source_id), False
-                )
+                if v5_context["geometry_bind_bake_by_mesh"].get(int(source_id), False)
                 else None
             )
             geometric_matrix = _source_geometric_matrix(source_model)
-            if geometry_bind_matrix is not None:
-                geometry_position_matrix = _generic_multiply_row_major_matrices(
-                    geometric_matrix, geometry_bind_matrix
+            geometry_position_matrix = (
+                _generic_multiply_row_major_matrices(geometric_matrix, geometry_bind_matrix)
+                if geometry_bind_matrix is not None
+                else geometric_matrix
+            )
+            geometry_tasks.append((int(geometry_id), source_geometry, geometry_position_matrix, geometry_position_matrix))
+            geometry_task_ids.add(int(geometry_id))
+            geometry_task_matrices[int(geometry_id)] = (geometry_position_matrix, geometry_position_matrix)
+    for geometry_id, source_geometry in geometry_by_id.items():
+        if geometry_id in geometry_task_ids:
+            continue
+        unlinked_geometry_matrix = _scale_affine_matrix(
+            axis_conversion,
+            float(v5_context["unit_factor"]),
+            label=f"Geometry {geometry_id} canonical unit matrix",
+        )
+        geometry_tasks.append((int(geometry_id), source_geometry, unlinked_geometry_matrix, unlinked_geometry_matrix))
+        geometry_task_ids.add(int(geometry_id))
+        geometry_task_matrices[int(geometry_id)] = (unlinked_geometry_matrix, unlinked_geometry_matrix)
+
+    geometry_payloads = _iter_generic_geometry_payloads(geometry_tasks)
+    try:
+        for source_id in sorted(mesh_model_ids):
+            source_model = model_by_id[source_id]
+            model_name = model_names.get(source_id, "Mesh")
+            for geometry_id in model_geometry_ids.get(source_id, []):
+                source_geometry = geometry_by_id.get(geometry_id)
+                if source_geometry is None or geometry_id in emitted_geometry_ids:
+                    continue
+                payload_id, geometry_payload = next(geometry_payloads)
+                if payload_id != geometry_id:
+                    raise ValueError("Probe Geometry result ID does not match the source")
+                record_normal_axis_domain(geometry_id, applied_matrix=geometry_task_matrices[int(geometry_id)][0])
+                generic_objects.children.append(
+                    _generic_geometry_node(
+                        source_geometry,
+                        geometry_output_ids[geometry_id],
+                        name_override=model_name,
+                        payload=geometry_payload,
+                    )
                 )
-            else:
-                geometry_position_matrix = geometric_matrix
-            geometry_payload = _extract_geometry_semantics(
-                source_geometry,
-                position_matrix=geometry_position_matrix,
-                normal_matrix=geometry_position_matrix,
-            )
-            record_normal_axis_domain(
-                geometry_id,
-                applied_matrix=geometry_position_matrix,
-            )
+                geometry_cp_maps[geometry_id] = dict(geometry_payload.get("cp_to_output", {}))
+                if geometry_payload.get("status") == "rebuilt":
+                    geometry_rebuilt_count += 1
+                else:
+                    geometry_header_only_count += 1
+                    reason = str(geometry_payload.get("reason", "geometry_header_only"))
+                    if reason not in geometry_skip_reasons:
+                        geometry_skip_reasons.append(reason)
+                emitted_geometry_ids.add(geometry_id)
             generic_objects.children.append(
-                _generic_geometry_node(
-                    source_geometry,
-                    geometry_output_ids[geometry_id],
+                _generic_mesh_model_node(
+                    source_model,
+                    id_map[source_id],
+                    local_matrix=_output_local_from_world(source_id, output_worlds, source_graph["model_parent_ids"]),
                     name_override=model_name,
-                    payload=geometry_payload,
                 )
+            )
+            emitted_object_ids.add(source_id)
+
+        # Preserve valid unlinked Geometry objects as standalone records.
+        for geometry_id, source_geometry in geometry_by_id.items():
+            if geometry_id in emitted_geometry_ids:
+                continue
+            payload_id, geometry_payload = next(geometry_payloads)
+            if payload_id != geometry_id:
+                raise ValueError("Probe Geometry result ID does not match the source")
+            record_normal_axis_domain(geometry_id, applied_matrix=geometry_task_matrices[int(geometry_id)][0])
+            generic_objects.children.append(
+                _generic_geometry_node(source_geometry, geometry_output_ids[geometry_id], payload=geometry_payload)
             )
             geometry_cp_maps[geometry_id] = dict(geometry_payload.get("cp_to_output", {}))
             if geometry_payload.get("status") == "rebuilt":
@@ -5460,49 +6029,8 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
                 if reason not in geometry_skip_reasons:
                     geometry_skip_reasons.append(reason)
             emitted_geometry_ids.add(geometry_id)
-        generic_objects.children.append(
-            _generic_mesh_model_node(
-                source_model,
-                id_map[source_id],
-                local_matrix=_output_local_from_world(
-                    source_id, output_worlds, source_graph["model_parent_ids"]
-                ),
-                name_override=model_name,
-            )
-        )
-        emitted_object_ids.add(source_id)
-
-    # Preserve valid unlinked Geometry objects as standalone Geometry records.
-    for geometry_id, source_geometry in geometry_by_id.items():
-        if geometry_id in emitted_geometry_ids:
-            continue
-        unlinked_geometry_matrix = _scale_affine_matrix(
-            axis_conversion,
-            float(v5_context["unit_factor"]),
-            label=f"Geometry {geometry_id} canonical unit matrix",
-        )
-        geometry_payload = _extract_geometry_semantics(
-            source_geometry,
-            position_matrix=unlinked_geometry_matrix,
-            normal_matrix=unlinked_geometry_matrix,
-        )
-        record_normal_axis_domain(geometry_id, applied_matrix=unlinked_geometry_matrix)
-        generic_objects.children.append(
-            _generic_geometry_node(
-                source_geometry,
-                geometry_output_ids[geometry_id],
-                payload=geometry_payload,
-            )
-        )
-        geometry_cp_maps[geometry_id] = dict(geometry_payload.get("cp_to_output", {}))
-        if geometry_payload.get("status") == "rebuilt":
-            geometry_rebuilt_count += 1
-        else:
-            geometry_header_only_count += 1
-            reason = str(geometry_payload.get("reason", "geometry_header_only"))
-            if reason not in geometry_skip_reasons:
-                geometry_skip_reasons.append(reason)
-        emitted_geometry_ids.add(geometry_id)
+    finally:
+        geometry_payloads.close()
 
     for source in deformer_nodes:
         source_id = _object_id(source)
@@ -5770,6 +6298,7 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         "target_unit_scale_cm": v5_context["target_unit_scale_cm"],
         "unit_factor": v5_context["unit_factor"],
         "unit_conversion_validation": unit_validation,
+        "generic_parallel": dict(_LAST_GENERIC_PARALLEL_STATS),
         # Keep the source->canonical basis used by rebuilt Model rows. The
         # downstream Writer can apply its inverse without assuming every Max
         # FBX used the same axis signature.
@@ -5811,7 +6340,8 @@ def _generic_encode_fbx_bytes(
         if output_version >= 7500
         else FBX_NULL_RECORD_NARROW
     )
-    body = b"".join(body_parts) + null_record
+    body_parts.append(null_record)
+    body = b"".join(body_parts)
     before_footer_version = (
         len(FBX_MAGIC) + 4 + len(body) + len(selected_footer_id) + 4
     )
@@ -5826,10 +6356,11 @@ def _generic_encode_fbx_bytes(
         + b"\x00" * 120
         + FBX_FOOT_MAGIC
     )
-    return FBX_MAGIC + struct.pack("<I", output_version) + body + footer
+    return b"".join((FBX_MAGIC, struct.pack("<I", output_version), body, footer))
 # The converter is embedded in Probe.  This request-scoped bridge keeps the
 # normalized FBX in memory and never creates a Generic FBX intermediate file.
 _GENERIC_FBX_MEMORY_CACHE: dict[str, tuple[int, int, _BinaryFbxDocument, dict[str, Any]]] = {}
+_GENERIC_FBX_MEMORY_CACHE_MAX = 2
 
 def _generic_prepare_fbx_bytes(source: Path) -> tuple[bytes, dict[str, Any]]:
     raw_bytes = source.read_bytes()
@@ -5881,6 +6412,10 @@ def _generic_memory_document_for_path(
         data=normalized_bytes,
         decode_array_names=frozenset(),
     )
+    if key in _GENERIC_FBX_MEMORY_CACHE:
+        _GENERIC_FBX_MEMORY_CACHE.pop(key, None)
+    while len(_GENERIC_FBX_MEMORY_CACHE) >= _GENERIC_FBX_MEMORY_CACHE_MAX:
+        _GENERIC_FBX_MEMORY_CACHE.pop(next(iter(_GENERIC_FBX_MEMORY_CACHE)))
     _GENERIC_FBX_MEMORY_CACHE[key] = (
         int(stat.st_size),
         int(stat.st_mtime_ns),
@@ -9390,6 +9925,8 @@ def _require_scene(
         try:
             document, generic_receipt = _generic_memory_document_for_path(fbx_path)
         except Exception as exc:
+            if getattr(exc, "export_blocking", False):
+                raise
             # MAX and Blender exports are Generic-only. Never reopen the raw
             # direct/UFBX axis path after normalization fails.
             raise RuntimeError(
@@ -11071,22 +11608,25 @@ def build_cli() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_cli()
     args = parser.parse_args(argv)
+    token = _export_gc_begin()
+    try:
+        summary = summarize_fbx(args.fbx)
+        if args.max_json:
+            max_snapshot = load_max_snapshot(args.max_json)
+            summary["max_compare"] = compare_fbx_to_max_snapshot(summary, max_snapshot)
 
-    summary = summarize_fbx(args.fbx)
-    if args.max_json:
-        max_snapshot = load_max_snapshot(args.max_json)
-        summary["max_compare"] = compare_fbx_to_max_snapshot(summary, max_snapshot)
-
-    if args.output:
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        runtime_write_json_file(output_path, summary, pretty=args.pretty)
-    else:
-        print(runtime_json_dumps_text(summary, pretty=args.pretty))
-    return 0
+        if args.output:
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            runtime_write_json_file(output_path, summary, pretty=args.pretty)
+        else:
+            print(runtime_json_dumps_text(summary, pretty=args.pretty), flush=True)
+        return 0
+    finally:
+        _export_gc_finish(token, cleanup=_GENERIC_FBX_MEMORY_CACHE.clear)
 
 
 # ====== END PUBLIC PROBE HANDOFF / RECEIPTS ======
 
-if __name__ == "__main__":
+if __name__ == "__main__" and not globals().get("__codex_parallel_source_load__"):
     raise SystemExit(main())

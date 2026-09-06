@@ -1268,6 +1268,7 @@ def _parse_meshes(
         for item in mesh_headers[:start_index]
     )
     parsed: list[ParsedMesh] = []
+    source_view = memoryview(data)
     for mesh_index, mesh_header in enumerate(
         mesh_headers[start_index:end_index], start=start_index + 1
     ):
@@ -1276,7 +1277,10 @@ def _parse_meshes(
         bone_palette = _mesh_bone_palette(mesh_header, bone_map_rows) if layout.skin_kind is not None else None
         vertex_start = header.ptr_vertex + mesh_header.vert_base + mesh_header.vert_start * mesh_header.vert_stride
         required_bytes = mesh_header.vert_count * layout.read_stride
-        _read_slice(data, vertex_start, required_bytes, f"Mesh {mesh_index} vertex buffer")
+        vertex_buffer = _read_slice(source_view, vertex_start, required_bytes, f"Mesh {mesh_index} vertex buffer")
+        vertex_records = struct.Struct(f"<{layout.read_stride}s").iter_unpack(vertex_buffer)
+        position_reader = _short_position_to_max if layout.position_kind == "short" else _float_position_to_max
+        max_influences = SKIN_KIND_MAX_INFLUENCES.get(layout.skin_kind)
         positions: list[list[float]] = []
         uv1_rows: list[list[float] | None] = []
         uv2_rows: list[list[float] | None] = []
@@ -1287,10 +1291,8 @@ def _parse_meshes(
         raw_weights: list[list[float] | None] = []
         fbx_bones: list[list[int] | None] = []
         fbx_weights: list[list[float] | None] = []
-        for vertex_index in range(mesh_header.vert_count):
-            record_offset = vertex_start + vertex_index * layout.read_stride
-            record = _read_slice(data, record_offset, layout.read_stride, f"Mesh {mesh_index} vertex {vertex_index}")
-            positions.append(_short_position_to_max(record) if layout.position_kind == "short" else _float_position_to_max(record))
+        for vertex_index, (record,) in enumerate(vertex_records):
+            positions.append(position_reader(record))
             if layout.uv_kind == "half" and layout.uv_offset is not None:
                 uv1_rows.append(_read_half_uv(record, layout.uv_offset))
             elif layout.uv_kind == "u16" and layout.uv_offset is not None:
@@ -1368,7 +1370,7 @@ def _parse_meshes(
                 semantic_bones, semantic_weights = _normalise_skin_pairs(
                     bones,
                     weights,
-                    max_influences=SKIN_KIND_MAX_INFLUENCES.get(layout.skin_kind),
+                    max_influences=max_influences,
                     merge_duplicate_weights=layout.skin_kind != "legacy4",
                 )
                 fbx_bones.append(semantic_bones)
@@ -1379,8 +1381,17 @@ def _parse_meshes(
             int(mesh_header.face_count),
             strict=validate_topology,
         )
-        for triangle_index in range(triangle_count):
-            raw = _read_int(data, face_cursor, "<3H", f"Mesh {mesh_index} face {triangle_index}")
+        face_end = face_cursor + triangle_count * TRIANGLE_STRUCT.size
+        if face_cursor >= 0 and face_end <= len(data):
+            triangle_rows = TRIANGLE_STRUCT.iter_unpack(source_view[face_cursor:face_end])
+        else:
+            # Preserve the original first-invalid-face diagnostic on truncated data.
+            face_start = face_cursor
+            triangle_rows = (
+                _read_int(data, face_start + index * TRIANGLE_STRUCT.size, "<3H", f"Mesh {mesh_index} face {index}")
+                for index in range(triangle_count)
+            )
+        for raw in triangle_rows:
             face_cursor += 6
             one_based, invalid_face = _sanitize_face_one_based(raw, mesh_header.vert_start, mesh_header.vert_count)
             if invalid_face:
@@ -3124,31 +3135,45 @@ def _fbx_property_blob(props: Sequence[tuple[str, Any]]) -> bytes:
     return b"".join(chunks)
 
 
-def _encode_fbx_node(node: _FbxNode, start_offset: int, *, is_last: bool) -> bytes:
+def _append_fbx_node_chunks(
+    node: _FbxNode,
+    start_offset: int,
+    chunks: list[bytes],
+    *,
+    is_last: bool,
+) -> int:
     property_blob = _fbx_property_blob(node.props)
     body_offset = start_offset + 13 + len(node.name) + len(property_blob)
-    child_blobs: list[bytes] = []
+    header_index = len(chunks)
+    chunks.append(b"")
+    chunks.append(property_blob)
     cursor = body_offset
     for child_index, child in enumerate(node.children):
-        encoded_child = _encode_fbx_node(child, cursor, is_last=child_index == len(node.children) - 1)
-        child_blobs.append(encoded_child)
-        cursor += len(encoded_child)
+        cursor = _append_fbx_node_chunks(
+            child, cursor, chunks, is_last=child_index == len(node.children) - 1
+        )
     if node.children or (not node.props and not is_last) or node.name in FBX_ALWAYS_BLOCK_SENTINEL:
-        child_blobs.append(FBX_NULL_RECORD)
+        chunks.append(FBX_NULL_RECORD)
         cursor += len(FBX_NULL_RECORD)
-    header = struct.pack("<III", cursor, len(node.props), len(property_blob)) + bytes((len(node.name),)) + node.name
-    return header + property_blob + b"".join(child_blobs)
+    chunks[header_index] = struct.pack("<III", cursor, len(node.props), len(property_blob)) + bytes((len(node.name),)) + node.name
+    return cursor
+
+
+def _encode_fbx_node(node: _FbxNode, start_offset: int, *, is_last: bool) -> bytes:
+    chunks: list[bytes] = []
+    _append_fbx_node_chunks(node, start_offset, chunks, is_last=is_last)
+    return b"".join(chunks)
 
 
 def _write_fbx_binary(path: Path, roots: Sequence[_FbxNode]) -> None:
     body_parts: list[bytes] = []
     cursor = len(FBX_MAGIC) + 4
     for root_index, root in enumerate(roots):
-        encoded = _encode_fbx_node(root, cursor, is_last=root_index == len(roots) - 1)
-        body_parts.append(encoded)
-        cursor += len(encoded)
-    body = b"".join(body_parts) + FBX_NULL_RECORD
-    before_footer_version = len(FBX_MAGIC) + 4 + len(body) + len(FBX_FOOT_ID) + 4
+        cursor = _append_fbx_node_chunks(
+            root, cursor, body_parts, is_last=root_index == len(roots) - 1
+        )
+    body_parts.append(FBX_NULL_RECORD)
+    before_footer_version = cursor + len(FBX_NULL_RECORD) + len(FBX_FOOT_ID) + 4
     padding = (-before_footer_version) % 16
     if padding == 0:
         padding = 16
@@ -3160,7 +3185,7 @@ def _write_fbx_binary(path: Path, roots: Sequence[_FbxNode]) -> None:
             temp_path = Path(handle.name)
             handle.write(FBX_MAGIC)
             handle.write(struct.pack("<I", FBX_BINARY_VERSION))
-            handle.write(body)
+            handle.writelines(body_parts)
             handle.write(footer)
             handle.flush()
             os.fsync(handle.fileno())
