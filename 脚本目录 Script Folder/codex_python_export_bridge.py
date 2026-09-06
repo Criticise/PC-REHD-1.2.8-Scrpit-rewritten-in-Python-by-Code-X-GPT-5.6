@@ -33497,6 +33497,14 @@ def _run_memory_export_impl(
     ]
     fbx_modify_meshes = [mesh for mesh in modify_meshes if not _mesh_uses_source_geometry(mesh)]
     bone_edit_enabled = _job_uses_bone_edit(job, contract)
+    # A Generic FBX backend is the authority for a requested mesh edit.  If
+    # its probe/normalization or route receipt fails, preserving source bytes
+    # would make the export look successful while silently discarding the edit.
+    # Keep the legacy source passthrough only for non-FBX source-backed paths.
+    strict_fbx_handoff = str(job.get("fbx_backend_kind", "") or "").strip().lower() in {
+        "blender_fbx",
+        "max_fbx",
+    }
     needs_fbx_handoff = bool(fbx_modify_meshes) or bone_edit_enabled
     if needs_fbx_handoff:
         phase_started_at = time.perf_counter()
@@ -33511,12 +33519,16 @@ def _run_memory_export_impl(
         handoff_status = str(fbx_handoff.get("status", "") or "")
         if handoff_status != "ok":
             detail = str(fbx_handoff.get("error", "") or handoff_status or "unknown FBX probe failure")
-            if bone_edit_enabled:
-                raise RuntimeError(f"Python could not read the current Bones Edit FBX: {detail}")
-            # A failed/missing FBX response is an explicit transport failure.
-            # Ordinary exports may preserve the source bytes for the affected
-            # Meshes; this exception never applies to Bones Edit, whose current
-            # bone matrices/skin pose are mandatory.
+            if bone_edit_enabled or strict_fbx_handoff:
+                failure_label = (
+                    "current Bones Edit FBX"
+                    if bone_edit_enabled
+                    else "current Generic FBX"
+                )
+                raise RuntimeError(f"Python could not read the {failure_label}: {detail}")
+            # Non-FBX source-backed paths may preserve source bytes for the
+            # affected meshes. Generic Blender/Max edits have already been
+            # rejected above so an FBX edit cannot be silently discarded.
             for mesh in fbx_modify_meshes:
                 if _skip_memory_source_missing_mesh(
                     job,
@@ -33560,7 +33572,7 @@ def _run_memory_export_impl(
                     require_explicit_route=require_explicit_max_route,
                 )
             except ValueError as exc:
-                if bone_edit_enabled:
+                if bone_edit_enabled or strict_fbx_handoff:
                     raise
                 # A malformed route receipt is still a missing FBX response
                 # for an ordinary Mesh export. Preserve each affected source
@@ -33583,7 +33595,7 @@ def _run_memory_export_impl(
                 }
                 route_receipt_error = None
         else:
-            if bone_edit_enabled:
+            if bone_edit_enabled or strict_fbx_handoff:
                 raise RuntimeError("Current FBX Probe did not return its required route receipt")
             reason = "fbx_probe_route_receipt_missing"
             for mesh in fbx_modify_meshes:

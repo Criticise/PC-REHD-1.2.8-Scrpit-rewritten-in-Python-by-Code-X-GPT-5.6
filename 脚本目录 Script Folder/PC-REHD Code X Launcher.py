@@ -672,6 +672,10 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
         "instance_copy_expand_sources", "auxiliary", CommandAccess.SCENE_WRITE,
         QueuePolicy.SINGLE_FLIGHT, 180.0, 10,
     ),
+    "bone_auto_focus": _spec(
+        "bone_auto_focus", "auxiliary", CommandAccess.SCENE_WRITE,
+        QueuePolicy.LATEST_WINS, 30.0, 25, foreground_required=False,
+    ),
     "instance_copy_undo": _spec(
         "instance_copy_undo", "auxiliary", CommandAccess.SCENE_WRITE,
         QueuePolicy.SINGLE_FLIGHT, 900.0, 10,
@@ -2962,6 +2966,7 @@ AGENT_COMMAND_OPERATIONS = {
     "inspect_scene": "inspect_scene",
     "probe_bucket_mesh_names": "inspect_scene",
     "probe_scene_names": "inspect_scene",
+    "bone_auto_focus": "auxiliary",
     "probe_scene_normals": "inspect_scene",
     "import_auxiliary": "auxiliary",
     "import_auxiliary_fbx": "auxiliary",
@@ -6952,6 +6957,12 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
     max_toolbox_visible = bool(
         source.get("max_toolbox_visible", source.get("toolbox_visible", False))
     )
+    # Automatically expand/focus a selected bone in 3ds Max.  This preference
+    # is intentionally enabled for new installs while preserving an explicit
+    # choice from older Launcher state files.
+    max_bone_auto_focus_enabled = bool(
+        source.get("max_bone_auto_focus_enabled", True)
+    )
     blender_toolbox_visible = bool(source.get("blender_toolbox_visible", False))
     scene_normals_geometry = str(
         source.get("scene_normals_geometry", "") or ""
@@ -7152,6 +7163,7 @@ def _normalize_launcher_state(raw: Any) -> dict[str, Any]:
         "toolbox_visible": max_toolbox_visible,
         "toolbox_geometry": max_toolbox_geometry,
         "max_toolbox_visible": max_toolbox_visible,
+        "max_bone_auto_focus_enabled": max_bone_auto_focus_enabled,
         "blender_toolbox_visible": blender_toolbox_visible,
         "max_toolbox_geometry": max_toolbox_geometry,
         "blender_toolbox_geometry": blender_toolbox_geometry,
@@ -20526,6 +20538,154 @@ def _max_instance_copy_execute(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _max_bone_auto_focus(rt: Any, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Reveal selected bones without changing the live scene selection."""
+    payload = payload if isinstance(payload, Mapping) else {}
+    rows: list[dict[str, Any]] = []
+    try:
+        selected_nodes = list(rt.selection)
+    except Exception:
+        selected_nodes = []
+    for node in selected_nodes:
+        try:
+            handle = _max_node_handle(rt, node)
+            name = str(getattr(node, "name", "") or "")
+        except Exception:
+            continue
+        if handle <= 0:
+            continue
+        # Imported RE bones can be Dummy helpers with boneEnable=False.
+        # Match the existing scene contract's b_ identity convention.
+        is_bone = name.casefold().startswith("b_")
+        if not is_bone:
+            try:
+                is_bone = bool(node.boneEnable)
+            except Exception:
+                pass
+        if not is_bone:
+            try:
+                base_object = node.baseObject
+            except Exception:
+                base_object = None
+            for candidate in (node, base_object):
+                if candidate is None:
+                    continue
+                try:
+                    cls_name = str(rt.classOf(candidate) or "").casefold()
+                except Exception:
+                    cls_name = ""
+                if "bone" in cls_name:
+                    is_bone = True
+                    break
+        if not is_bone:
+            continue
+        try:
+            parent = node.parent
+        except Exception:
+            parent = None
+        parent_handle = _max_node_handle(rt, parent) if parent is not None else 0
+        rows.append({"handle": handle, "name": name, "parent_handle": parent_handle})
+    rows.sort(key=lambda row: int(row["handle"]))
+    signature = hashlib.sha1(
+        json.dumps([(int(row["handle"]), str(row["name"])) for row in rows],
+                   ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    known_signature = str(payload.get("known_signature", "") or "")
+    changed = signature != known_signature
+    focus = {"expanded_count": 0, "explorers": [], "status": "UNCHANGED"}
+    probe_only = bool(payload.get("probe_only", False))
+    if (changed and rows) or probe_only:
+        focus = _max_bone_auto_focus_explorers(
+            rt,
+            {int(row["handle"]) for row in rows},
+            probe_only=probe_only,
+        )
+    elif not rows:
+        focus["status"] = "NO_SELECTED_BONES"
+    expanded_count = int(focus["expanded_count"])
+    return {
+        "action": "bone_auto_focus",
+        "max_process_id": os.getpid(),
+        "changed": changed,
+        "signature": signature,
+        "selected_bones": rows,
+        "selected_bone_count": len(rows),
+        "expanded": expanded_count > 0,
+        "expanded_count": expanded_count,
+        "status": focus["status"],
+        "explorers": focus["explorers"],
+    }
+
+
+def _max_bone_auto_focus_explorers(
+    rt: Any, bone_handles: set[int], *, probe_only: bool = False,
+) -> dict[str, Any]:
+    explorers: list[tuple[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    try:
+        active = rt.SceneExplorerManager.GetActiveExplorer()
+        if active is not None:
+            name = str(active.Name)
+            explorers.append((name, active))
+            seen_names.add(name)
+    except Exception:
+        # A viewport can own focus without an active Explorer; enumerate the
+        # docked instances as well.
+        pass
+    try:
+        count = max(0, int(rt.SceneExplorerManager.GetExplorerCount()))
+    except Exception as exc:
+        count = 0
+        diagnostics.append({"status": "EXPLORER_UNAVAILABLE", "detail": str(exc)})
+    for index in range(1, count + 1):
+        try:
+            name = str(rt.SceneExplorerManager.GetExplorerName(index))
+            if name in seen_names:
+                continue
+            explorer = rt.SceneExplorerManager.GetExplorer(name)
+            if explorer is not None:
+                explorers.append((name, explorer))
+                seen_names.add(name)
+        except Exception as exc:
+            diagnostics.append({"status": "EXPLORER_UNAVAILABLE", "detail": str(exc)})
+
+    expanded = 0
+    for name, explorer in explorers:
+        detail: dict[str, Any] = {"name": name}
+        diagnostics.append(detail)
+        try:
+            selected_items = list(explorer.SelectedItems())
+            selected_count = len(selected_items)
+            selected_handles = {_max_node_handle(rt, node) for node in selected_items}
+            selected_handles.discard(0)
+            detail["selected_item_count"] = selected_count
+            detail["selected_handles"] = sorted(selected_handles)
+            if probe_only:
+                detail["status"] = "PROBED"
+                continue
+            if selected_count <= 0 or not bone_handles.issubset(selected_handles):
+                detail["status"] = "WAITING_SELECTION_SYNC"
+                continue
+            # FindSelected expands ancestors and scrolls to the next selected
+            # item. Re-selecting the scene here clears Explorer's asynchronous
+            # selection cache and makes the immediate find silently do nothing.
+            for _ in range(max(1, selected_count)):
+                explorer.FindSelected()
+            detail["status"] = "FOCUSED"
+            expanded = len(bone_handles)
+        except Exception as exc:
+            detail.update(status="EXPLORER_ERROR", detail=str(exc))
+    return {
+        "expanded_count": expanded,
+        "explorers": diagnostics,
+        "status": (
+            "PROBED" if probe_only else "FOCUSED" if expanded else
+            "WAITING_SELECTION_SYNC" if explorers else "NO_SCENE_EXPLORER"
+        ),
+    }
+
+
 def _max_instance_copy_expand_sources(rt: Any, source_nodes: list[Any]) -> int:
     """Find source nodes by scene name, then expand them in every Scene Explorer."""
     requested_sources: set[tuple[int, str]] = set()
@@ -26244,6 +26404,8 @@ def _execute_max_command(command: str, payload: dict[str, Any]) -> dict[str, Any
         )
     if command == "instance_copy_expand_sources":
         return _max_instance_copy_expand_source_rows(payload)
+    if command == "bone_auto_focus":
+        return _max_bone_auto_focus(rt, payload)
     if command == "instance_copy_undo":
         return _max_execute_with_native_undo(
             INSTANCE_COPY_NATIVE_UNDO_LABELS["undo"],
@@ -50618,6 +50780,9 @@ MAX_SCENE_ACCESS_INTERFACES: dict[str, dict[str, str]] = {
     "instance_copy.expand_sources": {
         "command": "instance_copy_expand_sources", "contract": "passthrough", "operation": "auxiliary",
     },
+    "toolbox.bone_auto_focus": {
+        "command": "bone_auto_focus", "contract": "passthrough", "operation": "auxiliary",
+    },
     "instance_copy.set_selection": {
         "command": "set_selection", "contract": "passthrough", "operation": "auxiliary",
     },
@@ -56341,6 +56506,10 @@ class LauncherApp:
         self.scene_auto_colors_seed = max(
             1, int(self.launcher_state.get("scene_auto_colors_seed", 1) or 1)
         )
+        self.max_bone_auto_focus_enabled = bool(
+            self.launcher_state.get("max_bone_auto_focus_enabled", True)
+        )
+        self.bone_auto_focus_button = None
         self._scene_auto_colors_inflight_pids: set[int] = set()
         self._scene_auto_colors_pending_by_pid: dict[int, dict[str, Any]] = {}
         self._scene_auto_colors_post_import_after: dict[int, str] = {}
@@ -56633,6 +56802,10 @@ class LauncherApp:
         self._instance_copy_scene_probe_pid: int | None = None
         self._scene_normals_probe_at = 0.0
         self._scene_normals_probe_pid: int | None = None
+        self._bone_auto_focus_probe_at = 0.0
+        self._bone_auto_focus_probe_pid: int | None = None
+        self._bone_auto_focus_signature = ""
+        self._bone_auto_focus_signature_pid = 0
         self._scene_normals_monitor_generation = 0
         self._scene_normals_monitor_dock_side: str | None = (
             str(self.launcher_state.get("scene_normals_dock_side", "") or "")
@@ -62397,6 +62570,12 @@ class LauncherApp:
             "Accent.TButton": {
                 "padding": self._scale_main_ui_padding((5, 3))
             },
+            "BoneAutoFocusOn.TButton": {
+                "padding": self._scale_main_ui_padding((5, 3))
+            },
+            "BoneAutoFocusOff.TButton": {
+                "padding": self._scale_main_ui_padding((5, 3))
+            },
             "BakeSafe.TButton": {
                 "padding": self._scale_main_ui_padding((5, 3))
             },
@@ -62676,6 +62855,27 @@ class LauncherApp:
             bordercolor=c["accent"], lightcolor=c["accent"], darkcolor=c["accent"], padding=(5, 3),
         )
         style.map("Accent.TButton", background=[("pressed", c["select"]), ("active", c["select"])])
+        # Keep toggle colors distinct while the pointer is still over the
+        # button after clicking; the generic button hover is also blue.
+        for toggle_style, toggle_background, toggle_foreground in (
+            ("BoneAutoFocusOn.TButton", c["accent"], c["accent_text"]),
+            ("BoneAutoFocusOff.TButton", c["panel"], c["text"]),
+        ):
+            style.configure(
+                toggle_style,
+                background=toggle_background,
+                foreground=toggle_foreground,
+                bordercolor=c["border"],
+                lightcolor=toggle_background,
+                darkcolor=toggle_background,
+                padding=(5, 3),
+            )
+            style.map(
+                toggle_style,
+                background=[("disabled", c["panel"]), ("!disabled", toggle_background)],
+                foreground=[("disabled", c["muted"]), ("!disabled", toggle_foreground)],
+                bordercolor=[("focus", c["accent"]), ("!focus", c["border"])],
+            )
         style.configure(
             "BakeSafe.TButton",
             background=c["accent"],
@@ -63310,6 +63510,7 @@ class LauncherApp:
         self.random_normals_tool_button = None
         self.random_normals_tooltip = None
         self.message_editor_tool_button = None
+        self.bone_auto_focus_button = None
         self.instance_copy_tool_button = None
         self.scene_auto_colors_tool_button = None
         self.scene_auto_colors_mode_button = None
@@ -73003,6 +73204,41 @@ class LauncherApp:
         self.launcher_state["scene_auto_colors_seed"] = self.scene_auto_colors_seed
         self._queue_launcher_state_write()
 
+    def _bone_auto_focus_button_text(self) -> str:
+        enabled = bool(getattr(self, "max_bone_auto_focus_enabled", True))
+        return self._tr(
+            f"骨骼自动展开定位：{'开' if enabled else '关'}",
+            f"Auto Expand/Focus Bone: {'On' if enabled else 'Off'}",
+        )
+
+    def _refresh_bone_auto_focus_button(self) -> None:
+        button = getattr(self, "bone_auto_focus_button", None)
+        if button is None:
+            return
+        try:
+            button.configure(
+                text=self._bone_auto_focus_button_text(),
+                style="BoneAutoFocusOn.TButton"
+                if bool(getattr(self, "max_bone_auto_focus_enabled", True))
+                else "BoneAutoFocusOff.TButton",
+            )
+        except self.tk.TclError:
+            pass
+
+    def _toggle_bone_auto_focus(self) -> None:
+        self.max_bone_auto_focus_enabled = not bool(
+            getattr(self, "max_bone_auto_focus_enabled", True)
+        )
+        # A re-enable must probe the current selection even when it is the
+        # same bone that was selected before the switch was turned off.
+        self._bone_auto_focus_signature = ""
+        self._bone_auto_focus_probe_at = 0.0
+        self.launcher_state["max_bone_auto_focus_enabled"] = (
+            self.max_bone_auto_focus_enabled
+        )
+        self._queue_launcher_state_write()
+        self._refresh_bone_auto_focus_button()
+
     def _persist_window_preferences(self) -> None:
         self.always_on_top_enabled = bool(self.always_on_top_var.get())
         self.dark_mode_enabled = bool(self.dark_mode_var.get())
@@ -75183,6 +75419,7 @@ class LauncherApp:
             self.max_blender_fbx_import_tool_button = None
             self.max_blender_fbx_import_tooltip = None
             self.max_mod_file_scan_button = None
+            self.bone_auto_focus_button = None
             self.message_editor_tool_button = None
             self.instance_copy_tool_button = None
             self.scene_auto_colors_tool_button = None
@@ -75296,22 +75533,33 @@ class LauncherApp:
                 "Python analyzes the source FBX first. Only when a Parent-Child link can be repaired safely is a log-directory copy processed and imported into MAX, then deleted; otherwise the original FBX is imported directly. Supports _Import2 / _Import_3 and later variants. MAX does not scan, rename, or re-parent scene nodes; unrecognized nodes are skipped and never block import.",
             ),
         )
+        self.bone_auto_focus_button = self.ttk.Button(
+            body,
+            text=self._bone_auto_focus_button_text(),
+            command=self._toggle_bone_auto_focus,
+            style="BoneAutoFocusOn.TButton"
+            if bool(getattr(self, "max_bone_auto_focus_enabled", True))
+            else "BoneAutoFocusOff.TButton",
+        )
+        self.bone_auto_focus_button.grid(
+            row=5, column=0, sticky="ew", pady=(8, 0)
+        )
         self.message_editor_tool_button = self.ttk.Button(
             body,
             text=self._tr("消息编辑", "Message Editor"),
             command=self._show_message_editor,
             style="Accent.TButton",
         )
-        self.message_editor_tool_button.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        self.message_editor_tool_button.grid(row=6, column=0, sticky="ew", pady=(8, 0))
         self.instance_copy_tool_button = self.ttk.Button(
             body,
             text=self._tr("复制 Max 场景 Instance", "Copy Max Scene Instances"),
             command=self._show_instance_copy_tool,
             style="Accent.TButton",
         )
-        self.instance_copy_tool_button.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+        self.instance_copy_tool_button.grid(row=7, column=0, sticky="ew", pady=(8, 0))
         scene_auto_colors_row = self.ttk.Frame(body, style="Panel.TFrame")
-        scene_auto_colors_row.grid(row=7, column=0, sticky="ew", pady=(8, 0))
+        scene_auto_colors_row.grid(row=8, column=0, sticky="ew", pady=(8, 0))
         scene_auto_colors_row.columnconfigure(0, weight=2)
         scene_auto_colors_row.columnconfigure(1, weight=3)
         self.scene_auto_colors_tool_button = self.ttk.Button(
@@ -75338,7 +75586,7 @@ class LauncherApp:
             style="BakeSafe.TButton",
         )
         self.max_material_normalize_button.grid(
-            row=8, column=0, sticky="ew", pady=(8, 0), ipady=8
+            row=9, column=0, sticky="ew", pady=(8, 0), ipady=8
         )
         self.seam_weight_tool_button = self.ttk.Button(
             body,
@@ -75347,7 +75595,7 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.seam_weight_tool_button.grid(
-            row=9, column=0, sticky="ew", pady=(8, 0)
+            row=10, column=0, sticky="ew", pady=(8, 0)
         )
         self.max_mod_file_scan_button = self.ttk.Button(
             body,
@@ -75356,13 +75604,13 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.max_mod_file_scan_button.grid(
-            row=10, column=0, sticky="ew", pady=(8, 0)
+            row=11, column=0, sticky="ew", pady=(8, 0)
         )
         self.ttk.Button(
             body,
             text=self._tr("关闭", "Close"),
             command=close_toolbox,
-        ).grid(row=11, column=0, sticky="e", pady=(14, 0))
+        ).grid(row=12, column=0, sticky="e", pady=(14, 0))
 
         self._restore_toolbox_window_geometry(window)
         self._refresh_toolbox_action_states()
@@ -93347,6 +93595,77 @@ class LauncherApp:
             quiet=True,
         )
 
+    def _poll_bone_auto_focus(self, now: float) -> None:
+        """Keep Scene Explorer focused on the currently selected Max bone."""
+        if self.blender_mode_enabled or not bool(getattr(self, "max_bone_auto_focus_enabled", True)):
+            return
+        if self._import_export_priority_active() or self._bone_auto_focus_probe_pid is not None:
+            return
+        session = self._active_session()
+        if session is None or session.request_in_flight():
+            return
+        if int(getattr(self, "_bone_auto_focus_signature_pid", 0) or 0) != int(session.pid):
+            self._bone_auto_focus_signature = ""
+            self._bone_auto_focus_signature_pid = int(session.pid)
+        if float(now) - self._bone_auto_focus_probe_at < 0.35:
+            return
+        self._bone_auto_focus_probe_at = float(now)
+        self._bone_auto_focus_probe_pid = session.pid
+        known_signature = str(getattr(self, "_bone_auto_focus_signature", "") or "")
+
+        def operation() -> tuple[str, dict[str, Any]]:
+            return self._request_max_scene_interface(
+                session,
+                "toolbox.bone_auto_focus",
+                {"known_signature": known_signature},
+            )
+
+        def release_probe() -> None:
+            if self._bone_auto_focus_probe_pid == session.pid:
+                self._bone_auto_focus_probe_pid = None
+
+        def success(value: tuple[str, dict[str, Any]]) -> None:
+            release_probe()
+            if self.sessions.get(session.pid) is not session or self.active_pid != session.pid:
+                return
+            if self.blender_mode_enabled or not self.max_bone_auto_focus_enabled:
+                return
+            _request_id, receipt = value
+            if int(receipt.get("max_process_id", 0) or 0) not in {0, session.pid}:
+                return
+            signature = str(receipt.get("signature", "") or "")
+            selected_bone_count = int(receipt.get("selected_bone_count", 0) or 0)
+            changed = bool(receipt.get("changed", False))
+            expanded = bool(receipt.get("expanded", False))
+            # Keep an unexpanded selection retryable.  Scene Explorer can be
+            # temporarily unavailable (for example while its panel is being
+            # created); caching this signature here would make that first
+            # failed attempt permanent until the user selected another bone.
+            if signature and (not changed or selected_bone_count <= 0 or expanded):
+                self._bone_auto_focus_signature = signature
+                self._bone_auto_focus_signature_pid = int(session.pid)
+            elif changed and selected_bone_count > 0:
+                self._bone_auto_focus_probe_at = time.monotonic() + 0.7
+            if changed and selected_bone_count > 0 and expanded:
+                self._set_status(
+                    self._tr("已自动展开并定位选中骨骼", "Selected bone expanded and focused"),
+                    progress=100,
+                )
+
+        def failure(_exc: Exception) -> None:
+            release_probe()
+            self._bone_auto_focus_probe_at = time.monotonic() + 0.7
+
+        self._run_background(
+            operation,
+            success,
+            label=f"Probe selected bone PID {session.pid}",
+            on_error=failure,
+            quiet=True,
+            track_busy=False,
+            performance_critical=True,
+        )
+
     def _poll_scene_normals(self, now: float) -> None:
         if self._import_export_priority_active():
             return
@@ -93697,6 +94016,7 @@ class LauncherApp:
                     )
                 )
             if self.busy_count <= 0 and foreground_pid == self.active_pid:
+                self._poll_bone_auto_focus(now)
                 self._poll_scene_normals(now)
                 if self._scene_normals_probe_pid is None:
                     self._poll_instance_copy_scene(now)
@@ -99261,6 +99581,31 @@ def run_ui_smoke_test() -> dict[str, Any]:
     expected_message_editor = app._tr("消息编辑", "Message Editor")
     if expected_message_editor not in toolbox_buttons:
         raise RuntimeError("Toolbox popup lost the Message Editor entry")
+    bone_focus_button = app.bone_auto_focus_button
+    if bone_focus_button is None or not bool(app.max_bone_auto_focus_enabled):
+        raise RuntimeError("Bone auto focus must be enabled by default")
+    if bone_focus_button.master is not toolbox_button_widgets[expected_message_editor].master:
+        raise RuntimeError("Bone auto focus is not in the main Toolbox button column")
+    if int(bone_focus_button.grid_info()["row"]) >= int(
+        toolbox_button_widgets[expected_message_editor].grid_info()["row"]
+    ):
+        raise RuntimeError("Bone auto focus must appear before Message Editor")
+    bone_focus_style = app.ttk.Style(root)
+    for enabled in (True, False, True):
+        if bool(app.max_bone_auto_focus_enabled) != enabled:
+            bone_focus_button.invoke()
+            root.update_idletasks()
+        expected_style = "BoneAutoFocusOn.TButton" if enabled else "BoneAutoFocusOff.TButton"
+        expected_color = app.colors["accent"] if enabled else app.colors["panel"]
+        if (
+            str(bone_focus_button.cget("style")) != expected_style
+            or str(bone_focus_button.cget("text")) != app._bone_auto_focus_button_text()
+            or bool(app.launcher_state["max_bone_auto_focus_enabled"]) != enabled
+        ):
+            raise RuntimeError("Bone auto focus button did not update its state and appearance")
+        for button_state in ((), ("active",), ("pressed",), ("active", "focus")):
+            if bone_focus_style.lookup(expected_style, "background", button_state) != expected_color:
+                raise RuntimeError("Bone auto focus color is obscured by its hover or pressed state")
     expected_seam_tool = app._tr("接缝处权重统一", "Seam Weight Unify")
     if expected_seam_tool not in toolbox_buttons:
         raise RuntimeError("Toolbox popup lost the Seam Weight Unify entry")
@@ -99611,6 +99956,13 @@ def run_ui_smoke_test() -> dict[str, Any]:
         },
         "toolbox": {
             "status": "PASS",
+            "bone_auto_focus": {
+                "enabled_by_default": True,
+                "above_message_editor": True,
+                "on_style": "BoneAutoFocusOn.TButton",
+                "off_style": "BoneAutoFocusOff.TButton",
+                "hover_keeps_toggle_color": True,
+            },
             "topmost_bounds": topmost_bounds,
             "dark_mode_bounds": dark_mode_bounds,
             "button_bounds": toolbox_bounds,
