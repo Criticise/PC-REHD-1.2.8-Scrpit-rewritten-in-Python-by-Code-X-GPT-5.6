@@ -1,24 +1,89 @@
 from __future__ import annotations
 
 import hashlib
+import gc
+import inspect
 import json
 import locale
 import math
+import multiprocessing as mp
 import os
+import pickle
 import re
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import warnings
 import zlib
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Generator, Iterable
+
+
+# ====== BEGIN EXPORT GC DEFERRED CLEANUP ======
+# Keep the same scope protocol as the embedded Probe.  Reference counting is
+# unchanged; cyclic collection is run only after the conversion result exists.
+_EXPORT_GC_LOCK = threading.RLock()
+_EXPORT_GC_STACK = []
+_LAST_EXPORT_GC_STATS = {}
+
+
+def _export_gc_begin():
+    _EXPORT_GC_LOCK.acquire()
+    token = {"was_enabled": gc.isenabled()}
+    if not _EXPORT_GC_STACK:
+        gc.disable()
+    _EXPORT_GC_STACK.append(token)
+    return token
+
+
+def _export_gc_finish(token, *, cleanup=None):
+    global _LAST_EXPORT_GC_STATS
+    if not _EXPORT_GC_STACK or _EXPORT_GC_STACK[-1] is not token:
+        raise RuntimeError("Export GC scopes must finish in their owning thread/order")
+    try:
+        if len(_EXPORT_GC_STACK) == 1:
+            started = time.perf_counter()
+            try:
+                if cleanup is not None:
+                    cleanup()
+                collected = gc.collect()
+                _LAST_EXPORT_GC_STATS = {
+                    "policy": "after_export_delivery",
+                    "collected": collected,
+                    "cleanup_seconds": round(time.perf_counter() - started, 6),
+                }
+            finally:
+                if token["was_enabled"]:
+                    gc.enable()
+    finally:
+        _EXPORT_GC_STACK.pop()
+        _EXPORT_GC_LOCK.release()
+
+
+def _defer_export_gc(function):
+    def wrapped(*args, **kwargs):
+        token = _export_gc_begin()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _export_gc_finish(token)
+    wrapped.__name__ = getattr(function, "__name__", "wrapped")
+    wrapped.__doc__ = getattr(function, "__doc__", None)
+    return wrapped
+
+
+# ====== END EXPORT GC DEFERRED CLEANUP ======
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +194,7 @@ def _read_property(data: bytes, offset: int) -> tuple[Any, int, str]:
         raise ValueError("Binary FBX array byte count does not match its element count")
     if not count:
         return [], offset, kind
-    return list(struct.unpack("<" + item_fmt * int(count), raw)), offset, kind
+    return list(struct.unpack(f"<{int(count)}{item_fmt}", raw)), offset, kind
 
 
 def _read_node(data: bytes, offset: int, *, version: int) -> tuple[FbxNode | None, int]:
@@ -226,7 +291,7 @@ def _property_bytes(kind: str, value: Any) -> bytes:
             return bytes(int(item) & 0xFF for item in value)
         if not value:
             return b""
-        return struct.pack("<" + item_fmt * len(value), *value)
+        return struct.pack(f"<{len(value)}{item_fmt}", *value)
     raise ValueError(f"Unsupported FBX property type {kind!r}")
 
 
@@ -263,7 +328,7 @@ def _encode_node(node: FbxNode, start_offset: int, *, version: int, is_last: boo
         header = struct.pack("<QQQB", cursor, len(node.properties), len(property_blob), len(name))
     else:
         header = struct.pack("<IIIB", cursor, len(node.properties), len(property_blob), len(name))
-    return header + name + property_blob + b"".join(child_blobs)
+    return b"".join((header, name, property_blob, *child_blobs))
 
 
 def write_fbx(
@@ -288,7 +353,8 @@ def write_fbx(
         body_parts.append(encoded)
         cursor += len(encoded)
     null_record = FBX_NULL_RECORD_WIDE if output_version >= 7500 else FBX_NULL_RECORD_NARROW
-    body = b"".join(body_parts) + null_record
+    body_parts.append(null_record)
+    body = b"".join(body_parts)
     before_footer_version = len(FBX_MAGIC) + 4 + len(body) + len(selected_footer_id) + 4
     padding = (-before_footer_version) % 16
     if padding == 0:
@@ -648,11 +714,13 @@ def _invert_row_major_matrix(matrix: list[float]) -> list[float] | None:
     return [work[row][column] for row in range(4) for column in range(4, 8)]
 
 
-def _transform_position_row_major(row: Any, matrix: list[float]) -> list[float]:
-    values = list(row)
+def _transform_position_values_prevalidated(
+    values: Any,
+    matrix: list[float],
+) -> list[float]:
+    """Transform one position with a matrix already validated for this Geometry."""
     if len(values) < 3:
         raise ValueError("Position row must contain three values")
-    matrix = _finite_matrix(matrix, "position matrix")
     x, y, z = (float(values[0]), float(values[1]), float(values[2]))
     return [
         (x * matrix[0]) + (y * matrix[4]) + (z * matrix[8]) + matrix[12],
@@ -661,11 +729,8 @@ def _transform_position_row_major(row: Any, matrix: list[float]) -> list[float]:
     ]
 
 
-def _transform_normal_row_major(row: Any, matrix: list[float]) -> list[float]:
-    values = list(row)
-    if len(values) < 3:
-        raise ValueError("Normal row must contain three values")
-    matrix = _finite_matrix(matrix, "normal matrix")
+def _prepare_normal_transform(matrix: list[float]) -> tuple[bool, tuple[float, ...]]:
+    """Cache fixed 3x3 inverse coefficients from a validated normal matrix."""
     a00, a01, a02 = matrix[0], matrix[1], matrix[2]
     a10, a11, a12 = matrix[4], matrix[5], matrix[6]
     a20, a21, a22 = matrix[8], matrix[9], matrix[10]
@@ -673,35 +738,68 @@ def _transform_normal_row_major(row: Any, matrix: list[float]) -> list[float]:
     c01 = (a12 * a20) - (a10 * a22)
     c02 = (a10 * a21) - (a11 * a20)
     determinant = (a00 * c00) + (a01 * c01) + (a02 * c02)
-    x, y, z = (float(values[0]), float(values[1]), float(values[2]))
     if abs(determinant) <= 1.0e-12:
+        return False, (a00, a01, a02, a10, a11, a12, a20, a21, a22)
+    inverse_det = 1.0 / determinant
+    return True, (
+        c00 * inverse_det,
+        ((a02 * a21) - (a01 * a22)) * inverse_det,
+        ((a01 * a12) - (a02 * a11)) * inverse_det,
+        c01 * inverse_det,
+        ((a00 * a22) - (a02 * a20)) * inverse_det,
+        ((a02 * a10) - (a00 * a12)) * inverse_det,
+        c02 * inverse_det,
+        ((a01 * a20) - (a00 * a21)) * inverse_det,
+        ((a00 * a11) - (a01 * a10)) * inverse_det,
+    )
+
+
+def _transform_normal_values_prevalidated(
+    values: Any,
+    prepared: tuple[bool, tuple[float, ...]],
+) -> list[float]:
+    """Transform one normal using coefficients prepared for this Geometry."""
+    if len(values) < 3:
+        raise ValueError("Normal row must contain three values")
+    inverse, coefficients = prepared
+    a00, a01, a02, a10, a11, a12, a20, a21, a22 = coefficients
+    x, y, z = (float(values[0]), float(values[1]), float(values[2]))
+    if not inverse:
         transformed = [
             (x * a00) + (y * a10) + (z * a20),
             (x * a01) + (y * a11) + (z * a21),
             (x * a02) + (y * a12) + (z * a22),
         ]
     else:
-        inverse_det = 1.0 / determinant
-        normal = (
-            c00 * inverse_det,
-            ((a02 * a21) - (a01 * a22)) * inverse_det,
-            ((a01 * a12) - (a02 * a11)) * inverse_det,
-            c01 * inverse_det,
-            ((a00 * a22) - (a02 * a20)) * inverse_det,
-            ((a02 * a10) - (a00 * a12)) * inverse_det,
-            c02 * inverse_det,
-            ((a01 * a20) - (a00 * a21)) * inverse_det,
-            ((a00 * a11) - (a01 * a10)) * inverse_det,
-        )
         transformed = [
-            (normal[0] * x) + (normal[1] * y) + (normal[2] * z),
-            (normal[3] * x) + (normal[4] * y) + (normal[5] * z),
-            (normal[6] * x) + (normal[7] * y) + (normal[8] * z),
+            (a00 * x) + (a01 * y) + (a02 * z),
+            (a10 * x) + (a11 * y) + (a12 * z),
+            (a20 * x) + (a21 * y) + (a22 * z),
         ]
     length = math.sqrt(sum(value * value for value in transformed))
     if length <= 1.0e-12:
         return [0.0, 0.0, 1.0]
     return [value / length for value in transformed]
+
+
+def _transform_position_row_major(row: Any, matrix: list[float]) -> list[float]:
+    values = list(row)
+    if len(values) < 3:
+        raise ValueError("Position row must contain three values")
+    return _transform_position_values_prevalidated(
+        values,
+        _finite_matrix(matrix, "position matrix"),
+    )
+
+
+def _transform_normal_row_major(row: Any, matrix: list[float]) -> list[float]:
+    values = list(row)
+    if len(values) < 3:
+        raise ValueError("Normal row must contain three values")
+    return _transform_normal_values_prevalidated(
+        values,
+        _prepare_normal_transform(_finite_matrix(matrix, "normal matrix")),
+    )
 
 
 def _matrix_basis_mean_scale(matrix: Any, *, label: str) -> float:
@@ -2322,11 +2420,19 @@ def _extract_geometry_semantics(
     if not positions:
         return {"status": "header_only", "reason": "geometry_with_invalid_positions", "cp_to_output": {}}
     if isinstance(raw_indices, list) and not raw_indices:
+        prepared_position_matrix = (
+            _finite_matrix(position_matrix, "position matrix")
+            if position_matrix is not None
+            else None
+        )
         output_positions = []
         for position in positions:
             row = list(position)
-            if position_matrix is not None:
-                row = _transform_position_row_major(row, position_matrix)
+            if prepared_position_matrix is not None:
+                row = _transform_position_values_prevalidated(
+                    row,
+                    prepared_position_matrix,
+                )
             output_positions.append(row)
         return {
             "status": "rebuilt",
@@ -2498,6 +2604,19 @@ def _extract_geometry_semantics(
                 "cp_to_output": {},
             }
 
+    # Prepare only after layer validation, preserving header-only error returns.
+    prepared_position_matrix = (
+        _finite_matrix(position_matrix, "position matrix")
+        if position_matrix is not None and source_indices
+        else None
+    )
+    prepared_normal_matrix = (
+        _prepare_normal_transform(_finite_matrix(normal_matrix, "normal matrix"))
+        if normal_matrix is not None and source_indices and (
+            normal_values is not None or any(rows is not None for rows in vector_layers.values())
+        )
+        else None
+    )
     output_positions: list[list[float]] = []
     output_faces: list[list[int]] = []
     corner_normals: list[list[float]] = []
@@ -2522,14 +2641,20 @@ def _extract_geometry_semantics(
             output_index = len(output_positions)
             key_to_output[key] = output_index
             position = list(positions[source_index])
-            if position_matrix is not None:
-                position = _transform_position_row_major(position, position_matrix)
+            if prepared_position_matrix is not None:
+                position = _transform_position_values_prevalidated(
+                    position,
+                    prepared_position_matrix,
+                )
             output_positions.append(position)
             cp_to_output[source_index].append(output_index)
         if normal_row is not None:
             normal = list(normal_row)
-            if normal_matrix is not None:
-                normal = _transform_normal_row_major(normal, normal_matrix)
+            if prepared_normal_matrix is not None:
+                normal = _transform_normal_values_prevalidated(
+                    normal,
+                    prepared_normal_matrix,
+                )
             corner_normals.append(normal)
         for layer_name, output_rows in (
             ("LayerElementTangent", corner_tangents),
@@ -2538,8 +2663,11 @@ def _extract_geometry_semantics(
             rows = vector_layers.get(layer_name)
             if rows is not None:
                 vector = list(rows[corner_index][:3])
-                if normal_matrix is not None:
-                    vector = _transform_normal_row_major(vector, normal_matrix)
+                if prepared_normal_matrix is not None:
+                    vector = _transform_normal_values_prevalidated(
+                        vector,
+                        prepared_normal_matrix,
+                    )
                 output_rows.append(vector)
         for channel_index, channel in enumerate(uv_values):
             corner_uvs[channel_index].append([float(value) for value in channel[corner_index][:2]])
@@ -2599,6 +2727,97 @@ def _extract_geometry_semantics(
         "normal_split": bool(normal_values is not None),
         "uv_channel_count": len(uv_channels),
     }
+
+
+def _generic_geometry_semantics_worker(
+    task: tuple[int, FbxNode, list[float] | None, list[float] | None],
+) -> tuple[int, dict[str, Any]]:
+    """Extract one Geometry payload in a worker without touching scene state."""
+    if os.environ.get("PC_REHD_EXPORT_WORKER_GC_DISABLED") == "1":
+        gc.disable()
+    source_id, source_geometry, position_matrix, normal_matrix = task
+    payload = _extract_geometry_semantics(
+        source_geometry,
+        position_matrix=position_matrix,
+        normal_matrix=normal_matrix,
+    )
+    return int(source_id), payload
+
+
+def _disable_export_gc_worker() -> None:
+    gc.disable()
+
+
+def _iter_generic_geometry_payloads(
+    tasks: list[tuple[int, FbxNode, list[float] | None, list[float] | None]],
+) -> Generator[tuple[int, dict[str, Any]], None, None]:
+    """Yield in source order, bounding the process queue and decoded results."""
+    corner_counts = []
+    for _source_id, source_geometry, _position_matrix, _normal_matrix in tasks:
+        indices = _child_value(source_geometry, "PolygonVertexIndex")
+        corner_counts.append(len(indices) if isinstance(indices, list) else 0)
+    requested_workers = _int_or_default(
+        os.environ.get("GENERIC_FBX_WORKERS"),
+        0,
+    )
+    # Measured spawn/IPC overhead outweighs additional parallelism past eight
+    # workers on the export fixture. Scale down for CPUs and substantial tasks.
+    substantial_tasks = sum(count >= 20_000 for count in corner_counts)
+    cpu_count = os.cpu_count() or 1
+    max_workers = max(
+        1,
+        min(len(tasks), requested_workers or substantial_tasks, cpu_count, 8),
+    )
+    # Corner counts approximate work; small and single-mesh jobs stay serial.
+    if (
+        os.environ.get("GENERIC_FBX_PARALLEL", "1") == "0"
+        or max_workers < 2
+        or sum(corner_counts) < 100_000
+        or substantial_tasks < 2
+    ):
+        for task in tasks:
+            yield _generic_geometry_semantics_worker(task)
+        return
+
+    consumed = 0
+    previous_worker_gc = os.environ.get("PC_REHD_EXPORT_WORKER_GC_DISABLED")
+    os.environ["PC_REHD_EXPORT_WORKER_GC_DISABLED"] = "1"
+    try:
+        context = mp.get_context("spawn")
+        executor_kwargs = {"max_workers": max_workers, "mp_context": context}
+        # The production executor disables cyclic GC before it can unpickle a
+        # task.  The tiny fake executor used by regression tests has no
+        # initializer parameter, so retain its compatible call shape.
+        if "initializer" in inspect.signature(ProcessPoolExecutor).parameters:
+            executor_kwargs["initializer"] = _disable_export_gc_worker
+        with ProcessPoolExecutor(**executor_kwargs) as executor:
+            pending = deque()
+            task_iterator = iter(tasks)
+            for _ in range(max_workers):
+                task = next(task_iterator, None)
+                if task is not None:
+                    pending.append(executor.submit(_generic_geometry_semantics_worker, task))
+            try:
+                while pending:
+                    result = pending.popleft().result()
+                    consumed += 1
+                    yield result
+                    del result
+                    task = next(task_iterator, None)
+                    if task is not None:
+                        pending.append(executor.submit(_generic_geometry_semantics_worker, task))
+            finally:
+                for future in pending:
+                    future.cancel()
+    except (BrokenProcessPool, OSError, pickle.PicklingError) as exc:
+        warnings.warn(f"Generic FBX process pool unavailable; continuing serially: {exc}", RuntimeWarning)
+        for task in tasks[consumed:]:
+            yield _generic_geometry_semantics_worker(task)
+    finally:
+        if previous_worker_gc is None:
+            os.environ.pop("PC_REHD_EXPORT_WORKER_GC_DISABLED", None)
+        else:
+            os.environ["PC_REHD_EXPORT_WORKER_GC_DISABLED"] = previous_worker_gc
 
 
 def _apply_current_pose_inverse_skin_to_geometry_payload(
@@ -3946,15 +4165,22 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
     geometry_header_only_count = 0
     geometry_skip_reasons: list[str] = []
     skin_clusters_remapped = 0
+
+    # Geometry semantic decoding is independent once the scene-global
+    # matrices and source IDs are known.  Prepare each unique Geometry in the
+    # exact same first-use order as the serial loops below, then merge the
+    # payloads back in the parent process before any graph/deformer work.
+    geometry_tasks: list[
+        tuple[int, FbxNode, list[float] | None, list[float] | None]
+    ] = []
+    geometry_task_ids: set[int] = set()
+    geometry_task_matrices: dict[int, tuple[list[float] | None, list[float] | None]] = {}
     for source_id in sorted(mesh_model_ids):
         source_model = model_by_id[source_id]
-        model_name = model_names.get(source_id, "Mesh")
         for geometry_id in model_geometry_ids.get(source_id, []):
             source_geometry = geometry_by_id.get(geometry_id)
-            if source_geometry is None or geometry_id in emitted_geometry_ids:
+            if source_geometry is None or geometry_id in geometry_task_ids:
                 continue
-            # Bake only pre-bind Geometry domains. Ordinary-sized MeshBind is
-            # preserved by Cluster.Transform, so Geometry must stay untouched.
             geometry_bind_matrix = (
                 v5_context["bind_mesh_matrices"].get(int(source_id))
                 if v5_context["geometry_bind_bake_by_mesh"].get(
@@ -3969,20 +4195,102 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
                 )
             else:
                 geometry_position_matrix = geometric_matrix
-            geometry_payload = _extract_geometry_semantics(
-                source_geometry,
-                position_matrix=geometry_position_matrix,
-                normal_matrix=geometry_position_matrix,
+            geometry_tasks.append(
+                (
+                    int(geometry_id),
+                    source_geometry,
+                    geometry_position_matrix,
+                    geometry_position_matrix,
+                )
             )
+            geometry_task_ids.add(int(geometry_id))
+            geometry_task_matrices[int(geometry_id)] = (
+                geometry_position_matrix,
+                geometry_position_matrix,
+            )
+
+    for geometry_id, source_geometry in geometry_by_id.items():
+        if geometry_id in geometry_task_ids:
+            continue
+        unlinked_geometry_matrix = _scale_affine_matrix(
+            axis_conversion,
+            float(v5_context["unit_factor"]),
+            label=f"Geometry {geometry_id} canonical unit matrix",
+        )
+        geometry_tasks.append(
+            (
+                int(geometry_id),
+                source_geometry,
+                unlinked_geometry_matrix,
+                unlinked_geometry_matrix,
+            )
+        )
+        geometry_task_ids.add(int(geometry_id))
+        geometry_task_matrices[int(geometry_id)] = (
+            unlinked_geometry_matrix,
+            unlinked_geometry_matrix,
+        )
+
+    geometry_payloads = _iter_generic_geometry_payloads(geometry_tasks)
+    try:
+        for source_id in sorted(mesh_model_ids):
+            source_model = model_by_id[source_id]
+            model_name = model_names.get(source_id, "Mesh")
+            for geometry_id in model_geometry_ids.get(source_id, []):
+                source_geometry = geometry_by_id.get(geometry_id)
+                if source_geometry is None or geometry_id in emitted_geometry_ids:
+                    continue
+                _payload_id, geometry_payload = next(geometry_payloads)
+                if _payload_id != geometry_id:
+                    raise ValueError("Generic Geometry result ID does not match the source")
+                record_normal_axis_domain(
+                    geometry_id,
+                    applied_matrix=geometry_task_matrices[int(geometry_id)][0],
+                )
+                generic_objects.children.append(
+                    _generic_geometry_node(
+                        source_geometry,
+                        geometry_output_ids[geometry_id],
+                        name_override=model_name,
+                        payload=geometry_payload,
+                    )
+                )
+                geometry_cp_maps[geometry_id] = dict(geometry_payload.get("cp_to_output", {}))
+                if geometry_payload.get("status") == "rebuilt":
+                    geometry_rebuilt_count += 1
+                else:
+                    geometry_header_only_count += 1
+                    reason = str(geometry_payload.get("reason", "geometry_header_only"))
+                    if reason not in geometry_skip_reasons:
+                        geometry_skip_reasons.append(reason)
+                emitted_geometry_ids.add(geometry_id)
+            generic_objects.children.append(
+                _generic_mesh_model_node(
+                    source_model,
+                    id_map[source_id],
+                    local_matrix=_output_local_from_world(
+                        source_id, output_worlds, source_graph["model_parent_ids"]
+                    ),
+                    name_override=model_name,
+                )
+            )
+            emitted_object_ids.add(source_id)
+
+        # Preserve valid unlinked Geometry objects as standalone Geometry records.
+        for geometry_id, source_geometry in geometry_by_id.items():
+            if geometry_id in emitted_geometry_ids:
+                continue
+            _payload_id, geometry_payload = next(geometry_payloads)
+            if _payload_id != geometry_id:
+                raise ValueError("Generic Geometry result ID does not match the source")
             record_normal_axis_domain(
                 geometry_id,
-                applied_matrix=geometry_position_matrix,
+                applied_matrix=geometry_task_matrices[int(geometry_id)][0],
             )
             generic_objects.children.append(
                 _generic_geometry_node(
                     source_geometry,
                     geometry_output_ids[geometry_id],
-                    name_override=model_name,
                     payload=geometry_payload,
                 )
             )
@@ -3995,49 +4303,8 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
                 if reason not in geometry_skip_reasons:
                     geometry_skip_reasons.append(reason)
             emitted_geometry_ids.add(geometry_id)
-        generic_objects.children.append(
-            _generic_mesh_model_node(
-                source_model,
-                id_map[source_id],
-                local_matrix=_output_local_from_world(
-                    source_id, output_worlds, source_graph["model_parent_ids"]
-                ),
-                name_override=model_name,
-            )
-        )
-        emitted_object_ids.add(source_id)
-
-    # Preserve valid unlinked Geometry objects as standalone Geometry records.
-    for geometry_id, source_geometry in geometry_by_id.items():
-        if geometry_id in emitted_geometry_ids:
-            continue
-        unlinked_geometry_matrix = _scale_affine_matrix(
-            axis_conversion,
-            float(v5_context["unit_factor"]),
-            label=f"Geometry {geometry_id} canonical unit matrix",
-        )
-        geometry_payload = _extract_geometry_semantics(
-            source_geometry,
-            position_matrix=unlinked_geometry_matrix,
-            normal_matrix=unlinked_geometry_matrix,
-        )
-        record_normal_axis_domain(geometry_id, applied_matrix=unlinked_geometry_matrix)
-        generic_objects.children.append(
-            _generic_geometry_node(
-                source_geometry,
-                geometry_output_ids[geometry_id],
-                payload=geometry_payload,
-            )
-        )
-        geometry_cp_maps[geometry_id] = dict(geometry_payload.get("cp_to_output", {}))
-        if geometry_payload.get("status") == "rebuilt":
-            geometry_rebuilt_count += 1
-        else:
-            geometry_header_only_count += 1
-            reason = str(geometry_payload.get("reason", "geometry_header_only"))
-            if reason not in geometry_skip_reasons:
-                geometry_skip_reasons.append(reason)
-        emitted_geometry_ids.add(geometry_id)
+    finally:
+        geometry_payloads.close()
 
     for source in deformer_nodes:
         source_id = _object_id(source)
@@ -4443,6 +4710,9 @@ def convert_fbx(source_fbx: str | Path, output_fbx: str | Path | None = None) ->
         "normalization": normalization,
         "round_trip": round_trip,
     }
+
+
+convert_fbx = _defer_export_gc(convert_fbx)
 
 
 # ---------------------------------------------------------------------------
