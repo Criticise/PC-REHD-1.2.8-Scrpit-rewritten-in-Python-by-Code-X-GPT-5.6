@@ -2516,31 +2516,44 @@ def _extract_geometry_semantics(
     }
     for layer_name, (value_child, index_child) in vector_specs.items():
         nodes = [child for child in source.children if child.name == layer_name]
-        if len(nodes) > 1:
-            return {
-                "status": "header_only",
-                "reason": f"ambiguous_{layer_name.casefold()}",
-                "cp_to_output": {},
-            }
         if not nodes:
             continue
-        try:
-            vector_layers[layer_name] = _decode_corner_layer(
-                nodes[0],
-                value_child=value_child,
-                index_child=index_child,
-                tuple_size=3,
-                source_indices=source_indices,
-                corner_faces=corner_faces,
-                face_count=len(source_faces),
-                position_count=len(positions),
-            )
-        except (TypeError, ValueError, OverflowError) as exc:
-            return {
-                "status": "header_only",
-                "reason": f"invalid_{layer_name.casefold()}:{exc}",
-                "cp_to_output": {},
-            }
+        # Tangent/Binormal are optional vector channels.  Blender can emit
+        # one layer per UV set (for example UVMap and LightMap), while the
+        # Generic contract has one canonical slot for each vector type.
+        # Decode every candidate for validation, then select the lowest
+        # TypedIndex deterministically.  This keeps the primary layer (index
+        # 0 in Blender's output) and avoids rejecting an otherwise valid mesh
+        # merely because an additional optional tangent set is present.
+        decoded_layers: list[list[tuple[float, ...]]] = []
+        typed_indices: list[int] = []
+        for fallback_index, node in enumerate(nodes):
+            try:
+                decoded_layers.append(
+                    _decode_corner_layer(
+                        node,
+                        value_child=value_child,
+                        index_child=index_child,
+                        tuple_size=3,
+                        source_indices=source_indices,
+                        corner_faces=corner_faces,
+                        face_count=len(source_faces),
+                        position_count=len(positions),
+                    )
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                return {
+                    "status": "header_only",
+                    "reason": f"invalid_{layer_name.casefold()}:{exc}",
+                    "cp_to_output": {},
+                }
+            raw_typed_index = node.properties[0] if node.properties else fallback_index
+            try:
+                typed_indices.append(int(raw_typed_index))
+            except (TypeError, ValueError, OverflowError):
+                typed_indices.append(fallback_index)
+        primary = min(range(len(nodes)), key=lambda index: (typed_indices[index], index))
+        vector_layers[layer_name] = decoded_layers[primary]
 
     uv_values: list[list[tuple[float, ...]]] = []
     uv_names: list[str] = []
