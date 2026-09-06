@@ -21767,11 +21767,14 @@ def _max_focus_imported_model(
     marked_meshes: list[Any] = []
     fallback_meshes: list[Any] = []
     other_mesh_excluded_count = 0
+    empty_geometry_count = 0
     for node in imported_nodes:
         name = str(getattr(node, "name", "") or "")
         if name.casefold() in normalized_excluded_names:
             continue
         if is_under_other_mesh(node):
+            # OtherMesh is a diagnostic/secondary hierarchy in this game. Keep
+            # its existing exclusion from the automatic import framing path.
             other_mesh_excluded_count += 1
             continue
         try:
@@ -21782,10 +21785,19 @@ def _max_focus_imported_model(
         # actual Editable_Mesh, otherwise parent Helpers and bones can frame
         # the view instead of the imported model.
         is_editable_mesh = _max_is_editable_mesh_node(rt, node)
-        if physical_slot > 0 and is_editable_mesh:
-            marked_meshes.append(node)
+        if not is_editable_mesh:
             continue
-        if is_editable_mesh and _max_light_mesh_count(rt, node, "faces") > 0:
+        # FBX LOD groups commonly contain marker Mesh objects with no
+        # vertices/faces. They have no visual extent and must never poison the
+        # aggregate bounds used for viewport framing.
+        vertex_count = _max_light_mesh_count(rt, node, "vertices")
+        face_count = _max_light_mesh_count(rt, node, "faces")
+        if vertex_count <= 0 or face_count <= 0:
+            empty_geometry_count += 1
+            continue
+        if physical_slot > 0:
+            marked_meshes.append(node)
+        else:
             fallback_meshes.append(node)
     # The importer marks each physical Mesh. This prevents an imported
     # LodGroup/helper from becoming the framing target while retaining the
@@ -21796,6 +21808,7 @@ def _max_focus_imported_model(
             "status": "SKIPPED",
             "mesh_count": 0,
             "excluded_other_mesh_count": other_mesh_excluded_count,
+            "empty_geometry_count": empty_geometry_count,
             "reason": "no_visible_lod_editable_mesh",
         })
 
@@ -21826,58 +21839,18 @@ def _max_focus_imported_model(
                 "Viewport focus selected a non-Mesh hierarchy target: "
                 f"expected={len(target_handles)}, actual={len(selected_handles)}"
             )
-        # Use the documented Viewport interface with the current import's
-        # explicit world-space Mesh bounds. This avoids selection-dependent
-        # Max commands and cannot include bones, Helpers, or OtherMesh nodes.
-        world_space = rt.matrix3(1)
-        world_min: tuple[float, float, float] | None = None
-        world_max: tuple[float, float, float] | None = None
-        for node in focus_nodes:
-            try:
-                node_min_point, node_max_point = list(
-                    rt.nodeGetBoundingBox(node, world_space)
-                )
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError(
-                    f"Viewport focus could not read Editable_Mesh bounds: {node}"
-                ) from exc
-            node_min = (
-                float(node_min_point.x),
-                float(node_min_point.y),
-                float(node_min_point.z),
-            )
-            node_max = (
-                float(node_max_point.x),
-                float(node_max_point.y),
-                float(node_max_point.z),
-            )
-            if not all(math.isfinite(value) for value in (*node_min, *node_max)):
-                raise RuntimeError("Viewport focus received non-finite Editable_Mesh bounds")
-            if any(lower > upper for lower, upper in zip(node_min, node_max)):
-                raise RuntimeError("Viewport focus received inverted Editable_Mesh bounds")
-            if world_min is None or world_max is None:
-                world_min = node_min
-                world_max = node_max
-            else:
-                world_min = tuple(
-                    min(existing, incoming) for existing, incoming in zip(world_min, node_min)
-                )
-                world_max = tuple(
-                    max(existing, incoming) for existing, incoming in zip(world_max, node_max)
-                )
-        if world_min is None or world_max is None:
-            raise RuntimeError("Viewport focus could not resolve Editable_Mesh bounds")
+        # Let Max frame the selected real geometry itself. This avoids trusting
+        # per-node FBX bounding-box corner order, which can be inverted for
+        # otherwise valid imported LOD Meshes.
         rt.completeRedraw()
-        rt.viewport.ZoomToBounds(
-            False,
-            rt.point3(world_min[0], world_min[1], world_min[2]),
-            rt.point3(world_max[0], world_max[1], world_max[2]),
-        )
+        rt.execute("max zoomext sel")
         _max_refresh_viewport(rt)
     except Exception as exc:
         return restore_user_selection({
             "status": "SKIPPED",
             "mesh_count": len(focus_nodes),
+            "excluded_other_mesh_count": other_mesh_excluded_count,
+            "empty_geometry_count": empty_geometry_count,
             "reason": f"{type(exc).__name__}: {exc}",
         })
     return restore_user_selection({
@@ -21885,9 +21858,9 @@ def _max_focus_imported_model(
         "mesh_count": len(focus_nodes),
         "selected_mesh_count": len(target_handles),
         "excluded_other_mesh_count": other_mesh_excluded_count,
+        "empty_geometry_count": empty_geometry_count,
         "focus_node_source": "imported_mesh_marker" if marked_meshes else "editable_mesh_fallback",
-        "focus_command": "viewport.ZoomToBounds(false, world_min, world_max)",
-        "world_bounds": {"min": list(world_min), "max": list(world_max)},
+        "focus_command": "max zoomext sel",
         "previous_view_type": previous_view_type,
         "focused_view_type": focused_view_type,
     })

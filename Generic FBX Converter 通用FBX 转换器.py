@@ -860,8 +860,18 @@ _ALPHA_SAFE_CLONED_OBJECT_NAMES = {
     "BindingOperator", "SelectionNode", "SelectionSet",
 }
 
+# Animation records are currently passed through unchanged. Their source-space
+# semantics are not rebuilt or interpreted by the Generic converter yet.
+_ALPHA_ANIMATION_OBJECT_NAMES = {
+    "animationcurve", "animationcurvenode", "animationstack", "animationlayer",
+    "constraint", "character", "controlset", "layerelementtangent",
+    "layerelementbinormal",
+}
+
 
 def _guard_alpha_cloned_object(node: FbxNode) -> None:
+    if node.name.casefold() in _ALPHA_ANIMATION_OBJECT_NAMES:
+        return
     if node.name in _ALPHA_SAFE_CLONED_OBJECT_NAMES:
         return
     if _node_has_unverified_spatial_semantics(node):
