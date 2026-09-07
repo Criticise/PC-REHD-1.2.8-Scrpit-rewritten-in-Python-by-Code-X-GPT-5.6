@@ -1,8 +1,14 @@
 ### **🚨 Urgent Compatibility Notice**
 
+
 **Compatibility has changed!** The current workflow uses a Generic FBX based on 3ds Max scale units. As a result, models imported through the old Blender workflow and models imported through the current workflow can differ by a factor of **2.54**. Models created with the old workflow should be imported into Blender again, imported with the scale set to **2.54×**, checked until they match the intended reference size, and then exported again. This prevents the exported model from becoming offset.
 
+
 **We also do not know how to make this perfect; there is no going back.**
+
+
+<details>
+<summary>Previous updates</summary>
 
 - Added Scaling Mode
 - Added RE6 MOD scanning
@@ -20,3 +26,10 @@
 - Fixed MOD export normal fidelity: the exported normal representation, values, and count now remain consistent with the source FBX
 - Removed ufbx as a required dependency and made it optional to avoid the growing number of error cases
 - Non-conforming bone names no longer block export and are discarded
+
+</details>
+
+- Added a Generic FBX layer. All future exports must pass through this Generic FBX data conversion layer before final export.
+- GPT-6 optimized export speed and script response speed. Welcome to the AGI era.
+- Generic Layer: Unified Blender MMD FBX bone-scale normalization while preserving skinning and world placement.
+- Generic Layer: Normalized inconsistent 3ds Max FBX bone axes by applying one validated global axis conversion and rebuilding bind frames consistently.
