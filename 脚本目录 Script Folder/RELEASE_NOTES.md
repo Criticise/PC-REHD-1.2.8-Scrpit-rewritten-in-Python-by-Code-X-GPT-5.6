@@ -26,10 +26,11 @@
 - Fixed MOD export normal fidelity: the exported normal representation, values, and count now remain consistent with the source FBX
 - Removed ufbx as a required dependency and made it optional to avoid the growing number of error cases
 - Non-conforming bone names no longer block export and are discarded
+- Added a Generic FBX layer. All future exports must pass through this Generic FBX data conversion layer before final export.
 
 </details>
 
-- Added a Generic FBX layer. All future exports must pass through this Generic FBX data conversion layer before final export.
 - GPT-6 optimized export speed and script response speed. Welcome to the AGI era.
-- Generic Layer: Unified Blender MMD FBX bone-scale normalization while preserving skinning and world placement.
-- Generic Layer: Normalized inconsistent 3ds Max FBX bone axes by applying one validated global axis conversion and rebuilding bind frames consistently.
+- Generic Layer: Unified bone-scale normalization for Blender MMD FBX imports.
+- Generic Layer: 3ds Max FBX axis differences are handled by preserving authored local bone transforms while normalizing inherited armature scale and synchronizing bind and cluster matrices without blind XYZ rotation.
+- Added compact Generic, Probe, Export, and MOD node logs for scale, axis, and position debugging.

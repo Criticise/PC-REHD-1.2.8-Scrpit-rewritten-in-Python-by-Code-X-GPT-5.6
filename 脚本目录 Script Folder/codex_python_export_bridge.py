@@ -28636,6 +28636,50 @@ def _memory_export_probe_log(fbx_handoff: Any) -> dict[str, Any]:
         if isinstance(summary.get("generic_fbx_normalization"), dict)
         else {}
     )
+    generic_warnings = [
+        dict(row) for row in generic_normalization.get("warnings", [])
+        if isinstance(row, dict)
+    ]
+    generic_transform_source = generic_normalization.get("generic_node_transforms", [])
+    if not isinstance(generic_transform_source, list):
+        nested_normalization = generic_normalization.get("normalization")
+        generic_transform_source = nested_normalization.get("generic_node_transforms", []) if isinstance(nested_normalization, dict) else []
+    generic_node_transforms = [
+        dict(row) for row in generic_transform_source
+        if isinstance(row, dict)
+    ]
+    # Keep a compact forensic snapshot: one row per exported Mesh/Bone with
+    # transform basis lengths and translation. Large vertex arrays are never
+    # copied into the receipt.
+    node_transform_rows = []
+    def append_transform_row(kind: str, name: str, matrix: Any) -> None:
+        if not isinstance(matrix, (list, tuple)) or len(matrix) < 16:
+            return
+        try:
+            rows = [tuple(float(matrix[o + i]) for i in range(3)) for o in (0, 4, 8)]
+            scales = [sum(v * v for v in row) ** 0.5 for row in rows]
+            node_transform_rows.append({
+                "kind": kind,
+                "name": name,
+                "axis": [[round(v, 5) for v in row] for row in rows],
+                "scale": [round(v, 5) for v in scales],
+                "position": [round(float(matrix[o]), 5) for o in (12, 13, 14)],
+            })
+        except (TypeError, ValueError, OverflowError):
+            return
+    for mesh in handoff.get("contract_meshes", []):
+        if not isinstance(mesh, dict):
+            continue
+        matrix = mesh.get("fbx_node_to_world_matrix") or mesh.get("node_to_world")
+        if not isinstance(matrix, (list, tuple)) or len(matrix) < 16:
+            continue
+        try:
+            append_transform_row("MESH", str(mesh.get("node_name") or mesh.get("mesh_name") or ""), matrix)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    for bone in summary.get("bones", []):
+        if isinstance(bone, dict):
+            append_transform_row("BONE", str(bone.get("name") or bone.get("bone_name") or ""), bone.get("world_matrix"))
     generic_parallel = (
         generic_normalization.get("normalization", {}).get("generic_parallel", {})
         if isinstance(generic_normalization.get("normalization"), dict)
@@ -28675,6 +28719,10 @@ def _memory_export_probe_log(fbx_handoff: Any) -> dict[str, Any]:
         "probe_stage": dict(probe_stage),
         "fbx_generic_seconds": generic_normalization.get("elapsed_seconds"),
         "generic_parallel": dict(generic_parallel) if isinstance(generic_parallel, dict) else {},
+        "generic_validation_mode": str(generic_normalization.get("validation_mode", "") or ""),
+        "generic_warnings": generic_warnings,
+        "node_transform_rows": node_transform_rows,
+        "generic_node_transform_rows": generic_node_transforms,
         "route_receipt_schema": str(probe_route_receipt.get("schema", "") or ""),
         "route_receipt_rows": probe_route_rows,
         "route_receipt_count": len(probe_route_rows),
@@ -28797,6 +28845,8 @@ def _build_memory_export_txt(
     route_rows = route.get("bucket_rows") if isinstance(route.get("bucket_rows"), list) else request.get("bucket_rows", [])
     route_rows = [row for row in route_rows if isinstance(row, dict)]
     probe = payload.get("fbx_probe_log") if isinstance(payload.get("fbx_probe_log"), dict) else {}
+    bridge_rows = payload.get("export_bridge_node_transform_rows") if isinstance(payload.get("export_bridge_node_transform_rows"), list) else probe.get("node_transform_rows", [])
+    mod_internal_rows = payload.get("mod_internal_transform_rows") if isinstance(payload.get("mod_internal_transform_rows"), list) else []
     normal_fidelity_rows = [
         row for row in probe.get("normal_fidelity", []) if isinstance(row, dict)
     ]
@@ -29010,6 +29060,10 @@ def _build_memory_export_txt(
             f"UNMATCHED_FBX_COUNT={_int_or_default(probe.get('unmatched_fbx_count'), 0)}",
             f"UNMATCHED_MAX_COUNT={_int_or_default(probe.get('unmatched_max_count'), 0)}",
             f"ERROR={_export_log_scalar(probe.get('error'))}",
+            "",
+            "[GENERIC_WARNINGS]",
+            f"VALIDATION_MODE={_export_log_scalar(probe.get('generic_validation_mode'))}",
+            f"COUNT={len(probe.get('generic_warnings', [])) if isinstance(probe.get('generic_warnings'), list) else 0}",
             f"TOPOLOGY_AUTHORITY={_export_log_scalar(topology_reconciliation.get('authority'))}",
             f"TOPOLOGY_REFERENCE_MISMATCH_COUNT={_int_or_default(topology_reconciliation.get('mismatch_count'), 0)}",
             "",
@@ -29017,6 +29071,51 @@ def _build_memory_export_txt(
             f"CONSISTENCY={_export_log_scalar(axes.get('status'))}",
         )
     )
+    for index, row in enumerate(
+        (item for item in probe.get("generic_warnings", []) if isinstance(item, dict)),
+        start=1,
+    ):
+        lines.append(
+            f"WARN_{index:03d}={_export_log_scalar(row.get('code'))}: "
+            f"{_export_log_scalar(row.get('message'))}"
+        )
+    generic_rows = probe.get("generic_node_transform_rows", []) if isinstance(probe.get("generic_node_transform_rows"), list) else []
+    lines.extend(("", "[GENERIC_REBUILD_NODE_TRANSFORMS]", f"COUNT={len(generic_rows)}"))
+    for index, row in enumerate(
+        (item for item in generic_rows if isinstance(item, dict)),
+        start=1,
+    ):
+        lines.append(
+            f"NODE_{index:03d}=kind:{_export_log_scalar(row.get('kind'))}; "
+            f"name:{_export_log_scalar(row.get('name'))}; "
+            f"axis:{_export_log_scalar(json.dumps(row.get('axis', []), ensure_ascii=False, separators=(',', ':')))}; "
+            f"scale:{_export_log_scalar(json.dumps(row.get('scale', []), separators=(',', ':')))}; "
+            f"position:{_export_log_scalar(json.dumps(row.get('position', []), separators=(',', ':')))}"
+        )
+    lines.extend(("", "[FBX_PROBE_NODE_TRANSFORMS]", f"COUNT={len(probe.get('node_transform_rows', [])) if isinstance(probe.get('node_transform_rows'), list) else 0}"))
+    for index, row in enumerate((item for item in probe.get("node_transform_rows", []) if isinstance(item, dict)), start=1):
+        lines.append(
+            f"NODE_{index:03d}=kind:{_export_log_scalar(row.get('kind'))}; name:{_export_log_scalar(row.get('name'))}; "
+            f"axis:{_export_log_scalar(json.dumps(row.get('axis', []), separators=(',', ':')))}; "
+            f"scale:{_export_log_scalar(json.dumps(row.get('scale', []), separators=(',', ':')))}; "
+            f"position:{_export_log_scalar(json.dumps(row.get('position', []), separators=(',', ':')))}"
+        )
+    lines.extend(("", "[EXPORT_BRIDGE_NODE_TRANSFORMS]", f"COUNT={len(bridge_rows)}"))
+    for index, row in enumerate((item for item in bridge_rows if isinstance(item, dict)), start=1):
+        lines.append(
+            f"NODE_{index:03d}=kind:{_export_log_scalar(row.get('kind'))}; name:{_export_log_scalar(row.get('name'))}; "
+            f"axis:{_export_log_scalar(json.dumps(row.get('axis', []), separators=(',', ':')))}; "
+            f"scale:{_export_log_scalar(json.dumps(row.get('scale', []), separators=(',', ':')))}; "
+            f"position:{_export_log_scalar(json.dumps(row.get('position', []), separators=(',', ':')))}"
+        )
+    lines.extend(("", "[MOD_INTERNAL_TRANSFORMS]", f"COUNT={len(mod_internal_rows)}"))
+    for index, row in enumerate((item for item in mod_internal_rows if isinstance(item, dict)), start=1):
+        lines.append(
+            f"NODE_{index:03d}=kind:{_export_log_scalar(row.get('kind'))}; name:{_export_log_scalar(row.get('name'))}; "
+            f"axis:{_export_log_scalar(json.dumps(row.get('axis', []), separators=(',', ':')))}; "
+            f"scale:{_export_log_scalar(json.dumps(row.get('scale', []), separators=(',', ':')))}; "
+            f"position:{_export_log_scalar(json.dumps(row.get('position', []), separators=(',', ':')))}"
+        )
     lines.extend(("", "[FBX_NORMAL_FIDELITY]"))
     for index, row in enumerate(probe_route_rows, start=1):
         lines.append(
@@ -33859,6 +33958,46 @@ def _run_memory_export_impl(
         "blender_fbx",
         "max_fbx",
     }
+
+
+def _mod_internal_transform_rows(mod_file: Any) -> list[dict[str, Any]]:
+    """Summarize transforms as serialized inside the final MOD.
+
+    MOD stores bone matrices directly; Meshes have no node matrix table, so
+    their quantized vertex bounds are reported in MOD position space with an
+    identity basis. This keeps the receipt compact and honest.
+    """
+    if not isinstance(mod_file, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        tables = _read_mod_bone_tables(mod_file)
+        for index, matrix in enumerate(tables.get("bone_world_matrices", []), start=1):
+            if not isinstance(matrix, (list, tuple)) or len(matrix) < 16:
+                continue
+            axes = [[round(float(matrix[o + i]), 5) for i in range(3)] for o in (0, 4, 8)]
+            rows.append({"kind": "BONE", "name": f"Bone_{index}", "axis": axes,
+                         "scale": [round(sum(v * v for v in axis) ** 0.5, 5) for axis in axes],
+                         "position": [round(float(matrix[o]), 5) for o in (12, 13, 14)]})
+    except Exception:
+        pass
+    for slot, header in enumerate(mod_file.get("mesh_headers", []), start=1):
+        if not isinstance(header, dict) or _int_or_default(header.get("vert_count"), 0) <= 0:
+            continue
+        try:
+            blob = _get_effective_mesh_vertex_bytes(mod_file, header, face_index_mode="absolute")
+            stride = max(6, _int_or_default(header.get("vert_stride"), 0))
+            points = [struct.unpack_from("<hhh", blob, offset) for offset in range(0, min(len(blob), stride * 20000), stride)]
+            if not points:
+                continue
+            mins = [min(point[i] for point in points) for i in range(3)]
+            maxs = [max(point[i] for point in points) for i in range(3)]
+            rows.append({"kind": "MESH", "name": f"Mesh_{slot}", "axis": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                         "scale": [round((maxs[i] - mins[i]) * 0.5, 5) for i in range(3)],
+                         "position": [round((maxs[i] + mins[i]) * 0.5, 5) for i in range(3)]})
+        except Exception:
+            continue
+    return rows
     needs_fbx_handoff = bool(fbx_modify_meshes) or bone_edit_enabled
     if needs_fbx_handoff:
         phase_started_at = time.perf_counter()
@@ -34136,6 +34275,7 @@ def _run_memory_export_impl(
     except FileExistsError:
         return output_collision_receipt()
     source_mod_file.pop("_source_read_batch", None)
+    mod_internal_transform_rows = _mod_internal_transform_rows(read_mod_file(output_mod))
     _record_timing_phase(
         timing,
         "mod_write_seconds",
@@ -34214,6 +34354,7 @@ def _run_memory_export_impl(
     )
     total_seconds = time.perf_counter() - started_at
     timing["total_seconds"] = total_seconds
+    bridge_probe_log = _memory_export_probe_log(fbx_handoff)
     payload: dict[str, Any] = {
         "status": final_status["status"],
         "detail": (
@@ -34224,6 +34365,7 @@ def _run_memory_export_impl(
         "source_mod": str(source_mod),
         "source_sha256": actual_source_sha,
         "output_mod": str(output_mod),
+        "mod_internal_transform_rows": mod_internal_transform_rows,
         "output_sha256": output_sha256,
         "scene_signature": live_scene_signature,
         "scene_compatibility": copy.deepcopy(compatibility_receipt),
@@ -34255,7 +34397,8 @@ def _run_memory_export_impl(
         "zero_weight_advisory": copy.deepcopy(job.get("zero_weight_advisory", {})),
         "uv_risk": uv_risk,
         "check_source": dict(check_source_receipt),
-        "fbx_probe_log": _memory_export_probe_log(fbx_handoff),
+        "fbx_probe_log": bridge_probe_log,
+        "export_bridge_node_transform_rows": copy.deepcopy(bridge_probe_log.get("node_transform_rows", [])),
         "legacy_blender_scale": copy.deepcopy(job.get("legacy_blender_scale", {})),
         "semantic_parallel": copy.deepcopy(_LAST_SEMANTIC_PARALLEL_STATS),
         "fbx_axis_log": dict(job.get("fbx_axis_log", {})),

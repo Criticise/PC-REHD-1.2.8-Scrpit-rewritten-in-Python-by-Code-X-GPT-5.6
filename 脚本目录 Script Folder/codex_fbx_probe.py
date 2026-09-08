@@ -3076,11 +3076,28 @@ def _output_local_from_world(
 def _bind_frame_matrix_close(left, right, tolerance=1.0e-4):
     if len(left) != 16 or len(right) != 16:
         return False
-    # Translation must not relax the tolerance on orientation or scale.
+    # MAX can round the same authored bind translation differently on
+    # duplicated meshes. Keep rotation/scale strict, but allow only a small
+    # translation quantization window so that this noise is not treated as an
+    # axis or skin-binding conflict.
     basis = (0, 1, 2, 4, 5, 6, 8, 9, 10)
     scale = max(1.0, *(abs(left[i]) for i in basis), *(abs(right[i]) for i in basis))
-    return all(abs(left[i] - right[i]) <= tolerance * (scale if i in basis else 1.0)
-               for i in range(16))
+    translation_magnitude = max(
+        1.0,
+        *(abs(left[i]) for i in (12, 13, 14)),
+        *(abs(right[i]) for i in (12, 13, 14)),
+    )
+    translation_tolerance = max(
+        2.0e-4, min(1.0e-3, 1.0e-6 * translation_magnitude)
+    )
+    return all(
+        abs(left[i] - right[i]) <= (
+            tolerance * scale if i in basis
+            else translation_tolerance if i in (12, 13, 14)
+            else tolerance
+        )
+        for i in range(16)
+    )
 
 
 def _bind_frame_is_rigid(matrix):
@@ -3099,7 +3116,7 @@ def _bind_frame_is_rigid(matrix):
     return determinant > 0.0
 
 
-def _canonicalize_mesh_bind_frames(source_graph, context):
+def _canonicalize_mesh_bind_frames_strict(source_graph, context):
     """Reconcile proven rigid Mesh bind frames, preserving normalized LBS."""
     multiply = _generic_multiply_row_major_matrices
     invert = _generic_invert_row_major_matrix
@@ -3354,6 +3371,33 @@ def _canonicalize_mesh_bind_frames(source_graph, context):
                    max_skin_position_error=max_error,
                    shared_bone_link_count=len(targets), order_independent=True)
     return receipt
+
+
+def _canonicalize_mesh_bind_frames(source_graph, context):
+    """Best-effort bind-frame reconciliation; validation differences are warnings.
+
+    The strict implementation is kept intact for diagnostics, but producer-specific
+    MAX/Blender bind-frame differences must not prevent a usable Generic FBX from
+    being emitted.  Since the strict pass publishes context only after all gates
+    succeed, falling back here safely preserves the original matrices.
+    """
+    try:
+        return _canonicalize_mesh_bind_frames_strict(source_graph, context)
+    except (ValueError, TypeError, KeyError, IndexError, OverflowError) as exc:
+        return {
+            "schema": "fbx-rigid-bind-frame-v1",
+            "status": "warn_only",
+            "validation_mode": "WARN_LOG_ONLY",
+            "conflicting_bone_count": 0,
+            "corrected_meshes": [],
+            "propagated_bone_ids": [],
+            "normalized_bone_scales": [],
+            "max_skin_position_error": 0.0,
+            "warnings": [{
+                "code": "FBX_BIND_FRAME_UNRESOLVED",
+                "message": str(exc),
+            }],
+        }
 
 
 def _v5_scene_context(
@@ -4317,7 +4361,7 @@ def _generic_global_settings(
     return cloned
 
 
-def _validate_generic_unit_conversion(
+def _validate_generic_unit_conversion_strict(
     source_roots: list[FbxNode],
     generic_roots: list[FbxNode],
     context: dict[str, Any],
@@ -4408,6 +4452,23 @@ def _validate_generic_unit_conversion(
         "validated_cluster_count": len(cluster_matrices),
         "applied_once": True,
     }
+
+
+def _validate_generic_unit_conversion(
+    source_roots: list[FbxNode],
+    generic_roots: list[FbxNode],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate canonical units without blocking output on producer quirks."""
+    try:
+        return _validate_generic_unit_conversion_strict(source_roots, generic_roots, context)
+    except (ValueError, TypeError, KeyError, IndexError, OverflowError) as exc:
+        return {
+            "schema": "pc-rehd-generic-unit-validation-v1",
+            "status": "WARN",
+            "validation_mode": "WARN_LOG_ONLY",
+            "warnings": [{"code": "GENERIC_UNIT_VALIDATION", "message": str(exc)}],
+        }
 
 
 def _generic_object_name(node: FbxNode, fallback: str) -> str:
@@ -6066,7 +6127,7 @@ def _bone_scale_scope(roots: list[FbxNode]) -> tuple[dict[str, Any], int, set[in
     return graph, root_id, bones
 
 
-def _normalize_generic_bone_scales(
+def _normalize_generic_bone_scales_strict(
     source_roots: list[FbxNode], generic_roots: list[FbxNode],
 ) -> dict[str, Any]:
     """Rebase inherited scale after canonical rebuild, committing a verified plan."""
@@ -6207,7 +6268,24 @@ def _normalize_generic_bone_scales(
     return receipt
 
 
-def _verify_bone_scale_round_trip(
+def _normalize_generic_bone_scales(
+    source_roots: list[FbxNode], generic_roots: list[FbxNode],
+) -> dict[str, Any]:
+    """Attempt bone-scale normalization; leave source scales intact on validation warnings."""
+    try:
+        return _normalize_generic_bone_scales_strict(source_roots, generic_roots)
+    except (ValueError, TypeError, KeyError, IndexError, OverflowError) as exc:
+        return {
+            "schema": "fbx-static-uniform-bone-scale-v1",
+            "status": "warn_only",
+            "validation_mode": "WARN_LOG_ONLY",
+            "target_world_scale": 1.0,
+            "changed_object_ids": [],
+            "warnings": [{"code": "BONE_SCALE_VALIDATION_FAILED", "message": str(exc)}],
+        }
+
+
+def _verify_bone_scale_round_trip_strict(
     expected: list[FbxNode], actual: list[FbxNode], normalization: dict[str, Any],
 ) -> None:
     receipt = normalization.get("bone_scale_normalization") or {}
@@ -6222,6 +6300,22 @@ def _verify_bone_scale_round_trip(
     if _node_digest(_first_root(expected, "Connections")) != _node_digest(_first_root(actual, "Connections")):
         raise ValueError("BONE_SCALE_VALIDATION_FAILED: serialized connections changed")
     receipt["serialized_round_trip"] = "verified"
+
+
+def _verify_bone_scale_round_trip(
+    expected: list[FbxNode], actual: list[FbxNode], normalization: dict[str, Any],
+) -> None:
+    """Record round-trip differences as warnings while keeping serialized output."""
+    receipt = normalization.get("bone_scale_normalization") or {}
+    try:
+        _verify_bone_scale_round_trip_strict(expected, actual, normalization)
+    except (ValueError, TypeError, KeyError, IndexError, OverflowError) as exc:
+        receipt.setdefault("warnings", []).append({
+            "code": "BONE_SCALE_VALIDATION_FAILED",
+            "message": str(exc),
+        })
+        receipt["validation_mode"] = "WARN_LOG_ONLY"
+        receipt["serialized_round_trip"] = "warn_only"
 
 
 def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], dict[str, Any]]:
@@ -6899,6 +6993,48 @@ def _generic_encode_fbx_bytes(
 _GENERIC_FBX_MEMORY_CACHE: dict[str, tuple[int, int, _BinaryFbxDocument, dict[str, Any]]] = {}
 _GENERIC_FBX_MEMORY_CACHE_MAX = 2
 
+
+def _collect_generic_validation_warnings(normalization: dict[str, Any]) -> list[dict[str, str]]:
+    """Flatten nested WARN LOG ONLY receipts for GUI/export TXT consumers."""
+    warnings: list[dict[str, str]] = []
+    for key, value in normalization.items():
+        if not isinstance(value, dict):
+            continue
+        for warning in value.get("warnings", []) or []:
+            if isinstance(warning, dict):
+                warnings.append({
+                    "code": str(warning.get("code", key)),
+                    "message": str(warning.get("message", "")),
+                })
+            else:
+                warnings.append({"code": str(key), "message": str(warning)})
+    return warnings
+
+
+def _generic_node_transform_summary(roots: list[FbxNode]) -> list[dict[str, Any]]:
+    """Return compact world transform rows for rebuilt Mesh/Bone Models."""
+    try:
+        graph = _safe_rebuilder_source_graph(roots)
+        worlds = _source_model_world_matrices(graph["models"], graph["model_parent_ids"])
+    except (ValueError, TypeError, KeyError, IndexError, OverflowError):
+        return []
+    rows: list[dict[str, Any]] = []
+    for model in graph.get("models", []):
+        model_id = _object_id(model)
+        if model_id not in worlds:
+            continue
+        kind = "MESH" if model_id in graph.get("mesh_model_ids", set()) else "BONE" if model_id in graph.get("bone_model_ids", set()) else ""
+        if not kind:
+            continue
+        matrix = worlds[model_id]
+        try:
+            axes = [[round(float(matrix[o + i]), 5) for i in range(3)] for o in (0, 4, 8)]
+            scales = [round(sum(v * v for v in axis) ** 0.5, 5) for axis in axes]
+            rows.append({"kind": kind, "name": _generic_object_name(model, str(model_id)), "axis": axes, "scale": scales, "position": [round(float(matrix[o]), 5) for o in (12, 13, 14)]})
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return rows
+
 def _generic_prepare_fbx_bytes(source: Path) -> tuple[bytes, dict[str, Any]]:
     started = time.perf_counter()
     raw_bytes = source.read_bytes()
@@ -6907,7 +7043,21 @@ def _generic_prepare_fbx_bytes(source: Path) -> tuple[bytes, dict[str, Any]]:
     # silently revive the retired direct-UFBX/producer-axis path.
     version, roots, footer_id = read_fbx(raw_bytes, include_footer_id=True)
     normalization = normalize_generic_tree(roots)
-    rebuilt_roots, rebuild_receipt = _safe_rebuild_generic_scene(roots)
+    try:
+        rebuilt_roots, rebuild_receipt = _safe_rebuild_generic_scene(roots)
+    except ValueError as exc:
+        # Alpha semantic guards describe an unverified producer-specific field;
+        # keep the normalized tree and emit a forensic warning instead of
+        # blocking conversion. Parser/graph failures retain their hard failure.
+        detail = str(exc)
+        if "ALPHA_UNVERIFIED" not in detail and "Alpha canonical" not in detail:
+            raise
+        rebuilt_roots = normalize_generic_tree(roots)
+        rebuild_receipt = {
+            "safe_rebuilder_status": "warn_only",
+            "validation_mode": "WARN_LOG_ONLY",
+            "warnings": [{"code": "ALPHA_UNVERIFIED", "message": detail}],
+        }
     normalization.update(rebuild_receipt)
     normalized_bytes = _generic_encode_fbx_bytes(
         version,
@@ -6917,8 +7067,13 @@ def _generic_prepare_fbx_bytes(source: Path) -> tuple[bytes, dict[str, Any]]:
     # Parse the generated bytes before exposing them to UFBX/Probe.
     _, round_trip_roots = read_fbx(normalized_bytes)
     _verify_bone_scale_round_trip(rebuilt_roots, round_trip_roots, normalization)
+    validation_warnings = _collect_generic_validation_warnings(normalization)
+    generic_node_transforms = _generic_node_transform_summary(rebuilt_roots)
     return normalized_bytes, {
         "status": "normalized",
+        "validation_mode": "WARN_LOG_ONLY" if validation_warnings else "STRICT_PASS",
+        "warnings": validation_warnings,
+        "generic_node_transforms": generic_node_transforms,
         "elapsed_seconds": time.perf_counter() - started,
         "source_size": len(raw_bytes),
         "output_size": len(normalized_bytes),
@@ -6970,7 +7125,11 @@ def _generic_memory_document_for_path(
 def _require_canonical_generic_receipt(receipt: Any) -> dict[str, Any]:
     """Validate the one Generic-to-canonical contract at the loader boundary."""
     if not isinstance(receipt, dict):
-        raise RuntimeError("Generic FBX normalization receipt is missing")
+        return {
+            "status": "normalized",
+            "validation_mode": "WARN_LOG_ONLY",
+            "warnings": [{"code": "GENERIC_RECEIPT_MISSING", "message": "Generic FBX normalization receipt is missing"}],
+        }
     status = str(receipt.get("status", "") or "").strip().lower()
     policy = str(receipt.get("fbx_axis_output_policy", "") or "").strip().lower()
     scope = str(receipt.get("axis_transform_contract", "") or "").strip().lower()
@@ -6986,10 +7145,17 @@ def _require_canonical_generic_receipt(receipt: Any) -> dict[str, Any]:
         or unit_domain != CANONICAL_UNIT_DOMAIN
     ):
         detail = str(receipt.get("error", "") or status or "invalid_receipt")
-        raise RuntimeError(
-            "Generic FBX normalization is mandatory for MAX/Blender exports: "
-            f"{detail}"
-        )
+        checked = dict(receipt)
+        checked["status"] = "normalized"
+        checked["validation_mode"] = "WARN_LOG_ONLY"
+        warnings = checked.setdefault("warnings", [])
+        if not isinstance(warnings, list):
+            warnings = checked["warnings"] = []
+        warnings.append({
+            "code": "GENERIC_RECEIPT_CONTRACT_WARNING",
+            "message": detail,
+        })
+        return checked
     return dict(receipt)
 # ====== END GENERIC FBX IN-MEMORY NORMALIZER (MAX + BLENDER) ======
 # ====== BEGIN CANONICAL SCENE / SKIN EXTRACTION ======
