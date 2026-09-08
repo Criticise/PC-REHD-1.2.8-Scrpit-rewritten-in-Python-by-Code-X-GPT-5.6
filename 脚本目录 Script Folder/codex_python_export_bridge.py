@@ -29036,6 +29036,30 @@ def _memory_export_probe_log(fbx_handoff: Any) -> dict[str, Any]:
         dict(row) for row in generic_normalization.get("warnings", [])
         if isinstance(row, dict)
     ]
+    # Probe keeps malformed/partial PolygonVertexIndex streams advisory.  Add
+    # one compact WARN row per affected Mesh so the final export TXT contains
+    # the forensic evidence without copying any FBX arrays or blocking the
+    # export.  De-duplicate by node/mesh name because the same warning can be
+    # present in both the route receipt and contract row.
+    topology_warn_seen: set[tuple[str, str]] = set()
+    for mesh in handoff.get("contract_meshes", []):
+        if not isinstance(mesh, dict):
+            continue
+        detail = str(mesh.get("fbx_topology_warning", "") or "").strip()
+        if not detail:
+            continue
+        name = str(mesh.get("node_name") or mesh.get("mesh_name") or "<unnamed>")
+        key = (name, detail)
+        if key in topology_warn_seen:
+            continue
+        topology_warn_seen.add(key)
+        generic_warnings.append(
+            {
+                "code": "FBX_TOPOLOGY_WARN",
+                "message": f"{name}: {detail}",
+                "node_name": name,
+            }
+        )
     generic_transform_source = generic_normalization.get("generic_node_transforms", [])
     if not isinstance(generic_transform_source, list):
         nested_normalization = generic_normalization.get("normalization")

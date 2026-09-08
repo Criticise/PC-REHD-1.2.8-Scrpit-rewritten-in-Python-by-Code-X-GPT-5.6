@@ -8600,6 +8600,7 @@ class _BinaryFbxMeshAdapter:
     num_indices: int
     num_faces: int
     num_triangles: int
+    topology_warning: str = ""
     vertex_bitangent: list[Any] | None = None
     vertex_tangent: list[Any] | None = None
     vertex_color: list[Any] | None = None
@@ -8964,20 +8965,40 @@ def _binary_fbx_build_mesh_adapter(
         [float(raw_positions[index]), float(raw_positions[index + 1]), float(raw_positions[index + 2])]
         for index in range(0, len(raw_positions), 3)
     ]
-    # Generic MAX reconstruction intentionally keeps zero-vertex placeholder
-    # Meshes.  They are valid scene records and must not enter the polygon
-    # decoder, which correctly rejects missing topology for non-empty Meshes.
-    if not positions:
+    # FBX Meshes may contain only loose vertices/edges, with no polygons.
+    # Blender emits exactly this form after all faces are removed.  Keep the
+    # vertices, Skin and owning Model so those records cannot prevent the
+    # independent bone hierarchy from loading.  Stage A still observes zero
+    # faces and decides whether this Mesh needs any geometry export.  An
+    # existing non-empty polygon stream remains subject to strict decoding;
+    # this must not turn malformed faces into a successful empty Mesh.
+    no_polygon_stream = raw_polygon_indices is None or (
+        isinstance(raw_polygon_indices, list) and not raw_polygon_indices
+    )
+    topology_warning = ""
+    if no_polygon_stream:
         indices = []
         faces = []
+        topology_warning = (
+            "PolygonVertexIndex is missing"
+            if raw_polygon_indices is None
+            else "PolygonVertexIndex is empty (zero faces)"
+        )
     elif raw_geometry is not None:
         indices = [int(value) for value in raw_geometry.get("source_indices", [])]
         faces = [tuple(map(int, face)) for face in raw_geometry.get("faces", [])]
     else:
-        indices, faces, _corner_faces = _binary_fbx_polygon_vertex_stream(
-            raw_polygon_indices,
-            position_count=len(positions),
-        )
+        try:
+            indices, faces, _corner_faces = _binary_fbx_polygon_vertex_stream(
+                raw_polygon_indices,
+                position_count=len(positions),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            # Topology is advisory at the Probe boundary. Preserve the
+            # vertices/Skin and let routing fall back to source geometry while
+            # recording the exact malformed stream for the export TXT log.
+            topology_warning = f"{type(exc).__name__}: {exc}"
+            indices, faces = [], []
 
     # UFBX exposes vertex_normals as a stream aligned with polygon corners for
     # ByPolygonVertex layers.  Preserve that shape so the legacy compatibility
@@ -9049,6 +9070,7 @@ def _binary_fbx_build_mesh_adapter(
         num_indices=len(indices),
         num_faces=len(faces),
         num_triangles=sum(max(0, int(size) - 2) for _begin, size in faces),
+        topology_warning=topology_warning,
     )
 
 
@@ -11511,6 +11533,7 @@ def _probe_scene_handoff(
                 "geometry_skipped": not bool(exact_payload_required),
                 "skip_reason": probe_skip_reason,
                 "topology_scanned": topology_scanned,
+                "topology_warning": str(getattr(mesh, "topology_warning", "") or ""),
                 "fbx_has_skin": bool(has_skin),
                 "fbx_vertex_count": vertex_count,
                 "fbx_face_count": int(triangle_count),
@@ -11551,6 +11574,7 @@ def _probe_scene_handoff(
                 "fbx_probe_geometry_skipped": not bool(exact_payload_required),
                 "fbx_probe_skip_reason": probe_skip_reason,
                 "fbx_probe_topology_scanned": topology_scanned,
+                "fbx_topology_warning": str(getattr(mesh, "topology_warning", "") or ""),
                 "normal_fidelity": geometry.get("normal_fidelity", normal_fidelity),
                 **binary_identity,
                 **summary_skin,
@@ -11575,6 +11599,8 @@ def _probe_scene_handoff(
             probe_topology_scanned=topology_scanned,
             generic_normalization=generic_normalization,
         )
+        if str(getattr(mesh, "topology_warning", "") or ""):
+            contract_mesh["fbx_topology_warning"] = str(mesh.topology_warning)
         contract_meshes.append(contract_mesh)
 
     material_names_seen: dict[str, dict[str, Any]] = {}
