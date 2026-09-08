@@ -9,7 +9,9 @@ import math
 import multiprocessing as mp
 import os
 import pickle
+import queue
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -5484,6 +5486,10 @@ TEXT = {
         "convert": "选择 FBX 并转换",
         "dark": "深色模式",
         "language": "English",
+        "update_script": "下载更新",
+        "update_downloading": "正在下载更新",
+        "update_success": "更新完成，正在重启",
+        "update_failed": "更新失败",
         "ready": "准备就绪",
         "cancel": "已取消",
         "source": "源文件",
@@ -5502,6 +5508,10 @@ TEXT = {
         "convert": "Choose FBX and Convert",
         "dark": "Dark mode",
         "language": "中文",
+        "update_script": "Update Script",
+        "update_downloading": "Downloading update",
+        "update_success": "Update complete, restarting",
+        "update_failed": "Update failed",
         "ready": "Ready",
         "cancel": "Cancelled",
         "source": "Source",
@@ -5535,6 +5545,9 @@ GITHUB_RELEASE_URL = (
 GITHUB_API_REPOSITORY_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}"
 GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS = 6.0
 GITHUB_UPDATE_CHECK_USER_AGENT = "Generic-FBX-Converter-update-check"
+GITHUB_SOURCE_FILE_NAME = "Generic FBX Converter 通用FBX 转换器.py"
+GITHUB_SOURCE_BASE_SHA = "afd565b58c5f35e5a77b7fc84da5f4371ec25a13"
+GITHUB_SOURCE_DOWNLOAD_MAX_BYTES = 16 * 1024 * 1024
 
 
 def _github_json(url: str) -> dict[str, Any] | None:
@@ -5589,29 +5602,42 @@ def _check_github_update(local_script: str | Path | None = None) -> dict[str, An
             return {"available": False, "reason": "local_script_missing"}
         local_hash = _git_blob_sha1(local_path.read_bytes())
 
-        repository = _github_json(GITHUB_API_REPOSITORY_URL)
-        default_branch = (
-            str(repository.get("default_branch", "") or "").strip()
-            if isinstance(repository, dict)
-            else ""
-        )
-        if not default_branch:
-            return {"available": False, "reason": "default_branch_missing"}
+        def raw_fallback() -> dict[str, Any]:
+            raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}/main/{urllib.parse.quote(GITHUB_SOURCE_FILE_NAME, safe='')}"
+            request = urllib.request.Request(raw_url, headers={"User-Agent": GITHUB_UPDATE_CHECK_USER_AGENT}, method="GET")
+            try:
+                with urllib.request.urlopen(request, timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS) as response:
+                    remote_data = response.read(GITHUB_SOURCE_DOWNLOAD_MAX_BYTES + 1)
+            except Exception:
+                return {"available": False, "reason": "remote_unavailable"}
+            if len(remote_data) > GITHUB_SOURCE_DOWNLOAD_MAX_BYTES:
+                return {"available": False, "reason": "remote_file_too_large"}
+            remote_sha = _git_blob_sha1(remote_data)
+            same = remote_sha == local_hash
+            local_changes = remote_sha == GITHUB_SOURCE_BASE_SHA and not same
+            return {"checked": True, "available": not same and not local_changes, "reason": "same_hash" if same else "local_changes" if local_changes else "different_hash", "local_hash": local_hash, "remote_sha": remote_sha, "remote_path": GITHUB_SOURCE_FILE_NAME, "revision": "main", "matched_paths": [GITHUB_SOURCE_FILE_NAME], "changed_paths": [] if same or local_changes else [GITHUB_SOURCE_FILE_NAME], "release_url": GITHUB_RELEASE_URL}
 
+        head = _github_json(f"{GITHUB_API_REPOSITORY_URL}/commits/main")
+        revision = str((head or {}).get("sha", ""))
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            # GitHub may rate-limit unauthenticated API requests.  A raw
+            # branch read still gives an authoritative content comparison;
+            # the final post-install comparison below remains mandatory.
+            return raw_fallback()
         tree_url = (
             f"{GITHUB_API_REPOSITORY_URL}/git/trees/"
-            f"{urllib.parse.quote(default_branch, safe='')}?recursive=1"
+            f"{revision}?recursive=1"
         )
         tree_payload = _github_json(tree_url)
         tree_rows = tree_payload.get("tree") if isinstance(tree_payload, dict) else None
         if not isinstance(tree_rows, list):
-            return {"available": False, "reason": "tree_unavailable"}
+            return raw_fallback()
         if bool(tree_payload.get("truncated")):
             # A truncated recursive tree is not authoritative.  Keep the
             # check advisory and silent instead of making a partial decision.
-            return {"available": False, "reason": "tree_truncated"}
+            return raw_fallback()
 
-        local_name = local_path.name.casefold()
+        local_name = GITHUB_SOURCE_FILE_NAME.casefold()
         candidates: list[dict[str, str]] = []
         for row in tree_rows:
             if not isinstance(row, dict) or str(row.get("type", "")) != "blob":
@@ -5620,25 +5646,32 @@ def _check_github_update(local_script: str | Path | None = None) -> dict[str, An
             if remote_path.rsplit("/", 1)[-1].casefold() != local_name:
                 continue
             remote_hash = str(row.get("sha", "") or "").strip().casefold()
-            if not remote_hash:
+            if not re.fullmatch(r"[0-9a-f]{40}", remote_hash) or str(row.get("mode", "100644")) not in {"100644", "100755"}:
                 continue
             candidates.append({"path": remote_path, "sha": remote_hash})
         if not candidates:
-            return {"available": False, "reason": "same_name_file_not_found"}
+            return raw_fallback()
 
-        changed = [row for row in candidates if row["sha"] != local_hash]
-        if not changed:
-            return {
-                "available": False,
-                "reason": "same_hash",
-                "local_hash": local_hash,
-                "matched_paths": [row["path"] for row in candidates],
-            }
+        canonical = [row for row in candidates if row["path"] == GITHUB_SOURCE_FILE_NAME]
+        if len(canonical) == 1:
+            selected = canonical[0]
+        elif len(candidates) == 1:
+            selected = candidates[0]
+        else:
+            return {"available": False, "reason": "ambiguous_remote_file"}
+        same = selected["sha"] == local_hash
+        # Do not offer the unmodified upstream base over this working revision.
+        local_changes = not same and selected["sha"] == GITHUB_SOURCE_BASE_SHA
         return {
-            "available": True,
+            "checked": True,
+            "available": not same and not local_changes,
+            "reason": "same_hash" if same else "local_changes" if local_changes else "different_hash",
             "local_hash": local_hash,
-            "matched_paths": [row["path"] for row in candidates],
-            "changed_paths": [row["path"] for row in changed],
+            "remote_sha": selected["sha"],
+            "remote_path": selected["path"],
+            "revision": revision,
+            "matched_paths": [selected["path"]],
+            "changed_paths": [] if same else [selected["path"]],
             "release_url": GITHUB_RELEASE_URL,
         }
     except Exception:
@@ -5647,27 +5680,106 @@ def _check_github_update(local_script: str | Path | None = None) -> dict[str, An
         return {"available": False, "reason": "check_failed"}
 
 
+def _download_github_update(local_script: str | Path, on_progress: Any = None, *, expected: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Download, verify, replace, and re-check this script atomically."""
+    local_path = Path(local_script).resolve()
+    staging = None
+    backup = None
+    replaced = False
+    retain_backup = False
+    try:
+        if local_path.is_symlink():
+            raise RuntimeError("Cannot update a linked script")
+        check = _check_github_update(local_path)
+        if check.get("reason") == "same_hash":
+            return {"ok": True, "already_current": True, "check": check}
+        if not check.get("available"):
+            raise RuntimeError(f"Cannot verify remote update: {check.get('reason', 'unknown')}")
+        original_sha = str(check["local_hash"])
+        if expected and str(expected.get("local_hash")) != original_sha:
+            raise RuntimeError("Local script changed after the update check; restart and check again")
+        remote_path = str(check["remote_path"])
+        remote_sha = str(check["remote_sha"])
+        revision = str(check["revision"])
+        if not re.fullmatch(r"[0-9a-f]{40}", revision) or not re.fullmatch(r"[0-9a-f]{40}", remote_sha):
+            raise RuntimeError("Invalid remote revision")
+        raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}/{revision}/" + urllib.parse.quote(remote_path, safe="/")
+        # Staging and destination must share a volume for atomic replacement.
+        staging = Path(tempfile.mkdtemp(prefix=".generic-fbx-update-", dir=str(local_path.parent)))
+        temp_path = staging / "download.py"
+        backup = staging / "original.py"
+        request = urllib.request.Request(raw_url, headers={"User-Agent": GITHUB_UPDATE_CHECK_USER_AGENT}, method="GET")
+        with urllib.request.urlopen(request, timeout=30.0) as response, temp_path.open("wb") as out:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = response.read(256 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if done > GITHUB_SOURCE_DOWNLOAD_MAX_BYTES:
+                    raise RuntimeError("Remote script exceeded the download size limit")
+                if callable(on_progress):
+                    on_progress(done, total, local_path.name)
+        if _git_blob_sha1(temp_path.read_bytes()).lower() != remote_sha:
+            raise RuntimeError("Downloaded script hash differs from GitHub")
+        compile(temp_path.read_bytes(), str(local_path), "exec")
+        if _git_blob_sha1(local_path.read_bytes()) != original_sha:
+            raise RuntimeError("Local script changed during download")
+        shutil.copy2(local_path, backup)
+        if _git_blob_sha1(backup.read_bytes()) != original_sha:
+            raise RuntimeError("Local script changed while backing up")
+        if callable(on_progress):
+            on_progress(1, 1, "Verifying and replacing")
+        os.replace(temp_path, local_path)
+        replaced = True
+        if _git_blob_sha1(local_path.read_bytes()) != remote_sha:
+            raise RuntimeError("Installed script hash mismatch")
+        verify = _check_github_update(local_path)
+        if verify.get("reason") != "same_hash" or verify.get("remote_sha") != remote_sha:
+            raise RuntimeError(f"Final GitHub verification failed: {verify.get('reason', 'unknown')}")
+        return {"ok": True, "check": verify}
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        if replaced and backup is not None:
+            try:
+                os.replace(backup, local_path)
+            except Exception as rollback_exc:
+                retain_backup = True
+                error += f"; restore failed: {rollback_exc}; backup retained at {backup}"
+        return {"ok": False, "error": error}
+    finally:
+        if staging is not None and not retain_backup:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _restart_self() -> None:
+    """Replace the current process with the same Python script."""
+    executable = Path(sys.executable)
+    if os.name == "nt" and executable.name.casefold() == "python.exe" and executable.with_name("pythonw.exe").is_file():
+        executable = executable.with_name("pythonw.exe")
+    subprocess.Popen([str(executable), str(Path(__file__).resolve()), *sys.argv[1:]], close_fds=True,
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    os._exit(0)
+
+
 def _start_github_update_check(
     root: Any,
     on_result: Any,
 ) -> None:
     """Start exactly one daemon check and marshal its result onto Tk's thread."""
+    results = queue.Queue()
     def worker() -> None:
-        result = _check_github_update(Path(__file__))
+        results.put(_check_github_update(Path(__file__)))
 
-        def deliver_result() -> None:
-            try:
-                on_result(result)
-            except Exception:
-                # Tk can be torn down between the network reply and this
-                # callback.  Update discovery must never leak a GUI error.
-                pass
-
+    def poll() -> None:
         try:
-            root.after(0, deliver_result)
-        except Exception:
-            # The user may close the window while the request is in flight.
-            pass
+            result = results.get_nowait()
+        except queue.Empty:
+            root.after(100, poll)
+            return
+        on_result(result)
 
     try:
         threading.Thread(
@@ -5675,13 +5787,14 @@ def _start_github_update_check(
             name="Generic-FBX-Converter-GitHub-Update",
             daemon=True,
         ).start()
+        root.after(100, poll)
     except Exception:
         pass
 
 
 def _launch_gui() -> None:
     import tkinter as tk
-    from tkinter import filedialog, font as tkfont, messagebox
+    from tkinter import filedialog, font as tkfont, messagebox, ttk
 
     state = _load_user_state()
     lang = state["language"] or _language()
@@ -5708,7 +5821,7 @@ def _launch_gui() -> None:
     heading_row = tk.Frame(outer)
     heading_row.pack(fill="x")
     heading = tk.Label(heading_row, text=labels["title"], anchor="w", font=("Microsoft YaHei", 18, "bold"))
-    heading.pack(side="left")
+    heading.pack(anchor="w")
     update_badge = tk.Label(
         heading_row,
         text=labels["update_notice"],
@@ -5727,14 +5840,17 @@ def _launch_gui() -> None:
     dark_var = tk.BooleanVar(value=state["dark_mode"])
     convert_button = tk.Button(controls, text=labels["convert"], padx=18, pady=9, relief="flat", cursor="hand2")
     convert_button.pack(side="left")
-    language_button = tk.Button(controls, text=labels["language"], padx=12, pady=7, relief="flat", cursor="hand2")
-    language_button.pack(side="right", padx=(10, 0))
+    right_controls = tk.Frame(controls)
+    right_controls.pack(side="right")
+    update_button = tk.Button(right_controls, text=labels["update_script"], padx=12, pady=7, relief="flat", cursor="hand2")
+    language_button = tk.Button(right_controls, text=labels["language"], padx=12, pady=7, relief="flat", cursor="hand2")
+    language_button.pack(side="bottom")
     dark_button = tk.Checkbutton(controls, text=labels["dark"], variable=dark_var, relief="flat")
     dark_button.pack(side="right")
 
     status_var = tk.StringVar(value=labels["ready"])
     status_state = {"key": "ready"}
-    update_state = {"started": False, "available": False}
+    update_state = {"started": False, "available": False, "busy": False, "converting": False, "result": None, "blink_job": None}
     status = tk.Label(outer, textvariable=status_var, anchor="w", font=("Microsoft YaHei", 10, "bold"))
     status.pack(fill="x", pady=(18, 8))
     result_text = tk.Text(outer, height=14, wrap="word", state="disabled", relief="flat", padx=12, pady=10, font=("Microsoft YaHei", 10))
@@ -5767,6 +5883,7 @@ def _launch_gui() -> None:
         if not isinstance(result, dict) or not bool(result.get("available")):
             return
         update_state["available"] = True
+        update_state["result"] = result
         palette = colors["dark" if dark_var.get() else "light"]
         update_badge.configure(
             text=labels["update_notice"],
@@ -5775,9 +5892,122 @@ def _launch_gui() -> None:
             activebackground=palette["bg"],
         )
         if not update_badge.winfo_ismapped():
-            update_badge.pack(side="left", padx=(10, 0))
+            update_badge.pack(anchor="w", pady=(5, 0))
+        if not update_button.winfo_ismapped():
+            update_button.pack(side="top", pady=(0, 4))
+        start_update_button_blink()
         refresh_window_title()
         root.update_idletasks()
+
+    def start_update_button_blink() -> None:
+        if update_state.get("blink_job") is not None:
+            return
+        def mix_hex(a: str, b: str, t: float) -> str:
+            def rgb(value: str) -> tuple[int, int, int]:
+                value = value.lstrip("#")
+                return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+            ar, ag, ab = rgb(a)
+            br, bg, bb = rgb(b)
+            return "#%02x%02x%02x" % (round(ar + (br - ar) * t), round(ag + (bg - ag) * t), round(ab + (bb - ab) * t))
+        def tick() -> None:
+            if not update_state["available"] or update_state["busy"]:
+                update_state["blink_job"] = None
+                return
+            palette = colors["dark" if dark_var.get() else "light"]
+            cycle = (palette["bg"], palette["accent"], "#e28b2d", palette["bg"])
+            phase = (time.monotonic() % 4.8) / 1.6
+            segment = int(phase) % (len(cycle) - 1)
+            t = phase - int(phase)
+            t = t * t * (3.0 - 2.0 * t)
+            color = mix_hex(cycle[segment], cycle[segment + 1], t)
+            text_cycle = (palette["fg"], "#ffffff", "#18212b", palette["fg"])
+            foreground = mix_hex(text_cycle[segment], text_cycle[segment + 1], t)
+            update_button.configure(bg=color, activebackground=color, fg=foreground, activeforeground=foreground)
+            update_state["blink_job"] = root.after(40, tick)
+        tick()
+
+    def run_download_update() -> None:
+        if update_state["busy"] or update_state["converting"] or not update_state["available"]:
+            return
+        update_state["busy"] = True
+        if update_state.get("blink_job") is not None:
+            try:
+                root.after_cancel(update_state["blink_job"])
+            except Exception:
+                pass
+            update_state["blink_job"] = None
+        update_button.configure(state="disabled")
+        convert_button.configure(state="disabled")
+        progress = tk.Toplevel(root)
+        progress.title(labels["update_downloading"])
+        progress.transient(root)
+        progress.resizable(False, False)
+        progress.protocol("WM_DELETE_WINDOW", lambda: None)
+        palette = colors["dark" if dark_var.get() else "light"]
+        progress.configure(bg=palette["bg"])
+        progress_label = tk.Label(progress, text=labels["update_downloading"], padx=20, pady=12)
+        progress_label.configure(bg=palette["bg"], fg=palette["fg"])
+        progress_label.pack(fill="x")
+        bar = ttk.Progressbar(progress, orient="horizontal", length=360, mode="determinate")
+        bar.pack(padx=20, pady=(0, 8))
+        detail = tk.Label(progress, text="", anchor="w", padx=20, wraplength=360, bg=palette["bg"], fg=palette["fg"])
+        detail.pack(fill="x", pady=(0, 12))
+        progress.update_idletasks()
+        width, height = progress.winfo_reqwidth(), progress.winfo_reqheight()
+        x = max(0, root.winfo_rootx() + (root.winfo_width() - width) // 2)
+        y = max(0, root.winfo_rooty() + (root.winfo_height() - height) // 2)
+        progress.geometry(f"{width}x{height}+{x}+{y}")
+        progress.grab_set()
+        events = queue.Queue()
+        def report(done: int, total: int, name: str) -> None:
+            events.put(("progress", (done, total, name)))
+        def worker() -> None:
+            result = _download_github_update(Path(__file__), report, expected=update_state["result"])
+            events.put(("done", result))
+        def failure(error: str) -> None:
+            update_state["busy"] = False
+            progress.grab_release()
+            progress.destroy()
+            update_button.configure(state="normal")
+            convert_button.configure(state="normal")
+            start_update_button_blink()
+            set_result(f"{labels['update_failed']}: {error}")
+            messagebox.showerror(labels["update_failed"], error, parent=root)
+        def restart() -> None:
+            try:
+                save_user_state()
+                _restart_self()
+            except Exception as exc:
+                failure(str(exc))
+        def poll() -> None:
+            try:
+                while True:
+                    kind, value = events.get_nowait()
+                    if kind == "done":
+                        if value.get("ok"):
+                            bar.stop()
+                            bar.configure(mode="determinate", maximum=100, value=100)
+                            progress_label.configure(text=labels["update_success"])
+                            detail.configure(text="100%")
+                            root.after(500, restart)
+                        else:
+                            failure(str(value.get("error", "Unknown update error")))
+                        return
+                    downloaded, total, name = value
+                    bar.stop()
+                    if total:
+                        bar.configure(mode="determinate", maximum=total, value=downloaded)
+                    else:
+                        bar.configure(mode="indeterminate")
+                        bar.start(12)
+                    detail.configure(text=name)
+            except queue.Empty:
+                root.after(60, poll)
+        try:
+            threading.Thread(target=worker, name="Generic-FBX-Converter-GitHub-Download", daemon=False).start()
+            root.after(60, poll)
+        except Exception as exc:
+            failure(str(exc))
 
     def start_update_check() -> None:
         if update_state["started"]:
@@ -5792,6 +6022,7 @@ def _launch_gui() -> None:
         refresh_window_title()
         heading.configure(text=labels["title"])
         update_badge.configure(text=labels["update_notice"])
+        update_button.configure(text=labels["update_script"])
         subtitle.configure(text=labels["subtitle"])
         convert_button.configure(text=labels["convert"])
         language_button.configure(text=labels["language"])
@@ -5803,7 +6034,7 @@ def _launch_gui() -> None:
         palette = colors["dark" if dark_var.get() else "light"]
         root.configure(bg=palette["bg"])
         _apply_windows_dark_title_bar(root, dark_var.get(), palette["bg"])
-        for widget in (outer, heading_row, controls):
+        for widget in (outer, heading_row, controls, right_controls):
             widget.configure(bg=palette["bg"])
         for widget in (heading, update_badge, subtitle, status):
             widget.configure(bg=palette["bg"], fg=palette["fg"])
@@ -5812,6 +6043,7 @@ def _launch_gui() -> None:
         update_badge.configure(activebackground=palette["bg"])
         dark_button.configure(bg=palette["bg"], fg=palette["fg"], activebackground=palette["bg"], activeforeground=palette["fg"], selectcolor=palette["panel"])
         language_button.configure(bg=palette["panel"], fg=palette["fg"], activebackground=palette["panel"], activeforeground=palette["fg"])
+        update_button.configure(bg=palette["panel"], fg=palette["fg"], activebackground=palette["panel"], activeforeground=palette["fg"])
         convert_button.configure(bg=palette["accent"], fg="white", activebackground=palette["accent"], activeforeground="white")
         result_text.configure(bg=palette["panel"], fg=palette["fg"], insertbackground=palette["fg"])
         save_user_state()
@@ -5860,6 +6092,8 @@ def _launch_gui() -> None:
         return "\n".join(rows)
 
     def convert_clicked() -> None:
+        if update_state["busy"] or update_state["converting"]:
+            return
         selected = filedialog.askopenfilename(
             parent=root,
             title=labels["choose"],
@@ -5874,6 +6108,8 @@ def _launch_gui() -> None:
             set_status("cancel")
             return
         convert_button.configure(state="disabled")
+        update_state["converting"] = True
+        update_button.configure(state="disabled")
         set_status("convert", "...")
         root.update_idletasks()
         started = time.perf_counter()
@@ -5891,14 +6127,22 @@ def _launch_gui() -> None:
             set_status("success")
             set_result(result_summary(result))
         finally:
+            update_state["converting"] = False
             convert_button.configure(state="normal")
+            update_button.configure(state="normal")
 
     convert_button.configure(command=convert_clicked)
     dark_button.configure(command=apply_theme)
     language_button.configure(command=toggle_language)
+    update_button.configure(command=run_download_update)
     update_badge.bind("<Button-1>", open_release_page)
     update_badge.pack_forget()
-    root.protocol("WM_DELETE_WINDOW", lambda: (save_user_state(), root.destroy()))
+    update_button.pack_forget()
+    def close_window() -> None:
+        if not update_state["busy"]:
+            save_user_state()
+            root.destroy()
+    root.protocol("WM_DELETE_WINDOW", close_window)
     apply_theme()
     root.update_idletasks()
     width = max(700, root.winfo_reqwidth())
