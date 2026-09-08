@@ -3073,6 +3073,289 @@ def _output_local_from_world(
     return _generic_multiply_row_major_matrices(world, inverse)
 
 
+def _bind_frame_matrix_close(left, right, tolerance=1.0e-4):
+    if len(left) != 16 or len(right) != 16:
+        return False
+    # Translation must not relax the tolerance on orientation or scale.
+    basis = (0, 1, 2, 4, 5, 6, 8, 9, 10)
+    scale = max(1.0, *(abs(left[i]) for i in basis), *(abs(right[i]) for i in basis))
+    return all(abs(left[i] - right[i]) <= tolerance * (scale if i in basis else 1.0)
+               for i in range(16))
+
+
+def _bind_frame_is_rigid(matrix):
+    if not all(math.isfinite(v) for v in matrix):
+        return False
+    if any(abs(matrix[i]) > 1.0e-8 for i in (3, 7, 11)) or abs(matrix[15] - 1.0) > 1.0e-8:
+        return False
+    for a in range(3):
+        for b in range(3):
+            dot = sum(matrix[a * 4 + k] * matrix[b * 4 + k] for k in range(3))
+            if abs(dot - (1.0 if a == b else 0.0)) > 1.0e-4:
+                return False
+    determinant = (matrix[0] * (matrix[5] * matrix[10] - matrix[6] * matrix[9])
+                   - matrix[1] * (matrix[4] * matrix[10] - matrix[6] * matrix[8])
+                   + matrix[2] * (matrix[4] * matrix[9] - matrix[5] * matrix[8]))
+    return determinant > 0.0
+
+
+def _canonicalize_mesh_bind_frames(source_graph, context):
+    """Reconcile proven rigid Mesh bind frames, preserving normalized LBS."""
+    multiply = _generic_multiply_row_major_matrices
+    invert = _generic_invert_row_major_matrix
+    close = _bind_frame_matrix_close
+    identity = _identity_matrix()
+    objects = source_graph["objects_by_id"]
+    mesh_rows = context["mesh_clusters"]
+    pairs = context["cluster_matrices"]
+    owners = {}
+    rows_by_id = {}
+    by_bone = {}
+    for mid, rows in mesh_rows.items():
+        for row in rows:
+            cid = row["cluster_id"]
+            owners.setdefault(cid, set()).add(mid)
+            rows_by_id[cid] = row
+            by_bone.setdefault(row["bone_model_id"], {})[cid] = row
+    conflicts = [bid for bid, rows in by_bone.items()
+                 if any(not close(pairs[cid][1], pairs[min(rows)][1]) for cid in rows)]
+    receipt = {"schema": "fbx-rigid-bind-frame-v1", "status": "unchanged",
+               "conflicting_bone_count": len(conflicts), "corrected_meshes": [],
+               "propagated_bone_ids": [], "normalized_bone_scales": [],
+               "max_skin_position_error": 0.0}
+    if not conflicts:
+        return receipt
+
+    def fail(reason):
+        raise ValueError("FBX_BIND_FRAME_UNRESOLVED: " + reason)
+
+    # This repair is deliberately limited to normalized linear Skin. Other
+    # deformation models need their own equivalence proof.
+    for node in source_graph.get("deformers", []):
+        kind = _node_type(node).casefold()
+        if kind == "skin":
+            skin_type = _child_value(node, "SkinningType")
+            if skin_type in ("Blend", "blend"):
+                blend_weights = _child_value(node, "BlendWeights")
+                blend_indices = _child_value(node, "Indexes")
+                if (not isinstance(blend_weights, list) or not isinstance(blend_indices, list)
+                        or len(blend_weights) != len(blend_indices)
+                        or any(not math.isfinite(value) or value != 0.0 for value in blend_weights)):
+                    fail("nonzero or unverified dual-quaternion blend weights")
+            elif skin_type not in (None, 0, "Linear", "linear"):
+                fail("unsupported SkinningType on " + str(_object_id(node)))
+        elif kind == "cluster":
+            if _child_value(node, "Mode") not in (None, 0, "Normalize", "normalize"):
+                fail("unsupported Cluster mode on " + str(_object_id(node)))
+            if _child_node(node, "TransformAssociateModel") is not None:
+                fail("associate-model Skin requires a separate bind conversion")
+        else:
+            fail("additional deformer " + kind + " requires a separate bind conversion")
+
+    authored = {}
+    for pose in source_graph.get("poses", []):
+        if _node_type(pose).casefold() != "bindpose":
+            continue
+        for node in pose.children:
+            if node.name != "PoseNode" or _child_value(node, "Local") not in (None, 0, False):
+                continue
+            bid = _child_value(node, "Node")
+            value = _child_value(node, "Matrix")
+            if bid in by_bone and isinstance(value, list) and len(value) == 16:
+                authored.setdefault(bid, []).append(_finite_matrix(value, "authored BindPose"))
+
+    anchors = {}
+    for bid, rows in by_bone.items():
+        poses = authored.get(bid, [])
+        if not poses or any(not close(poses[0], value) for value in poses[1:]):
+            continue
+        matches = [cid for cid, row in rows.items() if row["positive_weight_count"] > 0
+                   and close(row["transform_link"], poses[0])]
+        # Instancing one Geometry/Skin does not create independent evidence.
+        support = []
+        for cid in sorted(matches):
+            geometry_ids = {gid for mid in owners[cid]
+                            for gid in source_graph["model_geometry_ids"].get(mid, [])}
+            if geometry_ids and all(geometry_ids.isdisjoint(existing) for existing in support):
+                support.append(geometry_ids)
+        if len(support) < 2:
+            continue
+        links = [pairs[cid][1] for cid in sorted(matches)]
+        if any(not close(links[0], link) for link in links[1:]):
+            fail("authored BindPose maps to incompatible canonical units on bone " + str(bid))
+        anchors[bid] = list(links[0])
+
+    frames = {}
+    anchor_counts = {}
+    for mid, rows in sorted(mesh_rows.items()):
+        active = [row for row in rows if row["positive_weight_count"] > 0]
+        if not active:
+            frames[mid] = list(identity)
+            continue
+        deltas = {}
+        for row in active:
+            bid = row["bone_model_id"]
+            if bid in anchors:
+                inverse_link = invert(pairs[row["cluster_id"]][1])
+                if inverse_link is None:
+                    fail("singular Cluster on Mesh " + str(mid))
+                deltas[bid] = multiply(inverse_link, anchors[bid])
+        values = [deltas[bid] for bid in sorted(deltas)]
+        if values and any(not close(values[0], delta) for delta in values[1:]):
+            fail("different bones require different frames on Mesh " + str(mid))
+        frame = values[0] if values else list(identity)
+        if close(frame, identity):
+            frame = list(identity)
+        elif len(values) < 2:
+            fail("nonidentity Mesh frame has fewer than two independent bone anchors: " + str(mid))
+        if not _bind_frame_is_rigid(frame):
+            fail("Mesh frame contains scale, reflection, or shear: " + str(mid))
+        frames[mid] = frame
+        anchor_counts[mid] = len(values)
+
+    # Geometry is emitted once even when multiple Models instance it.
+    geometry_owners = {}
+    for mid, gids in source_graph["model_geometry_ids"].items():
+        for gid in gids:
+            geometry_owners.setdefault(gid, []).append(mid)
+    for gid, mids in geometry_owners.items():
+        if any(not close(frames.get(mids[0], identity), frames.get(mid, identity)) for mid in mids[1:]):
+            fail("shared Geometry requires incompatible Mesh frames: " + str(gid))
+    for cid, mids in owners.items():
+        values = [frames[mid] for mid in sorted(mids)]
+        if any(not close(values[0], frame) for frame in values[1:]):
+            fail("shared Cluster requires incompatible Mesh frames: " + str(cid))
+
+    proposed_links = {}
+    targets = {}
+    for bid, rows in by_bone.items():
+        active = [cid for cid in sorted(rows) if rows[cid]["positive_weight_count"] > 0]
+        for cid in active:
+            mid = min(owners[cid])
+            proposed_links[cid] = multiply(pairs[cid][1], frames[mid])
+        target = anchors.get(bid)
+        if target is None and active:
+            target = proposed_links[active[0]]
+        if target is None:
+            target = context["canonical_bind_by_model"].get(bid, pairs[min(rows)][1])
+        if any(not close(target, proposed_links[cid]) for cid in active):
+            fail("bone still has incompatible active binds after Mesh correction: " + str(bid))
+        if invert(target) is None:
+            fail("singular canonical bone bind: " + str(bid))
+        targets[bid] = list(target)
+        if bid not in anchors and any(frames[min(owners[cid])] != identity for cid in active):
+            receipt["propagated_bone_ids"].append(bid)
+
+    # Blender constructs rest bones with unit-length basis rows. Neutralize
+    # uniform bind scale explicitly in both Link and Current so child offsets
+    # survive that import: inverse(A Link) (A Current) = inverse(Link) Current.
+    new_worlds = dict(context["output_worlds"])
+    new_bone_binds = dict(context["canonical_bind_by_model"])
+    new_bone_binds.update(targets)
+    bone_adjustments = {}
+    animated_or_constrained = any(
+        node.name in {"AnimationCurve", "AnimationCurveNode", "Constraint"}
+        for node in source_graph.get("object_nodes", [])
+    )
+    for bid, bind in new_bone_binds.items():
+        scales = _matrix_basis_scales(bind, label="canonical bone bind")
+        scale = sum(scales) / 3.0
+        if max(abs(value - 1.0) for value in scales) <= 1.0e-4:
+            continue
+        if animated_or_constrained:
+            fail("animated or constrained bone scale needs animation rebaking")
+        if max(scales) - min(scales) > max(1.0, scale) * 1.0e-4:
+            fail("nonuniform bone bind scale requires a separate conversion: " + str(bid))
+        adjustment = list(identity)
+        adjustment[0] = adjustment[5] = adjustment[10] = 1.0 / scale
+        normalized = multiply(adjustment, bind)
+        if bid not in new_worlds:
+            fail("scaled bind bone has no current world: " + str(bid))
+        new_worlds[bid] = multiply(adjustment, new_worlds[bid])
+        bone_adjustments[bid] = adjustment
+        new_bone_binds[bid] = normalized
+        if bid in targets:
+            targets[bid] = normalized
+        receipt["normalized_bone_scales"].append({"model_id": bid,
+            "name": _generic_object_name(objects[bid], str(bid)), "source_scale": scale})
+
+    new_pairs = {}
+    new_bakes = dict(context["bind_mesh_matrices"])
+    for mid, frame in frames.items():
+        if mid in new_bakes and frame != identity:
+            new_bakes[mid] = multiply(new_bakes[mid], frame)
+    for cid, row in rows_by_id.items():
+        target = targets[row["bone_model_id"]]
+        if all(context["geometry_bind_bake_by_mesh"].get(mid) for mid in owners[cid]):
+            # Baked Mesh Geometry has an identity MeshBind. Snap the tiny
+            # exporter roundoff between equivalent links to one shared value.
+            new_transform = invert(target)
+        else:
+            # Empty Cluster records must not override a bone with another
+            # frame in Blender. Preserve their MeshBind while sharing Link.
+            new_transform = multiply(multiply(pairs[cid][0], pairs[cid][1]), invert(target))
+        new_pairs[cid] = (new_transform, list(target))
+
+    max_error = 0.0
+    for mid, rows in mesh_rows.items():
+        active = [row for row in rows if row["positive_weight_count"] > 0]
+        if not active:
+            continue
+        frame = frames[mid]
+        if not context["geometry_bind_bake_by_mesh"].get(mid):
+            fail("active Mesh does not use the baked-geometry contract: " + str(mid))
+        geom = _source_geometric_matrix(objects[mid])
+        old_bake = multiply(geom, context["bind_mesh_matrices"][mid])
+        new_bake = multiply(geom, new_bakes[mid])
+        mesh_error = 0.0
+        for gid in source_graph["model_geometry_ids"].get(mid, []):
+            values = _child_value(objects[gid], "Vertices")
+            if not isinstance(values, list) or len(values) % 3:
+                fail("missing control points on Geometry " + str(gid))
+            count = len(values) // 3
+            totals = [0.0] * count
+            for row in active:
+                cid = row["cluster_id"]
+                old_coeff = multiply(old_bake, pairs[cid][0])
+                new_coeff = multiply(new_bake, new_pairs[cid][0])
+                bid = row["bone_model_id"]
+                old_world = multiply(old_coeff, context["output_worlds"][bid])
+                new_world = multiply(new_coeff, new_worlds[bid])
+                delta_world = [b - a for a, b in zip(old_world, new_world)]
+                compensated_coeff = multiply(new_coeff, bone_adjustments.get(bid, identity))
+                if not close(old_coeff, compensated_coeff):
+                    fail("Skin coefficient equivalence failed for Cluster " + str(cid))
+                for index, weight in zip(row["indexes"], row["weights"]):
+                    if not math.isfinite(weight) or weight < 0.0 or not 0 <= index < count:
+                        fail("invalid Skin influence on Cluster " + str(cid))
+                    if weight <= 0.0:
+                        continue
+                    totals[index] += weight
+                    x, y, z = values[index * 3:index * 3 + 3]
+                    error = max(abs(x * delta_world[a] + y * delta_world[4 + a]
+                                    + z * delta_world[8 + a] + delta_world[12 + a]) for a in range(3))
+                    mesh_error = max(mesh_error, error)
+            if frame != identity and any(total <= 1.0e-12 for total in totals):
+                fail("nonidentity Mesh frame has unweighted control points: " + str(mid))
+        if mesh_error > 1.0e-3:
+            fail("Skin position equivalence exceeds 0.001 canonical units on Mesh " + str(mid))
+        max_error = max(max_error, mesh_error)
+        if frame != identity:
+            receipt["corrected_meshes"].append({"model_id": mid,
+                "name": _generic_object_name(objects[mid], str(mid)), "matrix": frame,
+                "anchor_bone_count": anchor_counts[mid], "max_skin_position_error": mesh_error})
+
+    # All gates ran against temporary maps. Publish only a complete plan.
+    context["bind_mesh_matrices"] = new_bakes
+    context["cluster_matrices"] = new_pairs
+    context["canonical_bind_by_model"] = new_bone_binds
+    context["output_worlds"] = new_worlds
+    receipt.update(status="reconciled", anchor_bone_count=len(anchors),
+                   max_skin_position_error=max_error,
+                   shared_bone_link_count=len(targets), order_independent=True)
+    return receipt
+
+
 def _v5_scene_context(
     roots: list[FbxNode], source_graph: dict[str, Any], parents_by_child: dict[int, list[int]]
 ) -> dict[str, Any]:
@@ -5709,6 +5992,238 @@ def _generic_definitions(objects: FbxNode) -> FbxNode:
     return definitions
 
 
+def _bone_scale_scope(roots: list[FbxNode]) -> tuple[dict[str, Any], int, set[int]]:
+    """Identify the static, isolated, positive-uniform Armature case from V2."""
+    graph = _safe_rebuilder_source_graph(roots)
+    objects = graph.get("objects_by_id", {})
+    bones = set(graph["bone_model_ids"])
+    if not bones:
+        raise ValueError("no_bones")
+    if any(n.name.startswith("Animation") or n.name == "Constraint" for n in objects.values()):
+        raise ValueError("animation_or_constraints")
+    parents = graph["model_parent_ids"]
+    containers = set()
+    for bid in bones:
+        current, seen = bid, set()
+        while current in bones:
+            if current in seen:
+                raise ValueError("cyclic_skeleton")
+            seen.add(current)
+            current = parents.get(current, 0)
+        containers.add(current)
+    if len(containers) != 1:
+        raise ValueError("multiple_armatures")
+    root_id = next(iter(containers))
+    if root_id not in objects or _node_type(objects[root_id]).casefold() != "null" or parents[root_id]:
+        raise ValueError("no_isolated_armature_root")
+    affected = bones | {root_id}
+    if any(parent in affected and mid not in bones for mid, parent in parents.items()):
+        raise ValueError("non_bone_descendant")
+    connections = _first_root(roots, "Connections")
+    parent_edges: dict[int, set[int]] = {}
+    for edge in connections.children if connections else []:
+        if edge.name != "C" or len(edge.properties) < 3:
+            continue
+        kind, child, parent = edge.properties[:3]
+        if kind != "OO" or child not in affected:
+            continue
+        if parent == 0 or parent in parents:
+            parent_edges.setdefault(child, set()).add(parent)
+    if any(len(parent_edges.get(mid, set())) != 1 for mid in affected):
+        raise ValueError("ambiguous_model_parent")
+    for mid in affected:
+        model = objects[mid]
+        if _model_property_scalar(model, "InheritType", 1) != 1:
+            raise ValueError("unsupported_inherit_type")
+        for key in ("PreRotation", "PostRotation", "RotationPivot", "ScalingPivot",
+                    "RotationOffset", "ScalingOffset", "GeometricTranslation", "GeometricRotation"):
+            values = _model_property_vector(model, key, 3, [0.0] * 3)
+            if any(not math.isfinite(v) or abs(v) > 1e-10 for v in values):
+                raise ValueError("unsupported_pivot_offset_or_rotation")
+        geo = _model_property_vector(model, "GeometricScaling", 3, [1.0] * 3)
+        if any(not math.isfinite(v) or abs(v - 1.0) > 1e-10 for v in geo):
+            raise ValueError("geometric_bone_scaling")
+        scale = _model_property_vector(model, "Lcl Scaling", 3, [1.0] * 3)
+        if (any(not math.isfinite(v) or v <= 0 for v in scale)
+                or max(scale) - min(scale) > max(scale) * 1e-4):
+            raise ValueError("nonuniform_or_negative_scaling")
+    for node in graph["deformers"]:
+        kind = _node_type(node).casefold()
+        if kind == "skin":
+            if _child_value(node, "SkinningType") not in (None, 0, "Linear", "linear"):
+                raise ValueError("unsupported_skinning_type")
+        elif kind == "cluster":
+            if _child_value(node, "Mode") not in (None, 0, "Normalize", "normalize"):
+                raise ValueError("unsupported_cluster_mode")
+        else:
+            raise ValueError("additional_deformer")
+    for pose in graph["poses"]:
+        if _node_type(pose).casefold() != "bindpose":
+            raise ValueError("non_bind_pose")
+        if any(_child_value(n, "Local") not in (None, 0, False)
+               for n in pose.children if n.name == "PoseNode"):
+            raise ValueError("local_pose_matrix")
+    return graph, root_id, bones
+
+
+def _normalize_generic_bone_scales(
+    source_roots: list[FbxNode], generic_roots: list[FbxNode],
+) -> dict[str, Any]:
+    """Rebase inherited scale after canonical rebuild, committing a verified plan."""
+    receipt: dict[str, Any] = {
+        "schema": "fbx-static-uniform-bone-scale-v1", "status": "skipped",
+        "target_world_scale": 1.0, "changed_object_ids": [],
+    }
+    try:
+        # Inspect the source too: canonical rebuild may remove a Pivot/Mode/Local flag.
+        _bone_scale_scope(source_roots)
+        graph, root_id, bones = _bone_scale_scope(generic_roots)
+        objects = graph["objects_by_id"]
+        affected = bones | {root_id}
+        parents = graph["model_parent_ids"]
+        old_worlds = _source_model_world_matrices(graph["models"], parents)
+        root_scale = _model_property_vector(objects[root_id], "Lcl Scaling", 3, [1.0] * 3)
+        factor = sum(root_scale) / 3.0
+        if factor <= 1.0001:
+            raise ValueError("no_large_inherited_scale")
+        for mid in affected:
+            world = _finite_matrix(old_worlds[mid], "bone scale world")
+            scales = _matrix_basis_scales(world, label="bone scale world")
+            if any(abs(v / factor - 1.0) > 1e-4 for v in scales):
+                raise ValueError("compensated_or_inconsistent_world_scale")
+            normalized = _generic_multiply_row_major_matrices(_scaling_matrix([1.0 / factor] * 3), world)
+            if not _bind_frame_is_rigid(normalized):
+                raise ValueError("world_reflection_or_shear")
+        cluster_nodes = [n for n in graph["deformers"] if _node_type(n).casefold() == "cluster"]
+        if not cluster_nodes:
+            raise ValueError("no_skin_clusters")
+        cluster_ids = {_object_id(n) for n in cluster_nodes}
+        cluster_bones: dict[int, set[int]] = {}
+        connections = _first_root(generic_roots, "Connections")
+        for edge in connections.children if connections else []:
+            if edge.name == "C" and len(edge.properties) >= 3 and edge.properties[0] == "OO":
+                child, parent = edge.properties[1:3]
+                if parent in cluster_ids and child in parents:
+                    cluster_bones.setdefault(parent, set()).add(child)
+        for cid in cluster_ids:
+            links = cluster_bones.get(cid, set())
+            if len(links) != 1 or not links.issubset(bones):
+                raise ValueError("ambiguous_cluster_bone")
+            node = objects[cid]
+            for field in ("Transform", "TransformLink"):
+                matrix = _finite_matrix(_child_value(node, field), "bone scale " + field)
+                if _generic_invert_row_major_matrix(matrix) is None:
+                    raise ValueError("singular_cluster_matrix")
+            associate = _child_value(node, "TransformAssociateModel")
+            if associate is not None and not _bind_frame_matrix_close(
+                _finite_matrix(associate, "bone scale associate"), old_worlds[root_id]
+            ):
+                raise ValueError("unverified_associate_model")
+    except (ValueError, TypeError, KeyError, IndexError, OverflowError) as exc:
+        receipt["reason"] = str(exc)
+        return receipt
+
+    multiply = _generic_multiply_row_major_matrices
+    down = _scaling_matrix([1.0 / factor] * 3)
+    up = _scaling_matrix([factor] * 3)
+    replacements = {}
+
+    def cloned(oid: int) -> FbxNode:
+        if oid not in replacements:
+            replacements[oid] = _clone_generic_node(objects[oid], strip_max_metadata=False)
+        return replacements[oid]
+
+    def set_property(node: FbxNode, key: str, values: list[float]) -> None:
+        block = _child_node(node, "Properties70")
+        matches = [p for p in block.children if _property_name(p) == key] if block else []
+        if len(matches) != 1 or len(matches[0].properties) != 7:
+            raise ValueError("BONE_SCALE_VALIDATION_FAILED: missing canonical TRS property")
+        matches[0].properties[4:] = values
+
+    set_property(cloned(root_id), "Lcl Scaling", [v / factor for v in root_scale])
+    for bid in sorted(bones):
+        node = cloned(bid)
+        translation = _model_property_vector(node, "Lcl Translation", 3, [0.0] * 3)
+        set_property(node, "Lcl Translation", [v * factor for v in translation])
+        block = _child_node(node, "Properties70")
+        block.children = [p for p in block.children if _property_name(p) != "LODBox"]
+        block.add("P", ("S", "LODBox"), ("S", "bool"), ("S", ""), ("S", ""), ("I", 1))
+    for cid in sorted(cluster_ids):
+        node = cloned(cid)
+        _set_child_array(node, "Transform", "d", multiply(_child_value(objects[cid], "Transform"), up))
+        _set_child_array(node, "TransformLink", "d", multiply(down, _child_value(objects[cid], "TransformLink")))
+        associate = _child_value(objects[cid], "TransformAssociateModel")
+        if associate is not None:
+            _set_child_array(node, "TransformAssociateModel", "d", multiply(down, associate))
+    pose_updates = 0
+    for pose in graph["poses"]:
+        if not any(n.name == "PoseNode" and _child_value(n, "Node") in affected for n in pose.children):
+            continue
+        for node in cloned(_object_id(pose)).children:
+            if node.name == "PoseNode" and _child_value(node, "Node") in affected:
+                matrix = _finite_matrix(_child_value(node, "Matrix"), "bone scale bind pose")
+                _set_child_array(node, "Matrix", "d", multiply(down, matrix))
+                pose_updates += 1
+
+    new_models = [replacements.get(_object_id(n), n) for n in graph["models"]]
+    new_worlds = _source_model_world_matrices(new_models, parents)
+
+    def assert_close(left: list[float], right: list[float], label: str) -> float:
+        if len(left) != len(right) or any(not math.isfinite(v) for v in left + right):
+            raise ValueError("BONE_SCALE_VALIDATION_FAILED: invalid " + label)
+        error = max((abs(a - b) for a, b in zip(left, right)), default=0.0)
+        if any(abs(a - b) > 1e-8 * max(1.0, abs(a), abs(b)) for a, b in zip(left, right)):
+            raise ValueError("BONE_SCALE_VALIDATION_FAILED: " + label)
+        return error
+
+    world_error = position_error = bind_error = skin_error = 0.0
+    for mid, world in old_worlds.items():
+        expected = multiply(down, world) if mid in affected else world
+        world_error = max(world_error, assert_close(new_worlds[mid], expected, "world basis"))
+        position_error = max(position_error, assert_close(new_worlds[mid][12:15], world[12:15], "world position"))
+    for cid in cluster_ids:
+        old, new = objects[cid], replacements[cid]
+        bid = next(iter(cluster_bones[cid]))
+        t0, t1 = _child_value(old, "Transform"), _child_value(new, "Transform")
+        l0, l1 = _child_value(old, "TransformLink"), _child_value(new, "TransformLink")
+        bind_error = max(bind_error, assert_close(multiply(t0, l0), multiply(t1, l1), "MeshBind"))
+        skin_error = max(skin_error, assert_close(
+            multiply(t0, old_worlds[bid]), multiply(t1, new_worlds[bid]), "current skin"))
+        for field in ("Indexes", "Weights"):
+            if _child_value(old, field) != _child_value(new, field):
+                raise ValueError("BONE_SCALE_VALIDATION_FAILED: skin influence changed")
+    # Only Model TRS/LODBox, Cluster matrices and affected Pose matrices are replaced.
+    # Geometry, materials, attributes, IDs, links and all untouched objects retain their nodes.
+    generic_objects = _first_root(generic_roots, "Objects")
+    generic_objects.children = [replacements.get(_object_id(n), n) for n in generic_objects.children]
+    receipt.update(
+        status="normalized", reason="static_isolated_uniform_armature",
+        removed_scale_factor=factor, armature_id=root_id, bone_count=len(bones),
+        cluster_count=len(cluster_ids), pose_matrix_count=pose_updates,
+        changed_object_ids=sorted(replacements), max_world_matrix_error=world_error,
+        max_world_position_error=position_error, max_bind_product_error=bind_error,
+        max_skin_product_error=skin_error, lod_box=True,
+    )
+    return receipt
+
+
+def _verify_bone_scale_round_trip(
+    expected: list[FbxNode], actual: list[FbxNode], normalization: dict[str, Any],
+) -> None:
+    receipt = normalization.get("bone_scale_normalization") or {}
+    if receipt.get("status") != "normalized":
+        return
+    graphs = [_safe_rebuilder_source_graph(nodes) for nodes in (expected, actual)]
+    if set(graphs[0]["objects_by_id"]) != set(graphs[1]["objects_by_id"]):
+        raise ValueError("BONE_SCALE_VALIDATION_FAILED: serialized object IDs changed")
+    for oid in receipt["changed_object_ids"]:
+        if _node_digest(graphs[0]["objects_by_id"][oid]) != _node_digest(graphs[1]["objects_by_id"][oid]):
+            raise ValueError("BONE_SCALE_VALIDATION_FAILED: serialized transform changed")
+    if _node_digest(_first_root(expected, "Connections")) != _node_digest(_first_root(actual, "Connections")):
+        raise ValueError("BONE_SCALE_VALIDATION_FAILED: serialized connections changed")
+    receipt["serialized_round_trip"] = "verified"
+
+
 def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], dict[str, Any]]:
     """Rebuild the source FBX graph through explicit structure, bone and Mesh passes."""
     source_objects = _first_root(roots, "Objects")
@@ -5741,6 +6256,7 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
                 parents_by_child.setdefault(int(child_id), []).append(int(parent_id))
 
     v5_context = _v5_scene_context(roots, source_graph, parents_by_child)
+    bind_frame_validation = _canonicalize_mesh_bind_frames(source_graph, v5_context)
     output_worlds = dict(v5_context["output_worlds"])
     canonical_bind_by_model = dict(v5_context["canonical_bind_by_model"])
     # Publish the exact document-level basis used by the rebuild.  All
@@ -6286,6 +6802,7 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
     elif creator.properties:
         creator.properties[0] = "Generic FBX Converter"
     unit_validation = _validate_generic_unit_conversion(roots, generic_roots, v5_context)
+    bone_scale_normalization = _normalize_generic_bone_scales(roots, generic_roots)
     return generic_roots, {
         "safe_rebuilder_status": "rebuilt",
         "canonicalization_policy": FBX_CANONICALIZATION_POLICY,
@@ -6316,6 +6833,8 @@ def _safe_rebuild_generic_scene(roots: list[FbxNode]) -> tuple[list[FbxNode], di
         "target_unit_scale_cm": v5_context["target_unit_scale_cm"],
         "unit_factor": v5_context["unit_factor"],
         "unit_conversion_validation": unit_validation,
+        "bind_frame_validation": bind_frame_validation,
+        "bone_scale_normalization": bone_scale_normalization,
         "generic_parallel": dict(_LAST_GENERIC_PARALLEL_STATS),
         # Keep the source->canonical basis used by rebuilt Model rows. The
         # downstream Writer can apply its inverse without assuming every Max
@@ -6381,6 +6900,7 @@ _GENERIC_FBX_MEMORY_CACHE: dict[str, tuple[int, int, _BinaryFbxDocument, dict[st
 _GENERIC_FBX_MEMORY_CACHE_MAX = 2
 
 def _generic_prepare_fbx_bytes(source: Path) -> tuple[bytes, dict[str, Any]]:
+    started = time.perf_counter()
     raw_bytes = source.read_bytes()
     # ====== GENERIC REBUILD ONLY ======
     # A failed rebuild is a hard Probe error. Returning raw bytes here would
@@ -6395,9 +6915,11 @@ def _generic_prepare_fbx_bytes(source: Path) -> tuple[bytes, dict[str, Any]]:
         footer_id=footer_id,
     )
     # Parse the generated bytes before exposing them to UFBX/Probe.
-    read_fbx(normalized_bytes)
+    _, round_trip_roots = read_fbx(normalized_bytes)
+    _verify_bone_scale_round_trip(rebuilt_roots, round_trip_roots, normalization)
     return normalized_bytes, {
         "status": "normalized",
+        "elapsed_seconds": time.perf_counter() - started,
         "source_size": len(raw_bytes),
         "output_size": len(normalized_bytes),
         "fbx_axis_output_policy": GENERIC_AXIS_OUTPUT_POLICY,
@@ -6420,6 +6942,8 @@ def _generic_memory_document_for_path(
         cached_size, cached_mtime, document, receipt = cached
         if cached_size == int(stat.st_size) and cached_mtime == int(stat.st_mtime_ns):
             checked_receipt = _require_canonical_generic_receipt(receipt)
+            # This lookup reused the document; it did not run normalization.
+            checked_receipt["elapsed_seconds"] = 0.0
             return document, checked_receipt
     normalized_bytes, receipt = _generic_prepare_fbx_bytes(source)
     checked_receipt = _require_canonical_generic_receipt(receipt)
@@ -9908,6 +10432,7 @@ def _require_scene(
     *,
     use_generic_normalizer: bool = True,
     backend_kind: Any = "",
+    generic_context_out: list[tuple[_BinaryFbxDocument, dict[str, Any]]] | None = None,
 ) -> tuple[Path, Any]:
     # ========================================================================
     # CANONICAL INPUT BOUNDARY
@@ -9991,6 +10516,8 @@ def _require_scene(
             )
         if isinstance(getattr(scene, "metadata", None), dict):
             scene.metadata["generic_fbx_normalization"] = generic_receipt
+        if generic_context_out is not None:
+            generic_context_out.append((document, generic_receipt))
         return fbx_path, scene
 
     if ufbx is None:
@@ -11016,14 +11543,21 @@ def probe_fbx_handoff(
     # actual FBX, including direct/unknown callers, uses the same in-memory
     # Generic document and the same canonical parser below.
     use_generic_normalizer = True
+    generic_context: list[tuple[_BinaryFbxDocument, dict[str, Any]]] = []
     fbx_path, scene = _require_scene(
         path,
         use_generic_normalizer=use_generic_normalizer,
         backend_kind=normalized_route_hints.get("backend_kind"),
+        generic_context_out=generic_context,
     )
     # The export handoff starts with a structural tree only.  Large FBX arrays
     # are decoded lazily when the Stage B target actually consumes them.
-    binary_document, generic_receipt = _generic_memory_document_for_path(fbx_path)
+    # Retain the receipt from this load, before any internal cache lookups.
+    binary_document, generic_receipt = (
+        generic_context[0]
+        if generic_context
+        else _generic_memory_document_for_path(fbx_path)
+    )
     normalized_target_handles = {
         _int_or_default(value, 0)
         for value in (target_handles or set())

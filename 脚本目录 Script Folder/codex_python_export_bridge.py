@@ -21010,6 +21010,7 @@ def _apply_export_uv_layout(job: dict[str, Any], contract: dict[str, Any]) -> in
     fbx_map2_by_slot: dict[int, bool] = {}
     row_keys = (
         "positions",
+        "_legacy_unscaled_positions",
         "max_positions",
         "world_positions",
         "skinned_positions",
@@ -25267,6 +25268,7 @@ def _write_output_mod_with_bone_edit(
         }
     bone_edit_verify = _build_bone_edit_verify_expectation(bone_edit_plan, export_mode=export_mode)
     output_bytes, output_header = _build_bone_edit_mod_bytes(mod_file, mesh_layout, bone_edit_plan)
+    _verify_legacy_scale_output(job, contract, output_bytes, mesh_layout)
     _atomic_write_bytes(
         output,
         output_bytes,
@@ -25371,6 +25373,8 @@ def _write_output_mod_unlocked(
         fbx_handoff or {},
     )
     if effective_contract.get("staging_mod_path"):
+        if job.get("_legacy_scale_expectation"):
+            raise ValueError("2.54x verification cannot use a staging MOD; output was not written")
         return _copy_staging_output_mod(
             source,
             output,
@@ -25397,6 +25401,7 @@ def _write_output_mod_unlocked(
         rewritten_bytes,
         rewritten_layout["header"],
     )
+    _verify_legacy_scale_output(job, effective_contract, rewritten_bytes, rewritten_layout)
     _atomic_write_bytes(
         output,
         rewritten_bytes,
@@ -28627,6 +28632,8 @@ def _memory_export_probe_log(fbx_handoff: Any) -> dict[str, Any]:
     generic_normalization = (
         handoff.get("generic_fbx_normalization")
         if isinstance(handoff.get("generic_fbx_normalization"), dict)
+        else summary.get("generic_fbx_normalization")
+        if isinstance(summary.get("generic_fbx_normalization"), dict)
         else {}
     )
     generic_parallel = (
@@ -28666,6 +28673,7 @@ def _memory_export_probe_log(fbx_handoff: Any) -> dict[str, Any]:
             1 for row in normal_fidelity_rows if str(row.get("status", "") or "") == "fallback"
         ),
         "probe_stage": dict(probe_stage),
+        "fbx_generic_seconds": generic_normalization.get("elapsed_seconds"),
         "generic_parallel": dict(generic_parallel) if isinstance(generic_parallel, dict) else {},
         "route_receipt_schema": str(probe_route_receipt.get("schema", "") or ""),
         "route_receipt_rows": probe_route_rows,
@@ -28794,6 +28802,7 @@ def _build_memory_export_txt(
     ]
     probe_stage = probe.get("probe_stage") if isinstance(probe.get("probe_stage"), dict) else {}
     probe_parallel = probe.get("generic_parallel") if isinstance(probe.get("generic_parallel"), dict) else {}
+    fbx_generic_seconds = _float_or_default(probe.get("fbx_generic_seconds"), float("nan"))
     probe_route_rows = [
         row for row in probe.get("route_receipt_rows", []) if isinstance(row, dict)
     ]
@@ -29151,6 +29160,8 @@ def _build_memory_export_txt(
             "",
             "[TIMING]",
             f"TOTAL_SECONDS={_float_or_default(timing_payload.get('total_seconds'), 0.0):.6f}",
+            *((f"FBX_GENERIC_SECONDS={fbx_generic_seconds:.6f}",)
+              if math.isfinite(fbx_generic_seconds) and fbx_generic_seconds >= 0.0 else ()),
             *(
                 f"{str(name).upper()}={_float_or_default(seconds, 0.0):.6f}"
                 for name, seconds in sorted(timing_phases.items())
@@ -29196,6 +29207,16 @@ def _build_memory_export_txt(
     if bug_control:
         lines.extend(("", "[BUG_CONTROL_FULL_REPORT]"))
         lines.extend(_format_export_bug_receipt(bug_control))
+    scale_receipt = payload.get("legacy_blender_scale")
+    if isinstance(scale_receipt, dict) and scale_receipt:
+        lines.extend([
+            "",
+            "LEGACY_BLENDER_SCALE_FACTOR=2.54",
+            f"LEGACY_BLENDER_SCALE_STATUS={scale_receipt.get('status', '')}",
+            f"LEGACY_BLENDER_SCALE_VERIFIED_VERTICES={scale_receipt.get('verified_vertices', 0)}",
+            f"LEGACY_BLENDER_SCALE_VERIFIED_BONES={scale_receipt.get('verified_bones', 0)}",
+            f"LEGACY_BLENDER_SCALE_VERIFICATION={scale_receipt.get('verification', '')}",
+        ])
     return "\r\n".join(lines)
 
 
@@ -33334,6 +33355,339 @@ def _validate_memory_fbx_receipt(
     return dict(receipt)
 
 
+LEGACY_BLENDER_SCALE_FACTOR = 2.54
+LEGACY_BLENDER_SCALE_SCHEMA = "pc-rehd-legacy-blender-scale-v1"
+
+
+def _legacy_scale_cloud_equal(
+    left: list[list[float]], right: list[list[float]], tolerance: float,
+) -> bool:
+    """Compare complete point clouds, allowing FBX/UV vertex duplication."""
+    if not left or not right or not math.isfinite(tolerance) or tolerance <= 0:
+        return False
+
+    def covered(source: list[list[float]], target: list[list[float]]) -> bool:
+        grid: dict[tuple[int, int, int], list[list[float]]] = {}
+        for point in target:
+            key = tuple(int(math.floor(point[axis] / tolerance)) for axis in range(3))
+            grid.setdefault(key, []).append(point)
+        limit = tolerance * tolerance
+        for point in source:
+            cell = tuple(int(math.floor(point[axis] / tolerance)) for axis in range(3))
+            found = False
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        for candidate in grid.get((cell[0] + dx, cell[1] + dy, cell[2] + dz), ()):
+                            if sum((point[a] - candidate[a]) ** 2 for a in range(3)) <= limit:
+                                found = True
+                                break
+                        if found:
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+            if not found:
+                return False
+        return True
+
+    return covered(left, right) and covered(right, left)
+
+
+def _legacy_scale_xyz(rows: Any) -> list[list[float]]:
+    if not isinstance(rows, list):
+        raise ValueError("Scale check requires explicit position rows")
+    result = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
+            raise ValueError("Scale check encountered an invalid position")
+        point = [float(value) for value in row[:3]]
+        if not all(math.isfinite(value) for value in point):
+            raise ValueError("Scale check encountered a non-finite position")
+        result.append(point)
+    return result
+
+
+def _legacy_scale_decode_positions(
+    mod_file: dict[str, Any], mesh_header: dict[str, Any],
+    scale: list[float], offset: list[float] | None = None,
+) -> tuple[list[list[float]], float]:
+    """Decode the current XYZ writer domain, without retired axis fallbacks."""
+    if len(scale) != 3 or any(not math.isfinite(v) or v <= 0 for v in scale):
+        raise ValueError("Scale check has no reliable MOD position scale")
+    fvf = _parse_fvf_int(mesh_header.get("fvf_info"))
+    short = fvf in SHORT_POSITION_FVFS or fvf in WORLD_SHORT_REMAP_FVFS
+    if not short and fvf not in {0xA7D7D036, 0x207D6037, 0xD8297028, 0xD1A47038, 0xC66FA03A}:
+        raise ValueError("Scale check does not support this position encoding")
+    face_bytes = _get_source_face_bytes(mod_file, mesh_header)
+    face_mode = _infer_face_index_mode(mesh_header, face_bytes)
+    data = _get_effective_mesh_vertex_bytes(mod_file, mesh_header, face_index_mode=face_mode)
+    count = _int_or_default(mesh_header.get("vert_count"), 0)
+    stride = _int_or_default(mesh_header.get("vert_stride"), 0)
+    width = 6 if short else 12
+    if count < 1 or stride < width or len(data) < (count - 1) * stride + width:
+        raise ValueError("Scale check cannot decode the complete Mesh")
+    translation = offset or [0.0, 0.0, 0.0]
+    rows = [[(value - translation[a]) / scale[a] for a, value in enumerate(
+        struct.unpack_from("<hhh" if short else "<fff", data, index * stride)
+    )] for index in range(count)]
+    rows = _legacy_scale_xyz(rows)
+    precision = math.sqrt(sum((0.51 / value) ** 2 for value in scale)) if short else 0.0
+    return rows, precision
+
+
+def _legacy_scale_mesh_evidence(
+    original: list[list[float]], current: list[list[float]], precision: float,
+) -> dict[str, Any] | None:
+    if len(original) < 16 or len(current) < 16:
+        return None
+    bounds = []
+    for rows in (original, current):
+        low = [min(point[a] for point in rows) for a in range(3)]
+        high = [max(point[a] for point in rows) for a in range(3)]
+        bounds.append(([(high[a] + low[a]) * 0.5 for a in range(3)],
+                       [high[a] - low[a] for a in range(3)]))
+    centre, spans = bounds[0]
+    current_centre, current_spans = bounds[1]
+    extent = max(spans)
+    if extent <= max(precision * 100.0, 0.000001):
+        return None
+    axes = [a for a in range(3) if spans[a] > extent * 0.02]
+    if len(axes) < 2:
+        return None
+    ratios = [current_spans[a] / spans[a] for a in axes]
+    if any(abs(ratio * LEGACY_BLENDER_SCALE_FACTOR - 1.0) > 0.005 for ratio in ratios):
+        return None
+    tolerance = max(precision * 2.0, extent * 0.0005)
+    # The offered repair scales about the common scene origin. Per-Mesh
+    # centering could mistake separately resized/repositioned parts for one model.
+    if math.dist(centre, [v * LEGACY_BLENDER_SCALE_FACTOR for v in current_centre]) > tolerance:
+        return None
+    left = original
+    right = [[v * LEGACY_BLENDER_SCALE_FACTOR for v in p] for p in current]
+    if len({tuple(round(v / tolerance) for v in p) for p in left}) < 16:
+        return None
+    if not _legacy_scale_cloud_equal(left, right, tolerance):
+        return None
+    return {"ratio": sum(ratios) / len(ratios), "axes": axes,
+            "source_vertices": len(original), "fbx_vertices": len(current),
+            "shape_tolerance": tolerance}
+
+
+def _legacy_scale_bone_evidence(
+    source_tables: dict[str, Any], plan: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    source_info = source_tables.get("bone_info", [])
+    output_info = plan.get("output_bone_info", [])
+    if len(source_info) < 9 or len(source_info) != len(output_info):
+        return None
+    if any(a.get("ID") != b.get("ID") or a.get("Parent") != b.get("Parent")
+           for a, b in zip(source_info, output_info)):
+        return None
+    domain = str(plan.get("bone_matrix_output_domain", "mod_file") or "mod_file")
+    expected = {}
+    for kind in ("local", "world"):
+        rows = [_bone_edit_matrix_file_values(row, matrix_domain=domain, label="scale baseline")
+                for row in plan.get(f"output_{kind}_matrices", [])]
+        if len(rows) != len(source_info) or any(
+            row is None or len(row) != 16 or not all(math.isfinite(v) for v in row)
+            for row in rows
+        ):
+            return None
+        expected[f"bone_{kind}_matrices"] = rows
+    source = [row[12:15] for row in source_tables["bone_world_matrices"]]
+    current = [row[12:15] for row in expected["bone_world_matrices"]]
+    extent = max(math.dist(a, b) for a, b in zip(source, source[1:]))
+    if extent <= 0.0001:
+        return None
+    if any(math.dist(a, [v * LEGACY_BLENDER_SCALE_FACTOR for v in c]) > max(0.00001, extent * 0.0005)
+           for a, c in zip(source, current)):
+        return None
+    anchors = sorted({int(i * (len(source) - 1) / 11) for i in range(12)})
+    ratios = []
+    for index in range(len(source)):
+        for anchor in anchors:
+            distance = math.dist(source[index], source[anchor])
+            other = math.dist(current[index], current[anchor])
+            if distance <= 0.0001:
+                if other > 0.0001:
+                    return None
+                continue
+            ratio = other / distance
+            if not math.isfinite(ratio) or abs(ratio * LEGACY_BLENDER_SCALE_FACTOR - 1.0) > 0.005:
+                return None
+            ratios.append(ratio)
+    if len(ratios) < 24:
+        return None
+    return ({"ratio": sum(ratios) / len(ratios), "bones": len(source), "distances": len(ratios)}, expected)
+
+
+def _legacy_blender_scale_gate(
+    request: dict[str, Any], job: dict[str, Any], contract: dict[str, Any],
+    source: dict[str, Any], fbx_handoff: dict[str, Any],
+    writer_handoff: dict[str, Any], source_skin_context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    approval = str((request.get("decisions") or {}).get("legacy_blender_scale", "") or "")
+    mode = _memory_bone_export_mode(dict(request.get("export_options") or {}))
+    mesh_rows = [mesh for mesh in contract.get("meshes", []) if isinstance(mesh, dict)
+                 and str(mesh.get("lane", "")).lower() == "modify"
+                 and not _mesh_uses_source_geometry(mesh)] if mode != "bones_only" else []
+    evidence: list[dict[str, Any]] = []
+    expected_meshes: dict[int, list[list[float]]] = {}
+    expected_bones: dict[str, Any] = {}
+    try:
+        scale = _read_source_export_mesh_scale_from_mod_file(source)
+        for mesh in mesh_rows:
+            slot = _get_mesh_slot_value(mesh)
+            if slot < 1 or slot > len(source["mesh_headers"]):
+                raise ValueError("No corresponding source Mesh")
+            fvf = _parse_mesh_writer_fvf(mesh, _parse_fvf_int(source["mesh_headers"][slot - 1]["fvf_info"]))
+            remapped = _mesh_uses_world_short_remap(mesh, fvf)
+            encoding_scale = _coerce_vec3(mesh.get("short_remap_scale" if remapped else "mesh_scale"), tuple(scale))
+            encoding_offset = _coerce_vec3(mesh.get("short_remap_offset")) if remapped else [0.0, 0.0, 0.0]
+            if (any(not math.isfinite(v) or abs(v - reference) > max(1e-9, abs(reference) * 1e-6)
+                    for v, reference in zip(encoding_scale, scale))
+                    or any(not math.isfinite(v) or v != 0 for v in encoding_offset)):
+                raise ValueError("Mesh uses a custom encoding transform; legacy scale is not certain")
+            _, authority = _require_geometry_position_rows(mesh)
+            current = _legacy_scale_xyz(authority)
+            original, precision = _legacy_scale_decode_positions(source, source["mesh_headers"][slot - 1], scale)
+            result = _legacy_scale_mesh_evidence(original, current, precision)
+            if result is None:
+                raise ValueError("The whole Mesh does not prove the legacy uniform scale")
+            evidence.append({"kind": "mesh", "mesh_slot": slot, "name": _writer_mesh_label(mesh), **result})
+            expected_meshes[slot] = current
+        if mode != "disabled":
+            plan = _build_bone_edit_export_plan(job, source, contract, writer_handoff,
+                                               source_skin_context=source_skin_context)
+            result = _legacy_scale_bone_evidence(_source_skin_context_tables(source_skin_context, source), plan)
+            if result is None:
+                raise ValueError("The complete skeleton does not prove the legacy uniform scale")
+            row, expected_bones = result
+            evidence.append({"kind": "bones", "name": "Skeleton", **row})
+        if not evidence:
+            raise ValueError("No geometry or bones require a scale correction")
+    except (ValueError, TypeError, KeyError, IndexError, OverflowError, RuntimeError, struct.error):
+        if approval:
+            raise ValueError("Scale confirmation no longer matches the current export; export stopped")
+        return None
+    binding = {"schema": LEGACY_BLENDER_SCALE_SCHEMA, "request_id": request.get("request_id"),
+               "source_sha256": request.get("source_sha256"),
+               "fbx_sha256": fbx_handoff.get("fbx_sha256") or (request.get("fbx_receipt") or {}).get("sha256"),
+               "mode": mode, "evidence": evidence,
+               "positions_sha256": hashlib.sha256(json.dumps(expected_meshes, sort_keys=True, allow_nan=False).encode()).hexdigest(),
+               "bones_sha256": hashlib.sha256(json.dumps(expected_bones, sort_keys=True, allow_nan=False).encode()).hexdigest()}
+    token = hashlib.sha256(json.dumps(binding, sort_keys=True, allow_nan=False).encode()).hexdigest()
+    receipt = {"schema": LEGACY_BLENDER_SCALE_SCHEMA, "factor": LEGACY_BLENDER_SCALE_FACTOR,
+               "evidence": evidence, "confirmation_token": token, "status": "confirmation_required"}
+    if approval != token:
+        return {"status": "SCALE_CONFIRMATION_REQUIRED", "request_id": request.get("request_id"),
+                "max_process_id": request.get("target_max_pid"), "output_mod": request.get("output_mod"),
+                "legacy_blender_scale": receipt}
+    # Replace row lists instead of mutating the Probe cache or shared FBX arrays.
+    targets = set(expected_meshes)
+    seen: set[int] = set()
+    for mesh in list(contract.get("meshes", [])) + list(job.get("meshes", [])):
+        if not isinstance(mesh, dict) or id(mesh) in seen or _get_mesh_slot_value(mesh) not in targets:
+            continue
+        seen.add(id(mesh))
+        mesh["_legacy_unscaled_positions"] = expected_meshes[_get_mesh_slot_value(mesh)]
+        for field in ("positions", "max_positions", "world_positions", "skinned_max_positions",
+                      "binary_skin_unreferenced_max_positions"):
+            rows = mesh.get(field)
+            if isinstance(rows, list):
+                mesh[field] = [[float(v) * LEGACY_BLENDER_SCALE_FACTOR if a < 3 else v
+                                for a, v in enumerate(row)] for row in rows]
+    if expected_bones:
+        summary = dict(fbx_handoff.get("summary") or {})
+        bones = []
+        for original in summary.get("bones", []):
+            bone = dict(original)
+            for field in ("world_matrix", "local_matrix"):
+                matrix = list(bone[field])
+                matrix[12:15] = [float(v) * LEGACY_BLENDER_SCALE_FACTOR for v in matrix[12:15]]
+                bone[field] = matrix
+            bones.append(bone)
+        summary["bones"] = bones
+        fbx_handoff["summary"] = summary
+        writer_handoff["summary"] = summary
+    job["_legacy_scale_expectation"] = {"meshes": expected_meshes, "bones": expected_bones,
+                                      "source_mesh_scale": list(scale)}
+    receipt["status"] = "applied_pending_byte_verification"
+    job["legacy_blender_scale"] = receipt
+    return None
+
+
+def _verify_legacy_scale_output(
+    job: dict[str, Any], contract: dict[str, Any], data: bytes, layout: dict[str, Any],
+) -> None:
+    expectation = job.get("_legacy_scale_expectation")
+    if not isinstance(expectation, dict):
+        return
+    output = read_mod_file("scale-verification.NewMOD", data=data)
+    # Decode with the MOD's own unit scale, independently of mutable writer options.
+    output_scale = _read_source_export_mesh_scale_from_mod_file(output)
+    source_scale = expectation.get("source_mesh_scale", output_scale)
+    if expectation.get("meshes") and any(
+        not math.isfinite(a) or abs(a - b) > max(1e-9, abs(b) * 1e-6)
+        for a, b in zip(output_scale, source_scale)
+    ):
+        raise ValueError("2.54x verification failed: MOD unit scale changed; MOD was not written")
+    meshes = {_get_mesh_slot_value(m): m for m in contract.get("meshes", []) if isinstance(m, dict)}
+    vertex_count = 0
+    for source_slot, before in expectation.get("meshes", {}).items():
+        mesh = meshes[source_slot]
+        unscaled = _legacy_scale_xyz(mesh.get("_legacy_unscaled_positions", before))
+        expected_rows = [[v * LEGACY_BLENDER_SCALE_FACTOR for v in p] for p in unscaled]
+        slots = [layout["source_to_output_slot"][source_slot]]
+        for split in layout.get("auto_split_meshes", []):
+            if _int_or_default(split.get("source_slot"), 0) == source_slot:
+                slots = list(split["output_slots"])
+        partitions = [list(range(len(expected_rows)))]
+        if len(slots) > 1:
+            partitions = [part["source_vertex_indices"] for part in _plan_modified_mesh_partition(
+                bytes(len(expected_rows)), _flatten_face_indices(mesh.get("face_indices")), 1,
+            )]
+            if len(partitions) != len(slots):
+                raise ValueError("2.54x verification lost the split vertex mapping; MOD was not written")
+        actual = []
+        precision = 0.0
+        ordered_expected = []
+        for slot, indices in zip(slots, partitions):
+            header = output["mesh_headers"][int(slot) - 1]
+            rows, error = _legacy_scale_decode_positions(output, header, output_scale)
+            if len(rows) != len(indices):
+                raise ValueError(f"2.54x byte verification failed for Mesh {source_slot}: vertex count changed")
+            actual.extend(rows)
+            ordered_expected.extend(expected_rows[index] for index in indices)
+            precision = max(precision, error)
+        expected = ordered_expected
+        magnitude = max((abs(v) for row in expected for v in row), default=1.0)
+        tolerance = max(precision * 1.1, magnitude * 0.000001, 0.000001)
+        if len(expected) != len(actual) or any(math.dist(a, c) > tolerance for a, c in zip(expected, actual)):
+            raise ValueError(f"2.54x byte verification failed for Mesh {source_slot}; MOD was not written")
+        vertex_count += len(actual)
+    expected_bones = expectation.get("bones") or {}
+    if expected_bones:
+        tables = _read_mod_bone_tables(output)
+        for field, before in expected_bones.items():
+            actual = tables[field]
+            if len(actual) != len(before):
+                raise ValueError("2.54x bone verification failed: bone count changed; MOD was not written")
+            for original, written in zip(before, actual):
+                if len(original) != 16 or len(written) != 16:
+                    raise ValueError("2.54x bone verification failed: invalid matrix size; MOD was not written")
+                for index in range(16):
+                    expected = original[index] * (LEGACY_BLENDER_SCALE_FACTOR if 12 <= index < 15 else 1.0)
+                    if (not math.isfinite(expected) or not math.isfinite(written[index])
+                            or abs(written[index] - expected) > max(0.000001, abs(expected) * 0.000001)):
+                        raise ValueError("2.54x bone byte verification failed; MOD was not written")
+    job["legacy_blender_scale"].update({"status": "verified", "verified_vertices": vertex_count,
+                                        "verified_bones": len(expected_bones.get("bone_world_matrices", [])),
+                                        "verification": "decoded_mod_bytes_before_atomic_commit"})
+
+
 def _run_memory_export_impl(
     request: dict[str, Any],
     *,
@@ -33705,6 +34059,14 @@ def _run_memory_export_impl(
         source_skin_context=source_skin_context,
         fbx_handoff=fbx_handoff,
     )
+    # All Header/source passthrough decisions and UV splits are final here.
+    # Correct only the rows that will be written, before freezing their authority.
+    scale_confirmation = _legacy_blender_scale_gate(
+        request, job, contract, source_mod_file, fbx_handoff,
+        writer_handoff, source_skin_context,
+    )
+    if scale_confirmation is not None:
+        return scale_confirmation
     if bone_export_mode == "bones_plus_mesh":
         phase_started_at = time.perf_counter()
         fbx_world_geometry_receipt = _freeze_bones_plus_mesh_fbx_world_geometry_authority(
@@ -33894,6 +34256,7 @@ def _run_memory_export_impl(
         "uv_risk": uv_risk,
         "check_source": dict(check_source_receipt),
         "fbx_probe_log": _memory_export_probe_log(fbx_handoff),
+        "legacy_blender_scale": copy.deepcopy(job.get("legacy_blender_scale", {})),
         "semantic_parallel": copy.deepcopy(_LAST_SEMANTIC_PARALLEL_STATS),
         "fbx_axis_log": dict(job.get("fbx_axis_log", {})),
         "memory_contract": {
@@ -33957,6 +34320,7 @@ def run_memory_export(request: dict[str, Any]) -> dict[str, Any]:
         payload["bug_control"] = _complete_export_bug_receipt(bug_control, payload)
         transient_statuses = {
             "OUTPUT_COLLISION",
+            "SCALE_CONFIRMATION_REQUIRED",
             "MESH_SLOT_CHOICE_REQUIRED",
             "MESH_SLOT_CONFLICT",
             "NO_WEIGHT_WARNING",

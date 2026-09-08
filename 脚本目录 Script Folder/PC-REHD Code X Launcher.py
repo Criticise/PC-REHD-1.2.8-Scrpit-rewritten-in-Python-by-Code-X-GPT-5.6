@@ -652,6 +652,10 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
         "import_blender_fbx", "auxiliary", CommandAccess.SCENE_WRITE,
         QueuePolicy.SINGLE_FLIGHT, 1800.0, 10,
     ),
+    "import_generic_bones_fbx": _spec(
+        "import_generic_bones_fbx", "auxiliary", CommandAccess.SCENE_WRITE,
+        QueuePolicy.SINGLE_FLIGHT, 1800.0, 10,
+    ),
     "export_auxiliary": _spec(
         "export_auxiliary", "auxiliary", CommandAccess.SCENE_WRITE,
         QueuePolicy.SINGLE_FLIGHT, 900.0, 10,
@@ -1462,6 +1466,7 @@ MESH_FILTER_NATIVE_UNDO_LABEL = "PC-REHD Mesh Filter"
 EXPORT_MAP2_NATIVE_UNDO_LABEL = "PC-REHD Collapse UV Map 2"
 IMPORT_MOD_NATIVE_UNDO_LABEL = "PC-REHD Import MOD"
 BLENDER_FBX_IMPORT_NATIVE_UNDO_LABEL = "PC-REHD Import Blender FBX"
+GENERIC_BONES_FBX_IMPORT_NATIVE_UNDO_LABEL = "PC-REHD Import FBX Leave as Bones"
 _MAX_BLENDER_FBX_LOD_GROUP_IDS = frozenset((0, 1, 2, 3, 4, 5, 6, 249, 252, 254, 255))
 _MAX_BLENDER_FBX_IMPORT_SUFFIX_RE = re.compile(
     r"(?i)_Import_?(?P<ordinal>[2-9]|[1-9]\d+)(?:_(?P<duplicate>[1-9]\d*))?$"
@@ -2971,6 +2976,7 @@ AGENT_COMMAND_OPERATIONS = {
     "import_auxiliary": "auxiliary",
     "import_auxiliary_fbx": "auxiliary",
     "import_blender_fbx": "auxiliary",
+    "import_generic_bones_fbx": "auxiliary",
     "export_auxiliary": "auxiliary",
     "apply_mrl_bind": "texture",
     "manual_texture": "texture",
@@ -8651,7 +8657,7 @@ IMPORT_EXPORT_PERFORMANCE_FINGERPRINTS = {
     "LauncherApp._schedule_scene_auto_colors_after_import": "D15402F999A7ABA29F38553ED656C242852320912CA33A99D21ACCAEB9CEAEA6",
     "LauncherApp._poll_max_windows": "7C0DC41B01B212564320E70C7DA455A3C47EC63E08B82D56A95DB4119FE9F5B0",
     "LauncherApp._import_mod_active": "2E3FB55BD869AACF42206FA7573BBFD59D7F4B35FC228311C4A14C3DFC6DBD4A",
-    "LauncherApp._export_mod_active": "6E7922BAE0360B1248A6444F406426F69C57039B3C076D12EC80F1A685C5E91A",
+    "LauncherApp._export_mod_active": "40420ACCA1D2E62F819F776F3BCFCC7DBF443B616E344229E2655333E66A6A25",
     "LauncherApp._on_close": "43E353E9F78D09B76D2E833804AFC045E240F12FA7CF25C33A24A522F895BE3D",
     "_main_impl": "43D765CE2DD12E3111A0F0B4AAAFFE304E446955B6E72F081CA8AA18288F7682",
     "_run_import_export_performance_policy_guard": "025C8A6547AAFFC452AEA36C7B1AEF82ADE22B8C8150B5190511D6DE5851ECD5",
@@ -8664,9 +8670,9 @@ IMPORT_EXPORT_PERFORMANCE_FINGERPRINTS = {
 AI_MAINTENANCE_ONLY_MODULE_SHA256 = {
     "codex_python_runtime_bootstrap.py": "E6F69D64DFFEEE6CB44F636201A7F8EB5ACE3649718B7C196662987163A904BA",
     "codex_re6_mod_import_fbx.py": "F94AC8B0D9D7E60B14A42E88DCCF893371E99B9F85F6DDD628EEE8A55C75DA53",
-    "codex_python_export_bridge.py": "CA3466094B3FAF4B53A54CCA25F18DFDEA99DFC540BE75BD313926A81129A8F4",
+    "codex_python_export_bridge.py": "C50F97A0379427A7342304C2C595665EA0945FF619721B4DF5F285BC571525FA",
     "codex_re6_scene_compatibility.py": "0F387A805643A060C90B0FB3C32A5A884F925E9C1D872A117DFB3681BB5E16CC",
-    "codex_fbx_probe.py": "FAFA17773AE62752940BEDF3B0DEA9B3D4FB0A022F85C08717ED758138D67E9C",
+    "codex_fbx_probe.py": "71EE617C57EB5D2DE80A3349AA6BFAB36878A34DB81494E8911D3D7A70B6BFBD",
     "codex_re6_tex_decode.py": "2C3D689B5CC7CFF59BEF3479CB0DF979B932DB6ED1204D9BF1AC6E04D603CD56",
 }
 RESCUE_AGENT_MAINTENANCE_PROTECTED_FUNCTIONS = (
@@ -17590,6 +17596,18 @@ def _max_seam_activate_skin_modifier(rt: Any, node: Any, modifier: Any) -> None:
     protocol-smoke runtimes optional.
     """
     try:
+        selection = list(rt.selection)
+        if (
+            len(selection) == 1
+            and _max_node_handle(rt, selection[0]) == _max_node_handle(rt, node)
+            and rt.modPanel.getCurrentObject() == modifier
+            and rt.getCommandPanelTaskMode() == rt.name("modify")
+        ):
+            rt.subObjectLevel = 1
+            return
+    except Exception:
+        pass
+    try:
         rt.select(node)
     except Exception:
         pass
@@ -17753,14 +17771,11 @@ def _max_seam_world_positions(rt: Any, node: Any, indices: list[int]) -> dict[in
         snapshot = rt.snapshotAsMesh(node)
         if snapshot is None:
             raise RuntimeError(f"Seam tool could not evaluate Mesh: {getattr(node, 'name', '<unnamed>')}")
-        # RE6's imported Skin Mesh snapshots are expressed in the inverse
-        # node-transform space; using the forward matrix puts seam vertices
-        # tens of thousands of units away from their visible location.
-        transform = rt.inverse(node.objectTransform)
+        # snapshotAsMesh already evaluates into world space. Applying either
+        # node matrix here separates coincident vertices with different pivots.
         positions: dict[int, tuple[float, float, float]] = {}
         for index in indices:
-            local_point = rt.getVert(snapshot, int(index))
-            world_point = local_point * transform
+            world_point = rt.getVert(snapshot, int(index))
             positions[int(index)] = (
                 float(world_point.x),
                 float(world_point.y),
@@ -17985,28 +18000,33 @@ def _max_seam_bone_key(rt: Any, modifier: Any, bone_id: int) -> str:
                 break
     if name:
         try:
-            bone = rt.getNodeByName(name, exact=True)
+            matches = list(rt.getNodeByName(name, exact=True, all=True) or [])
+        except Exception:
+            try:
+                matches = [node for node in rt.objects if str(getattr(node, "name", "")) == name]
+            except Exception:
+                matches = []
+        if len(matches) > 1:
+            raise ValueError(f"Seam Skin bone name is ambiguous: {name}; give distinct skeleton nodes unique names")
+        try:
+            bone = matches[0] if matches else rt.getNodeByName(name, exact=True)
         except Exception:
             bone = None
         handle = _max_node_handle(rt, bone) if bone is not None else 0
         if handle > 0:
             return f"handle:{handle}"
         return "name:" + name.casefold()
-    return f"id:{int(bone_id)}"
+    raise ValueError(f"Seam tool could not resolve Skin bone {int(bone_id)} to a scene bone")
 
 
 def _max_seam_read_weights(rt: Any, modifier: Any, vertex_index: int) -> dict[str, float]:
-    try:
-        count = int(rt.skinOps.GetVertexWeightCount(modifier, int(vertex_index)) or 0)
-    except Exception:
-        count = 0
+    count = int(rt.skinOps.GetVertexWeightCount(modifier, int(vertex_index)) or 0)
     result: dict[str, float] = {}
     for weight_index in range(1, count + 1):
-        try:
-            bone_id = int(rt.skinOps.GetVertexWeightBoneID(modifier, int(vertex_index), weight_index) or 0)
-            weight = float(rt.skinOps.GetVertexWeight(modifier, int(vertex_index), weight_index) or 0.0)
-        except Exception:
-            continue
+        bone_id = int(rt.skinOps.GetVertexWeightBoneID(modifier, int(vertex_index), weight_index) or 0)
+        weight = float(rt.skinOps.GetVertexWeight(modifier, int(vertex_index), weight_index) or 0.0)
+        if not math.isfinite(weight) or weight < 0.0:
+            raise RuntimeError(f"Seam tool found invalid Skin weights at vertex {vertex_index}")
         if bone_id > 0 and weight > 0.0:
             key = _max_seam_bone_key(rt, modifier, bone_id)
             result[key] = result.get(key, 0.0) + weight
@@ -18049,6 +18069,8 @@ def _max_seam_blend_map(
     own: dict[str, float], other: dict[str, float], strength: float
 ) -> dict[str, float]:
     strength = max(0.0, min(1.0, float(strength)))
+    if strength == 0.0:
+        return dict(own)
     keys = set(own) | set(other)
     average = {key: (own.get(key, 0.0) + other.get(key, 0.0)) * 0.5 for key in keys}
     blended = {
@@ -18056,6 +18078,30 @@ def _max_seam_blend_map(
         for key in keys
     }
     return _max_seam_normalize_weights(blended)
+
+
+def _max_seam_weights_close(left: dict[str, float], right: dict[str, float]) -> bool:
+    return all(abs(left.get(key, 0.0) - right.get(key, 0.0)) <= 0.00001 for key in left.keys() | right.keys())
+
+
+def _max_seam_require_target_bones(
+    rt: Any, node: Any, weights: dict[str, float], bone_ids: dict[str, int]
+) -> None:
+    missing = sorted(key for key, value in weights.items() if value > 0.000001 and key not in bone_ids)
+    if not missing:
+        return
+    names: list[str] = []
+    for key in missing:
+        try:
+            bone = rt.getAnimByHandle(int(key.removeprefix("handle:")))
+            name = str(bone.name)
+        except Exception:
+            name = key.removeprefix("name:")
+        names.append(name)
+    raise ValueError(
+        f"Seam target Skin is missing required bones: {getattr(node, 'name', '<unnamed>')}: {', '.join(names)}; "
+        "add the same skeleton bones to both Skin modifiers before blending"
+    )
 
 
 def _max_seam_write_vertex(
@@ -18067,6 +18113,9 @@ def _max_seam_write_vertex(
     bone_ids: dict[str, int],
 ) -> bool:
     _max_seam_activate_skin_modifier(rt, node, modifier)
+    _max_seam_require_target_bones(rt, node, weights, bone_ids)
+    if _max_seam_weights_close(_max_seam_read_weights(rt, modifier, vertex_index), weights):
+        return False
     converted = [
         (int(bone_ids[key]), float(value))
         for key, value in weights.items()
@@ -18075,12 +18124,11 @@ def _max_seam_write_vertex(
     if not converted:
         return False
     converted.sort(key=lambda item: (-item[1], item[0]))
-    ids = [item[0] for item in converted[:4]]
-    values = [item[1] for item in converted[:4]]
+    ids = [item[0] for item in converted]
+    values = [item[1] for item in converted]
     total = sum(values)
     if total <= 0.0:
         return False
-    values = [value / total for value in values]
     try:
         ids_arg = rt.Array(*ids)
     except Exception:
@@ -18090,18 +18138,27 @@ def _max_seam_write_vertex(
     except Exception:
         values_arg = values
     try:
+        was_unnormalized = bool(rt.skinOps.isUnNormalizedVertex(modifier, int(vertex_index)))
+    except Exception:
+        was_unnormalized = False
+    try:
         rt.skinOps.unNormalizeVertex(modifier, int(vertex_index), True)
     except Exception:
         pass
     try:
-        rt.skinOps.ReplaceVertexWeights(
+        result = rt.skinOps.ReplaceVertexWeights(
             modifier, int(vertex_index), ids_arg, values_arg
         )
+        if result is False:
+            raise RuntimeError(f"Skin rejected seam weights at vertex {vertex_index}")
     finally:
         try:
-            rt.skinOps.unNormalizeVertex(modifier, int(vertex_index), False)
+            rt.skinOps.unNormalizeVertex(modifier, int(vertex_index), was_unnormalized)
         except Exception:
             pass
+    expected = {key: value for key, value in weights.items() if value > 0.000001}
+    if not _max_seam_weights_close(_max_seam_read_weights(rt, modifier, vertex_index), expected):
+        raise RuntimeError(f"Skin did not retain seam weights at vertex {vertex_index}")
     return True
 
 
@@ -18155,45 +18212,69 @@ def _max_seam_apply_pairs(
     pairs: list[tuple[int, int, float]],
     strength: float,
 ) -> dict[str, Any]:
-    left_weight_cache: dict[int, dict[str, float]] = {}
-    right_weight_cache: dict[int, dict[str, float]] = {}
-    _max_seam_activate_skin_context(rt, left["node"], left["modifier"])
-    _max_seam_activate_skin_context(rt, right["node"], right["modifier"])
     _max_seam_activate_skin_modifier(rt, left["node"], left["modifier"])
     left_bones = _max_seam_bone_id_map(rt, left["modifier"])
+    left_weight_cache = {
+        index: _max_seam_read_weights(rt, left["modifier"], index)
+        for index in sorted({pair[0] for pair in pairs})
+    }
     _max_seam_activate_skin_modifier(rt, right["node"], right["modifier"])
     right_bones = _max_seam_bone_id_map(rt, right["modifier"])
+    right_weight_cache = {
+        index: _max_seam_read_weights(rt, right["modifier"], index)
+        for index in sorted({pair[1] for pair in pairs})
+    }
     plans: list[tuple[dict[str, Any], int, dict[str, float], dict[str, int]]] = []
     for left_index, right_index, _distance in pairs:
-        _max_seam_activate_skin_modifier(rt, left["node"], left["modifier"])
-        own_left = left_weight_cache.setdefault(
-            left_index, _max_seam_read_weights(rt, left["modifier"], left_index)
-        )
-        _max_seam_activate_skin_modifier(rt, right["node"], right["modifier"])
-        own_right = right_weight_cache.setdefault(
-            right_index, _max_seam_read_weights(rt, right["modifier"], right_index)
-        )
+        own_left = left_weight_cache[left_index]
+        own_right = right_weight_cache[right_index]
+        if not own_left or not own_right:
+            raise ValueError("Seam tool found an unweighted vertex; assign Skin weights before blending")
         plans.append((left, left_index, _max_seam_blend_map(own_left, own_right, strength), left_bones))
         plans.append((right, right_index, _max_seam_blend_map(own_right, own_left, strength), right_bones))
+    # Validate every target before writing; filtering absent bones would turn
+    # the intended blend back into the original weights and report success.
+    for context, _index, weights, bone_ids in plans:
+        _max_seam_require_target_bones(rt, context["node"], weights, bone_ids)
+    # Each Skin context switch refreshes Max's Modify panel; group writes by
+    # mesh after all pair targets have been calculated from original weights.
+    plans.sort(key=lambda plan: 0 if plan[0] is left else 1)
     changed = 0
-    failed = 0
+    unchanged = 0
+    attempted: list[tuple[dict[str, Any], int, dict[str, int]]] = []
     for context, vertex_index, weights, bone_ids in plans:
+        original = (left_weight_cache if context is left else right_weight_cache)[vertex_index]
+        if _max_seam_weights_close(original, weights):
+            unchanged += 1
+            continue
+        attempted.append((context, vertex_index, bone_ids))
         try:
             if _max_seam_write_vertex(
                 rt, context["node"], context["modifier"], vertex_index, weights, bone_ids
             ):
                 changed += 1
-        except Exception:
-            failed += 1
+            else:
+                unchanged += 1
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            for prior, prior_index, prior_bones in reversed(attempted):
+                prior_weights = (left_weight_cache if prior is left else right_weight_cache)[prior_index]
+                try:
+                    _max_seam_write_vertex(rt, prior["node"], prior["modifier"], prior_index, prior_weights, prior_bones)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"{prior['name']} vertex {prior_index}: {rollback_exc}")
+            detail = f"{context['name']} vertex {vertex_index}: {exc}"
+            if rollback_errors:
+                raise RuntimeError("Seam weight write and rollback failed: " + detail + "; " + "; ".join(rollback_errors[:3])) from exc
+            raise RuntimeError("Seam weight write failed; original weights restored: " + detail) from exc
     highlight = _max_seam_highlight(rt, [left, right])
-    if plans and changed == 0 and failed:
-        raise RuntimeError("Seam weight blending could not write any selected vertex")
     return {
         "pair_count": len(pairs),
         "changed_vertex_count": changed,
-        "failed_vertex_count": failed,
+        "unchanged_vertex_count": unchanged,
+        "failed_vertex_count": 0,
         "highlight": highlight,
-        "status": "partial" if failed else "PASS",
+        "status": "PASS",
     }
 
 
@@ -18205,7 +18286,7 @@ def _max_seam_weight_tool(rt: Any, payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Unsupported seam weight operation: {operation}")
     try:
         radius = max(0.0001, min(1000.0, float(payload.get("range", 1.0) or 1.0)))
-        strength = max(0.0, min(1.0, float(payload.get("strength", 0.5) or 0.5)))
+        strength = max(0.0, min(1.0, float(payload.get("strength", 0.5))))
     except (TypeError, ValueError) as exc:
         raise ValueError("Seam weight range and strength must be numeric") from exc
 
@@ -23186,6 +23267,71 @@ def _max_import_blender_fbx(payload: dict[str, Any]) -> dict[str, Any]:
         _max_release_transient_runtime(rt)
 
 
+def _max_import_generic_bones_fbx(payload: dict[str, Any]) -> dict[str, Any]:
+    """Import a prepared Generic FBX using the user's current Max settings."""
+    fbx_path = Path(str(payload.get("fbx_path", "") or "")).expanduser().resolve(strict=False)
+    if not fbx_path.is_file() or fbx_path.suffix.casefold() != ".fbx":
+        raise FileNotFoundError(f"Generic bone FBX is missing or invalid: {fbx_path}")
+    raw_receipt = payload.get("generic_fbx_normalization")
+    if not isinstance(raw_receipt, Mapping):
+        raise ValueError("Bone FBX must pass the Generic converter before Max import")
+    receipt = dict(raw_receipt)
+    if (
+        receipt.get("status") != "normalized"
+        or receipt.get("canonical_probe_schema") != "pc-rehd-canonical-fbx-probe-v1"
+    ):
+        raise ValueError("Bone FBX Generic normalization receipt is invalid")
+    prepared_path = str(receipt.get("path", "") or "").strip()
+    if not prepared_path or Path(prepared_path).expanduser().resolve(strict=False) != fbx_path:
+        raise ValueError("Max import path is not the prepared Generic bone FBX")
+    stat = fbx_path.stat()
+    if (
+        int(receipt.get("size", -1)) != int(stat.st_size)
+        or int(receipt.get("mtime_ns", -1)) != int(stat.st_mtime_ns)
+    ):
+        raise ValueError("Generic bone FBX changed before Max consumed it")
+
+    rt = _max_runtime()
+    native_undo_open = False
+    try:
+        rt.pluginManager.loadClass(rt.FBXIMP)
+        _max_begin_native_fbx_import_undo(rt, GENERIC_BONES_FBX_IMPORT_NATIVE_UNDO_LABEL)
+        native_undo_open = True
+        imported = rt.importFile(str(fbx_path), rt.Name("noPrompt"), using=rt.FBXIMP)
+        if not imported:
+            raise RuntimeError("3ds Max FBX importer returned failure")
+        # The importer owns scene creation; no node scan or post-import repair
+        # is needed for the already normalized file.
+        rt.completeRedraw()
+        _max_accept_native_fbx_import_undo(rt, GENERIC_BONES_FBX_IMPORT_NATIVE_UNDO_LABEL)
+        native_undo_open = False
+        return {
+            "action": "import_generic_bones_fbx",
+            "imported": True,
+            "native_undo": True,
+            "native_undo_label": GENERIC_BONES_FBX_IMPORT_NATIVE_UNDO_LABEL,
+            "native_undo_scope": "fbx_import_only",
+            "fbx_path": str(fbx_path),
+            "max_process_id": os.getpid(),
+            "bone_conversion": "user_default",
+            "importer_settings_changed": False,
+            "generic_fbx_normalization": receipt,
+        }
+    except Exception as exc:
+        recovery_failures: list[str] = []
+        if native_undo_open:
+            try:
+                _max_cancel_native_fbx_import_undo(rt)
+            except Exception as undo_exc:
+                recovery_failures.append(f"FBX native Undo rollback failed: {undo_exc}")
+            native_undo_open = False
+        if recovery_failures:
+            raise RuntimeError(f"{exc} | " + " | ".join(recovery_failures)) from exc
+        raise
+    finally:
+        _max_release_transient_runtime(rt)
+
+
 def _max_mesh_rename_callback_row(rt: Any, node: Any) -> dict[str, Any]:
     """Return the live name and hierarchy facts for one completed rename."""
     name = str(getattr(node, "name", "") or "")
@@ -26336,6 +26482,8 @@ def _execute_max_command(command: str, payload: dict[str, Any]) -> dict[str, Any
         # Its native Hold transaction lives inside the import function, never
         # inside pymxs.undo().
         return _max_import_blender_fbx(payload)
+    if command == "import_generic_bones_fbx":
+        return _max_import_generic_bones_fbx(payload)
     if command == "export_embedded_fbx":
         return _max_export_embedded_fbx(payload)
     if command == "export_mod":
@@ -28475,6 +28623,7 @@ TTK_UI_SURFACE_CATALOG: dict[str, TtkUiSurfaceSpec] = {
         _ttk_ui_surface_spec("tool.blender_compact_reference_legacy", "tool.blender_compact_reference", "tool", "blender_compact_name_reference_window", "LauncherApp", "_show_blender_compact_name_reference_legacy", "Legacy Blender compact name reference entry.", "blender", "managed"),
         _ttk_ui_surface_spec("tool.instance_copy", "tool.instance_copy", "tool", "instance_copy_window", "LauncherApp", "_show_instance_copy_tool", "Max scene instance-copy tool.", "max", "managed"),
         _ttk_ui_surface_spec("tool.seam_weight", "tool.seam_weight", "exclusive-tool", "seam_window", "LauncherApp", "_show_seam_weight_tool", "Seam Weight Unify tool and recorded selection controls.", "max", "managed", "exclusive"),
+        _ttk_ui_surface_spec("tool.generic_bones_import", "tool.generic_bones_import", "tool", "max_generic_bones_import_window", "LauncherApp", "_show_max_generic_bones_import_notice", "Generic FBX bone import status.", "max", "managed", "non-modal"),
         _ttk_ui_surface_spec("dialog.seam_error", "dialog.choice", "dialog", "", "LauncherApp", "_show_seam_error", "Seam Weight tool error dialog."),
         _ttk_ui_surface_spec("tool.message_editor", "tool.message_editor", "tool", "message_editor_window", "LauncherApp", "_show_message_editor", "Persistent Launcher message editor.", "managed"),
         _ttk_ui_surface_spec("tool.scene_normals", "tool.scene_normals", "monitor", "scene_normals_window", "LauncherApp", "_show_scene_normals_monitor", "Selected and full-scene normal status monitor.", "max", "managed", "non-modal"),
@@ -29393,7 +29542,21 @@ class _ManagedWindowScheduler:
 
     def begin_native_dialog(self) -> int:
         """Give the Windows chooser the top slot for its modal lifetime."""
-        if self._native_dialog_depth <= 0:
+        outermost = self._native_dialog_depth <= 0
+        # Changing the native topmost band can synchronously dispatch Tk
+        # events. Block all foreground work before making the first change.
+        self._native_dialog_depth += 1
+        setattr(self.root, "_pc_rehd_native_dialog_active", self._native_dialog_depth)
+        if outermost:
+            for attribute in ("_restack_after", "_pointer_activation_after"):
+                after_id = getattr(self, attribute, None)
+                if after_id is not None:
+                    try:
+                        self.root.after_cancel(after_id)
+                    except Exception:
+                        pass
+                    setattr(self, attribute, None)
+            self._pointer_activation_requests.clear()
             snapshot: list[tuple[Any, bool]] = []
             for window in (self.root, *self._live_windows()):
                 try:
@@ -29405,15 +29568,15 @@ class _ManagedWindowScheduler:
                     continue
             self._native_dialog_topmost_snapshot = snapshot
             self._stack_signature = ()
-        self._native_dialog_depth += 1
-        setattr(self.root, "_pc_rehd_native_dialog_active", self._native_dialog_depth)
         return self._native_dialog_depth
 
     def end_native_dialog(self) -> int:
         """Restore the pre-chooser Python window band after the chooser closes."""
-        self._native_dialog_depth = max(0, self._native_dialog_depth - 1)
-        setattr(self.root, "_pc_rehd_native_dialog_active", self._native_dialog_depth)
-        if self._native_dialog_depth:
+        if self._native_dialog_depth <= 0:
+            return 0
+        if self._native_dialog_depth > 1:
+            self._native_dialog_depth -= 1
+            setattr(self.root, "_pc_rehd_native_dialog_active", self._native_dialog_depth)
             return self._native_dialog_depth
         snapshot = self._native_dialog_topmost_snapshot
         self._native_dialog_topmost_snapshot = []
@@ -29426,7 +29589,11 @@ class _ManagedWindowScheduler:
             except Exception:
                 continue
         self._stack_signature = ()
-        self.request_restack(force_order=True, immediate=True)
+        self._native_dialog_depth = 0
+        setattr(self.root, "_pc_rehd_native_dialog_active", 0)
+        # One deferred stack commit also includes any result popup created by
+        # the caller after the file chooser returns. Do not reactivate its old owner.
+        self.request_restack(force_order=True)
         return 0
 
     def is_floating_ball(self, window: Any) -> bool:
@@ -31052,6 +31219,8 @@ def _restore_tk_owner_foreground(owner: Any) -> tuple[bool, str]:
         root = _tk_root_window(owner)
         if not bool(root.winfo_exists()):
             return False, "Launcher root no longer exists"
+        if _managed_window_scheduler(root).native_dialog_active():
+            return False, "Launcher owner restore skipped while a native dialog is active"
         _show_themed_window(root)
         activated, detail = _managed_window_scheduler(root).request_activation(root)
         root.lift()
@@ -31415,10 +31584,12 @@ def _run_managed_native_dialog(
     )
     native_dialog_started = False
     try:
-        if dialog_owner is root:
-            _restore_tk_owner_foreground(root)
-        else:
-            _restore_managed_window_foreground(dialog_owner, root, activate=True)
+        if not bool(dialog_owner.winfo_viewable()):
+            if dialog_owner is root:
+                _restore_tk_owner_foreground(root)
+            else:
+                _restore_managed_window_foreground(dialog_owner, root, activate=True)
+        if dialog_owner is not root:
             setattr(
                 dialog_owner,
                 "_pc_rehd_stack_layer",
@@ -31428,7 +31599,6 @@ def _run_managed_native_dialog(
         native_dialog_depth = scheduler.begin_native_dialog()
         native_dialog_started = True
         setattr(root, "_pc_rehd_native_dialog_active", native_dialog_depth)
-        dialog_owner.lift()
         call_options = dict(options)
         call_options["parent"] = dialog_owner
         return dialog(**call_options)
@@ -31439,29 +31609,8 @@ def _run_managed_native_dialog(
                 setattr(dialog_owner, "_pc_rehd_native_dialog_lease", previous_lease)
         except Exception:
             pass
-        remaining_depth = (
+        if native_dialog_started:
             scheduler.end_native_dialog()
-            if native_dialog_started
-            else int(getattr(root, "_pc_rehd_native_dialog_active", 0) or 0)
-        )
-        if remaining_depth == 0:
-            scheduler.request_restack(force_order=True, immediate=True)
-
-            def restore_exact_owner() -> None:
-                try:
-                    if dialog_owner is root:
-                        _restore_tk_owner_foreground(root)
-                    elif bool(dialog_owner.winfo_exists()):
-                        _restore_managed_window_foreground(
-                            dialog_owner, root, activate=True
-                        )
-                except Exception:
-                    return
-
-            try:
-                root.after(0, restore_exact_owner)
-            except Exception:
-                pass
 
 
 def _managed_file_dialog(owner: Any, method: str, **options: Any) -> Any:
@@ -39019,21 +39168,50 @@ def _import_3ds_max_exported_fbx(payload):
         raise ValueError("3ds Max FBX preprocessor direction is invalid for Blender import")
     if preprocess.get("source_preserved") is not True:
         raise ValueError("3ds Max FBX preprocessor did not confirm the source was preserved")
-    if (
-        preprocess.get("direct_source_import") is not True
-        and preprocess.get("full_mesh_names_preserved") is not True
-    ):
-        raise ValueError("3ds Max FBX import must be passed through unchanged")
+    if preprocess.get("full_mesh_names_preserved") is not True:
+        raise ValueError("3ds Max FBX import must use the Generic full-name artifact")
     source_path = os.path.abspath(str(preprocess.get("source_path", "") or ""))
-    if source_path != path:
-        raise ValueError("Blender import path is not the original Launcher-approved FBX")
+    import_path = os.path.abspath(str(preprocess.get("import_path", "") or ""))
+    temporary_path = os.path.abspath(str(preprocess.get("temporary_path", "") or ""))
+    # Every Launcher import must consume the Generic Probe artifact.  The
+    # original source is retained only as evidence for optional hierarchy
+    # recovery and is never passed to Blender's native importer.
+    if not source_path or source_path == path or import_path != path or temporary_path != path:
+        raise ValueError("Blender import path is not the Launcher-approved Generic FBX")
+    normalization = preprocess.get("generic_fbx_normalization")
+    if not isinstance(normalization, dict):
+        raise ValueError("Blender 3ds Max FBX is missing its Generic normalization receipt")
+    if (
+        str(normalization.get("status", "") or "") != "normalized"
+        or str(normalization.get("canonical_probe_schema", "") or "")
+        != "pc-rehd-canonical-fbx-probe-v1"
+    ):
+        raise ValueError("Blender 3ds Max FBX Generic normalization receipt is invalid")
+    normalized_path = os.path.abspath(str(normalization.get("path", "") or ""))
+    if normalized_path != path:
+        raise ValueError("Blender import path does not match the Generic normalization receipt")
+    normalized_stat = os.stat(path)
+    if (
+        int(normalization.get("size", -1)) != int(normalized_stat.st_size)
+        or int(normalization.get("mtime_ns", -1)) != int(normalized_stat.st_mtime_ns)
+    ):
+        raise ValueError("Generic FBX changed before Blender consumed it")
+    if preprocess.get("source_preserved") is not True or preprocess.get("imported_original") is not False:
+        raise ValueError("Blender Generic import must preserve the source and reject direct import")
     _ensure_object_mode()
     if bool(payload.get("reset_scene", False)):
         for node in list(bpy.data.objects):
             bpy.data.objects.remove(node, do_unlink=True)
-    source_hierarchy_contract = _fbx_hierarchy_validate_contract(
-        payload.get("fbx_hierarchy_contract"), path
-    )
+    try:
+        source_hierarchy_contract = _fbx_hierarchy_validate_contract(
+            payload.get("fbx_hierarchy_contract"), path
+        )
+        if not isinstance(source_hierarchy_contract, dict):
+            raise ValueError("Generic FBX hierarchy evidence is unavailable")
+    except Exception as exc:
+        source_hierarchy_contract = _fbx_hierarchy_unavailable_contract(
+            path, "%s: %s" % (type(exc).__name__, exc)
+        )
     _FBX_HIERARCHY_MANUAL_IMPORT_ARMS.pop(_pointer(bpy.context.scene), None)
     before = {
         _pointer(node)
@@ -39045,6 +39223,8 @@ def _import_3ds_max_exported_fbx(payload):
         path,
         use_custom_normals=bool(payload.get("include_normals", True)),
     )
+    if not outcome or "FINISHED" not in outcome:
+        raise RuntimeError("Blender's Generic FBX import did not finish")
     imported = [
         node
         for node in _fbx_hierarchy_live_objects(
@@ -39088,12 +39268,30 @@ def _import_3ds_max_exported_fbx(payload):
     # This explicit Launcher tool owns one immediate repair pass. The selected
     # source FBX is authoritative for every imported Model, including ordinary
     # user-named Meshes that do not match the RE6 Header naming convention.
-    hierarchy = _fbx_hierarchy_apply_import_contract(
-        source_hierarchy_contract,
-        imported,
-        strict=True,
-        full_source_hierarchy=True,
-    )
+    try:
+        hierarchy = _fbx_hierarchy_apply_import_contract(
+            source_hierarchy_contract,
+            imported,
+            # Incomplete or ambiguous identities stop the optional repair
+            # before it changes parents; the catch below preserves import.
+            strict=True,
+            full_source_hierarchy=True,
+        )
+    except Exception as exc:
+        # Hierarchy recovery is optional evidence.  Native FBX import has
+        # already succeeded, so a mapping/API failure must remain advisory.
+        hierarchy = {
+            "schema": _FBX_HIERARCHY_CONTRACT_SCHEMA,
+            "status": "ADVISORY_SKIPPED",
+            "advisory": True,
+            "contract_available": bool(source_hierarchy_contract.get("contract_available", False)),
+            "routed_model_count": 0,
+            "unchanged_model_count": 0,
+            "missing_helper_count": 0,
+            "unresolved_node_names": [],
+            "issues": ["%s: %s" % (type(exc).__name__, exc)],
+            "routed": [],
+        }
     try:
         # Restore the source graph while __CIX still uniquely identifies every
         # Model; collision cleanup is deliberately the final import step.
@@ -48046,6 +48244,63 @@ def _write_generic_fbx_from_source(
     }
 
 
+# All FBX import tools share one clearly identifiable disposable artifact.
+GENERIC_FBX_IMPORT_TEMP_NAME = "Generic-FBX-TEMPT.fbx"
+# Compatibility alias for older receipts/tests; the on-disk name is unified.
+GENERIC_BONES_IMPORT_TEMP_NAME = GENERIC_FBX_IMPORT_TEMP_NAME
+
+
+@contextmanager
+def _generic_bones_fbx_import_slot(log_directory: str | Path) -> Any:
+    import msvcrt
+
+    directory = _public_long_term_cache_directory(log_directory)
+    output = directory / GENERIC_BONES_IMPORT_TEMP_NAME
+    # An OS lock is released even after a crash, and protects other Launchers
+    # from deleting the fixed-name FBX while Max is importing it.
+    with output.with_suffix(".lock").open("a+b") as lock:
+        lock.seek(0)
+        try:
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise RuntimeError("Blender MMD FBX import is already using the temporary file") from exc
+        try:
+            yield output
+        finally:
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def _cleanup_generic_bones_fbx_import_temporary_file(log_directory: str | Path) -> bool:
+    try:
+        directory = _public_long_term_cache_directory(log_directory)
+        if not (directory / GENERIC_BONES_IMPORT_TEMP_NAME).is_file():
+            return False
+        with _generic_bones_fbx_import_slot(log_directory) as output:
+            output.unlink(missing_ok=True)
+        return True
+    except (OSError, RuntimeError):
+        return False
+
+
+@contextmanager
+def _prepared_generic_bones_fbx_import(
+    source_path: str | Path,
+    log_directory: str | Path,
+) -> Any:
+    source = Path(source_path).expanduser().resolve(strict=True)
+    with _generic_bones_fbx_import_slot(log_directory) as output:
+        if source == output.resolve(strict=False):
+            raise ValueError("Select the original Blender FBX, not the temporary import file")
+        output.unlink(missing_ok=True)
+        receipt = _write_generic_fbx_from_source(source, output)
+        yield {
+            "fbx_path": str(output),
+            "source_fbx_path": str(source),
+            "generic_fbx_normalization": receipt,
+        }
+
+
 EMBEDDED_MEDIA_FBX_STEM = "内置贴图 Embedded Media"
 GENERIC_EMBEDDED_MEDIA_FBX_STEM = "通用内置贴图 Generic Embedded Media"
 
@@ -48188,6 +48443,158 @@ def _prepare_fbx_interchange_artifact(
         }
     )
     return _PreparedFbxInterchangeArtifact(source, temporary_path, receipt)
+
+
+def _prepare_generic_fbx_interchange_artifact(
+    source_path: str | Path,
+    *,
+    direction: str,
+    log_directory: str | Path,
+    existing_scene_names: Iterable[str] = (),
+    hierarchy_recovery_source_path: str | Path | None = None,
+    _output_path: str | Path | None = None,
+) -> _PreparedFbxInterchangeArtifact:
+    """Normalize an FBX through Probe Generic before hierarchy rewriting.
+
+    The MAX Blender-import button and the MMD bones-import button must share
+    the same Generic input contract.  Keep the Generic result in memory, then
+    apply the existing hierarchy repair to those bytes and write one scoped
+    temporary FBX for MAX.  This preserves the old hierarchy receipt while
+    guaranteeing that an unchanged hierarchy still imports the Generic copy,
+    never the user's source file.
+    """
+    source = Path(source_path).expanduser().resolve(strict=True)
+    if source.suffix.casefold() != ".fbx":
+        raise ValueError(f"FBX interchange source is not an .fbx file: {source}")
+    if direction not in {"max_to_blender", "blender_to_max"}:
+        raise ValueError(f"Unsupported FBX interchange direction: {direction}")
+    # Generic import artifacts live in the public long-term cache so both the
+    # MAX and Blender tools use the same discoverable location.
+    root = _public_long_term_cache_directory(log_directory)
+    root.mkdir(parents=True, exist_ok=True)
+    fixed_output = (
+        Path(_output_path).expanduser().resolve(strict=False)
+        if _output_path is not None
+        else root / GENERIC_FBX_IMPORT_TEMP_NAME
+    )
+    if fixed_output.parent != root:
+        raise ValueError("Generic FBX temporary path escaped the long-term cache")
+    if source == fixed_output.resolve(strict=False):
+        raise ValueError("Select the original FBX, not Generic-FBX-TEMPT.fbx")
+    _cleanup_fbx_interchange_temporary_files(root)
+    try:
+        fixed_output.unlink(missing_ok=True)
+    except OSError:
+        pass
+    before = source.stat()
+
+    # Use the same in-memory Probe entry point as the standalone Generic
+    # converter.  No Generic intermediate file is exposed to the user.
+    probe = _load_operation_dependency("auxiliary", "auxiliary_probe")
+    prepare = getattr(probe, "_generic_prepare_fbx_bytes", None)
+    if not callable(prepare):
+        raise RuntimeError("FBX Probe Generic in-memory conversion entry point is unavailable")
+    generic_data, generic_receipt = prepare(source)
+    if not isinstance(generic_data, (bytes, bytearray)) or not generic_data:
+        raise RuntimeError("FBX Probe Generic conversion returned no FBX bytes")
+    after = source.stat()
+    if (
+        int(before.st_size) != int(after.st_size)
+        or int(before.st_mtime_ns) != int(after.st_mtime_ns)
+    ):
+        raise RuntimeError("The source FBX changed while its Generic import copy was prepared")
+
+    if direction == "max_to_blender":
+        # The compact-name rewrite path is retired. Generic is already the
+        # canonical artifact and is passed through byte-for-byte here.
+        output_data = bytes(generic_data)
+        hierarchy_receipt = {
+            "direction": direction,
+            "status": "GENERIC_ONLY",
+            "changed": False,
+            "unresolved_node_names": [],
+        }
+    else:
+        output_data, hierarchy_receipt = _fbx_rewrite_interchange_bytes(
+            bytes(generic_data),
+            direction=direction,
+            existing_scene_names=existing_scene_names,
+            hierarchy_recovery_source_path=hierarchy_recovery_source_path,
+        )
+    # All Generic imports use one fixed, discoverable disposable filename.
+    stale_generic = fixed_output
+    try:
+        stale_generic.unlink(missing_ok=True)
+    except OSError:
+        pass
+    temporary_path = stale_generic
+    write_path = temporary_path.with_name(f".{temporary_path.name}.tmp")
+    try:
+        write_path.write_bytes(output_data)
+        os.replace(write_path, temporary_path)
+    finally:
+        write_path.unlink(missing_ok=True)
+
+    temporary_stat = temporary_path.stat()
+    normalization_receipt = dict(generic_receipt) if isinstance(generic_receipt, Mapping) else {}
+    normalization_receipt.update(
+        {
+            "path": str(temporary_path),
+            "size": int(temporary_stat.st_size),
+            "mtime_ns": int(temporary_stat.st_mtime_ns),
+        }
+    )
+    receipt = dict(hierarchy_receipt)
+    receipt.update(
+        {
+            "source_path": str(source),
+            "import_path": str(temporary_path),
+            "temporary_path": str(temporary_path),
+            "source_size": int(before.st_size),
+            "temporary_size": int(temporary_stat.st_size),
+            "source_preserved": True,
+            "imported_original": False,
+            "temporary_cleanup": "PENDING",
+            "generic_fbx_normalization": normalization_receipt,
+            "generic_input_size": len(generic_data),
+            # max_to_blender keeps full RE6 names; Blender uses the Generic
+            # artifact only for stable transforms, never the retired compact
+            # name rewrite path.
+            "full_mesh_names_preserved": direction == "max_to_blender",
+        }
+    )
+    return _PreparedFbxInterchangeArtifact(source, temporary_path, receipt)
+
+
+@contextmanager
+def _prepared_generic_fbx_interchange_artifact(
+    source_path: str | Path,
+    *,
+    direction: str,
+    log_directory: str | Path,
+    existing_scene_names: Iterable[str] = (),
+    hierarchy_recovery_source_path: str | Path | None = None,
+) -> Iterable[_PreparedFbxInterchangeArtifact]:
+    # Hold the same OS lock used by the MMD importer for the complete prepare
+    # and native-import lifetime, preventing another Launcher from replacing
+    # the fixed-name file while it is being consumed.
+    with _generic_bones_fbx_import_slot(log_directory) as output:
+        artifact = _prepare_generic_fbx_interchange_artifact(
+            source_path,
+            direction=direction,
+            log_directory=log_directory,
+            existing_scene_names=existing_scene_names,
+            hierarchy_recovery_source_path=hierarchy_recovery_source_path,
+            _output_path=output,
+        )
+        try:
+            yield artifact
+        finally:
+            try:
+                artifact.path.unlink(missing_ok=True)
+                artifact.receipt["temporary_cleanup"] = "REMOVED"
+            except OSError as exc:
+                artifact.receipt["temporary_cleanup"] = f"RETRY_ON_NEXT_LAUNCH: {type(exc).__name__}"
 
 
 @contextmanager
@@ -50721,6 +51128,9 @@ MAX_SCENE_ACCESS_INTERFACES: dict[str, dict[str, str]] = {
     },
     "toolbox.blender_fbx.import": {
         "command": "import_blender_fbx", "contract": "passthrough", "operation": "auxiliary",
+    },
+    "toolbox.generic_bones_fbx.import": {
+        "command": "import_generic_bones_fbx", "contract": "passthrough", "operation": "auxiliary",
     },
     "toolbox.blender_fbx.focus": {
         "command": "focus_viewport", "contract": "passthrough", "operation": "auxiliary",
@@ -56475,6 +56885,7 @@ class LauncherApp:
             )
         except OSError:
             self._startup_interchange_cleanup = []
+        _cleanup_generic_bones_fbx_import_temporary_file(self._long_term_cache_directory)
         self.launcher_icon_style = str(
             self.launcher_state.get(
                 "launcher_icon_style", LAUNCHER_ICON_STYLE_UMBRELLA
@@ -57591,6 +58002,7 @@ class LauncherApp:
         if workspace is not None:
             workspace.log_dir = value
         if directory_changed:
+            _cleanup_generic_bones_fbx_import_temporary_file(resolved)
             self._queue_export_history_write()
             if self._persist_launcher_state_enabled:
                 _write_export_sets_window_size(
@@ -58521,6 +58933,8 @@ class LauncherApp:
             if not bool(self.root.winfo_exists()):
                 return
             scheduler = _managed_window_scheduler(self.root)
+            if scheduler.native_dialog_active():
+                return
             if scheduler.floating_ball_active():
                 scheduler.enforce_floating_ball()
                 return
@@ -63503,6 +63917,8 @@ class LauncherApp:
         self.max_embedded_texture_fbx_tooltip = None
         self.max_blender_fbx_import_tool_button = None
         self.max_blender_fbx_import_tooltip = None
+        self.max_generic_bones_import_tool_button = None
+        self.max_generic_bones_import_window = None
         self.max_mod_file_scan_button = None
         self._max_blender_fbx_import_inflight = False
         self._embedded_texture_fbx_tool_inflight = False
@@ -70636,6 +71052,10 @@ class LauncherApp:
             getattr(self, "max_blender_fbx_import_tool_button", None),
             max_ready and not bool(self._max_blender_fbx_import_inflight),
         )
+        set_state(
+            getattr(self, "max_generic_bones_import_tool_button", None),
+            max_ready and not bool(self._max_blender_fbx_import_inflight),
+        )
         blender_tool_busy = bool(
             self._blender_material_bind_inflight
             or self._blender_texture_tool_inflight
@@ -70911,6 +71331,215 @@ class LauncherApp:
             on_error=failure,
         )
 
+    def _show_max_generic_bones_import_notice(self) -> Any:
+        existing = getattr(self, "max_generic_bones_import_window", None)
+        if existing is not None and bool(existing.winfo_exists()):
+            existing._pc_rehd_import_close()
+        window = _create_indexed_toplevel(self.root, "tool.generic_bones_import")
+        self.max_generic_bones_import_window = window
+        self._register_managed_ui_surface("tool.generic_bones_import", window)
+        setattr(window, "_pc_rehd_stack_layer", MANAGED_WINDOW_DIALOG_LAYER)
+        window.title(self._tr("Blender MMD FBX 导入", "Blender MMD FBX Import"))
+        window.configure(background=self.colors["bg"])
+        window.resizable(False, False)
+        window.columnconfigure(0, weight=1)
+        body = self.ttk.Frame(window, style="Panel.TFrame", padding=(26, 22))
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        labels = []
+
+        def label(row: int, text: str, *, size: int = 12, bold: bool = False,
+                  accent: bool = False, pady: tuple[int, int] = (0, 0)) -> Any:
+            widget = self.ttk.Label(
+                body, text=text, wraplength=650, justify="left",
+                font=("Microsoft YaHei UI", size, "bold" if bold else "normal"),
+                **({"foreground": self.colors["accent"]} if accent else {}),
+            )
+            widget.grid(row=row, column=0, sticky="ew", pady=pady)
+            labels.append(widget)
+            return widget
+
+        label(0, "Blender MMD  >  3ds Max", size=17, bold=True, pady=(0, 16))
+        label(1, self._tr(
+            "将 Blender 导出的 FBX 进行一次通用化转换，临时存放在日志和长期缓存目录，再导入 3ds Max",
+            "Convert the Blender FBX once to Generic FBX, temporarily store it in the log and long-term cache folder, then import it into 3ds Max",
+        ))
+        label(2, self._tr(
+            "导入成功之后将自动删除临时 FBX 文件",
+            "The temporary FBX is automatically deleted after a successful import",
+        ), pady=(20, 4))
+        label(3, GENERIC_BONES_IMPORT_TEMP_NAME, size=11, bold=True)
+        self.ttk.Separator(body).grid(row=4, column=0, sticky="ew", pady=(20, 16))
+        status = label(5, self._tr("正在通用化并导入", "Converting and importing"), size=11)
+        click_hint = label(6, "", size=10, pady=(14, 0))
+        click_hint.configure(anchor="center", justify="center")
+        click_hint.grid_remove()
+        state = {"keep_open": False, "finished": False, "after": None}
+
+        def fit() -> None:
+            # Toolbox minimum heights survive content changes. This notice
+            # instead measures its own wrapped content for each state.
+            window.minsize(1, 1)
+            width = min(720, max(320, window.winfo_screenwidth() - 64))
+            for widget in labels:
+                widget.configure(wraplength=width - 52)
+            window.update_idletasks()
+            height = int(body.winfo_reqheight())
+            x, y = _centered_window_position(
+                width, height, window.winfo_screenwidth(), window.winfo_screenheight()
+            )
+            window.minsize(min(width, 560), height)
+            _set_themed_window_geometry(window, f"{width}x{height}{x:+d}{y:+d}", dark=bool(self._theme_dark))
+
+        def close() -> None:
+            if state["after"] is not None:
+                window.after_cancel(state["after"])
+                state["after"] = None
+            self._unregister_managed_ui_surface("tool.generic_bones_import", window)
+            if self.max_generic_bones_import_window is window:
+                self.max_generic_bones_import_window = None
+            window.destroy()
+
+        def finish(imported: bool) -> None:
+            state["finished"] = imported
+            if imported and not state["keep_open"]:
+                state["after"] = window.after(1200, close)
+
+        def toggle_auto_close(_event: Any = None) -> None:
+            state["keep_open"] = not state["keep_open"]
+            if state["after"] is not None:
+                window.after_cancel(state["after"])
+                state["after"] = None
+            click_hint.configure(text=self._tr(
+                "用户已点击窗口，将不会自动关闭，再次点击自动关闭",
+                "Window clicked; auto-close paused; click again to enable it",
+            ) if state["keep_open"] else "")
+            if state["keep_open"]:
+                click_hint.grid()
+            else:
+                click_hint.grid_remove()
+            if state["finished"] and not state["keep_open"]:
+                close()
+            else:
+                fit()
+
+        window._pc_rehd_import_close = close
+        window._pc_rehd_import_finish = finish
+        window._pc_rehd_import_fit = fit
+        window.protocol("WM_DELETE_WINDOW", close)
+        window.bind("<Escape>", lambda _event: close())
+        window.bind("<Button-1>", toggle_auto_close)
+        fit()
+        _show_managed_toplevel(window, self.root, activate=True)
+        self._apply_topmost()
+        return status
+
+    def _run_max_generic_bones_fbx_import_tool(self) -> None:
+        session = self._active_session()
+        if self.blender_mode_enabled or session is None:
+            self._show_error(RuntimeError(self._tr(
+                "请先在 MAX 模式连接一个活动 3ds Max 进程。",
+                "Connect an active 3ds Max process in MAX mode first.",
+            )))
+            return
+        if self._max_blender_fbx_import_inflight:
+            return
+        self._max_blender_fbx_import_inflight = True
+        self._refresh_toolbox_action_states()
+        try:
+            picker_owner = getattr(self, "toolbox_window", None)
+            if picker_owner is None or not bool(picker_owner.winfo_exists()):
+                picker_owner = self.root
+            selected = _managed_file_dialog(
+                picker_owner,
+                "askopenfilename",
+                title=self._tr("选择 Blender MMD 带骨骼 FBX", "Select Blender MMD FBX with Bones"),
+                filetypes=[("FBX", "*.fbx")],
+            )
+            if not selected:
+                self._max_blender_fbx_import_inflight = False
+                self._refresh_toolbox_action_states()
+                return
+            source = Path(str(selected)).expanduser().resolve(strict=True)
+            if not source.is_file() or source.suffix.casefold() != ".fbx":
+                raise ValueError(self._tr("请选择有效的 .fbx 文件。", "Choose a valid .fbx file."))
+            cache_directory = Path(self._long_term_cache_directory)
+            status = self._show_max_generic_bones_import_notice()
+            action = "max_generic_bones_fbx_import"
+            generation = self._begin_session_operation(session, action)
+        except Exception as exc:
+            self._max_blender_fbx_import_inflight = False
+            self._refresh_toolbox_action_states()
+            self._show_error(exc)
+            return
+
+        def set_notice(text: str, *, imported: bool = False) -> None:
+            try:
+                if bool(status.winfo_exists()):
+                    status.configure(text=text)
+                    window = status.winfo_toplevel()
+                    window._pc_rehd_import_fit()
+                    window._pc_rehd_import_finish(imported)
+            except self.tk.TclError:
+                pass
+
+        def operation() -> dict[str, Any]:
+            with _prepared_generic_bones_fbx_import(source, cache_directory) as payload:
+                temporary = Path(payload["fbx_path"])
+                try:
+                    _request_id, result = self._request_max_scene_interface(
+                        session, "toolbox.generic_bones_fbx.import", payload,
+                    )
+                    if result.get("imported") is not True or result.get("importer_settings_changed") is not False:
+                        raise RuntimeError("3ds Max did not confirm import without changing importer settings")
+                except Exception as exc:
+                    if isinstance(exc, MaxPythonLinkError):
+                        raise
+                    raise RuntimeError(f"{exc}\n\nTemporary FBX: {temporary}") from exc
+                # Keep failed imports until the next cleanup; a success is final.
+                try:
+                    temporary.unlink()
+                    result["temporary_cleanup"] = "deleted"
+                except OSError as exc:
+                    result["temporary_cleanup"] = "failed"
+                    result["temporary_cleanup_error"] = str(exc)
+                    result["temporary_fbx_path"] = str(temporary)
+                return result
+
+        def success(result: dict[str, Any]) -> None:
+            self._max_blender_fbx_import_inflight = False
+            self._refresh_toolbox_action_states()
+            if not self._owns_session_operation(session, action, generation):
+                return
+            message = self._tr(
+                    "导入完成：已使用 Generic-FBX-TEMPT.fbx 导入，临时文件已删除。",
+                "Import complete: Generic-FBX-TEMPT.fbx was imported and deleted",
+            )
+            if result.get("temporary_cleanup") != "deleted":
+                message = self._tr(
+                    f"导入完成；临时 Generic-FBX-TEMPT.fbx 删除失败：{result.get('temporary_fbx_path')}。",
+                    f"Import complete; could not delete Generic-FBX-TEMPT.fbx: {result.get('temporary_fbx_path')}",
+                )
+            set_notice(message, imported=result.get("temporary_cleanup") == "deleted")
+            session.workspace.last_status = message
+            if self._session_is_visible(session):
+                self._set_status(message, progress=100)
+
+        def failure(exc: Exception) -> None:
+            self._max_blender_fbx_import_inflight = False
+            self._refresh_toolbox_action_states()
+            set_notice(self._tr("导入未完成，请查看错误信息", "Import did not complete; see the error details"))
+            self._session_error(session, action, generation, exc)
+
+        try:
+            self._dispatch_operation("auxiliary", lambda: self._run_background(
+                operation, success,
+                label=self._tr("通用化 FBX 并以骨骼导入 MAX", "Converting FBX and Importing Bones into MAX"),
+                on_error=failure, performance_critical=True,
+            ))
+        except Exception as exc:
+            failure(exc)
+
     def _run_max_import_blender_fbx_tool(self) -> None:
         """Import a Blender FBX through Max's scoped hierarchy repair route."""
         session = self._active_session()
@@ -70976,7 +71605,7 @@ class LauncherApp:
                 log_directory = _resolve_log_directory(
                     str(workspace.log_dir or DEFAULT_LOG_DIR)
                 )
-                with _prepared_fbx_interchange_artifact(
+                with _prepared_generic_fbx_interchange_artifact(
                     fbx_path,
                     direction="blender_to_max",
                     log_directory=log_directory,
@@ -71018,16 +71647,8 @@ class LauncherApp:
                 unresolved_detail = self._fbx_hierarchy_unresolved_detail(
                     unresolved_node_names, max_import_notice=True
                 )
-                source_cleanup_cn = (
-                    "源 FBX 未改动；没有可安全改写的层级，已直接导入原始 FBX。"
-                    if bool(preprocess.get("imported_original", False))
-                    else "源 FBX 未改动；已导入日志目录处理副本，临时副本已在导入后删除。"
-                )
-                source_cleanup_en = (
-                    "The source FBX was unchanged; no hierarchy link could be safely rewritten, so the original FBX was imported directly."
-                    if bool(preprocess.get("imported_original", False))
-                    else "The source FBX was unchanged; the processed log-directory copy was imported and deleted after import."
-                )
+                source_cleanup_cn = "源 FBX 已先经过 FBX Probe 通用层重建；Generic-FBX-TEMPT.fbx 已在导入后删除。层级匹配失败会自动跳过。"
+                source_cleanup_en = "The source FBX was rebuilt by the FBX Probe Generic layer; Generic-FBX-TEMPT.fbx was deleted after import. Hierarchy matches that fail are skipped."
                 session.workspace.last_status = self._tr(
                     f"Blender FBX 已导入 MAX | Mesh {imported_mesh_count} | 导入前层级修复 {routed_count}",
                     f"Blender FBX imported into MAX | Meshes {imported_mesh_count} | Pre-import hierarchy repairs {routed_count}",
@@ -71125,8 +71746,8 @@ class LauncherApp:
                 self.root,
                 "askopenfilename",
                 title=self._tr(
-                    "导入并修复3ds MAX FBX 进Blender后层级错误",
-                    "Import and Repair 3ds Max FBX Hierarchy Errors in Blender",
+                    "通用化后导入并修复3ds MAX FBX层级错误",
+                    "Generic Rebuild, Import and Repair 3ds Max FBX in Blender",
                 ),
                 initialdir=str(initial_directory),
                 filetypes=[
@@ -71157,29 +71778,29 @@ class LauncherApp:
         self._refresh_toolbox_action_states()
 
         def operation() -> dict[str, Any]:
-            # Keep the source untouched. BPY repairs hierarchy only for Meshes
-            # whose complete RE6 Header can actually be recognized after import.
-            preprocess = {
-                "direction": "max_to_blender",
-                "format": "source",
-                "status": "DIRECT_SOURCE_FBX",
-                "changed": False,
-                "source_path": str(fbx_path),
-                "source_preserved": True,
-                "direct_source_import": True,
-            }
-            result = self._request_blender_3ds_max_fbx_import(
-                session,
-                {
-                    "path": str(fbx_path),
-                    "fbx_preprocess": preprocess,
-                    "include_normals": bool(self.import_normals_var.get()),
-                    "reset_scene": False,
-                },
+            # Every import goes through the in-memory Probe Generic rebuild.
+            # Hierarchy repair remains advisory and may be skipped when no
+            # complete source match is available; the source FBX is untouched.
+            log_directory = _resolve_log_directory(
+                str(workspace.log_dir or DEFAULT_LOG_DIR)
             )
-            result["source_fbx_path"] = str(fbx_path)
-            result["fbx_preprocess"] = preprocess
-            return result
+            with _prepared_generic_fbx_interchange_artifact(
+                fbx_path,
+                direction="max_to_blender",
+                log_directory=log_directory,
+            ) as artifact:
+                result = self._request_blender_3ds_max_fbx_import(
+                    session,
+                    {
+                        "path": str(artifact.path),
+                        "fbx_preprocess": artifact.receipt,
+                        "include_normals": bool(self.import_normals_var.get()),
+                        "reset_scene": False,
+                    },
+                )
+                result["source_fbx_path"] = str(fbx_path)
+                result["fbx_preprocess"] = artifact.receipt
+                return result
 
         def success(result: dict[str, Any]) -> None:
             self._blender_max_fbx_import_inflight = False
@@ -71225,7 +71846,7 @@ class LauncherApp:
                     f"未找到对应父级：{missing_helper_count}\n"
                     f"无法解析、已原样导入：{unrecognized_mesh_count}\n\n"
                     f"缺乏追踪溯源记录：{len(unresolved_node_names)}\n\n"
-                    "源 FBX 直接导入 Blender。不能解析的节点会直接导入，不会阻断导入。",
+                    "源 FBX 已先经过 FBX Probe 通用层重建，再导入 Blender；临时 Generic-FBX-TEMPT.fbx 已自动删除。层级无法匹配的节点跳过修复并继续导入。",
                     f"Imported the FBX exported from 3ds Max.\n\n"
                     f"Imported Meshes: {imported_mesh_count}\n"
                     f"Recognized and hierarchy-checked: {recognized_mesh_count}\n"
@@ -71234,7 +71855,7 @@ class LauncherApp:
                     f"Missing parent helpers: {missing_helper_count}\n"
                     f"Unrecognized and imported unchanged: {unrecognized_mesh_count}\n\n"
                     f"Missing traceable source evidence: {len(unresolved_node_names)}\n\n"
-                    "The source FBX was imported directly into Blender. Unrecognized nodes are imported directly and never block import.",
+                    "The source FBX was rebuilt by the FBX Probe Generic layer before Blender import; Generic-FBX-TEMPT.fbx was deleted automatically. Nodes without a reliable hierarchy match skip repair and never block import.",
                 ),
                 detail_message=unresolved_detail,
                 detail_scroll=bool(unresolved_detail),
@@ -75418,6 +76039,7 @@ class LauncherApp:
             self.max_embedded_texture_fbx_tooltip = None
             self.max_blender_fbx_import_tool_button = None
             self.max_blender_fbx_import_tooltip = None
+            self.max_generic_bones_import_tool_button = None
             self.max_mod_file_scan_button = None
             self.bone_auto_focus_button = None
             self.message_editor_tool_button = None
@@ -75517,8 +76139,8 @@ class LauncherApp:
         self.max_blender_fbx_import_tool_button = self.ttk.Button(
             body,
             text=self._tr(
-                "导入并修复Blender 节点层级错误的FBX",
-                "Import and Repair Blender FBX Hierarchy Errors",
+                "通用化后导入并修复Blender 节点层级错误的FBX",
+                "Generic Rebuild, Import and Repair Blender FBX Hierarchy",
             ),
             command=self._run_max_import_blender_fbx_tool,
             style="Accent.TButton",
@@ -75529,8 +76151,8 @@ class LauncherApp:
         self.max_blender_fbx_import_tooltip = HoverTooltip(
             self.max_blender_fbx_import_tool_button,
             lambda: self._tr(
-                "Python先分析源FBX。命中可安全修复的 Parent - Child 层级时，才复制到日志目录处理后导入MAX，完成后删除副本；没有可安全改写的节点则直接导入原始FBX。支持 _Import2 / _Import_3 等情况。MAX不会扫描、重命名或重挂场景节点；无法解析的节点默认跳过，不会阻断导入。",
-                "Python analyzes the source FBX first. Only when a Parent-Child link can be repaired safely is a log-directory copy processed and imported into MAX, then deleted; otherwise the original FBX is imported directly. Supports _Import2 / _Import_3 and later variants. MAX does not scan, rename, or re-parent scene nodes; unrecognized nodes are skipped and never block import.",
+                "源 FBX 始终先经过 FBX Probe 通用层重建，再用临时 Generic-FBX-TEMPT.fbx 导入 MAX；导入完成后自动删除临时文件。层级仅修复可可靠匹配的节点，匹配失败自动跳过，不会阻断导入。",
+                "The source FBX always goes through the FBX Probe Generic rebuild before MAX import using Generic-FBX-TEMPT.fbx; the temporary file is deleted after import. Hierarchy repair is limited to reliable matches, and failures are skipped without blocking import.",
             ),
         )
         self.bone_auto_focus_button = self.ttk.Button(
@@ -75542,7 +76164,7 @@ class LauncherApp:
             else "BoneAutoFocusOff.TButton",
         )
         self.bone_auto_focus_button.grid(
-            row=5, column=0, sticky="ew", pady=(8, 0)
+            row=6, column=0, sticky="ew", pady=(8, 0)
         )
         self.message_editor_tool_button = self.ttk.Button(
             body,
@@ -75550,16 +76172,16 @@ class LauncherApp:
             command=self._show_message_editor,
             style="Accent.TButton",
         )
-        self.message_editor_tool_button.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+        self.message_editor_tool_button.grid(row=7, column=0, sticky="ew", pady=(8, 0))
         self.instance_copy_tool_button = self.ttk.Button(
             body,
             text=self._tr("复制 Max 场景 Instance", "Copy Max Scene Instances"),
             command=self._show_instance_copy_tool,
             style="Accent.TButton",
         )
-        self.instance_copy_tool_button.grid(row=7, column=0, sticky="ew", pady=(8, 0))
+        self.instance_copy_tool_button.grid(row=8, column=0, sticky="ew", pady=(8, 0))
         scene_auto_colors_row = self.ttk.Frame(body, style="Panel.TFrame")
-        scene_auto_colors_row.grid(row=8, column=0, sticky="ew", pady=(8, 0))
+        scene_auto_colors_row.grid(row=9, column=0, sticky="ew", pady=(8, 0))
         scene_auto_colors_row.columnconfigure(0, weight=2)
         scene_auto_colors_row.columnconfigure(1, weight=3)
         self.scene_auto_colors_tool_button = self.ttk.Button(
@@ -75586,8 +76208,18 @@ class LauncherApp:
             style="BakeSafe.TButton",
         )
         self.max_material_normalize_button.grid(
-            row=9, column=0, sticky="ew", pady=(8, 0), ipady=8
+            row=10, column=0, sticky="ew", pady=(8, 0), ipady=8
         )
+        self.max_generic_bones_import_tool_button = self.ttk.Button(
+            body,
+            text=self._tr(
+                "Blender MMD 模型带骨骼 FBX导入3ds Max",
+                "Import Blender MMD FBX with Bones into 3ds Max",
+            ),
+            command=self._run_max_generic_bones_fbx_import_tool,
+            style="Accent.TButton",
+        )
+        self.max_generic_bones_import_tool_button.grid(row=5, column=0, sticky="ew", pady=(8, 0))
         self.seam_weight_tool_button = self.ttk.Button(
             body,
             text=self._tr("接缝处权重统一", "Seam Weight Unify"),
@@ -75595,7 +76227,7 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.seam_weight_tool_button.grid(
-            row=10, column=0, sticky="ew", pady=(8, 0)
+            row=12, column=0, sticky="ew", pady=(8, 0)
         )
         self.max_mod_file_scan_button = self.ttk.Button(
             body,
@@ -75604,13 +76236,13 @@ class LauncherApp:
             style="Accent.TButton",
         )
         self.max_mod_file_scan_button.grid(
-            row=11, column=0, sticky="ew", pady=(8, 0)
+            row=13, column=0, sticky="ew", pady=(8, 0)
         )
         self.ttk.Button(
             body,
             text=self._tr("关闭", "Close"),
             command=close_toolbox,
-        ).grid(row=12, column=0, sticky="e", pady=(14, 0))
+        ).grid(row=14, column=0, sticky="e", pady=(14, 0))
 
         self._restore_toolbox_window_geometry(window)
         self._refresh_toolbox_action_states()
@@ -75970,8 +76602,8 @@ class LauncherApp:
         self.blender_max_fbx_import_tool_button = self.ttk.Button(
             body,
             text=self._tr(
-                "导入并修复3ds MAX FBX 进Blender后层级错误",
-                "Import and Repair 3ds Max FBX Hierarchy Errors in Blender",
+                "通用化后导入并修复3ds MAX FBX层级错误",
+                "Generic Rebuild, Import and Repair 3ds Max FBX in Blender",
             ),
             command=self._run_blender_import_3ds_max_fbx_tool,
             style="Accent.TButton",
@@ -75982,8 +76614,8 @@ class LauncherApp:
         self.blender_max_fbx_import_tooltip = HoverTooltip(
             self.blender_max_fbx_import_tool_button,
             lambda: self._tr(
-                "源 FBX 直接导入 Blender；导入成功后执行一次“修复MAX FBX层级错误”按钮的同款功能。不能解析的节点会直接导入，不会阻断导入。",
-                "Imports the source FBX directly into Blender, then runs the same hierarchy repair as Fix 3ds Max FBX Hierarchy once after import. Unrecognized nodes are imported directly and never block import.",
+                "源 FBX 始终先经过 FBX Probe 通用层重建，再导入 Blender；临时 Generic-FBX-TEMPT.fbx 导入完成后自动删除。层级仅修复可可靠匹配的节点，匹配失败自动跳过，不会阻断导入。",
+                "The source FBX always goes through the FBX Probe Generic rebuild before Blender import using Generic-FBX-TEMPT.fbx; the temporary file is deleted after import. Hierarchy repair is limited to reliable matches, and failures are skipped without blocking import.",
             ),
         )
         self.blender_embedded_texture_fbx_tool_button = self.ttk.Button(
@@ -82049,6 +82681,13 @@ class LauncherApp:
 
     def _show_seam_error(self, exc: Exception) -> None:
         detail = self._localized_error_detail(exc)
+        missing_prefix = "Seam target Skin is missing required bones: "
+        if missing_prefix in str(exc):
+            missing_detail = str(exc).split(missing_prefix, 1)[1].split("; add the same skeleton", 1)[0]
+            detail = self._tr(
+                f"以下 Mesh 的 Skin 缺少骨骼：{missing_detail}。请先将这些骨骼加入对应 Skin，再执行混合",
+                f"Skin is missing bones: {missing_detail}. Add these bones to the target Skin before blending",
+            )
         message = self._tr(f"未完成：{detail}", f"Not completed: {detail}")
         self.seam_status_var.set(message)
         self._set_status(message, progress=0)
@@ -82144,13 +82783,12 @@ class LauncherApp:
                 session.workspace.seam_right = copy.deepcopy(record)
             if self._session_is_visible(session):
                 self._refresh_seam_tool_view()
-                self._set_status(
-                    self._tr(
+                status = self._tr(
                         f"已记录 Mesh {1 if normalized == 'left' else 2} 接缝选区 | Request {request_id[:12]}",
                         f"Mesh {1 if normalized == 'left' else 2} seam selection recorded | Request {request_id[:12]}",
-                    ),
-                    progress=100,
                 )
+                self.seam_status_var.set(status)
+                self._set_status(status, progress=100)
 
         self._run_seam_operation("capture", {"side": normalized}, success)
 
@@ -82173,11 +82811,15 @@ class LauncherApp:
     ) -> str:
         pairs = int(result.get("pair_count", 0) or 0)
         changed = int(result.get("changed_vertex_count", 0) or 0)
+        unchanged = int(result.get("unchanged_vertex_count", 0) or 0)
         failed = int(result.get("failed_vertex_count", 0) or 0)
         mode_cn = "自动混合" if automatic else "接缝权重混合"
         mode_en = "Automatic blend" if automatic else "Seam weight blend"
         suffix_cn = f"，{failed} 个顶点写入失败" if failed else ""
         suffix_en = f", {failed} vertex writes failed" if failed else ""
+        if unchanged:
+            suffix_cn += f"，{unchanged} 个无需改变"
+            suffix_en += f", {unchanged} unchanged"
         return self._tr(
             f"{mode_cn}完成：匹配 {pairs} 对，写入 {changed} 个顶点{suffix_cn} | {request_id[:12]}",
             f"{mode_en} complete: {pairs} pairs, {changed} vertices written{suffix_en} | {request_id[:12]}",
@@ -82210,7 +82852,9 @@ class LauncherApp:
             session.workspace.seam_right = copy.deepcopy(result.get("right") or session.workspace.seam_right)
             if self._session_is_visible(session):
                 self._refresh_seam_tool_view()
-                self._set_status(self._seam_blend_result_status(result, request_id, automatic=False), progress=100)
+                status = self._seam_blend_result_status(result, request_id, automatic=False)
+                self.seam_status_var.set(status)
+                self._set_status(status, progress=100)
 
         self._run_seam_operation("blend", payload, success)
 
@@ -82231,7 +82875,9 @@ class LauncherApp:
                 session.workspace.seam_right = copy.deepcopy(result["right"])
             if self._session_is_visible(session):
                 self._refresh_seam_tool_view()
-                self._set_status(self._seam_blend_result_status(result, request_id, automatic=True), progress=100)
+                status = self._seam_blend_result_status(result, request_id, automatic=True)
+                self.seam_status_var.set(status)
+                self._set_status(status, progress=100)
 
         self._run_seam_operation("auto", payload, success)
 
@@ -82434,7 +83080,7 @@ class LauncherApp:
             text=self._tr("清除两侧记录", "Clear Both Records"),
             command=lambda: self._clear_seam_selection(None),
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0))
-        self.ttk.Label(body, textvariable=self.seam_status_var, style="Muted.TLabel", anchor="w").grid(
+        self.ttk.Label(body, textvariable=self.seam_status_var, style="Muted.TLabel", anchor="w", wraplength=560).grid(
             row=6, column=0, sticky="ew", pady=(10, 0)
         )
         self._refresh_seam_tool_view()
@@ -92644,13 +93290,44 @@ class LauncherApp:
     ) -> dict[str, Any]:
         """Run the Blender-only repair route for an FBX exported by 3ds Max."""
         request = dict(payload)
-        requested_path = Path(str(request.get("path", "") or "")).resolve(
-            strict=False
-        )
+        requested_path = Path(str(request.get("path", "") or "")).resolve(strict=False)
         if not requested_path.is_file():
-            raise FileNotFoundError(
-                f"3ds Max FBX import file is missing: {requested_path}"
-            )
+            raise FileNotFoundError(f"3ds Max FBX import file is missing: {requested_path}")
+        preprocess = request.get("fbx_preprocess")
+        if not isinstance(preprocess, Mapping):
+            raise ProtocolError("Blender 3ds Max FBX import requires Generic preprocessing")
+        preprocess = dict(preprocess)
+        if str(preprocess.get("direction", "") or "") != "max_to_blender":
+            raise ProtocolError("Blender 3ds Max FBX Generic preprocessing direction is invalid")
+        source_path = Path(str(preprocess.get("source_path", "") or "")).resolve(strict=False)
+        import_path = Path(str(preprocess.get("import_path", "") or "")).resolve(strict=False)
+        temporary_path = Path(str(preprocess.get("temporary_path", "") or "")).resolve(strict=False)
+        if (
+            not source_path.is_file()
+            or source_path == requested_path
+            or import_path != requested_path
+            or temporary_path != requested_path
+            or preprocess.get("source_preserved") is not True
+            or preprocess.get("imported_original") is not False
+        ):
+            raise ProtocolError("Blender 3ds Max FBX import must consume the Generic temporary FBX")
+        normalization = preprocess.get("generic_fbx_normalization")
+        if not isinstance(normalization, Mapping):
+            raise ProtocolError("Blender 3ds Max FBX import is missing Generic normalization receipt")
+        if (
+            str(normalization.get("status", "") or "") != "normalized"
+            or str(normalization.get("canonical_probe_schema", "") or "")
+            != "pc-rehd-canonical-fbx-probe-v1"
+        ):
+            raise ProtocolError("Blender 3ds Max FBX Generic normalization receipt is invalid")
+        normalized_path = Path(str(normalization.get("path", "") or "")).resolve(strict=False)
+        stat = requested_path.stat()
+        if (
+            normalized_path != requested_path
+            or int(normalization.get("size", -1)) != int(stat.st_size)
+            or int(normalization.get("mtime_ns", -1)) != int(stat.st_mtime_ns)
+        ):
+            raise ProtocolError("Blender Generic temporary FBX changed before import")
         try:
             request["fbx_hierarchy_contract"] = _fbx_source_model_hierarchy_contract(
                 requested_path
@@ -92666,7 +93343,7 @@ class LauncherApp:
                     "schema": "pc-rehd-blender-3dsmax-hierarchy-import-v1",
                     "status": "WARNING",
                     "advisory": True,
-                    "path": str(requested_path),
+                    "path": str(source_path),
                     "detail": f"{type(exc).__name__}: {exc}",
                 },
                 detail=(
@@ -92675,37 +93352,12 @@ class LauncherApp:
             )
         result = session.request("tool.import_3dsmax_fbx", request)
         if result.get("imported") is not True:
-            self._record_operation_diagnostic(
-                "blender_import_3dsmax_fbx",
-                receipt={
-                    "schema": "pc-rehd-blender-3dsmax-hierarchy-import-v1",
-                    "status": "WARNING",
-                    "advisory": True,
-                    "path": str(requested_path),
-                    "imported": result.get("imported"),
-                },
-                detail=(
-                    "Blender did not confirm imported=True for the 3ds Max FBX import; "
-                    "the Launcher treats this as advisory and continues with the returned receipt."
-                ),
-            )
+            raise ProtocolError("Blender native FBX import did not return imported=True")
         returned_path = Path(str(result.get("path", "") or "")).resolve(
             strict=False
         )
         if returned_path != requested_path:
-            self._record_operation_diagnostic(
-                "blender_import_3dsmax_fbx",
-                receipt={
-                    "schema": "pc-rehd-blender-3dsmax-hierarchy-import-v1",
-                    "status": "WARNING",
-                    "advisory": True,
-                    "expected_path": str(requested_path),
-                    "returned_path": str(returned_path),
-                },
-                detail=(
-                    "Blender 3ds Max FBX import receipt path mismatch; imported=True was accepted."
-                ),
-            )
+            raise ProtocolError("Blender 3ds Max FBX import receipt path mismatch")
         if str(result.get("scope", "") or "") != "3ds_max_exported_fbx":
             self._record_operation_diagnostic(
                 "blender_import_3dsmax_fbx",
@@ -92721,18 +93373,21 @@ class LauncherApp:
             )
         hierarchy = result.get("hierarchy")
         if not isinstance(hierarchy, Mapping):
-            raise ProtocolError(
-                "Blender 3ds Max FBX import omitted its mandatory hierarchy repair receipt"
-            )
-        if str(hierarchy.get("status", "") or "") != "RESTORED":
-            raise ProtocolError(
-                "Blender did not fully restore the selected source FBX hierarchy: "
-                + str(hierarchy.get("status", "") or "UNKNOWN")
+            hierarchy = {
+                "status": "ADVISORY_SKIPPED",
+                "advisory": True,
+                "issues": ["Blender omitted optional hierarchy repair receipt"],
+            }
+            result["hierarchy"] = hierarchy
+            self._record_operation_diagnostic(
+                "blender_import_3dsmax_fbx",
+                receipt={"schema": "pc-rehd-blender-3dsmax-hierarchy-import-v1", "status": "WARNING", "advisory": True},
+                detail="Optional Blender FBX hierarchy repair receipt was missing; import remains successful.",
             )
         hierarchy_contract = result.get("fbx_hierarchy_contract")
         if not isinstance(hierarchy_contract, Mapping):
             hierarchy_contract = _fbx_hierarchy_unavailable_contract(
-                requested_path,
+                source_path,
                 "Blender 3ds Max FBX import omitted its source hierarchy contract",
             )
             result["fbx_hierarchy_contract"] = hierarchy_contract
@@ -97679,6 +98334,74 @@ class LauncherApp:
                 "Processing the Writer receipt",
                 86,
             )
+            if status == "SCALE_CONFIRMATION_REQUIRED":
+                scale_receipt = writer_result.get("legacy_blender_scale") or {}
+                token = str(scale_receipt.get("confirmation_token", "") or "")
+                if (scale_receipt.get("schema") != "pc-rehd-legacy-blender-scale-v1"
+                    or scale_receipt.get("factor") != 2.54
+                    or re.fullmatch(r"[0-9a-f]{64}", token) is None):
+                    raise ProtocolError("Writer returned an invalid scale confirmation")
+                evidence = [row for row in scale_receipt.get("evidence", []) if isinstance(row, dict)]
+                if not evidence:
+                    raise ProtocolError("Writer returned scale confirmation without evidence")
+                names = "\n".join(
+                    f"  {row.get('name', 'Mesh')}  ({float(row.get('ratio', 0)):.6f}x)"
+                    for row in evidence
+                )
+                set_export_progress(
+                    "等待确认本次导出的 2.54 倍缩放修复",
+                    "Waiting for the 2.54x export scale decision",
+                    87,
+                )
+                choice = ChoiceDialog(
+                    self.root,
+                    title=self._tr("检测到旧版 Blender 缩放差异", "Legacy Blender Scale Difference"),
+                    message=self._tr(
+                        "发现 FBX 及 3D 软件场景中的模型和选中的 MOD 文件内的模型大小不一致。"
+                        "已知旧版 Blender 导入模型时比现在的标准缩放小了 2.54 倍。\n\n"
+                        "这种情况无需丢弃已经做好的模型。在 Blender 中重新导入做好的 FBX，"
+                        "再将缩放改为 2.54，可以恢复对应的大小。\n\n"
+                        f"本次确认整体比例约为 1/2.54 的写入对象：\n{names}\n\n"
+                        "本次导出做一次 2.54 倍的缩放放大？\n"
+                        "是：仅修正本次导出数据，校验最终 MOD 字节后继续写入。\n"
+                        "否：终止本次导出。原场景和原始 FBX 不变。",
+                        "The FBX model size differs from the selected MOD. Older Blender imports "
+                        "could produce models 2.54 times smaller than the current standard.\n\n"
+                        "Your work can be kept. Reimporting the edited FBX into Blender and setting "
+                        "its scale to 2.54 restores the corresponding size.\n\n"
+                        f"Written objects verified at approximately 1/2.54 scale:\n{names}\n\n"
+                        "Enlarge this export once by 2.54x?\n"
+                        "Yes: correct this export only, then verify the final MOD bytes before writing.\n"
+                        "No: cancel this export. The scene and original FBX stay unchanged.",
+                    ),
+                    choices=[(self._tr("是，放大 2.54 倍", "Yes, Enlarge 2.54x"), "scale"),
+                             (self._tr("否，终止导出", "No, Cancel Export"), "cancel")],
+                    center_on_screen=True,
+                ).show()
+                if choice != "scale":
+                    restore_detail = restore_renamed_source_after_failure()
+                    release_export_transaction()
+                    self._report_bootstrap_health_operation(
+                        action, "cancelled", max_process_id=session.pid,
+                        request_id=request_token, detail="User cancelled the legacy scale confirmation.",
+                    )
+                    session.workspace.last_status = self._tr(
+                        f"导出已取消 | PID {session.pid}", f"Export cancelled | PID {session.pid}")
+                    session.workspace.progress_value = 0.0
+                    self._set_status(session.workspace.last_status, progress=0)
+                    if restore_detail:
+                        ChoiceDialog(self.root, title=self._tr("源文件保留状态", "Source File Status"),
+                                     message=restore_detail, choices=[(self._tr("确定", "OK"), "ok")]).show()
+                    finish_export_reservation_pipeline()
+                    return
+                memory_request.setdefault("decisions", {})["legacy_blender_scale"] = token
+                self._run_background(
+                    lambda: run_writer_with_receipt_hash(memory_request),
+                    lambda result: finish_writer(request_id, max_result, result, memory_request),
+                    label=self._tr("修正并校验本次导出缩放", "Correcting and Verifying Export Scale"),
+                    on_error=export_failure, quiet=True, performance_critical=True,
+                )
+                return
             if status == "OUTPUT_COLLISION":
                 set_export_progress(
                     "等待确认输出文件覆盖",
@@ -100100,4 +100823,5 @@ if __name__ == "__main__":
         raise SystemExit(main())
     else:
         _start_rescue_agent_for_current_process()
+
 
