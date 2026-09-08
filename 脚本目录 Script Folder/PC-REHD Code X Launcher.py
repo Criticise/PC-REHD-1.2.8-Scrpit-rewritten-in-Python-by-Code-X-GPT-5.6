@@ -68788,15 +68788,45 @@ class LauncherApp:
                     f"{label} (will be renamed)",
                 )
             values.append(label)
+        # Updating the readonly Combobox values can make Tk emit a synthetic
+        # ``<<ComboboxSelected>>`` event (usually selecting the first row).
+        # That event is a list refresh, not a user choice, and must never
+        # replace the workspace's bound source MOD.  Keep the guard active for
+        # the entire configure/current operation so only an actual click can
+        # enter _on_export_source_selected.
+        self._export_source_candidates_updating = True
         try:
             combo.configure(values=values)
+            if selected_identity:
+                selected_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(candidates)
+                        if _export_path_identity(candidate) == selected_identity
+                    ),
+                    -1,
+                )
+                if selected_index >= 0:
+                    combo.current(selected_index)
         except self.tk.TclError:
             return
+        finally:
+            self._export_source_candidates_updating = False
 
     def _prepare_export_source_dropdown(self) -> None:
-        self._refresh_export_source_candidates(self._active_workspace(), force=True)
+        # ``postcommand`` runs immediately before Tk posts the popup.  Refresh
+        # the displayed selection as well as the candidate list here so a MOD
+        # deleted or added since the export window was opened is reflected at
+        # the moment the user opens the dropdown.
+        workspace = self._active_workspace()
+        self.export_source_name_var.set(self._export_source_display_text(workspace))
+        self._refresh_export_source_candidates(workspace, force=True)
 
     def _on_export_source_selected(self, event: Any = None) -> None:
+        if bool(getattr(self, "_export_source_candidates_updating", False)):
+            # Tk may report a selection while postcommand/refresh replaces the
+            # candidate list.  It is not a user selection and must be ignored.
+            return
         combo = getattr(event, "widget", None) or getattr(
             self, "export_source_name_entry", None
         )
@@ -95773,19 +95803,12 @@ class LauncherApp:
                 remember_directory=False,
                 sync_export_target=False,
             )
+        # Never infer a different source from the output directory/name.  That
+        # fallback silently rebound the Export Sets source when the selected
+        # MOD was renamed or removed, so the next export could target an
+        # unrelated file.  A source is an explicit user binding; a missing
+        # binding must remain missing until the user chooses one.
         self._capture_export_target_into_workspace(workspace)
-        try:
-            export_candidate = Path(workspace.export_directory) / _normalize_export_mod_name(
-                workspace.export_mod_name
-            )
-        except ValueError:
-            export_candidate = Path()
-        if export_candidate.is_file():
-            return self._set_workspace_source_mod(
-                workspace,
-                export_candidate,
-                sync_export_target=False,
-            )
         self._set_status(
             self._tr(
                 "尚未绑定有效源 .MOD；请在导出分流窗口点击“选择 .MOD”。",
@@ -98554,6 +98577,12 @@ class LauncherApp:
                 source_snapshot,
                 label="Source MOD",
             )
+            # Freeze the selected MOD bytes before the long-running DCC/FBX
+            # phase.  The writer must consume this snapshot even if the user
+            # moves or deletes the source file while export is in progress.
+            source_mod_bytes = writer_source_mod.read_bytes()
+            if hashlib.sha256(source_mod_bytes).hexdigest().upper() != source_sha:
+                raise ProtocolError("Source MOD changed while creating the export snapshot")
             queue_export_progress(
                 "正在使用已确认的导出分组和场景快照",
                 "Preparing current-scene export",
@@ -98868,6 +98897,7 @@ class LauncherApp:
             memory_request = {
                 "action": "export_mod", "entry": "pc_rehd_memory_v1", "request_id": request_id,
                 "target_max_pid": session.pid, "source_mod": str(writer_source_mod), "source_sha256": source_sha,
+                "source_mod_bytes": source_mod_bytes,
                 "output_mod": str(output_mod), "scene_contract": scene_contract, "bucket_rows": live_bucket_rows,
                 "bucket_receipt": bucket_receipt,
                 "header_mode": header_mode, "fbx_receipt": fbx_receipt,

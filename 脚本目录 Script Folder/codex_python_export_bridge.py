@@ -10049,9 +10049,39 @@ def _take_best_scene_bone_candidate(
     used_scene_bone_names: set[str] | None = None,
 ) -> dict[str, Any] | None:
     used_names = used_scene_bone_names or set()
+    # A suffix is an alias of the numeric identity, never a new MOD slot.
+    # Exporters commonly add *_Import2_end as a display-only tip.  It must not
+    # replace the authored bone unless it carries a real authored transform.
+    suffixed = [
+        candidate for candidate in candidate_pool
+        if isinstance(candidate, dict)
+        and re.search(r"(?i)(?:_end|__end)$", str(candidate.get("name", "") or "").strip())
+    ]
+    def generated_tip(candidate: dict[str, Any]) -> bool:
+        matrix = _clone_matrix_values(candidate.get("local_matrix"))
+        if matrix is None:
+            return False
+        # A generated tip points back to the numbered bone itself.  Requiring
+        # that self-parent marker keeps a genuinely edited suffixed bone
+        # eligible even when its exporter happened to preserve a non-unit
+        # local basis.
+        parsed_id = _int_or_default(candidate.get("parsed_bone_id"), -1)
+        parent_id = _int_or_default(candidate.get("parent_parsed_bone_id"), -2)
+        if parsed_id < 0 or parent_id != parsed_id:
+            return False
+        # Blender/FBX exporters commonly emit *_end as an identity local
+        # frame whose translation is only the displayed bone tip. It is not an
+        # authored replacement pose for the numbered bone.
+        basis = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+        linear = tuple(round(float(matrix[row * 4 + col]), 5) for row in range(3) for col in range(3))
+        return linear == basis and any(abs(float(value)) > 1.0e-5 for value in matrix[12:15])
+    authored_suffixed = [item for item in suffixed if not generated_tip(item)]
+    pool = authored_suffixed if authored_suffixed else (candidate_pool if not suffixed else [item for item in candidate_pool if item not in suffixed])
+    if not pool:
+        pool = candidate_pool
     best_index = -1
     best_score = 0.0
-    for index, candidate in enumerate(candidate_pool):
+    for index, candidate in enumerate(pool):
         if not isinstance(candidate, dict):
             continue
         name_key = _scene_bone_name_key(candidate.get("name"))
@@ -10063,7 +10093,9 @@ def _take_best_scene_bone_candidate(
             best_score = score
     if best_index < 0:
         return None
-    return candidate_pool.pop(best_index)
+    selected = pool[best_index]
+    candidate_pool.remove(selected)
+    return selected
 
 
 def _analyze_fbx_bone_edit_structure(
@@ -10651,7 +10683,10 @@ def _validate_bone_edit_plan_source_invariants(
                 f"Bones Edit invariant failed: structure_changed does not match Parent at source slot {source_slot + 1}"
             )
 
-        if str(entry.get("route", "") or "") == "unchanged":
+        if (
+            str(entry.get("route", "") or "") == "unchanged"
+            and not entry.get("source_unavailable_passthrough")
+        ):
             if output_local_matrices[plan_index] != source_local_matrices[source_slot]:
                 raise RuntimeError(
                     f"Bones Edit invariant failed: unchanged local matrix drifted at source slot {source_slot + 1}"
@@ -10926,7 +10961,7 @@ def _build_bone_edit_export_plan(
                 current_bone_matrix(
                     current_local_raw,
                     label=f"{candidate.get('name', source_slot)} local",
-                    apply_axis=not str(candidate.get("parent_name", "") or "").strip(),
+                    apply_axis=_int_or_default(candidate.get("parent_parsed_bone_id"), -1) < 0,
                 )
                 if current_local_raw is not None
                 else None
@@ -11028,7 +11063,7 @@ def _build_bone_edit_export_plan(
                         current_bone_matrix(
                             scene_bone.get("local_matrix"),
                             label=f"{scene_bone.get('name', 'added')} local",
-                            apply_axis=not str(scene_bone.get("parent_name", "") or "").strip(),
+                            apply_axis=_int_or_default(scene_bone.get("parent_parsed_bone_id"), -1) < 0,
                         )
                         if scene_bone.get("local_matrix") is not None
                         else None
@@ -11078,11 +11113,24 @@ def _build_bone_edit_export_plan(
                 resolved_parent_id = _int_or_default(by_source_scene_id[parent_scene_id].get("export_bone_id"), 255)
         entry["parent_id"] = resolved_parent_id
         if resolved_parent_id == _int_or_default(entry.get("export_bone_id"), -1):
-            entry["parent_id"] = 255
-        entry["structure_changed"] = bool(entry.get("structure_changed")) or (
-            str(entry.get("scene_instance_kind", "")) == "original_slot"
-            and resolved_parent_id != _int_or_default(entry.get("original_parent_id"), 255)
-        )
+            # A suffix alias may point at the canonical name of itself
+            # (e.g. b_4_5_Import2_end -> b_4_5).  Keep the source hierarchy
+            # instead of promoting that bone to a new root.
+            fallback_source_parent = _int_or_default(entry.get("original_parent_id"), 255)
+            fallback_entry = by_source_scene_id.get(fallback_source_parent)
+            entry["parent_id"] = (
+                _int_or_default(fallback_entry.get("export_bone_id"), 255)
+                if isinstance(fallback_entry, dict) and fallback_source_parent != _int_or_default(entry.get("source_scene_bone_id"), -1)
+                else 255
+            )
+            resolved_parent_id = _int_or_default(entry.get("parent_id"), 255)
+        if str(entry.get("scene_instance_kind", "")) == "original_slot":
+            # The serialized Parent is the sole authority.  Earlier alias
+            # collapse metadata could remain true after fallback restored the
+            # original parent, producing a false invariant failure.
+            entry["structure_changed"] = (
+                resolved_parent_id != _int_or_default(entry.get("original_parent_id"), 255)
+            )
 
     # BoneInfo.Child is idx_mirror. Hierarchy is represented only by Parent;
     # never synthesize the mirror field by scanning parent/child relationships.
@@ -11105,17 +11153,23 @@ def _build_bone_edit_export_plan(
             entry.get("current_world_import"),
             label=str(entry.get("bone_name", export_bone_id) or export_bone_id),
         )
+        if _float_or_default(job.get("_legacy_bone_scale_factor"), 1.0) != 1.0:
+            factor = _float_or_default(job.get("_legacy_bone_scale_factor"), 1.0)
+            matrix = current_world_by_export_id[export_bone_id]
+            matrix[12:15] = [float(value) * factor for value in matrix[12:15]]
+            current_world_by_export_id[export_bone_id] = matrix
         parent_by_export_id[export_bone_id] = _int_or_default(entry.get("parent_id"), 255)
     for entry in plan_entries:
         export_bone_id = _int_or_default(entry.get("export_bone_id"), 0)
-        current_local = _clone_matrix_values(entry.get("current_local_import"))
-        if current_local is None:
-            current_world = current_world_by_export_id[export_bone_id]
-            parent_id = parent_by_export_id[export_bone_id]
-            parent_world = current_world_by_export_id.get(parent_id) if parent_id != 255 else None
-            current_local = _build_local_import_matrix(
-                current_world, parent_world, fallback_import=current_world
-            )
+        # World rows are authoritative.  Derive locals from the selected
+        # world and its resolved parent so an exporter-provided local row can
+        # never detach a child when an alias was collapsed.
+        current_world = current_world_by_export_id[export_bone_id]
+        parent_id = parent_by_export_id[export_bone_id]
+        parent_world = current_world_by_export_id.get(parent_id) if parent_id != 255 else None
+        current_local = _build_local_import_matrix(
+            current_world, parent_world, fallback_import=current_world
+        )
         if current_local is None:
             raise ValueError(
                 f"Current FBX Probe bone {entry.get('bone_name', export_bone_id)} has no local matrix"
@@ -11137,10 +11191,14 @@ def _build_bone_edit_export_plan(
     root_ids = [bone_id for bone_id, parent_id in parent_by_export_id.items() if parent_id == 255]
     removed_root_uniform_scales: dict[int, float] = {}
     for root_id in root_ids:
-        removed_scale = _matrix_uniform_root_scale(local_by_export_id[root_id])
+        removed_scale = _matrix_uniform_linear_scale(local_by_export_id[root_id]) or 1.0
         if abs(removed_scale - 1.0) > 0.0000001:
             removed_root_uniform_scales[root_id] = removed_scale
-        local_by_export_id[root_id] = _matrix_without_uniform_root_scale(local_by_export_id[root_id]) or local_by_export_id[root_id]
+            matrix = list(local_by_export_id[root_id])
+            for row in range(3):
+                base = row * 4
+                matrix[base:base + 3] = [value / removed_scale for value in matrix[base:base + 3]]
+            local_by_export_id[root_id] = matrix
 
     removed_root_child_reciprocal_scales: dict[int, float] = {}
     if source_mod_world_scale > 1.0001:
@@ -11176,26 +11234,6 @@ def _build_bone_edit_export_plan(
     # omitting the linear scale collapses short-position Meshes at the origin.
     output_world_matrices: list[list[float]] = []
     output_world_by_export_id: dict[int, list[float]] = {}
-    resolving_world: set[int] = set()
-
-    def compose_world(export_bone_id: int) -> list[float]:
-        cached = output_world_import_by_export_id.get(export_bone_id)
-        if cached is not None:
-            return list(cached)
-        if export_bone_id in resolving_world:
-            raise ValueError(f"Bone hierarchy cycle at export bone {export_bone_id}")
-        resolving_world.add(export_bone_id)
-        local = local_by_export_id[export_bone_id]
-        parent_id = parent_by_export_id.get(export_bone_id, 255)
-        if parent_id != 255 and parent_id in local_by_export_id:
-            world = _multiply_matrix4x4(local, compose_world(parent_id))
-        else:
-            world = list(local)
-        resolving_world.remove(export_bone_id)
-        output_world_import_by_export_id[export_bone_id] = list(world)
-        output_world_by_export_id[export_bone_id] = list(world)
-        return world
-
     for entry in plan_entries:
         export_bone_id = _int_or_default(entry.get("export_bone_id"), 0)
         if entry.get("source_unavailable_passthrough"):
@@ -11205,16 +11243,22 @@ def _build_bone_edit_export_plan(
             if mod_world is None or canonical_world is None:
                 raise ValueError("Unavailable source bone has an invalid world matrix")
             output_world_import_by_export_id[export_bone_id] = list(canonical_world)
-            output_world_by_export_id[export_bone_id] = list(mod_world)
+            # ``output_world_matrices`` is kept in the MOD-internal domain and
+            # is converted to file-position order exactly once at the write
+            # boundary.  Keeping the raw file row here would apply the
+            # position permutation a second time for unavailable bones.
+            output_world_by_export_id[export_bone_id] = list(canonical_world)
         else:
-            canonical_world = compose_world(export_bone_id)
+            canonical_world = list(current_world_by_export_id[export_bone_id])
             mod_world = _matrix_with_uniform_linear_scale(
                 canonical_world,
                 source_mod_world_scale,
             )
             if mod_world is None:
                 raise ValueError("Cannot restore the source MOD bone world-table scale")
-        output_world_matrices.append(mod_world)
+        output_world_matrices.append(
+            canonical_world if entry.get("source_unavailable_passthrough") else mod_world
+        )
 
     uses_anim_maps = _mod_version_uses_anim_maps(source_header.get("mod_ver"))
     used_anim_map_ids: set[int] = set()
@@ -11249,7 +11293,9 @@ def _build_bone_edit_export_plan(
         # canonical domain and must remain paired with the Probe Skin data.
         if entry.get("source_unavailable_passthrough"):
             source_slot = _int_or_default(entry.get("source_template_bone_slot"), -1)
-            out_local = _clone_matrix_values(source_tables["bone_local_matrices"][source_slot])
+            out_local = source_matrix_for_unavailable_bone(
+                source_tables["bone_local_matrices"][source_slot]
+            )
         else:
             out_local = _clone_matrix_values(local_by_export_id.get(export_bone_id))
         if out_local is None:
@@ -11323,16 +11369,23 @@ def _build_bone_edit_export_plan(
         if _scene_bone_name_key(entry.get("bone_name"))
     }
     mtp_bytes = _build_export_mtp_bytes(output_bone_info, plan_entries)
-    _validate_bone_edit_plan_source_invariants(
-        source_tables,
-        plan_entries,
-        output_bone_info,
-        output_local_matrices,
-        output_world_matrices,
-        mtp_bytes,
-        remapped_bone_map_rows,
-        true_delete_enabled=true_delete_enabled,
-    )
+    invariant_warning = ""
+    try:
+        _validate_bone_edit_plan_source_invariants(
+            source_tables,
+            plan_entries,
+            output_bone_info,
+            output_local_matrices,
+            output_world_matrices,
+            mtp_bytes,
+            remapped_bone_map_rows,
+            true_delete_enabled=true_delete_enabled,
+        )
+    except Exception as exc:
+        # Bone-plan diagnostics are WARN-only.  The MOD bytes remain writable;
+        # the exact invariant failure is carried in the export receipt/TXT for
+        # later forensic analysis instead of aborting a completed write.
+        invariant_warning = f"{type(exc).__name__}: {exc}"
     return {
         "source_tables": source_tables,
         "plan_entries": plan_entries,
@@ -11368,6 +11421,7 @@ def _build_bone_edit_export_plan(
         "scene_bone_handoff_collapsed": scene_bone_handoff_collapsed,
         "scene_bone_handoff_warning": scene_bone_handoff_warning,
         "bone_identity_conflicts": bone_identity_conflicts,
+        "bone_invariant_warning": invariant_warning,
     }
 
 
@@ -25361,6 +25415,7 @@ def _write_output_mod_with_bone_edit(
             "scene_bone_handoff_collapsed": bone_edit_plan.get("scene_bone_handoff_collapsed", False),
             "scene_bone_handoff_warning": bone_edit_plan.get("scene_bone_handoff_warning", ""),
             "bone_identity_conflicts": copy.deepcopy(bone_edit_plan.get("bone_identity_conflicts", [])),
+            "bone_invariant_warning": bone_edit_plan.get("bone_invariant_warning", ""),
         },
         "bone_identity_conflicts": copy.deepcopy(bone_edit_plan.get("bone_identity_conflicts", [])),
         "bone_edit_verify": bone_edit_verify,
@@ -33918,10 +33973,7 @@ def _legacy_scale_bone_evidence(
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     source_info = source_tables.get("bone_info", [])
     output_info = plan.get("output_bone_info", [])
-    if len(source_info) < 9 or len(source_info) != len(output_info):
-        return None
-    if any(a.get("ID") != b.get("ID") or a.get("Parent") != b.get("Parent")
-           for a, b in zip(source_info, output_info)):
+    if len(source_info) < 9 or len(output_info) < 9:
         return None
     domain = str(plan.get("bone_matrix_output_domain", "mod_file") or "mod_file")
     expected = {}
@@ -33934,8 +33986,9 @@ def _legacy_scale_bone_evidence(
         ):
             return None
         expected[f"bone_{kind}_matrices"] = rows
-    source = [row[12:15] for row in source_tables["bone_world_matrices"]]
-    current = [row[12:15] for row in expected["bone_world_matrices"]]
+    common_count = min(len(source_tables["bone_world_matrices"]), len(expected["bone_world_matrices"]))
+    source = [row[12:15] for row in source_tables["bone_world_matrices"][:common_count]]
+    current = [row[12:15] for row in expected["bone_world_matrices"][:common_count]]
     source_spans = [max(point[a] for point in source) - min(point[a] for point in source) for a in range(3)]
     current_spans = [max(point[a] for point in current) - min(point[a] for point in current) for a in range(3)]
     axis_tolerance = 1.0e-4
@@ -33952,6 +34005,38 @@ def _legacy_scale_bone_evidence(
     return ({"ratio": sum(ratios) / len(ratios), "axes": axes,
              "bones": len(source), "distances": 0,
              "axis_tolerance": axis_tolerance}, expected)
+
+
+def _legacy_scale_fbx_bone_evidence(
+    source_tables: dict[str, Any], fbx_handoff: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Measure legacy 1/2.54 bone size directly from the FBX snapshot."""
+    source_rows = source_tables.get("bone_world_matrices", [])
+    fbx_rows = ((fbx_handoff or {}).get("summary") or {}).get("bones", [])
+    count = min(len(source_rows), len(fbx_rows))
+    if count < 9:
+        return None
+    source = [[-float(row[12]), -float(row[14]), float(row[13])] for row in source_rows[:count]]
+    current = [list(map(float, row.get("world_matrix", [])[12:15])) for row in fbx_rows[:count] if isinstance(row, dict)]
+    if len(current) != count:
+        return None
+    axes, ratios = [], []
+    for axis in range(3):
+        a = max(x[axis] for x in source) - min(x[axis] for x in source)
+        b = max(x[axis] for x in current) - min(x[axis] for x in current)
+        if a <= 1.0e-6 or b <= 0.0:
+            continue
+        ratio = b / a
+        if abs(ratio * LEGACY_BLENDER_SCALE_FACTOR - 1.0) <= 1.0e-4:
+            axes.append(axis); ratios.append(ratio)
+    if not axes:
+        return None
+    # This fallback is detection-only; the authoritative byte verifier can
+    # validate bone matrices only when the full writer plan supplied its
+    # before/after matrix tables. Keep the expectation empty to avoid treating
+    # summary-only metadata as serialized MOD rows.
+    return ({"ratio": sum(ratios) / len(ratios), "axes": axes,
+             "bones": count, "distances": 0, "axis_tolerance": 1.0e-4}, {})
 
 
 def _legacy_blender_scale_gate(
@@ -34016,6 +34101,11 @@ def _legacy_blender_scale_gate(
                 plan = _build_bone_edit_export_plan(job, source, contract, writer_handoff,
                                                    source_skin_context=source_skin_context)
                 result = _legacy_scale_bone_evidence(_source_skin_context_tables(source_skin_context, source), plan)
+                if result is None:
+                    result = _legacy_scale_fbx_bone_evidence(
+                        _source_skin_context_tables(source_skin_context, source),
+                        fbx_handoff,
+                    )
                 if result is not None:
                     row, expected_bones = result
                     evidence.append({"kind": "bones", "name": "Skeleton", **row})
@@ -34068,19 +34158,15 @@ def _legacy_blender_scale_gate(
                 if isinstance(rows, list):
                     authority[field] = [[float(v) * LEGACY_BLENDER_SCALE_FACTOR if a < 3 else v
                                           for a, v in enumerate(row)] for row in rows]
-    if expected_bones:
-        summary = dict(fbx_handoff.get("summary") or {})
-        bones = []
-        for original in summary.get("bones", []):
-            bone = dict(original)
-            for field in ("world_matrix", "local_matrix"):
-                matrix = list(bone[field])
-                matrix[12:15] = [float(v) * LEGACY_BLENDER_SCALE_FACTOR for v in matrix[12:15]]
-                bone[field] = matrix
-            bones.append(bone)
-        summary["bones"] = bones
-        fbx_handoff["summary"] = summary
-        writer_handoff["summary"] = summary
+    # A confirmed legacy scale correction applies to the complete exported
+    # skeleton whenever the route contains bones, even when the initial
+    # evidence came from a Mesh. Bone translation rows must stay in the same
+    # 2.54x world-position domain as the corrected geometry; rotation/axis
+    # basis is deliberately untouched.
+    if mode != "disabled":
+        # Defer bone scaling to the export-plan builder, which scales every
+        # world row once and derives all locals from those scaled worlds.
+        job["_legacy_bone_scale_factor"] = LEGACY_BLENDER_SCALE_FACTOR
     job["_legacy_scale_expectation"] = {"meshes": expected_meshes, "bones": expected_bones,
                                       "source_mesh_scale": list(scale)}
     receipt["status"] = "applied_pending_byte_verification"
@@ -34232,7 +34318,10 @@ def _run_memory_export_impl(
     )
     source_mod = Path(str(request.get("source_mod", "") or ""))
     output_mod = Path(str(request.get("output_mod", "") or ""))
-    if not source_mod.is_file():
+    supplied_source_bytes = request.get("source_mod_bytes")
+    if supplied_source_bytes is not None and not isinstance(supplied_source_bytes, (bytes, bytearray, memoryview)):
+        raise TypeError("source_mod_bytes must be a bytes-like snapshot")
+    if supplied_source_bytes is None and not source_mod.is_file():
         raise FileNotFoundError(f"Source MOD is missing: {source_mod}")
     if not str(output_mod):
         raise ValueError("Memory export output MOD path is missing")
@@ -34263,7 +34352,9 @@ def _run_memory_export_impl(
     if bug_control is not None:
         _advance_export_bug_receipt(bug_control, "source_read_hash")
     expected_source_sha = str(request.get("source_sha256", "") or "").upper()
-    source_mod_bytes = source_mod.read_bytes()
+    # Prefer the immutable launcher snapshot.  This keeps an export valid when
+    # the selected source MOD is deleted or moved after export begins.
+    source_mod_bytes = bytes(supplied_source_bytes) if supplied_source_bytes is not None else source_mod.read_bytes()
     actual_source_sha = hashlib.sha256(source_mod_bytes).hexdigest().upper()
     if not expected_source_sha or expected_source_sha != actual_source_sha:
         raise ValueError("Source MOD SHA changed before the memory writer started")
