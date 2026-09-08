@@ -2618,6 +2618,7 @@ def _apply_reserved_scene_name_plan(
 def build_import_scene(
     mod_path: str | Path,
     *,
+    data: bytes | None = None,
     include_normals: bool = True,
     fix_lp2: bool = False,
     fix_dmc: bool = False,
@@ -2631,6 +2632,8 @@ def build_import_scene(
     This is intentionally an all-or-nothing parse: no caller receives a
     half-populated scene model.  It differs from legacy V4's direct scene
     creation, which could leave bounds/bones or partial Meshes after a failure.
+    Supplied ``data`` is parsed directly; ``mod_path`` then supplies identity
+    only and is never opened. This keeps post-export verification in memory.
     """
     if bug_control is not None:
         bug_control.advance("source_parse")
@@ -2640,7 +2643,10 @@ def build_import_scene(
         )
     source = _windows_lexical_full_path(mod_path)
     normalized_fix_mode = _normalize_fix_processing_mode(fix_processing_mode)
-    data = source.read_bytes()
+    if data is None:
+        data = source.read_bytes()
+    elif not isinstance(data, bytes):
+        raise TypeError("MOD import data must be bytes")
     header = _parse_header(data)
     bounds, preamble = _read_bounds_and_preamble(data)
     mesh_headers = _parse_mesh_headers(data, header)
@@ -3165,7 +3171,8 @@ def _encode_fbx_node(node: _FbxNode, start_offset: int, *, is_last: bool) -> byt
     return b"".join(chunks)
 
 
-def _write_fbx_binary(path: Path, roots: Sequence[_FbxNode]) -> None:
+def _fbx_binary_chunks(roots: Sequence[_FbxNode]) -> list[bytes]:
+    """Encode the shared disk/memory FBX representation without filesystem I/O."""
     body_parts: list[bytes] = []
     cursor = len(FBX_MAGIC) + 4
     for root_index, root in enumerate(roots):
@@ -3178,15 +3185,17 @@ def _write_fbx_binary(path: Path, roots: Sequence[_FbxNode]) -> None:
     if padding == 0:
         padding = 16
     footer = FBX_FOOT_ID + b"\x00" * 4 + b"\x00" * padding + struct.pack("<I", FBX_BINARY_VERSION) + b"\x00" * 120 + FBX_FOOT_MAGIC
+    return [FBX_MAGIC, struct.pack("<I", FBX_BINARY_VERSION), *body_parts, footer]
+
+
+def _write_fbx_binary(path: Path, roots: Sequence[_FbxNode]) -> None:
+    chunks = _fbx_binary_chunks(roots)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile("wb", delete=False, dir=path.parent, prefix=f".{path.name}.", suffix=".tmp") as handle:
             temp_path = Path(handle.name)
-            handle.write(FBX_MAGIC)
-            handle.write(struct.pack("<I", FBX_BINARY_VERSION))
-            handle.writelines(body_parts)
-            handle.write(footer)
+            handle.writelines(chunks)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, path)
@@ -4419,6 +4428,33 @@ def _build_fbx_roots(
     takes = _FbxNode(b"Takes")
     takes.add("Current", ("S", ""))
     return [header_ext, file_id, creation_time, global_settings, documents, definitions, objects, connections, takes]
+
+
+def build_import_fbx_bytes(
+    scene: dict[str, Any],
+    *,
+    include_normals: bool = True,
+    route_file_name: str = "",
+    mrl_bindings: dict[int, dict[str, Any]] | None = None,
+    normal_profile: str = FBX_NORMAL_PROFILE_MAX,
+    bug_control: Any | None = None,
+) -> bytes:
+    """Build the actual import-mod FBX entirely in memory, without sidecars.
+
+    Uses the same roots, graph check and binary chunks as ``write_import_fbx``.
+    Texture bindings, when explicitly supplied, may read their source images.
+    """
+    if bug_control is not None:
+        bug_control.advance("fbx_build")
+    roots = _build_fbx_roots(
+        scene,
+        include_normals=include_normals,
+        route_file_name=route_file_name,
+        mrl_bindings=mrl_bindings,
+        normal_profile=normal_profile,
+    )
+    _require_all_fbx_models_reachable(roots)
+    return b"".join(_fbx_binary_chunks(roots))
 
 
 def write_import_fbx(

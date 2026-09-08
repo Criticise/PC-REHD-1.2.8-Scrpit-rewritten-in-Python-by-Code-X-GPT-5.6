@@ -10024,6 +10024,12 @@ def _scene_bone_name_key(value: Any) -> str:
     return str(value or "").strip().upper()
 
 
+def _scene_bone_identity_key(value: Any) -> str:
+    """Canonical identity is the numeric b_<parent>_<slot> prefix only."""
+    match = re.match(r"(?i)^(b_\d+_\d+)", str(value or "").strip())
+    return match.group(1).upper() if match else ""
+
+
 def _scene_bone_world_distance_score(current_import: list[float] | None, baseline_import: list[float] | None) -> float:
     if current_import is None and baseline_import is None:
         return 0.0
@@ -10740,8 +10746,10 @@ def _build_bone_edit_export_plan(
     source_header = mod_file["header"]
     dynamic_mapping = _build_dynamic_mod_fbx_mapping(job, contract, fbx_handoff)
 
-    def current_bone_matrix(value: Any, *, label: str) -> list[float]:
+    def current_bone_matrix(value: Any, *, label: str, apply_axis: bool = True) -> list[float]:
         probe_matrix = _require_current_bone_matrix(value, label=label)
+        if not apply_axis:
+            return probe_matrix
         mapped_matrix = _dynamic_map_bone_matrix(probe_matrix, dynamic_mapping)
         if mapped_matrix is None:
             raise ValueError(
@@ -10775,6 +10783,7 @@ def _build_bone_edit_export_plan(
     # source MOD matrices against the current FBX domain.
     scene_bone_handoff_collapsed = False
     scene_bone_handoff_warning = ""
+    bone_identity_conflicts: list[dict[str, Any]] = []
     scene_bones_by_id: dict[int, list[dict[str, Any]]] = {}
     scene_bones_by_name: dict[str, dict[str, Any]] = {}
     scene_order_index: dict[str, int] = {}
@@ -10792,23 +10801,34 @@ def _build_bone_edit_export_plan(
     # sidecar.  The one current FBX Probe snapshot is the only authority for
     # source-slot deletion and newly introduced FBX bone nodes.
     fbx_structure = _analyze_fbx_bone_edit_structure(source_bone_count, scene_bones)
-    # Blender's exporter may omit an isolated leaf helper even when the user
-    # made no structural edit.  Preserve that existing structural safeguard;
-    # it does not select or re-encode any matrix axis.
-    if scene_authority == "blender_selected_fbx_bones":
-        blender_omitted_leaf_source_bone_ids = _blender_fbx_exporter_omitted_leaf_source_bone_ids(
-            source_bone_info,
-            list(fbx_structure["deleted_source_bone_ids"]),
-        )
-        if blender_omitted_leaf_source_bone_ids:
-            fbx_structure["blender_exporter_omitted_leaf_source_bone_ids"] = (
-                blender_omitted_leaf_source_bone_ids
-            )
-            fbx_structure["deleted_source_bone_ids"] = [
-                bone_id
-                for bone_id in fbx_structure["deleted_source_bone_ids"]
-                if bone_id not in blender_omitted_leaf_source_bone_ids
-            ]
+    # 3D software cannot edit or re-export a source helper that is absent from
+    # the FBX created by import-mod.  If that source bone is also absent from
+    # every MOD BoneMap influence, its authoritative state is the MOD itself:
+    # preserve its BoneInfo/local/world rows verbatim while applying FBX
+    # add/delete semantics to every bone that the FBX actually carries.
+    referenced_bone_ids = {
+        _int_or_default(value, -1)
+        for row in source_tables.get("bone_map_rows", [])
+        if isinstance(row, (list, tuple))
+        for value in row
+        if 0 <= _int_or_default(value, -1) <= 254
+    }
+    explicit_skip_bone_ids = {
+        _int_or_default(value, -1)
+        for value in job.get("export_rule_skip_bones", [])
+        if 0 <= _int_or_default(value, -1) < source_bone_count
+    }
+    unavailable_source_bone_ids = [
+        bone_id
+        for bone_id in fbx_structure["deleted_source_bone_ids"]
+        if bone_id not in referenced_bone_ids and bone_id not in explicit_skip_bone_ids
+    ]
+    fbx_structure["unavailable_source_bone_ids"] = list(unavailable_source_bone_ids)
+    fbx_structure["deleted_source_bone_ids"] = [
+        bone_id
+        for bone_id in fbx_structure["deleted_source_bone_ids"]
+        if bone_id not in unavailable_source_bone_ids
+    ]
     skip_bone_ids = list(fbx_structure["deleted_source_bone_ids"])
     true_delete_enabled = len(skip_bone_ids) > 0
     delete_plan = _build_bone_delete_plan(source_bone_count, skip_bone_ids) if true_delete_enabled else None
@@ -10819,6 +10839,18 @@ def _build_bone_edit_export_plan(
 
     used_scene_bone_names: set[str] = set()
     plan_entries: list[dict[str, Any]] = []
+    unavailable_source_id_set = set(unavailable_source_bone_ids)
+
+    def source_matrix_for_unavailable_bone(value: Any) -> list[float] | None:
+        matrix = _clone_matrix_values(value)
+        if matrix is None:
+            return None
+        file_x, file_y, file_z = matrix[12], matrix[13], matrix[14]
+        matrix[12:15] = [-file_x, file_z, -file_y]
+        if abs(matrix[15]) <= 0.000001:
+            matrix[15] = 1.0
+        return matrix
+
     for source_slot in range(1, source_bone_count + 1):
         source_bone_id = source_slot - 1
         if true_delete_enabled and source_slot in (delete_plan or {}).get("skip_slots", set()):
@@ -10843,31 +10875,62 @@ def _build_bone_edit_export_plan(
         )
 
         candidate_pool = scene_bones_by_id.get(source_bone_id, [])
+        candidate_names = [str(item.get("name", "")) for item in candidate_pool if isinstance(item, dict)]
         candidate = _take_best_scene_bone_candidate(
             candidate_pool,
+            baseline_world_import=source_tables["bone_world_matrices"][source_bone_id],
             used_scene_bone_names=used_scene_bone_names,
         )
+        if len(candidate_names) > 1:
+            scene_bone_handoff_collapsed = True
+            selected_name = str(candidate.get("name", "")) if isinstance(candidate, dict) else ""
+            bone_identity_conflicts.append({
+                "canonical_name": _scene_bone_identity_key(selected_name) or f"BONE_{source_bone_id + 1}",
+                "candidate_names": candidate_names,
+                "selected_name": selected_name,
+                "reason": "same numeric b_<parent>_<slot> identity; suffixes are aliases",
+                "ambiguous": len(candidate_names) > 2,
+            })
         if isinstance(candidate, dict):
             name_key = _scene_bone_name_key(candidate.get("name"))
             if name_key:
                 used_scene_bone_names.add(name_key)
-        if not isinstance(candidate, dict):
+        unavailable_source = not isinstance(candidate, dict) and source_bone_id in unavailable_source_id_set
+        if unavailable_source:
+            candidate = {
+                "name": f"B_Source_Unavailable_{source_slot}",
+                "parent_name": "",
+                "parent_parsed_bone_id": source_parent_id,
+            }
+            current_world_import = source_matrix_for_unavailable_bone(
+                source_tables["bone_world_matrices"][source_bone_id]
+            )
+            current_local_import = source_matrix_for_unavailable_bone(
+                source_tables["bone_local_matrices"][source_bone_id]
+            )
+            if current_world_import is None or current_local_import is None:
+                raise ValueError(
+                    f"MOD source has no usable matrix for unavailable bone slot {source_slot}"
+                )
+        elif not isinstance(candidate, dict):
             raise ValueError(
                 f"Current FBX Probe has no matrix for source bone slot {source_slot}"
             )
-        current_world_import = current_bone_matrix(
-            candidate.get("world_matrix"),
-            label=str(candidate.get("name", f"B_Source_{source_slot}") or source_slot),
-        )
-        current_local_raw = candidate.get("local_matrix")
-        current_local_import = (
-            current_bone_matrix(
-                current_local_raw,
-                label=f"{candidate.get('name', source_slot)} local",
+        else:
+            current_world_import = current_bone_matrix(
+                candidate.get("world_matrix"),
+                label=str(candidate.get("name", f"B_Source_{source_slot}") or source_slot),
             )
-            if current_local_raw is not None
-            else None
-        )
+            current_local_raw = candidate.get("local_matrix")
+            current_local_import = (
+                current_bone_matrix(
+                    current_local_raw,
+                    label=f"{candidate.get('name', source_slot)} local",
+                    apply_axis=not str(candidate.get("parent_name", "") or "").strip(),
+                )
+                if current_local_raw is not None
+                else None
+            )
         # Every surviving row is written from the current FBX snapshot.  There
         # is intentionally no "unchanged" route that can reinsert a source MOD
         # matrix into this plan.
@@ -10896,10 +10959,11 @@ def _build_bone_edit_export_plan(
                 "original_mirror_id": source_mirror_id,
                 "current_world_import": current_world_import,
                 "current_local_import": current_local_import,
-                "change_class": change_class,
-                "move_changed": bool(change_meta.get("move_changed", False)),
-                "rotate_changed": bool(change_meta.get("rotate_changed", False)),
-                "scale_changed": bool(change_meta.get("scale_changed", False)),
+            "change_class": "unchanged" if unavailable_source else change_class,
+            "move_changed": False if unavailable_source else bool(change_meta.get("move_changed", False)),
+            "rotate_changed": False if unavailable_source else bool(change_meta.get("rotate_changed", False)),
+            "scale_changed": False if unavailable_source else bool(change_meta.get("scale_changed", False)),
+            "source_unavailable_passthrough": unavailable_source,
                 "structure_changed": bool(
                     true_delete_enabled
                     and parent_id != source_parent_id
@@ -10914,54 +10978,9 @@ def _build_bone_edit_export_plan(
     }
     next_export_bone_id = len(plan_entries)
 
-    for source_bone_id in range(source_bone_count):
-        if true_delete_enabled and source_bone_id in skip_bone_ids:
-            continue
-        candidate_pool = scene_bones_by_id.get(source_bone_id, [])
-        while candidate_pool:
-            scene_bone = _take_best_scene_bone_candidate(
-                candidate_pool,
-                used_scene_bone_names=used_scene_bone_names,
-            )
-            if not isinstance(scene_bone, dict):
-                break
-            scene_name_key = _scene_bone_name_key(scene_bone.get("name"))
-            if scene_name_key:
-                used_scene_bone_names.add(scene_name_key)
-            export_bone_id = _reserve_next_export_bone_id(reserved_export_ids, next_export_bone_id)
-            next_export_bone_id = export_bone_id + 1
-            plan_entries.append(
-                {
-                    "bone_name": str(scene_bone.get("name", "") or f"B_Duplicate_{source_bone_id + 1}"),
-                    "scene_parent_name": str(scene_bone.get("parent_name", "") or ""),
-                    "scene_parent_parsed_bone_id": _int_or_default(scene_bone.get("parent_parsed_bone_id"), -1),
-                    "scene_instance_kind": "duplicate_instance",
-                    "source_template_bone_slot": source_bone_id,
-                    "source_scene_bone_id": source_bone_id,
-                    "export_bone_id": export_bone_id,
-                    "parent_id": 255,
-                    "mirror_id": 255,
-                    "original_parent_id": 255,
-                    "original_mirror_id": 255,
-                    "current_world_import": current_bone_matrix(
-                        scene_bone.get("world_matrix"),
-                        label=str(scene_bone.get("name", source_bone_id) or source_bone_id),
-                    ),
-                    "current_local_import": (
-                        current_bone_matrix(
-                            scene_bone.get("local_matrix"),
-                            label=f"{scene_bone.get('name', source_bone_id)} local",
-                        )
-                        if scene_bone.get("local_matrix") is not None
-                        else None
-                    ),
-                    "change_class": "duplicate",
-                    "move_changed": True,
-                    "rotate_changed": True,
-                    "scale_changed": True,
-                    "structure_changed": True,
-                }
-            )
+    # Additional nodes sharing a source identity are aliases (often exporter
+    # generated _end/_Import2 helpers), never extra MOD slots.  Their names and
+    # selection are retained in the conflict receipt above.
 
     fbx_added_names = _collect_pending_add_bone_closure_keys(
         scene_bones_by_name,
@@ -11009,6 +11028,7 @@ def _build_bone_edit_export_plan(
                         current_bone_matrix(
                             scene_bone.get("local_matrix"),
                             label=f"{scene_bone.get('name', 'added')} local",
+                            apply_axis=not str(scene_bone.get("parent_name", "") or "").strip(),
                         )
                         if scene_bone.get("local_matrix") is not None
                         else None
@@ -11023,6 +11043,10 @@ def _build_bone_edit_export_plan(
 
     plan_entries.sort(key=lambda entry: _int_or_default(entry.get("export_bone_id"), 0))
     by_bone_name = {str(entry.get("bone_name", "") or "").upper(): entry for entry in plan_entries}
+    by_bone_identity = {
+        _scene_bone_identity_key(entry.get("bone_name")): entry
+        for entry in plan_entries if _scene_bone_identity_key(entry.get("bone_name"))
+    }
     by_source_scene_id: dict[int, dict[str, Any]] = {}
     for entry in plan_entries:
         source_scene_bone_id = _int_or_default(entry.get("source_scene_bone_id"), -1)
@@ -11043,13 +11067,18 @@ def _build_bone_edit_export_plan(
     for entry in plan_entries:
         resolved_parent_id = _int_or_default(entry.get("parent_id"), 255)
         scene_parent_name = str(entry.get("scene_parent_name", "") or "").upper()
+        parent_identity = _scene_bone_identity_key(entry.get("scene_parent_name"))
         if scene_parent_name and scene_parent_name in by_bone_name:
             resolved_parent_id = _int_or_default(by_bone_name[scene_parent_name].get("export_bone_id"), 255)
+        elif parent_identity and parent_identity in by_bone_identity:
+            resolved_parent_id = _int_or_default(by_bone_identity[parent_identity].get("export_bone_id"), 255)
         else:
             parent_scene_id = _int_or_default(entry.get("scene_parent_parsed_bone_id"), -1)
             if parent_scene_id >= 0 and parent_scene_id in by_source_scene_id:
                 resolved_parent_id = _int_or_default(by_source_scene_id[parent_scene_id].get("export_bone_id"), 255)
         entry["parent_id"] = resolved_parent_id
+        if resolved_parent_id == _int_or_default(entry.get("export_bone_id"), -1):
+            entry["parent_id"] = 255
         entry["structure_changed"] = bool(entry.get("structure_changed")) or (
             str(entry.get("scene_instance_kind", "")) == "original_slot"
             and resolved_parent_id != _int_or_default(entry.get("original_parent_id"), 255)
@@ -11168,13 +11197,23 @@ def _build_bone_edit_export_plan(
         return world
 
     for entry in plan_entries:
-        canonical_world = compose_world(_int_or_default(entry.get("export_bone_id"), 0))
-        mod_world = _matrix_with_uniform_linear_scale(
-            canonical_world,
-            source_mod_world_scale,
-        )
-        if mod_world is None:
-            raise ValueError("Cannot restore the source MOD bone world-table scale")
+        export_bone_id = _int_or_default(entry.get("export_bone_id"), 0)
+        if entry.get("source_unavailable_passthrough"):
+            source_slot = _int_or_default(entry.get("source_template_bone_slot"), -1)
+            mod_world = _clone_matrix_values(source_tables["bone_world_matrices"][source_slot])
+            canonical_world = source_matrix_for_unavailable_bone(mod_world)
+            if mod_world is None or canonical_world is None:
+                raise ValueError("Unavailable source bone has an invalid world matrix")
+            output_world_import_by_export_id[export_bone_id] = list(canonical_world)
+            output_world_by_export_id[export_bone_id] = list(mod_world)
+        else:
+            canonical_world = compose_world(export_bone_id)
+            mod_world = _matrix_with_uniform_linear_scale(
+                canonical_world,
+                source_mod_world_scale,
+            )
+            if mod_world is None:
+                raise ValueError("Cannot restore the source MOD bone world-table scale")
         output_world_matrices.append(mod_world)
 
     uses_anim_maps = _mod_version_uses_anim_maps(source_header.get("mod_ver"))
@@ -11208,7 +11247,11 @@ def _build_bone_edit_export_plan(
         output_world_import = list(out_world)
         # Preserve the Probe local/bind row.  It is already in the mapped
         # canonical domain and must remain paired with the Probe Skin data.
-        out_local = _clone_matrix_values(local_by_export_id.get(export_bone_id))
+        if entry.get("source_unavailable_passthrough"):
+            source_slot = _int_or_default(entry.get("source_template_bone_slot"), -1)
+            out_local = _clone_matrix_values(source_tables["bone_local_matrices"][source_slot])
+        else:
+            out_local = _clone_matrix_values(local_by_export_id.get(export_bone_id))
         if out_local is None:
             raise ValueError(
                 f"Current FBX Probe bone {entry.get('bone_name', export_bone_id)} has no local matrix"
@@ -11324,6 +11367,7 @@ def _build_bone_edit_export_plan(
         "blender_fbx_local_authority": "",
         "scene_bone_handoff_collapsed": scene_bone_handoff_collapsed,
         "scene_bone_handoff_warning": scene_bone_handoff_warning,
+        "bone_identity_conflicts": bone_identity_conflicts,
     }
 
 
@@ -15985,13 +16029,12 @@ def _dynamic_map_bone_matrix(
     canonical_to_mod = _dynamic_matrix_from_value(mapping.get("canonical_to_mod_matrix"))
     if probe_matrix is None or mod_to_canonical is None or canonical_to_mod is None:
         return None
-    # Preserve the empirically verified Bridge convention for bone rows.  The
-    # MOD importer expects the inverse conjugation used by the original bridge;
-    # do not replace it with the generic row-vector textbook ordering.
-    mapped = _multiply_matrix4x4(
-        _multiply_matrix4x4(canonical_to_mod, probe_matrix),
-        mod_to_canonical,
-    )
+    # The importer writes FBX bone worlds as ``MOD_world * R`` (a right-side
+    # axis basis conversion).  Returning to MOD therefore applies only the
+    # inverse basis on the right: ``FBX_world * R^-1``.  The old conjugation
+    # ``R * FBX * R^-1`` rotated authored bones a second time, especially for
+    # newly added bones that have no MOD baseline.
+    mapped = _multiply_matrix4x4(probe_matrix, mod_to_canonical)
     return _dynamic_matrix_from_value(mapped)
 
 
@@ -25317,7 +25360,9 @@ def _write_output_mod_with_bone_edit(
             "fbx_structure": copy.deepcopy(bone_edit_plan.get("fbx_structure", {})),
             "scene_bone_handoff_collapsed": bone_edit_plan.get("scene_bone_handoff_collapsed", False),
             "scene_bone_handoff_warning": bone_edit_plan.get("scene_bone_handoff_warning", ""),
+            "bone_identity_conflicts": copy.deepcopy(bone_edit_plan.get("bone_identity_conflicts", [])),
         },
+        "bone_identity_conflicts": copy.deepcopy(bone_edit_plan.get("bone_identity_conflicts", [])),
         "bone_edit_verify": bone_edit_verify,
     }
 
@@ -27729,7 +27774,7 @@ def _merge_verify_components(scope: str, components: dict[str, dict[str, Any]]) 
 
 def _normalize_verify_status(value: Any) -> str:
     text = str(value or "").strip().upper()
-    if text in {"PASS", "WARN", "FAIL", "SKIP"}:
+    if text in {"PASS", "WARN", "FAIL", "SKIP", "PENDING"}:
         return text
     return "SKIP"
 
@@ -27832,7 +27877,9 @@ def _build_uv_overlap_summary(job: dict[str, Any], mesh: dict[str, Any]) -> dict
         selected_channel, triangles = _build_uv_risk_mesh_triangles(job, mesh)
     except Exception:
         return {"selected_channel": 0, "triangle_count": 0, "overlap_pairs": 0}
-    overlap_pairs = _find_uv_risk_overlap_pairs(triangles) if len(triangles) >= 2 else []
+    overlap_pairs = _find_uv_risk_overlap_pairs(
+        triangles, yield_to_writer=bool(job.get("_deferred_verify_worker")),
+    ) if len(triangles) >= 2 else []
     return {
         "selected_channel": selected_channel,
         "triangle_count": len(triangles),
@@ -28000,13 +28047,19 @@ def _collect_export_diagnostics(
     output_mod: str | Path,
     mod_write_info: dict[str, Any],
     source_mod_file: dict[str, Any] | None = None,
+    output_mod_file: dict[str, Any] | None = None,
+    yield_to_writer: bool = False,
 ) -> dict[str, Any]:
     source_mod_file = (
         source_mod_file
         if isinstance(source_mod_file, dict)
         else read_mod_file(source_mod)
     )
-    output_mod_file = read_mod_file(output_mod)
+    output_mod_file = (
+        output_mod_file
+        if isinstance(output_mod_file, dict)
+        else read_mod_file(output_mod)
+    )
     contract_meshes = _build_contract_mesh_index(contract if isinstance(contract, dict) else {})
     semantic_payloads = job.get("_writer_semantic_payloads_by_source_slot")
     if not isinstance(semantic_payloads, dict):
@@ -28075,6 +28128,8 @@ def _collect_export_diagnostics(
         physical_vertex_start_by_output_slot[output_slot_index] = physical_vertex_cursor
         physical_vertex_cursor += output_vert_count * output_vert_stride
     for source_slot, source_mesh_header in enumerate(source_mesh_headers, start=1):
+        if yield_to_writer:
+            _wait_for_writer_main_operation()
         contract_mesh = contract_meshes.get(source_slot)
         output_slot = source_to_output_slot.get(source_slot)
 
@@ -28458,6 +28513,8 @@ def _collect_export_diagnostics(
             }
         )
     for append_summary in appended_source_missing_meshes:
+        if yield_to_writer:
+            _wait_for_writer_main_operation()
         effective_slot = _int_or_default(append_summary.get("effective_mesh_slot"), 0)
         scene_name = str(append_summary.get("scene_node", "") or f"Mesh_{effective_slot}")
         pieces = [row for row in append_summary.get("pieces", []) if isinstance(row, dict)]
@@ -28596,6 +28653,8 @@ def _run_post_write_diagnostics(
     output_mod: str | Path,
     mod_write_info: dict[str, Any],
     source_mod_file: dict[str, Any] | None = None,
+    output_mod_file: dict[str, Any] | None = None,
+    yield_to_writer: bool = False,
     result_path: str | Path | None = None,
 ) -> dict[str, Any]:
     diagnostics = _collect_export_diagnostics(
@@ -28605,6 +28664,8 @@ def _run_post_write_diagnostics(
         output_mod=output_mod,
         mod_write_info=mod_write_info,
         source_mod_file=source_mod_file,
+        output_mod_file=output_mod_file,
+        yield_to_writer=yield_to_writer,
     )
     verdict = _reduce_verify_verdict(diagnostics["diff_dump"])
     diagnostics["diff_dump"]["verify"] = verdict
@@ -28614,6 +28675,278 @@ def _run_post_write_diagnostics(
         "artifacts": {},
         "diagnostics": diagnostics,
     }
+
+
+DEFERRED_VERIFY_SCHEMA = "pc-rehd-deferred-verify-v1"
+_DEFERRED_VERIFY_LOG_LOCK = threading.RLock()
+
+
+def _deferred_verify_log_operation(path: str | Path, operation: Callable[[Path], Any]) -> Any:
+    """Use the same per-TXT lock protocol as Launcher's public log API."""
+    target = Path(path)
+    lock_path = target.with_name(f".{target.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _DEFERRED_VERIFY_LOG_LOCK:
+        with lock_path.open("a+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            locked = False
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                locked = True
+                return operation(target)
+            finally:
+                if locked:
+                    if os.name == "nt":
+                        import msvcrt
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _deferred_verify_log_lines(receipt: dict[str, Any]) -> list[str]:
+    verify = receipt.get("verify") if isinstance(receipt.get("verify"), dict) else {}
+    roundtrip = receipt.get("roundtrip") if isinstance(receipt.get("roundtrip"), dict) else {}
+    lines = [
+        "[VERIFY_RESULT]",
+        f"TASK_ID={_export_log_scalar(receipt.get('task_id'))}",
+        f"REQUEST_ID={_export_log_scalar(receipt.get('request_id'))}",
+        f"OUTPUT_SHA256={_export_log_scalar(receipt.get('output_sha256'))}",
+        f"STATUS={_export_log_scalar(verify.get('status'))}",
+        f"SUMMARY={_export_log_scalar(verify.get('summary'))}",
+        f"ELAPSED_SECONDS={_float_or_default(receipt.get('elapsed_seconds'), 0.0):.6f}",
+        "VERIFY_JSON=" + json.dumps(verify, ensure_ascii=False, separators=(",", ":"), default=str),
+        "[END_VERIFY_RESULT]",
+        "",
+        "[MOD_FBX_ROUNDTRIP]",
+        f"STATUS={_export_log_scalar(roundtrip.get('status'))}",
+        f"SUMMARY={_export_log_scalar(roundtrip.get('summary'))}",
+        "COUNTS=" + json.dumps(roundtrip.get("counts", {}), ensure_ascii=False, separators=(",", ":"), default=str),
+    ]
+    for index, row in enumerate(roundtrip.get("differences", []), start=1):
+        lines.append(f"DIFFERENCE_{index:03d}=" + json.dumps(row, ensure_ascii=False, separators=(",", ":"), default=str))
+    lines.extend(("[END_MOD_FBX_ROUNDTRIP]", "", "[VERIFY_MESH_DETAILS]"))
+    for index, row in enumerate(receipt.get("mesh_results", []), start=1):
+        lines.append(f"MESH_{index:03d}=" + json.dumps(row, ensure_ascii=False, separators=(",", ":"), default=str))
+    rows = receipt.get("mod_internal_transform_rows", [])
+    lines.extend(("[END_VERIFY_MESH_DETAILS]", "", "[MOD_INTERNAL_TRANSFORMS]", f"COUNT={len(rows)}"))
+    for index, row in enumerate(rows, start=1):
+        lines.append(
+            f"NODE_{index:03d}=kind:{_export_log_scalar(row.get('kind'))}; name:{_export_log_scalar(row.get('name'))}; "
+            f"axis:{json.dumps(row.get('axis', []), separators=(',', ':'))}; "
+            f"scale:{json.dumps(row.get('scale', []), separators=(',', ':'))}; "
+            f"position:{json.dumps(row.get('position', []), separators=(',', ':'))}"
+        )
+    lines.append("[END_MOD_INTERNAL_TRANSFORMS]")
+    return lines
+
+
+def _append_deferred_verify_log(log_path: str | Path, receipt: dict[str, Any]) -> bool:
+    def append_if_current(target: Path) -> bool:
+        if not target.is_file():
+            return False
+        existing = target.read_text(encoding="utf-8-sig", errors="replace")
+        marker = f"VERIFY_TASK_ID={receipt['task_id']}"
+        if marker not in existing.splitlines():
+            return False
+        if f"TASK_ID={receipt['task_id']}" in existing.splitlines():
+            return True
+        combined = existing.rstrip() + "\r\n\r\n" + "\r\n".join(_deferred_verify_log_lines(receipt)) + "\r\n"
+        _atomic_write_bytes(target, combined.encode("utf-8-sig"))
+        return True
+
+    return bool(_deferred_verify_log_operation(log_path, append_if_current))
+
+
+def _prepare_deferred_verify_task(
+    request: dict[str, Any],
+    job: dict[str, Any],
+    contract: dict[str, Any],
+    source_mod_file: dict[str, Any],
+    output_mod_bytes: bytes | None,
+    mod_write_info: dict[str, Any],
+    fbx_handoff: dict[str, Any],
+    *,
+    output_mod: str | Path,
+    output_sha256: str,
+    snapshot_error: str = "",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    request_id = str(job.get("request_id", "") or request.get("request_id", "") or "")
+    max_process_id = _int_or_default(job.get("max_process_id"), _int_or_default(request.get("target_max_pid"), 0))
+    task_id = hashlib.sha256(f"{os.getpid()}:{request_id}:{time.time_ns()}".encode("utf-8")).hexdigest()[:32]
+    result_root = _memory_export_log_target(request).parent
+    task = {
+        "schema": DEFERRED_VERIFY_SCHEMA,
+        "status": "pending",
+        "task_id": task_id,
+        "request_id": request_id,
+        "max_process_id": max_process_id,
+        "output_mod": str(output_mod),
+        "result_path": str(result_root / f"verify_{max(0, max_process_id)}_{task_id}.json"),
+        "output_sha256": output_sha256,
+    }
+    # Transfer these request-owned data graphs to the background worker. The
+    # source/output MOD bytes are immutable and never re-read from their paths.
+    # Copy only the job envelope: UV's separate advisory cache must not be shared.
+    worker_job = dict(job)
+    if not worker_job.get("source_mod"):
+        worker_job["source_mod"] = request.get("source_mod", "")
+    if not worker_job.get("output_mod"):
+        worker_job["output_mod"] = str(output_mod)
+    worker_job.pop("_uv_overlap_summary_cache", None)
+    worker_job["_deferred_verify_worker"] = True
+    context = {
+        "job": worker_job,
+        "contract": contract,
+        "source_mod_file": source_mod_file,
+        "output_mod_bytes": output_mod_bytes,
+        "mod_write_info": mod_write_info,
+        "fbx_handoff": fbx_handoff,
+        "snapshot_error": snapshot_error,
+        "verify_enabled": _as_bool(job.get("export_rules", {}).get("verify"), True),
+    }
+    return task, context
+
+
+def _compare_mod_fbx_roundtrip(
+    job: dict[str, Any], contract: dict[str, Any], source_mod_file: dict[str, Any],
+    output_mod_file: dict[str, Any], mod_write_info: dict[str, Any],
+    fbx_handoff: dict[str, Any],
+) -> dict[str, Any]:
+    """Re-import the written MOD in memory and compare its Generic/Probe bones.
+
+    This is deliberately post-write and WARN-only: a diagnostic mismatch must
+    never invalidate a MOD that was already written successfully.
+    """
+    try:
+        importer = importlib.import_module("codex_re6_mod_import_fbx")
+        probe = importlib.import_module("codex_fbx_probe")
+        output_bytes = output_mod_file.get("bytes") if isinstance(output_mod_file, dict) else None
+        if not isinstance(output_bytes, (bytes, bytearray)):
+            return {"status": "WARN", "summary": "Round-trip MOD bytes unavailable", "counts": {}, "differences": []}
+        source_path = str(
+            (job or {}).get("source_mod")
+            or (source_mod_file or {}).get("path")
+            or "roundtrip.mod"
+        )
+        scene = importer.build_import_scene(source_path, data=bytes(output_bytes), include_normals=False)
+        fbx_bytes = importer.build_import_fbx_bytes(scene, include_normals=False)
+        version, roots, footer = probe.read_fbx(fbx_bytes, include_footer_id=True)
+        probe.normalize_generic_tree(roots)
+        roots, _receipt = probe._safe_rebuild_generic_scene(roots)
+        generic_bytes = probe._generic_encode_fbx_bytes(version, roots, footer_id=footer)
+        doc = probe._build_binary_fbx_document(Path("post-export-memory.fbx"), data=generic_bytes)
+        parsed = probe.ufbx_missed_substitute(Path("post-export-memory.fbx"), binary_document=doc)
+        generated = probe._summarize_scene(parsed, fbx_path="post-export-memory.fbx")
+        expected = ((fbx_handoff or {}).get("summary") or {}).get("bones", [])
+        actual = generated.get("bones", []) if isinstance(generated, dict) else []
+        differences: list[dict[str, Any]] = []
+        if len(expected) != len(actual):
+            differences.append({"field": "bone_count", "expected": len(expected), "actual": len(actual)})
+        def key(row: Any) -> str:
+            return _scene_bone_name_key(row.get("name")) if isinstance(row, dict) else ""
+        actual_by_name = {key(row): row for row in actual if key(row)}
+        for row in expected:
+            name = key(row)
+            if not name or name not in actual_by_name:
+                continue
+            other = actual_by_name[name]
+            for field in ("world_matrix", "local_matrix"):
+                left = _clone_matrix_values(row.get(field)); right = _clone_matrix_values(other.get(field))
+                if left is None or right is None:
+                    continue
+                error = max(abs(float(a) - float(b)) for a, b in zip(left, right))
+                if error > 1.0e-3:
+                    differences.append({"bone": row.get("name"), "field": field, "max_abs_error": round(error, 6)})
+                    break
+        status = "PASS" if not differences else "WARN"
+        return {"status": status, "summary": "Round-trip Generic/Probe comparison passed" if status == "PASS" else "Round-trip Generic/Probe comparison found differences", "counts": {"expected_bones": len(expected), "actual_bones": len(actual), "differences": len(differences)}, "differences": differences[:32]}
+    except Exception as exc:
+        return {"status": "WARN", "summary": f"Round-trip comparison could not complete: {type(exc).__name__}: {exc}", "counts": {}, "differences": []}
+
+
+def _start_deferred_verify_task(task: dict[str, Any], context: dict[str, Any], *, log_path: str) -> None:
+    def collect_and_publish() -> None:
+        _wait_for_writer_main_operation()
+        started_at = time.perf_counter()
+        receipt = {**task, "status": "complete", "log_path": log_path}
+        mesh_results: list[dict[str, Any]] = []
+        mod_internal_rows: list[dict[str, Any]] = []
+        errors: list[str] = []
+        output_mod_file: dict[str, Any] | None = None
+        try:
+            output_bytes = context.get("output_mod_bytes")
+            if not isinstance(output_bytes, bytes):
+                raise RuntimeError(context.get("snapshot_error") or "The written MOD snapshot is unavailable")
+            output_mod_file = read_mod_file(task["output_mod"], data=output_bytes)
+            mod_internal_rows = _mod_internal_transform_rows(output_mod_file)
+        except Exception as exc:
+            errors.append(f"MOD snapshot: {type(exc).__name__}: {exc}")
+        verify = {"status": "SKIP", "summary": "Verify is disabled", "fail_count": 0, "warn_count": 0}
+        roundtrip = {"status": "SKIP", "summary": "Verify is disabled", "counts": {}, "differences": []}
+        if bool(context.get("verify_enabled", True)):
+            try:
+                if output_mod_file is None:
+                    raise RuntimeError("The written MOD snapshot could not be decoded")
+                _wait_for_writer_main_operation()
+                diagnostics = _run_post_write_diagnostics(
+                    context["job"], context["contract"],
+                    source_mod=context["job"].get("source_mod", ""), output_mod=task["output_mod"],
+                    mod_write_info=context["mod_write_info"], source_mod_file=context["source_mod_file"],
+                    output_mod_file=output_mod_file, yield_to_writer=True,
+                )
+                verify = diagnostics["verify"]
+                mesh_results = diagnostics["diagnostics"]["diff_dump"].get("mesh_results", [])
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"
+                errors.append("Verify: " + detail)
+                verify = {"status": "WARN", "summary": "Background Verify could not complete: " + detail, "fail_count": 0, "warn_count": 1}
+            try:
+                if output_mod_file is None:
+                    raise RuntimeError("The written MOD snapshot could not be decoded")
+                _wait_for_writer_main_operation()
+                roundtrip = _compare_mod_fbx_roundtrip(
+                    context["job"], context["contract"], context["source_mod_file"],
+                    output_mod_file, context["mod_write_info"], context["fbx_handoff"],
+                )
+                if not isinstance(roundtrip, dict) or str(roundtrip.get("status", "")).upper() not in {"PASS", "WARN", "SKIP"}:
+                    raise RuntimeError("Round-trip comparison returned no valid verdict")
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"
+                errors.append("Round-trip: " + detail)
+                roundtrip = {"status": "WARN", "summary": "Round-trip comparison could not complete: " + detail, "counts": {}, "differences": []}
+        receipt.update(
+            verify=verify, roundtrip=roundtrip, mesh_results=mesh_results,
+            mod_internal_transform_rows=mod_internal_rows, errors=errors,
+            elapsed_seconds=round(time.perf_counter() - started_at, 6),
+        )
+        try:
+            receipt["log_written"] = _append_deferred_verify_log(log_path, receipt) if log_path else False
+            if not receipt["log_written"]:
+                receipt["log_warning"] = "The initial TXT is missing or belongs to a newer export; it was not overwritten"
+        except Exception as exc:
+            receipt["log_written"] = False
+            receipt["log_warning"] = f"{type(exc).__name__}: {exc}"
+        try:
+            _atomic_write_bytes(Path(task["result_path"]), json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
+        except Exception:
+            # Post-write reporting must never turn an already written MOD into
+            # a failed export, even if its optional result channel is unavailable.
+            pass
+
+    threading.Thread(
+        target=collect_and_publish, name=f"PC-REHD-Verify-{task['task_id'][:8]}", daemon=False,
+    ).start()
 
 
 def _memory_export_probe_log(fbx_handoff: Any) -> dict[str, Any]:
@@ -28918,6 +29251,7 @@ def _build_memory_export_txt(
         row for row in operations.get("bb4240x_final_geometry_normals", []) if isinstance(row, dict)
     ]
     verify = payload.get("verify") if isinstance(payload.get("verify"), dict) else {}
+    verify_task = payload.get("verify_task") if isinstance(payload.get("verify_task"), dict) else {}
     timing_payload = _normalize_timing_payload(payload.get("timing")) or {}
     timing_phases = (
         timing_payload.get("phases")
@@ -29116,7 +29450,7 @@ def _build_memory_export_txt(
             f"scale:{_export_log_scalar(json.dumps(row.get('scale', []), separators=(',', ':')))}; "
             f"position:{_export_log_scalar(json.dumps(row.get('position', []), separators=(',', ':')))}"
         )
-    lines.extend(("", "[MOD_INTERNAL_TRANSFORMS]", f"COUNT={len(mod_internal_rows)}"))
+    lines.extend(("", "[MOD_INTERNAL_TRANSFORMS]", f"STATUS={_export_log_scalar(payload.get('mod_internal_transform_status', 'complete'))}", f"COUNT={len(mod_internal_rows)}"))
     for index, row in enumerate((item for item in mod_internal_rows if isinstance(item, dict)), start=1):
         lines.append(
             f"NODE_{index:03d}=kind:{_export_log_scalar(row.get('kind'))}; name:{_export_log_scalar(row.get('name'))}; "
@@ -29250,6 +29584,8 @@ def _build_memory_export_txt(
             ),
             "",
             "[VERIFY]",
+            f"VERIFY_TASK_ID={_export_log_scalar(verify_task.get('task_id'))}",
+            f"RESULT_PATH={_export_log_scalar(verify_task.get('result_path'))}",
             f"STATUS={_export_log_scalar(payload.get('verify_status') or verify.get('status'))}",
             f"SUMMARY={_export_log_scalar(payload.get('verify_summary') or verify.get('summary'))}",
             f"SCOPE={_export_log_scalar(verify.get('scope'))}",
@@ -29338,7 +29674,8 @@ def _write_memory_export_txt_log(
     # inspectable even when the optional legacy log_mode flag is disabled.
     try:
         target = _memory_export_log_target(request)
-        _atomic_write_bytes(target, _build_memory_export_txt(request, result=result, error=error).encode("utf-8-sig"))
+        log_bytes = _build_memory_export_txt(request, result=result, error=error).encode("utf-8-sig")
+        _deferred_verify_log_operation(target, lambda path: _atomic_write_bytes(path, log_bytes))
         _prune_memory_export_samples(target.parent)
         return str(target), ""
     except Exception as exc:
@@ -31430,7 +31767,8 @@ def build_memory_route_plan(
     scene_index = _memory_route_scene_index(scene_contract, target_max_pid)
     state = _normalize_memory_bucket_state(scene_index, bucket_state)
     rows = _memory_route_bucket_rows(scene_index, state)
-    conflicts = _memory_route_slot_conflicts(rows)
+    # Bones Only consumes skeletons; duplicate Mesh slots are not write targets.
+    conflicts = [] if _normalize_bone_edit_export_mode(bone_export_mode) == "bones_only" else _memory_route_slot_conflicts(rows)
     if any(_int_or_default(conflict.get("candidate_count"), 0) > 2 for conflict in conflicts):
         status = "BLOCKED"
     elif conflicts:
@@ -33547,39 +33885,32 @@ def _legacy_scale_decode_positions(
 def _legacy_scale_mesh_evidence(
     original: list[list[float]], current: list[list[float]], precision: float,
 ) -> dict[str, Any] | None:
-    if len(original) < 16 or len(current) < 16:
+    if len(original) < 2 or len(current) < 2:
         return None
-    bounds = []
-    for rows in (original, current):
-        low = [min(point[a] for point in rows) for a in range(3)]
-        high = [max(point[a] for point in rows) for a in range(3)]
-        bounds.append(([(high[a] + low[a]) * 0.5 for a in range(3)],
-                       [high[a] - low[a] for a in range(3)]))
-    centre, spans = bounds[0]
-    current_centre, current_spans = bounds[1]
+    spans = [max(point[a] for point in original) - min(point[a] for point in original)
+             for a in range(3)]
+    current_spans = [max(point[a] for point in current) - min(point[a] for point in current)
+                     for a in range(3)]
     extent = max(spans)
     if extent <= max(precision * 100.0, 0.000001):
         return None
-    axes = [a for a in range(3) if spans[a] > extent * 0.02]
-    if len(axes) < 2:
-        return None
-    ratios = [current_spans[a] / spans[a] for a in axes]
-    if any(abs(ratio * LEGACY_BLENDER_SCALE_FACTOR - 1.0) > 0.005 for ratio in ratios):
-        return None
-    tolerance = max(precision * 2.0, extent * 0.0005)
-    # The offered repair scales about the common scene origin. Per-Mesh
-    # centering could mistake separately resized/repositioned parts for one model.
-    if math.dist(centre, [v * LEGACY_BLENDER_SCALE_FACTOR for v in current_centre]) > tolerance:
-        return None
-    left = original
-    right = [[v * LEGACY_BLENDER_SCALE_FACTOR for v in p] for p in current]
-    if len({tuple(round(v / tolerance) for v in p) for p in left}) < 16:
-        return None
-    if not _legacy_scale_cloud_equal(left, right, tolerance):
+    # MAX/Blender exports can contain local edits or split UV vertices.  The
+    # scale repair is offered when any reliable spatial axis is the legacy
+    # 1/2.54 size; shape, centre, and the other axes are deliberately ignored.
+    axis_tolerance = 1.0e-4
+    axes, ratios = [], []
+    for axis, (source_span, fbx_span) in enumerate(zip(spans, current_spans)):
+        if source_span <= max(precision * 100.0, 0.000001) or fbx_span <= 0:
+            continue
+        ratio = fbx_span / source_span
+        if math.isfinite(ratio) and abs(ratio * LEGACY_BLENDER_SCALE_FACTOR - 1.0) <= axis_tolerance:
+            axes.append(axis)
+            ratios.append(ratio)
+    if not axes:
         return None
     return {"ratio": sum(ratios) / len(ratios), "axes": axes,
             "source_vertices": len(original), "fbx_vertices": len(current),
-            "shape_tolerance": tolerance}
+            "shape_tolerance": 0.0, "axis_tolerance": axis_tolerance}
 
 
 def _legacy_scale_bone_evidence(
@@ -33605,29 +33936,22 @@ def _legacy_scale_bone_evidence(
         expected[f"bone_{kind}_matrices"] = rows
     source = [row[12:15] for row in source_tables["bone_world_matrices"]]
     current = [row[12:15] for row in expected["bone_world_matrices"]]
-    extent = max(math.dist(a, b) for a, b in zip(source, source[1:]))
-    if extent <= 0.0001:
-        return None
-    if any(math.dist(a, [v * LEGACY_BLENDER_SCALE_FACTOR for v in c]) > max(0.00001, extent * 0.0005)
-           for a, c in zip(source, current)):
-        return None
-    anchors = sorted({int(i * (len(source) - 1) / 11) for i in range(12)})
-    ratios = []
-    for index in range(len(source)):
-        for anchor in anchors:
-            distance = math.dist(source[index], source[anchor])
-            other = math.dist(current[index], current[anchor])
-            if distance <= 0.0001:
-                if other > 0.0001:
-                    return None
-                continue
-            ratio = other / distance
-            if not math.isfinite(ratio) or abs(ratio * LEGACY_BLENDER_SCALE_FACTOR - 1.0) > 0.005:
-                return None
+    source_spans = [max(point[a] for point in source) - min(point[a] for point in source) for a in range(3)]
+    current_spans = [max(point[a] for point in current) - min(point[a] for point in current) for a in range(3)]
+    axis_tolerance = 1.0e-4
+    axes, ratios = [], []
+    for axis, (source_span, current_span) in enumerate(zip(source_spans, current_spans)):
+        if source_span <= 1.0e-6 or current_span <= 0:
+            continue
+        ratio = current_span / source_span
+        if math.isfinite(ratio) and abs(ratio * LEGACY_BLENDER_SCALE_FACTOR - 1.0) <= axis_tolerance:
+            axes.append(axis)
             ratios.append(ratio)
-    if len(ratios) < 24:
+    if not axes:
         return None
-    return ({"ratio": sum(ratios) / len(ratios), "bones": len(source), "distances": len(ratios)}, expected)
+    return ({"ratio": sum(ratios) / len(ratios), "axes": axes,
+             "bones": len(source), "distances": 0,
+             "axis_tolerance": axis_tolerance}, expected)
 
 
 def _legacy_blender_scale_gate(
@@ -33636,7 +33960,26 @@ def _legacy_blender_scale_gate(
     writer_handoff: dict[str, Any], source_skin_context: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     approval = str((request.get("decisions") or {}).get("legacy_blender_scale", "") or "")
-    mode = _memory_bone_export_mode(dict(request.get("export_options") or {}))
+    # The memory request normally carries the mode in export_options.  Older
+    # callers and a few retry paths can omit that carrier while the finalized
+    # job/contract still explicitly says Bones Only. Resolve those fallbacks
+    # before collecting any Mesh scale evidence; Bones Only must never prompt
+    # about a Mesh node.
+    mode_options = dict(request.get("export_options") or {})
+    mode = _memory_bone_export_mode(mode_options)
+    if mode == "disabled":
+        for fallback in (job, contract):
+            if not isinstance(fallback, dict):
+                continue
+            fallback_mode = str(
+                fallback.get("bone_edit_export_mode", fallback.get("bone_export_mode", ""))
+                or ""
+            ).strip()
+            if fallback_mode:
+                resolved = _normalize_bone_edit_export_mode(fallback_mode)
+                if resolved != "disabled" or _as_bool(fallback.get("experimental_bone_edit"), False):
+                    mode = resolved
+                    break
     mesh_rows = [mesh for mesh in contract.get("meshes", []) if isinstance(mesh, dict)
                  and str(mesh.get("lane", "")).lower() == "modify"
                  and not _mesh_uses_source_geometry(mesh)] if mode != "bones_only" else []
@@ -33646,33 +33989,38 @@ def _legacy_blender_scale_gate(
     try:
         scale = _read_source_export_mesh_scale_from_mod_file(source)
         for mesh in mesh_rows:
-            slot = _get_mesh_slot_value(mesh)
-            if slot < 1 or slot > len(source["mesh_headers"]):
-                raise ValueError("No corresponding source Mesh")
-            fvf = _parse_mesh_writer_fvf(mesh, _parse_fvf_int(source["mesh_headers"][slot - 1]["fvf_info"]))
-            remapped = _mesh_uses_world_short_remap(mesh, fvf)
-            encoding_scale = _coerce_vec3(mesh.get("short_remap_scale" if remapped else "mesh_scale"), tuple(scale))
-            encoding_offset = _coerce_vec3(mesh.get("short_remap_offset")) if remapped else [0.0, 0.0, 0.0]
-            if (any(not math.isfinite(v) or abs(v - reference) > max(1e-9, abs(reference) * 1e-6)
-                    for v, reference in zip(encoding_scale, scale))
-                    or any(not math.isfinite(v) or v != 0 for v in encoding_offset)):
-                raise ValueError("Mesh uses a custom encoding transform; legacy scale is not certain")
-            _, authority = _require_geometry_position_rows(mesh)
-            current = _legacy_scale_xyz(authority)
-            original, precision = _legacy_scale_decode_positions(source, source["mesh_headers"][slot - 1], scale)
-            result = _legacy_scale_mesh_evidence(original, current, precision)
-            if result is None:
-                raise ValueError("The whole Mesh does not prove the legacy uniform scale")
-            evidence.append({"kind": "mesh", "mesh_slot": slot, "name": _writer_mesh_label(mesh), **result})
-            expected_meshes[slot] = current
+            try:
+                slot = _get_mesh_slot_value(mesh)
+                if slot < 1 or slot > len(source["mesh_headers"]):
+                    continue
+                fvf = _parse_mesh_writer_fvf(mesh, _parse_fvf_int(source["mesh_headers"][slot - 1]["fvf_info"]))
+                remapped = _mesh_uses_world_short_remap(mesh, fvf)
+                encoding_scale = _coerce_vec3(mesh.get("short_remap_scale" if remapped else "mesh_scale"), tuple(scale))
+                encoding_offset = _coerce_vec3(mesh.get("short_remap_offset")) if remapped else [0.0, 0.0, 0.0]
+                if (any(not math.isfinite(v) or abs(v - reference) > max(1e-9, abs(reference) * 1e-6)
+                        for v, reference in zip(encoding_scale, scale))
+                        or any(not math.isfinite(v) or v != 0 for v in encoding_offset)):
+                    continue
+                _, authority = _require_geometry_position_rows(mesh)
+                current = _legacy_scale_xyz(authority)
+                original, precision = _legacy_scale_decode_positions(source, source["mesh_headers"][slot - 1], scale)
+                result = _legacy_scale_mesh_evidence(original, current, precision)
+                if result is None:
+                    continue
+                evidence.append({"kind": "mesh", "mesh_slot": slot, "name": _writer_mesh_label(mesh), **result})
+                expected_meshes[slot] = current
+            except (ValueError, TypeError, KeyError, IndexError, OverflowError, RuntimeError, struct.error):
+                continue
         if mode != "disabled":
-            plan = _build_bone_edit_export_plan(job, source, contract, writer_handoff,
-                                               source_skin_context=source_skin_context)
-            result = _legacy_scale_bone_evidence(_source_skin_context_tables(source_skin_context, source), plan)
-            if result is None:
-                raise ValueError("The complete skeleton does not prove the legacy uniform scale")
-            row, expected_bones = result
-            evidence.append({"kind": "bones", "name": "Skeleton", **row})
+            try:
+                plan = _build_bone_edit_export_plan(job, source, contract, writer_handoff,
+                                                   source_skin_context=source_skin_context)
+                result = _legacy_scale_bone_evidence(_source_skin_context_tables(source_skin_context, source), plan)
+                if result is not None:
+                    row, expected_bones = result
+                    evidence.append({"kind": "bones", "name": "Skeleton", **row})
+            except (ValueError, TypeError, KeyError, IndexError, OverflowError, RuntimeError, struct.error):
+                pass
         if not evidence:
             raise ValueError("No geometry or bones require a scale correction")
     except (ValueError, TypeError, KeyError, IndexError, OverflowError, RuntimeError, struct.error):
@@ -33688,6 +34036,12 @@ def _legacy_blender_scale_gate(
     token = hashlib.sha256(json.dumps(binding, sort_keys=True, allow_nan=False).encode()).hexdigest()
     receipt = {"schema": LEGACY_BLENDER_SCALE_SCHEMA, "factor": LEGACY_BLENDER_SCALE_FACTOR,
                "evidence": evidence, "confirmation_token": token, "status": "confirmation_required"}
+    if approval == "keep":
+        receipt["status"] = "kept_unscaled"
+        receipt["decision"] = "keep"
+        receipt["note"] = "User chose to keep the detected export scale unchanged"
+        job["legacy_blender_scale"] = receipt
+        return None
     if approval != token:
         return {"status": "SCALE_CONFIRMATION_REQUIRED", "request_id": request.get("request_id"),
                 "max_process_id": request.get("target_max_pid"), "output_mod": request.get("output_mod"),
@@ -33706,6 +34060,14 @@ def _legacy_blender_scale_gate(
             if isinstance(rows, list):
                 mesh[field] = [[float(v) * LEGACY_BLENDER_SCALE_FACTOR if a < 3 else v
                                 for a, v in enumerate(row)] for row in rows]
+        authority = mesh.get("final_geometry_authority")
+        if isinstance(authority, dict):
+            for field in ("mod_write_positions", "mod_write_world_positions",
+                          "binary_skin_unreferenced_max_positions"):
+                rows = authority.get(field)
+                if isinstance(rows, list):
+                    authority[field] = [[float(v) * LEGACY_BLENDER_SCALE_FACTOR if a < 3 else v
+                                          for a, v in enumerate(row)] for row in rows]
     if expected_bones:
         summary = dict(fbx_handoff.get("summary") or {})
         bones = []
@@ -34285,7 +34647,14 @@ def _run_memory_export_impl(
     except FileExistsError:
         return output_collision_receipt()
     source_mod_file.pop("_source_read_batch", None)
-    mod_internal_transform_rows = _mod_internal_transform_rows(read_mod_file(output_mod))
+    # Capture the exact written generation while the output lease is held.
+    # Decoding, table scans and comparisons run after the initial TXT is ready.
+    output_mod_bytes: bytes | None = None
+    output_snapshot_error = ""
+    try:
+        output_mod_bytes = output_mod.read_bytes()
+    except OSError as exc:
+        output_snapshot_error = f"{type(exc).__name__}: {exc}"
     _record_timing_phase(
         timing,
         "mod_write_seconds",
@@ -34310,29 +34679,13 @@ def _run_memory_export_impl(
             bone_export_mode=bone_export_mode,
         )
     )
-    verify_payload: dict[str, Any] | None = None
-    verify_status = "SKIP"
-    verify_summary = ""
-    phase_started_at = time.perf_counter()
-    if bug_control is not None:
-        _advance_export_bug_receipt(bug_control, "post_write_verify")
-    if _as_bool(job.get("export_rules", {}).get("verify"), True):
-        verify_payload = _run_post_write_diagnostics(
-            job,
-            contract,
-            source_mod=source_mod,
-            output_mod=output_mod,
-            mod_write_info=mod_write_info,
-            source_mod_file=source_mod_file,
-            result_path=None,
-        )
-        verify_info = verify_payload.get("verify", {}) if isinstance(verify_payload, dict) else {}
-        verify_status = _normalize_verify_status(verify_info.get("status"))
-        verify_summary = str(verify_info.get("summary", "") or "")
+    verify_enabled = _as_bool(job.get("export_rules", {}).get("verify"), True)
+    verify_status = "PENDING" if verify_enabled else "SKIP"
+    verify_summary = "The MOD is written; background verification is pending" if verify_enabled else "Verify is disabled"
     _record_timing_phase(
         timing,
         "verify_seconds",
-        time.perf_counter() - phase_started_at,
+        0.0,
     )
     phase_started_at = time.perf_counter()
     if bug_control is not None:
@@ -34344,19 +34697,32 @@ def _run_memory_export_impl(
     )
     if (source_fallback_meshes or source_missing_skipped_meshes) and final_status["status"] == "OK":
         final_status["status"] = "WARN"
-    output_sha256 = str(
-        verify_payload.get("output_sha256", "") if isinstance(verify_payload, dict) else ""
-    ).upper()
-    if not re.fullmatch(r"[0-9A-F]{64}", output_sha256):
-        output_sha256 = _sha256_file(output_mod)
+    output_sha256 = hashlib.sha256(output_mod_bytes).hexdigest().upper() if isinstance(output_mod_bytes, bytes) else ""
+    verify_task: dict[str, Any] | None = None
+    verify_context: dict[str, Any] | None = None
+    post_write_warnings: list[str] = []
+    if verify_enabled:
+        try:
+            verify_task, verify_context = _prepare_deferred_verify_task(
+                request, job, contract, source_mod_file, output_mod_bytes,
+                mod_write_info, writer_handoff, output_mod=output_mod,
+                output_sha256=output_sha256, snapshot_error=output_snapshot_error,
+            )
+        except Exception as exc:
+            verify_status = "WARN"
+            verify_summary = f"Background Verify could not be prepared: {type(exc).__name__}: {exc}"
+            final_status["verify_status"] = verify_status
+            final_status["verify_summary"] = verify_summary
+            post_write_warnings.append(verify_summary)
     uv_risk_task: dict[str, Any] | None = None
     if uv_risk_enabled:
-        uv_risk_task = _start_deferred_uv_risk_task(
-            request,
-            job,
-            contract,
-            output_mod=output_mod,
-        )
+        try:
+            uv_risk_task = _start_deferred_uv_risk_task(
+                request, job, contract, output_mod=output_mod,
+            )
+        except Exception as exc:
+            post_write_warnings.append(f"Background UV report could not start: {type(exc).__name__}: {exc}")
+            uv_risk["status"] = "failed"
     _record_timing_phase(
         timing,
         "result_finalize_seconds",
@@ -34375,7 +34741,8 @@ def _run_memory_export_impl(
         "source_mod": str(source_mod),
         "source_sha256": actual_source_sha,
         "output_mod": str(output_mod),
-        "mod_internal_transform_rows": mod_internal_transform_rows,
+        "mod_internal_transform_rows": [],
+        "mod_internal_transform_status": "pending",
         "output_sha256": output_sha256,
         "scene_signature": live_scene_signature,
         "scene_compatibility": copy.deepcopy(compatibility_receipt),
@@ -34385,6 +34752,9 @@ def _run_memory_export_impl(
         "write_status": final_status["write_status"],
         "verify_status": final_status["verify_status"],
         "verify_summary": final_status["verify_summary"],
+        "verify": {"status": verify_status, "summary": verify_summary},
+        "verify_task": verify_task,
+        "_deferred_verify_context": verify_context,
         "output_retained": final_status["output_retained"],
         "elapsed_seconds": total_seconds,
         "timing": _normalize_timing_payload(timing) or {},
@@ -34422,8 +34792,8 @@ def _run_memory_export_impl(
     }
     if uv_risk_task is not None:
         payload["uv_risk_task"] = uv_risk_task
-    if verify_payload is not None:
-        payload["verify"] = verify_payload.get("verify", {})
+    if post_write_warnings:
+        payload["log_warning"] = " | ".join(post_write_warnings)
     return payload
 
 
@@ -34472,6 +34842,7 @@ def run_memory_export(request: dict[str, Any]) -> dict[str, Any]:
                 pass
         raise
     else:
+        verify_context = payload.pop("_deferred_verify_context", None)
         payload["bug_control"] = _complete_export_bug_receipt(bug_control, payload)
         transient_statuses = {
             "OUTPUT_COLLISION",
@@ -34487,7 +34858,17 @@ def run_memory_export(request: dict[str, Any]) -> dict[str, Any]:
             if log_path:
                 payload["log_path"] = log_path
             if log_warning:
-                payload["log_warning"] = log_warning
+                payload["log_warning"] = " | ".join(part for part in (payload.get("log_warning", ""), log_warning) if part)
+            if isinstance(verify_context, dict) and isinstance(payload.get("verify_task"), dict):
+                try:
+                    _start_deferred_verify_task(payload["verify_task"], verify_context, log_path=log_path)
+                except Exception as exc:
+                    detail = f"Background Verify could not start: {type(exc).__name__}: {exc}"
+                    payload["verify_task"]["status"] = "failed"
+                    payload["verify_status"] = "WARN"
+                    payload["verify_summary"] = detail
+                    payload["verify"] = {"status": "WARN", "summary": detail}
+                    payload["log_warning"] = " | ".join(part for part in (payload.get("log_warning", ""), detail) if part)
         return payload
     finally:
         try:

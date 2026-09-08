@@ -39745,6 +39745,9 @@ def _export_fbx(payload):
             "use_tspace": True,
             "use_triangles": False,
             "use_custom_props": True,
+            # Keep Blender's actual armature bones only.  Synthetic leaf bones
+            # do not restore a source bone that is absent from the scene and
+            # would change the FBX hierarchy for no benefit.
             "add_leaf_bones": False,
             "primary_bone_axis": "Y",
             "secondary_bone_axis": "X",
@@ -54670,6 +54673,166 @@ def _uv_risk_receipt_lines(
     return lines
 
 
+def _export_verification_receipt_lines(
+    ui_language: str,
+    verify: Any = None,
+    roundtrip: Any = None,
+    *,
+    pending: bool = False,
+    failure: str = "",
+) -> list[str]:
+    chinese = str(ui_language).upper() == "CN"
+    if pending:
+        return [
+            "VERIFY：后台验证中" if chinese else "VERIFY: PENDING",
+            "MOD 已写入，验证结果稍后更新；关闭窗口不影响后台验证和 TXT 日志"
+            if chinese else
+            "The MOD is written. Verification and TXT logging continue after this dialog closes.",
+            "回读比对：等待后台结果" if chinese else "Round-trip comparison: pending",
+        ]
+    if failure:
+        return [
+            "VERIFY：WARN" if chinese else "VERIFY: WARN",
+            "后台验证报告未完成，已写入的 MOD 保留" if chinese else "The verification report did not complete; the written MOD is retained.",
+            str(failure),
+        ]
+    verify = verify if isinstance(verify, dict) else {}
+    status = str(verify.get("status", "SKIP") or "SKIP").upper()
+    verdicts = {
+        "PASS": ("导出后 Verify 通过。", "Post-write Verify passed."),
+        "WARN": ("导出后 Verify 给出警告，请查看验证详情。", "Post-write Verify returned warnings; review the details."),
+        "FAIL": ("导出后 Verify 失败，但写入结果已保留，请检查后再使用。", "Post-write Verify failed; the written result is retained for inspection."),
+        "SKIP": ("本次未启用 Verify，已跳过写入后验证。", "Post-write Verify was disabled for this export."),
+    }
+    verdict = verdicts.get(status, (f"Verify 返回未知状态：{status}", f"Verify returned an unknown status: {status}"))
+    lines = [f"VERIFY：{status}" if chinese else f"VERIFY: {status}", verdict[0 if chinese else 1]]
+    if isinstance(roundtrip, dict):
+        roundtrip_status = str(roundtrip.get("status", "UNKNOWN") or "UNKNOWN").upper()
+        summary = str(roundtrip.get("summary", "") or "").strip()
+        lines.append((f"回读比对：{roundtrip_status}" if chinese else f"Round-trip comparison: {roundtrip_status}") + (f" | {summary}" if summary else ""))
+        differences = roundtrip.get("differences")
+        if isinstance(differences, list):
+            lines.extend(f"- {item}" for item in differences if str(item).strip())
+    def count(field: str) -> int:
+        try:
+            return max(0, int(verify.get(field, 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+    lines.append(
+        f"验证统计：失败 {count('fail_count')} | 警告 {count('warn_count')}"
+        if chinese else f"Verification counts: failures {count('fail_count')} | warnings {count('warn_count')}"
+    )
+    summary = str(verify.get("summary", "") or "").strip()
+    if summary:
+        lines.append(("验证详情：" if chinese else "Verification details: ") + summary)
+    return lines
+
+
+def _consume_deferred_verify_result(context: dict[str, Any]) -> dict[str, Any]:
+    """Read the writer-owned report without modifying its files or TXT log."""
+    try:
+        expected_output = _normalized_output_path_identity(context["expected_output_mod"])[0]
+        def matches_identity(receipt: dict[str, Any]) -> bool:
+            return (
+                receipt.get("schema") == "pc-rehd-deferred-verify-v1"
+                and receipt.get("request_id") == context["expected_request_id"]
+                and int(receipt.get("max_process_id", 0) or 0) == int(context["expected_max_process_id"])
+                and str(receipt.get("task_id", "") or "") == str(context.get("task_id", "") or "")
+                and bool(context.get("task_id"))
+                and _normalized_output_path_identity(receipt.get("output_mod", ""))[0] == expected_output
+                and (
+                    not context.get("expected_output_sha256")
+                    or str(receipt.get("output_sha256", "") or "").upper() == str(context["expected_output_sha256"]).upper()
+                )
+            )
+        if not matches_identity(context):
+            return {"state": "failed", "detail": "Deferred Verify task does not belong to this export."}
+        if str(context.get("status", "") or "").lower() == "failed":
+            return {"state": "failed", "detail": str(context.get("error") or context.get("detail") or "The background Verify worker could not start.")}
+        path = Path(str(context.get("result_path", "") or "")).resolve(strict=False)
+        log_root = Path(context["expected_log_directory"]).resolve(strict=False)
+        if not path.is_relative_to(log_root):
+            return {"state": "failed", "detail": "Deferred Verify result is outside the export log directory."}
+        if not path.is_file():
+            return {"state": "pending"}
+        if not 0 < path.stat().st_size <= 16 * 1024 * 1024:
+            return {"state": "failed", "detail": "Deferred Verify result has an invalid size."}
+        result = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(result, dict) or not matches_identity(result):
+            return {"state": "failed", "detail": "Deferred Verify result does not belong to this export."}
+        status = str(result.get("status", "") or "").lower()
+        if status in {"pending", "running"}:
+            return {"state": "pending"}
+        if status == "failed":
+            return {"state": "failed", "detail": str(result.get("error") or result.get("detail") or "Background verification failed.")}
+        if not isinstance(result.get("verify"), dict):
+            return {"state": "failed", "detail": "Deferred Verify result omitted its verification payload."}
+        return {"state": "complete", "verify": result["verify"], "roundtrip": result.get("roundtrip"), "log_warning": str(result.get("log_warning", "") or "")}
+    except FileNotFoundError:
+        return {"state": "pending"}
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError) as exc:
+        return {"state": "failed", "detail": f"Deferred Verify result could not be read: {type(exc).__name__}: {exc}"}
+
+
+def _bone_identity_conflict_receipt_text(
+    conflicts: Any, ui_language: str
+) -> str:
+    if not isinstance(conflicts, list):
+        return ""
+    chinese = str(ui_language).upper() == "CN"
+    lines: list[str] = []
+    for row in conflicts:
+        if not isinstance(row, dict):
+            continue
+        candidates = row.get("candidate_names")
+        if not isinstance(candidates, (list, tuple)) or len(candidates) < 2:
+            continue
+        canonical_name = str(row.get("canonical_name", "") or "").strip()
+        selected_name = str(row.get("selected_name", "") or "").strip()
+        if not canonical_name or not selected_name:
+            continue
+        reason = str(row.get("reason", "") or "").lower()
+        if row.get("ambiguous") or reason == "ambiguous_changes":
+            explanation = (
+                "候选存在不同改动，已自动选择，无法唯一确定，请核对"
+                if chinese else
+                "Candidates differ; selected automatically, but the intended candidate is uncertain. Please review"
+            )
+        elif reason == "changed_copy":
+            explanation = (
+                "已自动选择相对源 MOD 有改动的候选"
+                if chinese else
+                "Automatically selected the candidate changed from the source MOD"
+            )
+        elif reason == "equivalent":
+            explanation = (
+                "候选骨骼数据一致，已自动选择"
+                if chinese else
+                "Candidates have equivalent bone data; selected automatically"
+            )
+        elif reason == "no_baseline":
+            explanation = (
+                "已自动选择，缺少可确认的源 MOD 对照，请核对"
+                if chinese else
+                "Selected automatically without a confirmed source MOD baseline. Please review"
+            )
+        else:
+            explanation = (
+                "已按导出模块的选择规则自动选择，请核对"
+                if chinese else
+                "Selected automatically by the export module. Please review"
+            )
+        lines.append(f"{canonical_name}: {explanation}\n{selected_name}")
+    if not lines:
+        return ""
+    heading = (
+        "骨骼名称冲突：同一 b_数字_数字 存在多个后缀候选，本次实际写入的完整节点名如下"
+        if chinese else
+        "Bone name conflicts: multiple suffix candidates share a b_number_number identity. Full node names written in this export:"
+    )
+    return heading + "\n" + "\n\n".join(lines)
+
+
 class ChoiceDialog:
     def __init__(
         self,
@@ -58860,6 +59023,66 @@ class LauncherApp:
             self._draw_compact_floating_ball_button(badge)
         except self.tk.TclError:
             return
+
+    def _start_deferred_verify_dialog_update(
+        self,
+        dialog: ChoiceDialog,
+        context: dict[str, Any],
+        compose_message: Callable[[list[str]], str],
+    ) -> None:
+        deadline = time.monotonic() + 600.0
+        finished = False
+
+        def display(lines: list[str]) -> None:
+            message = compose_message(lines)
+            try:
+                if bool(dialog.window.winfo_exists()):
+                    dialog.set_message(message)
+            except self.tk.TclError:
+                pass
+
+        def consume(result: Any) -> None:
+            nonlocal finished
+            if finished:
+                return
+            if not isinstance(result, dict):
+                result = {"state": "failed", "detail": "Background Verify returned an invalid report."}
+            state = result.get("state")
+            if state == "complete":
+                finished = True
+                lines = _export_verification_receipt_lines(self.ui_language, result.get("verify"), result.get("roundtrip"))
+                if result.get("log_warning"):
+                    lines.append(self._tr("后台 TXT 日志提醒：", "Background TXT log notice: ") + str(result["log_warning"]))
+                display(lines)
+            elif state == "failed" or time.monotonic() >= deadline:
+                finished = True
+                display(_export_verification_receipt_lines(
+                    self.ui_language,
+                    failure=str(result.get("detail") or "Timed out waiting for the background Verify report."),
+                ))
+            else:
+                try:
+                    self.root.after(250, poll)
+                except self.tk.TclError:
+                    finished = True
+
+        def poll() -> None:
+            nonlocal finished
+            if finished:
+                return
+            try:
+                self._run_background(
+                    lambda: _consume_deferred_verify_result(context),
+                    consume,
+                    label="Deferred Verify report",
+                    on_error=lambda exc: consume({"state": "failed", "detail": f"{type(exc).__name__}: {exc}"}),
+                    quiet=True,
+                    track_busy=False,
+                )
+            except Exception as exc:
+                consume({"state": "failed", "detail": f"{type(exc).__name__}: {exc}"})
+
+        self.root.after(40, poll)
 
     def _start_deferred_uv_risk_dialog_update(
         self,
@@ -69666,8 +69889,6 @@ class LauncherApp:
         # stale Modify entries before the Max selection request so every exit
         # path, including an empty selection, leaves Bucket 3 empty.
         workspace.buckets["modify"] = []
-        self._refresh_bucket_lists()
-
         legacy_preflight_lease, legacy_preflight_conflict = (
             self.export_transactions.try_acquire_pid_preflight(session.pid)
         )
@@ -69878,7 +70099,10 @@ class LauncherApp:
             self._show_error(RuntimeError(self._tr("当前没有活动的建模程序。", "No active modeling session.")))
             return
         scene_label = "Blender" if isinstance(session, ManagedBlenderSession) else "Max"
-        self._schedule_writer_warmup(delay_ms=0)
+        # Do not launch the background Writer while Tk is constructing this
+        # dialog.  Starting it a moment later avoids disk/CPU contention on
+        # the GUI thread without changing its eventual warmup behavior.
+        self._schedule_writer_warmup(delay_ms=650)
         workspace = self._active_workspace()
         if workspace is not None:
             _normalize_workspace_buckets(workspace)
@@ -69886,7 +70110,7 @@ class LauncherApp:
             self._apply_export_target_to_view(workspace)
         window = getattr(self, "export_sets_window", None)
         if window is not None and bool(window.winfo_exists()):
-            self._bucket_mesh_name_probe_at = 0.0
+            self._bucket_mesh_name_probe_at = time.monotonic() + 0.5
             self._sync_legacy_export_control(workspace)
             self._present_exclusive_export_sets_window(window)
             return
@@ -69923,7 +70147,6 @@ class LauncherApp:
         window.title(self._tr("导出分组", "Export Sets"))
         window.configure(background=self.colors["bg"])
         window.resizable(True, True)
-        self._apply_topmost()
         window.protocol("WM_DELETE_WINDOW", self._close_export_sets)
         shell = self.ttk.Frame(window, style="Panel.TFrame")
         shell.pack(fill="both", expand=True)
@@ -70267,7 +70490,6 @@ class LauncherApp:
                     "horizontal_bar": inline_horizontal_scrollbar,
                 }
             )
-        self._refresh_export_history_panel()
         self._set_export_history_inline_visible(False)
 
         hint_label = self.ttk.Label(
@@ -70544,7 +70766,6 @@ class LauncherApp:
                 columnspan=2,
                 style="Accent.TButton",
             )
-        self._refresh_bucket_lists()
         window.update_idletasks()
         requested_height = max(620, body.winfo_reqheight() + 8)
         dialog_height = min(screen_height - 60, requested_height)
@@ -70573,12 +70794,6 @@ class LauncherApp:
         refresh_scroll_region()
         minimum_width = min(dialog_width, 600)
         minimum_height = min(dialog_height, 320)
-        if self._persist_launcher_state_enabled:
-            persisted_size = _load_export_sets_window_size(
-                self._long_term_cache_directory
-            )
-            if persisted_size:
-                self._export_sets_window_size = tuple(persisted_size)
         cached_width, cached_height = self._export_sets_window_size
         restored_width = min(
             screen_width - 20, max(minimum_width, cached_width)
@@ -70606,10 +70821,24 @@ class LauncherApp:
             restored_geometry,
             dark=bool(getattr(self, "_theme_dark", False)),
         )
-        window.update_idletasks()
-        self._bind_export_sets_mousewheel(window)
-        self._bucket_mesh_name_probe_at = 0.0
+        # Give the first frame time to paint before the periodic Max scene
+        # identity probe is allowed to compete for the session connection.
+        self._bucket_mesh_name_probe_at = time.monotonic() + 0.75
         self._present_exclusive_export_sets_window(window)
+        # Let the shell paint before inserting potentially large bucket rows.
+        # A short timer (instead of after_idle) prevents the sizing pass above
+        # from pulling the expensive refresh back into the opening call.
+        def finish_export_sets_open(owner: Any = window) -> None:
+            try:
+                self._bind_export_sets_mousewheel(owner)
+                self._refresh_bucket_lists()
+            except self.tk.TclError:
+                return
+
+        try:
+            window.after(1, finish_export_sets_open)
+        except self.tk.TclError:
+            finish_export_sets_open()
         self._export_sets_resize_ready = True
         self._probe_export_sets_window_size()
         self._apply_topmost()
@@ -95256,7 +95485,22 @@ class LauncherApp:
                 f"DEL: {len(workspace.buckets['delete'])}  "
                 f"MOD: {len(workspace.buckets['modify'])}"
             )
-            mesh_index = _scene_mesh_index(workspace.scene_contract)
+            scene_contract = workspace.scene_contract
+            index_key = (
+                id(scene_contract),
+                len(scene_contract.get("meshes", []))
+                if isinstance(scene_contract, dict)
+                else 0,
+                scene_contract.get("scene_signature")
+                if isinstance(scene_contract, dict)
+                else None,
+            )
+            cached_index = getattr(self, "_export_bucket_mesh_index_cache", None)
+            if cached_index is not None and cached_index[0] == index_key:
+                mesh_index = cached_index[1]
+            else:
+                mesh_index = _scene_mesh_index(scene_contract)
+                self._export_bucket_mesh_index_cache = (index_key, mesh_index)
             for lane in ("header", "delete", "modify"):
                 rows_by_lane[lane] = tuple(
                     f"{_scene_mesh_ui_name(mesh, blender=blender_scene)}  "
@@ -96928,7 +97172,8 @@ class LauncherApp:
             for row in fvf_receipt.get("rows", [])
             if isinstance(row, dict)
             and bool(row.get("writer_reduces_influences"))
-            and int(row.get("actual_weight_count", 0) or 0) > 4
+            and 0 < int(row.get("selected_weight_limit", 4) or 4) < 4
+            and int(row.get("actual_weight_count", 0) or 0) > int(row.get("selected_weight_limit", 4) or 4)
         ]
         zero_weight_rows = [
             dict(row)
@@ -96946,10 +97191,11 @@ class LauncherApp:
                 or unnamed
             )
 
-        grouped_over_capacity: dict[int, list[str]] = {}
+        grouped_over_capacity: dict[tuple[int, int], list[str]] = {}
         for row in over_capacity_rows:
-            influence_count = max(5, int(row.get("actual_weight_count", 0) or 0))
-            names = grouped_over_capacity.setdefault(influence_count, [])
+            influence_count = int(row.get("actual_weight_count", 0) or 0)
+            selected_limit = int(row.get("selected_weight_limit", 4) or 4)
+            names = grouped_over_capacity.setdefault((influence_count, selected_limit), [])
             name = mesh_name(row, "<未命名 Mesh>" if self.ui_language == "CN" else "<Unnamed Mesh>")
             if name not in names:
                 names.append(name)
@@ -96962,12 +97208,11 @@ class LauncherApp:
 
         lines: list[str] = []
         if self.ui_language == "CN":
-            for influence_count, names in sorted(grouped_over_capacity.items()):
+            for (influence_count, selected_limit), names in sorted(grouped_over_capacity.items()):
                 lines.extend(
                     (
-                        f"当前选中 Mesh 受到 {influence_count} 根骨骼权重影响，这是正常 MOD 流程，即将按照脚本自动处理逻辑：",
-                        "合并同一骨骼的重复影响并忽略非正权重；按照场景权重从大到小保留最大的 4 个，"
-                        "舍弃第 5 个及以后较小影响的权重，再将保留权重归一化为总和 1.0 后写入。",
+                        f"本次 Mesh 的 {influence_count} 根骨骼影响已缩减到 {selected_limit} 根，低于通常的 4 权重容量，请核对游戏内效果：",
+                        f"所选 FVF 仅保留最大的 {selected_limit} 个有效影响，其余影响已舍弃，保留权重已归一化为总和 1.0。",
                         "",
                         "受影响的 Mesh：",
                         *names,
@@ -96989,12 +97234,11 @@ class LauncherApp:
                 )
             lines.append("点击窗口其他位置可停止关闭窗口倒计时。")
         else:
-            for influence_count, names in sorted(grouped_over_capacity.items()):
+            for (influence_count, selected_limit), names in sorted(grouped_over_capacity.items()):
                 lines.extend(
                     (
-                        f"The selected Mesh is affected by {influence_count} bone influences. This is a normal MOD workflow and will use the automatic export path:",
-                        "Duplicate bone influences are merged and non-positive weights are ignored. The four largest scene weights are kept, "
-                        "the smaller fifth and later influences are discarded, and the retained weights are normalized to a total of 1.0 before writing.",
+                        f"This Mesh was reduced from {influence_count} bone influences to {selected_limit}, below the usual four-influence capacity. Please review the in-game result:",
+                        f"The selected FVF retained the largest {selected_limit} valid influences, discarded the others, and normalized the retained weights to a total of 1.0.",
                         "",
                         "Affected Meshes:",
                         *names,
@@ -97057,6 +97301,10 @@ class LauncherApp:
             dict(row)
             for row in receipt.get("rows", [])
             if isinstance(row, dict) and row.get("action") == "auto_corrected_name"
+            and not (
+                int(row.get("actual_weight_count", 0) or 0) > 4
+                and int(row.get("selected_weight_limit", 0) or 0) == 4
+            )
         ]
         if not corrected_rows:
             return
@@ -98746,7 +98994,8 @@ class LauncherApp:
                 if not evidence:
                     raise ProtocolError("Writer returned scale confirmation without evidence")
                 names = "\n".join(
-                    f"  {row.get('name', 'Mesh')}  ({float(row.get('ratio', 0)):.6f}x)"
+                    f"  {row.get('name', 'Mesh')}  ({float(row.get('ratio', 0)):.6f}x; "
+                    f"axes: {','.join('XYZ'[int(axis)] for axis in row.get('axes', [])) or '—'})"
                     for row in evidence
                 )
                 set_export_progress(
@@ -98762,24 +99011,27 @@ class LauncherApp:
                         "已知旧版 Blender 导入模型时比现在的标准缩放小了 2.54 倍。\n\n"
                         "这种情况无需丢弃已经做好的模型。在 Blender 中重新导入做好的 FBX，"
                         "再将缩放改为 2.54，可以恢复对应的大小。\n\n"
-                        f"本次确认整体比例约为 1/2.54 的写入对象：\n{names}\n\n"
-                        "本次导出做一次 2.54 倍的缩放放大？\n"
+                        f"本次检测到至少一个轴符合 1/2.54 的写入对象：\n{names}\n\n"
+                        "本次导出做一次 2.54 倍的缩放放大？也可以保持不变继续导出。\n"
                         "是：仅修正本次导出数据，校验最终 MOD 字节后继续写入。\n"
+                        "保持不变：不缩放，按当前数据继续导出。\n"
                         "否：终止本次导出。原场景和原始 FBX 不变。",
                         "The FBX model size differs from the selected MOD. Older Blender imports "
                         "could produce models 2.54 times smaller than the current standard.\n\n"
                         "Your work can be kept. Reimporting the edited FBX into Blender and setting "
                         "its scale to 2.54 restores the corresponding size.\n\n"
-                        f"Written objects verified at approximately 1/2.54 scale:\n{names}\n\n"
-                        "Enlarge this export once by 2.54x?\n"
+                        f"Written objects with at least one axis matching 1/2.54:\n{names}\n\n"
+                        "Enlarge this export once by 2.54x, or keep it unchanged?\n"
                         "Yes: correct this export only, then verify the final MOD bytes before writing.\n"
+                        "Keep unchanged: continue with the current export data without scaling.\n"
                         "No: cancel this export. The scene and original FBX stay unchanged.",
                     ),
                     choices=[(self._tr("是，放大 2.54 倍", "Yes, Enlarge 2.54x"), "scale"),
+                             (self._tr("保持不变，继续导出", "Keep Unchanged, Continue"), "keep"),
                              (self._tr("否，终止导出", "No, Cancel Export"), "cancel")],
                     center_on_screen=True,
                 ).show()
-                if choice != "scale":
+                if choice == "cancel":
                     restore_detail = restore_renamed_source_after_failure()
                     release_export_transaction()
                     self._report_bootstrap_health_operation(
@@ -98795,7 +99047,9 @@ class LauncherApp:
                                      message=restore_detail, choices=[(self._tr("确定", "OK"), "ok")]).show()
                     finish_export_reservation_pipeline()
                     return
-                memory_request.setdefault("decisions", {})["legacy_blender_scale"] = token
+                memory_request.setdefault("decisions", {})["legacy_blender_scale"] = (
+                    "keep" if choice == "keep" else token
+                )
                 self._run_background(
                     lambda: run_writer_with_receipt_hash(memory_request),
                     lambda result: finish_writer(request_id, max_result, result, memory_request),
@@ -99147,11 +99401,29 @@ class LauncherApp:
                 self._set_status(workspace.last_status, progress=100)
                 verify_status = str(writer_result.get("verify_status", "") or "SKIP")
                 verify_summary = str(writer_result.get("verify_summary", "") or "").strip()
+                bone_conflict_banner = _bone_identity_conflict_receipt_text(
+                    writer_result.get("bone_identity_conflicts"), self.ui_language
+                )
                 verify_payload = writer_result.get("verify")
                 if not isinstance(verify_payload, dict):
                     verify_payload = {}
-                verify_fail_count = max(0, receipt_int(verify_payload.get("fail_count")))
-                verify_warn_count = max(0, receipt_int(verify_payload.get("warn_count")))
+                deferred_verify_marker = "__PC_REHD_DEFERRED_VERIFY_SECTION__"
+                verify_task_present = "verify_task" in writer_result
+                verify_task = writer_result.get("verify_task")
+                deferred_verify_context = {
+                    **(verify_task if isinstance(verify_task, dict) else {}),
+                    "expected_request_id": request_id,
+                    "expected_max_process_id": session.pid,
+                    "expected_output_mod": str(output_path),
+                    "expected_output_sha256": output_sha,
+                    "expected_log_directory": str(log_directory),
+                } if verify_task_present else None
+                verification_lines = _export_verification_receipt_lines(
+                    self.ui_language,
+                    {**verify_payload, "status": verify_status},
+                    writer_result.get("roundtrip"),
+                    pending=verify_task_present,
+                )
                 uv_risk = writer_result.get("uv_risk")
                 if not isinstance(uv_risk, dict):
                     uv_risk = {}
@@ -99283,12 +99555,6 @@ class LauncherApp:
                     return f"FVF {fvf} ({label})"
 
                 if self.ui_language == "CN":
-                    verify_verdict = {
-                        "PASS": "导出后 Verify 通过。",
-                        "WARN": "导出后 Verify 给出警告，请查看验证详情。",
-                        "FAIL": "导出后 Verify 失败，但写入结果已保留，请检查后再使用。",
-                        "SKIP": "本次未启用 Verify，已跳过写入后验证。",
-                    }.get(verify_status.upper(), f"Verify 返回未知状态：{verify_status}")
                     receipt_lines = [
                         "已生成 NEW MOD：",
                         "",
@@ -99296,9 +99562,7 @@ class LauncherApp:
                         "",
                         f"导出写入已完成，用时 {elapsed:.2f} 秒，可自行去查看 NEW MOD。",
                         "",
-                        f"VERIFY：{verify_status.upper()}",
-                        verify_verdict,
-                        f"验证统计：失败 {verify_fail_count} | 警告 {verify_warn_count}",
+                        deferred_verify_marker,
                         {
                             "PASS": check_source_pass_text_cn,
                             "NOTICE": "检查源文件：已提示差异（仅提醒，不影响导出）",
@@ -99322,7 +99586,7 @@ class LauncherApp:
                             log_health_warning,
                             f"Bootstrap 健康日志：{_public_bootstrap_health_log_path(log_directory)}",
                         ))
-                    if verify_summary:
+                    if verify_summary and not verify_task_present:
                         receipt_lines.extend(("", f"验证详情：{localized_verify_summary(verify_summary)}"))
                     if check_source_status == "NOTICE" and check_source_differences:
                         receipt_lines.extend((
@@ -99414,12 +99678,6 @@ class LauncherApp:
                     receipt_button = "确定"
                     receipt_open_folder_button = "打开输出文件夹"
                 else:
-                    verify_verdict = {
-                        "PASS": "Post-write Verify passed.",
-                        "WARN": "Post-write Verify returned warnings; review the verification detail.",
-                        "FAIL": "Post-write Verify failed, but the written result was retained. Inspect it before use.",
-                        "SKIP": "Verify was disabled for this export; post-write verification was skipped.",
-                    }.get(verify_status.upper(), f"Verify returned an unknown status: {verify_status}")
                     receipt_lines = [
                         "Generated NEW MOD:",
                         "",
@@ -99428,9 +99686,7 @@ class LauncherApp:
                         f"Export writing completed in {elapsed:.2f} seconds.",
                         "You can inspect the NEW MOD now.",
                         "",
-                        f"VERIFY: {verify_status.upper()}",
-                        verify_verdict,
-                        f"Verification counts: failures {verify_fail_count} | warnings {verify_warn_count}",
+                        deferred_verify_marker,
                         {
                             "PASS": check_source_pass_text_en,
                             "NOTICE": "Check Source: differences shown (advisory only; export was not blocked)",
@@ -99454,7 +99710,7 @@ class LauncherApp:
                             log_health_warning,
                             f"Bootstrap health log: {_public_bootstrap_health_log_path(log_directory)}",
                         ))
-                    if verify_summary:
+                    if verify_summary and not verify_task_present:
                         receipt_lines.extend(("", f"Verification detail: {verify_summary}"))
                     if check_source_status == "NOTICE" and check_source_differences:
                         receipt_lines.extend((
@@ -99561,16 +99817,52 @@ class LauncherApp:
                         map2_fallback_banner,
                     )
 
+                if bone_conflict_banner:
+                    verify_index = receipt_lines.index(deferred_verify_marker)
+                    receipt_lines[verify_index:verify_index] = [bone_conflict_banner, ""]
+                routine_weight_rows = [
+                    row for row in fvf_weight_capacity.get("rows", [])
+                    if isinstance(row, dict)
+                    and bool(row.get("writer_reduces_influences"))
+                    and receipt_int(row.get("actual_weight_count")) > 4
+                    and receipt_int(row.get("selected_weight_limit")) == 4
+                ]
+                if routine_weight_rows:
+                    receipt_lines.extend(("", self._tr(
+                        "Skin 权重常规处理：已保留最大的 4 个有效骨骼影响，并将权重归一化为总和 1.0 后写入",
+                        "Routine Skin processing: retained the four largest valid bone influences and normalized their weights to a total of 1.0 before writing",
+                    )))
+                    receipt_lines.extend(
+                        f"- {receipt_mesh_name(row)} | {receipt_int(row.get('actual_weight_count'))} -> 4"
+                        for row in routine_weight_rows
+                    )
+                # ChoiceDialog's inline highlighter intentionally tracks one
+                # contiguous warning block. Prefer the bone conflict block so
+                # its selected full node name stays prominent when UV2 and
+                # bone warnings happen in the same receipt.
+                inline_receipt_warning = bone_conflict_banner or (
+                    map2_fallback_banner if map2_fallback_detected else ""
+                )
                 base_receipt_lines = tuple(receipt_lines)
+                current_uv_lines: list[str] = []
 
                 def compose_uv_receipt(uv_lines: list[str]) -> str:
+                    nonlocal current_uv_lines
+                    current_uv_lines = list(uv_lines)
                     composed: list[str] = []
                     for line in base_receipt_lines:
                         if line == deferred_uv_marker:
                             composed.extend(uv_lines)
+                        elif line == deferred_verify_marker:
+                            composed.extend(verification_lines)
                         else:
                             composed.append(line)
                     return "\n".join(composed)
+
+                def compose_verify_receipt(lines: list[str]) -> str:
+                    nonlocal verification_lines
+                    verification_lines = list(lines)
+                    return compose_uv_receipt(current_uv_lines)
 
                 if deferred_uv_task_present:
                     if deferred_uv_context is not None:
@@ -99589,7 +99881,7 @@ class LauncherApp:
                         uv_risk=uv_risk,
                     )
 
-                if bool(
+                if not bone_conflict_banner and not routine_weight_rows and not verify_task_present and bool(
                     self.launcher_state.get(
                         "simplified_export_success_dialog", False
                     )
@@ -99669,6 +99961,7 @@ class LauncherApp:
                     choices=[
                         (receipt_button, "ok"),
                         (receipt_open_folder_button, "open_output_folder"),
+                    ] + ([] if bone_conflict_banner else [
                         (
                             self._tr(
                                 "简化弹窗：下次生效 + 2秒钟后关闭",
@@ -99676,11 +99969,9 @@ class LauncherApp:
                             ),
                             "simplify_next",
                         ),
-                    ],
+                    ]),
                     non_closing_actions={"open_output_folder": open_output_folder},
-                    inline_warning_message=(
-                        map2_fallback_banner if map2_fallback_detected else ""
-                    ),
+                    inline_warning_message=inline_receipt_warning,
                     callout=self._tr(
                         "如果发现游戏内贴图和 MAX 场景中的不一样，请检查 UV 是否重叠。\n\n"
                         "若有重叠，请使用：\n"
@@ -99692,14 +99983,29 @@ class LauncherApp:
                         "Remove the overlap, then bake the texture again.",
                     ),
                 )
+                if deferred_verify_context is not None:
+                    self._start_deferred_verify_dialog_update(
+                        receipt_dialog,
+                        deferred_verify_context,
+                        compose_verify_receipt,
+                    )
                 show_fvf_notice = bool(
-                    int(fvf_weight_capacity.get("corrected_count", 0) or 0) > 0
+                    any(
+                        isinstance(row, dict)
+                        and row.get("action") == "auto_corrected_name"
+                        and not (
+                            receipt_int(row.get("actual_weight_count")) > 4
+                            and receipt_int(row.get("selected_weight_limit")) == 4
+                        )
+                        for row in fvf_weight_capacity.get("rows", [])
+                    )
                 )
                 show_skin_influence_notice = bool(
                     any(
                         isinstance(row, dict)
                         and bool(row.get("writer_reduces_influences"))
-                        and int(row.get("actual_weight_count", 0) or 0) > 4
+                        and 0 < receipt_int(row.get("selected_weight_limit")) < 4
+                        and receipt_int(row.get("actual_weight_count")) > receipt_int(row.get("selected_weight_limit"))
                         for row in fvf_weight_capacity.get("rows", [])
                     )
                     or any(
