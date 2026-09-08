@@ -89,6 +89,7 @@ import traceback
 import types
 import unicodedata
 from urllib import request as urllib_request
+from urllib.parse import quote as urllib_quote
 import uuid
 import webbrowser
 import zlib
@@ -1418,6 +1419,10 @@ GITHUB_RELEASE_PAGE_URL = (
 )
 GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS = 20.0
 GITHUB_SOURCE_METADATA_MAX_BYTES = 4 * 1024 * 1024
+GITHUB_SOURCE_DOWNLOAD_MAX_BYTES = 128 * 1024 * 1024
+GITHUB_SOURCE_TREE_PREFIX = "脚本目录 Script Folder/"
+# This local updater supersedes this published base until its own source is released.
+GITHUB_LAUNCHER_UPDATE_BASE_SHA = "f8646e2f94acaf51fefd288b2039a5e3809eead7"
 LAUNCHER_SUPPORTED_PYTHON_MINORS = ((3, 14),)
 LAUNCHER_REQUIRED_PYTHON = (3, 14, 7)
 ISOLATED_PYTHON_ENVIRONMENT = {
@@ -13238,6 +13243,196 @@ def _fetch_github_launcher_source_blob_sha(
 def _github_launcher_blob_matches_current(remote_blob_sha: str) -> bool:
     """Match GitHub's source-file blob identifier against this local source file."""
     return secrets.compare_digest(remote_blob_sha, LAUNCHER_SOURCE_GIT_BLOB_SHA1)
+
+
+def _git_blob_sha1_bytes(payload: bytes) -> str:
+    header = b"blob " + str(len(payload)).encode("ascii") + b"\0"
+    return hashlib.sha1(header + payload).hexdigest()
+
+
+def _github_source_local_target(root: Path, relative: str) -> Path:
+    parts = str(relative).replace("\\", "/").split("/")
+    if any(part in {"", ".", ".."} or ":" in part for part in parts):
+        raise ValueError(f"Invalid source path: {relative}")
+    target = root
+    for part in parts:
+        target = target / part
+        if target.is_symlink() or (hasattr(target, "is_junction") and target.is_junction()):
+            raise ValueError(f"Source path points through a link: {relative}")
+    target.resolve().relative_to(root.resolve())
+    return target
+
+
+def _github_source_json(url: str) -> Any:
+    request = urllib_request.Request(
+        url,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": f"{APP_NAME}/{LAUNCHER_BUILD_ID}"},
+    )
+    open_request = urllib_request.build_opener(urllib_request.ProxyHandler({})).open
+    with open_request(request, timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS) as response:
+        payload = response.read(GITHUB_SOURCE_METADATA_MAX_BYTES + 1)
+    if len(payload) > GITHUB_SOURCE_METADATA_MAX_BYTES:
+        raise ValueError("GitHub repository tree metadata exceeded the size limit")
+    return json.loads(payload.decode("utf-8"))
+
+
+def _github_source_tree_entries() -> list[dict[str, str]]:
+    """Resolve one immutable revision and its complete repository file tree."""
+    head = _github_source_json(f"{GITHUB_REPOSITORY_API_URL}commits/main")
+    revision = str(head.get("sha", "")) if isinstance(head, dict) else ""
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("GitHub main branch has no commit revision")
+    metadata = _github_source_json(f"{GITHUB_REPOSITORY_API_URL}git/trees/{revision}?recursive=1")
+    if not isinstance(metadata, dict) or bool(metadata.get("truncated", False)):
+        raise ValueError("GitHub repository tree metadata is incomplete")
+    entries = metadata.get("tree")
+    if not isinstance(entries, list):
+        raise ValueError("GitHub repository tree metadata has no file tree")
+    result: list[dict[str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or str(entry.get("type", "")) != "blob":
+            continue
+        remote_path = str(entry.get("path", "") or "").replace("\\", "/")
+        if not remote_path.startswith(GITHUB_SOURCE_TREE_PREFIX):
+            continue
+        sha = str(entry.get("sha", "") or "").strip().casefold()
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            continue
+        relative = remote_path[len(GITHUB_SOURCE_TREE_PREFIX):]
+        if not relative or any(part in {"", ".", ".."} or ":" in part for part in relative.split("/")):
+            continue
+        result.append({"path": remote_path, "relative": relative, "sha": sha, "revision": revision})
+    if not result:
+        raise ValueError("GitHub source tree contains no supported Script Folder files")
+    return result
+
+
+def _github_source_update_plan() -> dict[str, Any]:
+    """Compare content of matching local files with one published revision."""
+    entries = _github_source_tree_entries()
+    local_root = LAUNCHER_SOURCE_PATH.parent
+    updates: list[dict[str, Any]] = []
+    matched: list[dict[str, Any]] = []
+    local_changes: list[str] = []
+    for entry in entries:
+        try:
+            local_path = _github_source_local_target(local_root, str(entry["relative"]))
+        except ValueError:
+            continue
+        if not local_path.is_file() or local_path.is_symlink():
+            continue
+        local_data = local_path.read_bytes()
+        local_sha = _git_blob_sha1_bytes(local_data)
+        if local_path == LAUNCHER_SOURCE_PATH and str(entry["sha"]) == GITHUB_LAUNCHER_UPDATE_BASE_SHA and local_sha != str(entry["sha"]):
+            local_changes.append(str(entry["relative"]))
+            continue
+        record: dict[str, Any] = {
+                **entry,
+                "local_path": str(local_path),
+                "local_sha": local_sha,
+                "download_url": (
+                    "https://raw.githubusercontent.com/Criticise/"
+                    "PC-REHD-1.2.8-Scrpit-rewritten-in-Python-by-Code-X-GPT-5.6/"
+                    + str(entry["revision"]) + "/"
+                    + urllib_quote(str(entry["path"]), safe="/")
+                ),
+        }
+        matched.append(record)
+        if local_sha == str(entry["sha"]):
+            continue
+        updates.append(record)
+    return {
+        "updates": updates,
+        "checked_count": len(matched),
+        "matched": matched,
+        "local_changes": local_changes,
+    }
+
+
+def _download_and_replace_github_sources(
+    plan: dict[str, Any],
+    progress: Callable[[int, int, str], None] | None = None,
+) -> dict[str, Any]:
+    """Stage, verify, atomically replace, and re-check all changed files."""
+    updates = list(plan.get("updates", ()))
+    if not updates:
+        return {"updated": 0, "checked_count": int(plan.get("checked_count", 0)), "verified": True}
+    local_root = LAUNCHER_SOURCE_PATH.parent
+    staging = Path(tempfile.mkdtemp(prefix=".source-update-", dir=str(local_root)))
+    backups = staging / ".backups"
+    backups.mkdir()
+    staged: list[tuple[Path, Path, bool]] = []
+    replaced: list[Path] = []
+    retain_recovery = False
+    try:
+        total = len(updates)
+        for index, item in enumerate(updates, 1):
+            remote_path = str(item["path"])
+            if progress:
+                progress(index - 1, total * 3, f"{index}/{total}  {remote_path}")
+            request = urllib_request.Request(
+                str(item["download_url"]),
+                headers={"User-Agent": f"{APP_NAME}/{LAUNCHER_BUILD_ID}"},
+            )
+            open_request = urllib_request.build_opener(urllib_request.ProxyHandler({})).open
+            with open_request(request, timeout=GITHUB_UPDATE_CHECK_TIMEOUT_SECONDS) as response:
+                data = response.read(GITHUB_SOURCE_DOWNLOAD_MAX_BYTES + 1)
+            if len(data) > GITHUB_SOURCE_DOWNLOAD_MAX_BYTES:
+                raise ValueError(f"远端文件过大：{remote_path}")
+            if _git_blob_sha1_bytes(data) != str(item["sha"]):
+                raise ValueError(f"远端文件校验失败：{remote_path}")
+            relative = Path(str(item["relative"]))
+            destination = _github_source_local_target(local_root, str(relative))
+            if destination != Path(str(item["local_path"])):
+                raise ValueError(f"Invalid local update target: {relative}")
+            staged_path = staging / relative
+            staged_path.parent.mkdir(parents=True, exist_ok=True)
+            staged_path.write_bytes(data)
+            staged.append((staged_path, destination, destination.exists()))
+        # Back up and re-check every original before touching the first file.
+        for index, (staged_path, destination, existed) in enumerate(staged, 1):
+            _github_source_local_target(local_root, str(destination.relative_to(local_root)))
+            if _git_blob_sha1_bytes(destination.read_bytes()) != str(updates[index - 1]["local_sha"]):
+                raise RuntimeError(f"Local source changed after update detection: {destination.name}")
+            if existed:
+                backup = backups / Path(str(updates[index - 1]["relative"]))
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(destination, backup)
+        for index, (staged_path, destination, existed) in enumerate(staged, 1):
+            _github_source_local_target(local_root, str(destination.relative_to(local_root)))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staged_path, destination)
+            replaced.append(destination)
+            if progress:
+                progress(total + index, total * 3, f"{index}/{total}  {destination.name}")
+        current_entries = {entry["path"]: entry for entry in _github_source_tree_entries()}
+        for item in list(plan.get("matched", updates)):
+            current = current_entries.get(str(item["path"]))
+            if current is None or str(current["sha"]) != str(item["sha"]):
+                raise RuntimeError("Remote source changed during the update; retry the update")
+            local_data = _github_source_local_target(local_root, str(item["relative"])).read_bytes()
+            expected = str(item["sha"])
+            if _git_blob_sha1_bytes(local_data) != expected:
+                raise RuntimeError(f"Post-update verification failed: {item['relative']}")
+        if progress:
+            progress(total * 3, total * 3, "100%")
+        return {"updated": len(staged), "checked_count": len(plan.get("matched", ())), "verified": True}
+    except Exception as error:
+        rollback_errors: list[str] = []
+        for destination in reversed(replaced):
+            try:
+                _github_source_local_target(local_root, str(destination.relative_to(local_root)))
+                backup = backups / destination.relative_to(local_root)
+                os.replace(backup, destination)
+            except Exception as rollback_error:
+                rollback_errors.append(f"{destination.name}: {rollback_error}")
+        if rollback_errors:
+            retain_recovery = True
+            raise RuntimeError(f"{error}; recovery files retained at {staging}: {'; '.join(rollback_errors)}") from error
+        raise
+    finally:
+        if not retain_recovery:
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 class PolicyValidationRevisionChanged(RuntimeError):
@@ -28603,6 +28798,7 @@ TTK_UI_SURFACE_CATALOG: dict[str, TtkUiSurfaceSpec] = {
         _ttk_ui_surface_spec("tool.blender_node_map.data", "tool.blender_node_map", "data-view", "", "LauncherApp", "_build_and_apply_blender_node_map", "Blender node-map data view builder.", "blender", "managed"),
         _ttk_ui_surface_spec("popup.toolbar_process_dropdown", "popup.toolbar_process", "menu", "toolbar_process_dropdown_window", "LauncherApp", "_show_toolbar_process_dropdown", "Toolbar process selection dropdown.", "managed"),
         _ttk_ui_surface_spec("popup.github_update_title_click_surface", "popup.github_update", "transparent-hit-target", "_github_update_click_surface", "LauncherApp", "_sync_github_update_title_click_surface", "Native-caption update reminder click surface.", "managed", "transient"),
+        _ttk_ui_surface_spec("popup.github_source_update", "popup.github_update", "dialog", "_github_source_update_progress_window", "LauncherApp", "_show_source_update_progress", "Source update download and verification progress.", "all-modes", "transient"),
         _ttk_ui_surface_spec("popup.main_resize_grip", "popup.main_resize", "transparent-hit-target", "main_resize_grip", "LauncherApp", "_build_ui", "Invisible lower-right main-window resize hit surface.", "all-modes", "transient"),
         _ttk_ui_surface_spec("popup.blender_hierarchy_message", "popup.blender_hierarchy", "notice", "blender_hierarchy_message_window", "LauncherApp", "_build_toolbar", "Blender hierarchy repair status message overlay.", "blender", "managed", "transient"),
         _ttk_ui_surface_spec("popup.rename_value_history", "popup.rename_history", "menu", "rename_value_history_window", "LauncherApp", "_ensure_rename_value_history_dropdown", "Rename-value history dropdown.", "managed", "transient"),
@@ -28907,6 +29103,7 @@ TTK_UI_TOPLEVEL_FACTORY_CATALOG: dict[str, TtkUiToplevelFactorySpec] = {
         _ttk_ui_toplevel_factory_spec("factory.mrl_texture_bind_history", "MrlTextureBindDialog", "_show_history", "dialog.mrl_texture_bind.history", "Creates the MRL path history dialog.", "managed"),
         _ttk_ui_toplevel_factory_spec("factory.import_texture_config", "ImportTextureConfigDialog", "__init__", "dialog.import_texture_config", "Creates the texture configuration dialog.", "managed"),
         _ttk_ui_toplevel_factory_spec("factory.github_update_title_click_surface", "LauncherApp", "_sync_github_update_title_click_surface", "popup.github_update_title_click_surface", "Creates the transparent native-caption update hit surface.", "transient"),
+        _ttk_ui_toplevel_factory_spec("factory.github_source_update", "LauncherApp", "_show_source_update_progress", "popup.github_source_update", "Creates source update progress.", "all-modes", "transient"),
         _ttk_ui_toplevel_factory_spec("factory.main_resize_grip", "LauncherApp", "_build_ui", "popup.main_resize_grip", "Creates the transparent main-window resize hit surface.", "transient"),
         _ttk_ui_toplevel_factory_spec("factory.toolbar_process_dropdown", "LauncherApp", "_ensure_toolbar_process_dropdown", "popup.toolbar_process_dropdown", "Creates the toolbar process dropdown.", "transient"),
         _ttk_ui_toplevel_factory_spec("factory.blender_hierarchy_message", "LauncherApp", "_build_toolbar", "popup.blender_hierarchy_message", "Creates the Blender hierarchy message overlay.", "transient"),
@@ -56959,6 +57156,13 @@ class LauncherApp:
         self._github_update_check_started = False
         self._github_update_available = False
         self._github_remote_launcher_blob_sha = ""
+        self._github_source_update_plan: dict[str, Any] = {}
+        self._github_source_update_inflight = False
+        self._github_source_update_progress_window: Any | None = None
+        self._github_source_update_progress_var: Any | None = None
+        self._github_source_update_progress_label: Any | None = None
+        self._github_source_update_pulse_after: Any | None = None
+        self._github_source_update_pulse_started = 0.0
         self._github_update_click_surface: Any | None = None
         self._github_update_click_surface_after: str | None = None
         self._refresh_launcher_window_title()
@@ -57779,26 +57983,176 @@ class LauncherApp:
             return
         self._github_update_check_started = True
 
-        def receive(remote_blob_sha: Any) -> None:
+        def receive(plan: Any) -> None:
             if self._close_in_progress:
                 return
-            remote = str(remote_blob_sha or "").strip().casefold()
-            if len(remote) != 40 or not re.fullmatch(r"[0-9a-f]{40}", remote):
+            if not isinstance(plan, dict):
                 return
-            self._github_remote_launcher_blob_sha = remote
-            self._github_update_available = not _github_launcher_blob_matches_current(
-                remote
-            )
+            self._github_source_update_plan = plan
+            self._github_update_available = bool(plan.get("updates"))
+            # A local-only edit is informational; it is never treated as a
+            # remote update and therefore cannot trigger an overwrite.
             self._refresh_launcher_window_title()
+            self._sync_source_update_buttons()
 
         self._run_background(
-            _fetch_github_launcher_source_blob_sha,
+            _github_source_update_plan,
             receive,
             label="GitHub update check",
             on_error=lambda _error: None,
             quiet=True,
             track_busy=False,
         )
+
+    def _sync_source_update_buttons(self) -> None:
+        available = bool(self._github_update_available) and not self._github_source_update_inflight
+        for button in (
+            getattr(self, "download_source_update_button", None),
+            getattr(self, "compact_download_source_update_button", None),
+        ):
+            if button is None:
+                continue
+            try:
+                if available:
+                    button.state(["!disabled"])
+                else:
+                    button.state(["disabled"])
+            except self.tk.TclError:
+                pass
+        if hasattr(self, "advanced_visible_var"):
+            self._apply_model_process_toolbar_mode(advanced_visible=bool(self.advanced_visible_var.get()))
+            self._apply_toolbar_action_layout()
+            self._sync_toolbar_region_geometry()
+            self._position_content_after_toolbar(flush_layout=False)
+            self._reflow_left_sections(flush_layout=False)
+        if available and self._github_source_update_pulse_after is None:
+            self._github_source_update_pulse_started = time.monotonic()
+            self._pulse_source_update_buttons()
+
+    def _pulse_source_update_buttons(self) -> None:
+        self._github_source_update_pulse_after = None
+        if self._close_in_progress or not self._github_update_available or self._github_source_update_inflight:
+            return
+        elapsed = (time.monotonic() - self._github_source_update_pulse_started) % 6.0
+        colors = (str(self.colors["panel"]), "#3f8fcf", "#de9a36", str(self.colors["panel"]))
+        segment = min(2, int(elapsed / 2.0))
+        fraction = (elapsed - segment * 2.0) / 2.0
+        fraction = fraction * fraction * (3.0 - 2.0 * fraction)
+        first = self.root.winfo_rgb(colors[segment])
+        second = self.root.winfo_rgb(colors[segment + 1])
+        background = "#" + "".join(f"{round((a + (b - a) * fraction) / 257):02x}" for a, b in zip(first, second))
+        style = self.ttk.Style(self.root)
+        for button in (getattr(self, "download_source_update_button", None), getattr(self, "compact_download_source_update_button", None)):
+            if button is None:
+                continue
+            try:
+                style_name = str(button.cget("style"))
+                style.configure(style_name, background=background)
+                style.map(style_name, background=[("disabled", self.colors["panel"]), ("pressed", self.colors["accent"]), ("active", background)])
+            except self.tk.TclError:
+                pass
+        self._github_source_update_pulse_after = self.root.after(40, self._pulse_source_update_buttons)
+
+    def _show_source_update_progress(self) -> None:
+        window = getattr(self, "_github_source_update_progress_window", None)
+        if window is not None:
+            self._close_source_update_progress()
+        window = _create_indexed_toplevel(self.root, "popup.github_source_update", activate=True)
+        window.title(self._tr("下载更新", "Download Update"))
+        window.resizable(False, False)
+        frame = self.tk.Frame(window, background=self.colors["panel"], padx=18, pady=14)
+        frame.pack(fill="both", expand=True)
+        label = self.tk.Label(frame, text=self._tr("准备下载更新", "Preparing update"), background=self.colors["panel"], foreground=self.colors["text"], anchor="w", justify="left", width=48, wraplength=420)
+        label.pack(fill="x", pady=(0, 8))
+        progress = self.ttk.Progressbar(frame, mode="determinate", maximum=100, length=360)
+        progress.pack(fill="x")
+        self._github_source_update_progress_window = window
+        self._github_source_update_progress_var = progress
+        self._github_source_update_progress_label = label
+        try:
+            window.protocol("WM_DELETE_WINDOW", lambda: None)
+            window.update_idletasks()
+            width = max(440, int(window.winfo_reqwidth()))
+            height = max(115, int(window.winfo_reqheight()))
+            x = max(0, int(self.root.winfo_rootx()) + (int(self.root.winfo_width()) - width) // 2)
+            y = max(0, int(self.root.winfo_rooty()) + (int(self.root.winfo_height()) - height) // 2)
+            _set_themed_window_geometry(window, f"{width}x{height}+{x}+{y}", dark=bool(self.dark_mode_enabled))
+            _show_managed_toplevel(window, self.root, activate=True, force_front=True)
+            window.grab_set()
+        except Exception:
+            pass
+
+    def _close_source_update_progress(self) -> None:
+        window = self._github_source_update_progress_window
+        self._github_source_update_progress_window = None
+        self._github_source_update_progress_var = None
+        self._github_source_update_progress_label = None
+        if window is not None:
+            try:
+                _managed_window_scheduler(self.root).dispose(window)
+            except Exception:
+                try:
+                    window.destroy()
+                except Exception:
+                    pass
+
+    def _queue_source_update_progress(self, done: int, total: int, text: str) -> None:
+        def apply() -> None:
+            if self._github_source_update_progress_var is not None:
+                try:
+                    self._github_source_update_progress_var["value"] = (float(done) / max(1, total)) * 100.0
+                except self.tk.TclError:
+                    pass
+            if self._github_source_update_progress_label is not None:
+                try:
+                    self._github_source_update_progress_label.configure(text=text)
+                except self.tk.TclError:
+                    pass
+        self._background_callback_queue.put(apply)
+
+    def _download_source_update(self) -> None:
+        if self._github_source_update_inflight or not self._github_update_available:
+            return
+        if self.busy_count > 0 or self._close_in_progress or self._manual_restart_in_progress:
+            self._set_status(self._tr("请等待当前操作结束再下载更新", "Wait for the current operation before updating"))
+            return
+        self._github_source_update_inflight = True
+        self._sync_source_update_buttons()
+        self._show_source_update_progress()
+        plan = dict(self._github_source_update_plan)
+
+        def operation() -> dict[str, Any]:
+            self._queue_source_update_progress(0, 1, self._tr("正在下载并校验源码", "Downloading and verifying source"))
+            return _download_and_replace_github_sources(
+                plan,
+                progress=lambda done, total, text: self._queue_source_update_progress(done, total, text),
+            )
+
+        def success(result: dict[str, Any]) -> None:
+            if not bool(result.get("verified")):
+                failure(RuntimeError("更新校验未通过"))
+                return
+            self._github_source_update_inflight = False
+            self._github_update_available = False
+            self._github_source_update_plan = {}
+            self._queue_source_update_progress(1, 1, self._tr("更新完成，正在重启 Launcher", "Update complete, restarting Launcher"))
+            self._refresh_launcher_window_title()
+            self._sync_source_update_buttons()
+            self.root.after(500, self._close_source_update_progress)
+            self.root.after(650, self._restart_script)
+
+        def failure(error: Exception) -> None:
+            self._github_source_update_inflight = False
+            self._sync_source_update_buttons()
+            self._queue_source_update_progress(0, 1, self._tr(f"更新失败：{error}", f"Update failed: {error}"))
+            if self._github_source_update_progress_window is not None:
+                self._github_source_update_progress_window.protocol("WM_DELETE_WINDOW", self._close_source_update_progress)
+                try:
+                    self._github_source_update_progress_window.grab_release()
+                except self.tk.TclError:
+                    pass
+
+        self._run_background(operation, success, label="GitHub source update", on_error=failure, quiet=True, track_busy=True, performance_critical=False)
 
     def _dispatch_operation(
         self,
@@ -61785,7 +62139,7 @@ class LauncherApp:
 
     def _restart_script(self) -> None:
         """Launch a fresh windowed Launcher, then close this UI instance."""
-        if self._close_in_progress or self._manual_restart_in_progress:
+        if self._close_in_progress or self._manual_restart_in_progress or self._github_source_update_inflight:
             return
         executable = _windowed_python_executable() or Path(sys.executable).resolve()
         environment = _isolated_python_child_environment()
@@ -63937,8 +64291,12 @@ class LauncherApp:
         self.launcher_icon_tooltip = None
         self.restart_script_button = None
         self.restart_script_tooltip = None
+        self.download_source_update_button = None
+        self.download_source_update_tooltip = None
         self.compact_restart_script_button = None
         self.compact_restart_script_tooltip = None
+        self.compact_download_source_update_button = None
+        self.compact_download_source_update_tooltip = None
         self.seam_window = None
         self.seam_left_record_button = None
         self.seam_right_record_button = None
@@ -66330,6 +66688,21 @@ class LauncherApp:
             self.compact_restart_script_button,
             self._restart_script_tooltip_text,
         )
+        self.compact_download_source_update_button = ttk.Button(
+            process_area,
+            text=self._tr("下载更新", "Update"),
+            command=self._download_source_update,
+            width=8,
+            style="GithubUpdate.Toolbox.TButton",
+        )
+        self.compact_download_source_update_button.grid(
+            row=0, column=3, columnspan=4, sticky="e", pady=(0, 4)
+        )
+        self.compact_download_source_update_button.grid_remove()
+        self.compact_download_source_update_tooltip = HoverTooltip(
+            self.compact_download_source_update_button,
+            lambda: self._tr("下载并替换远端最新源码，完成后自动重启 Launcher。", "Download latest source and restart Launcher."),
+        )
 
         self.backend_mode_status_badge = self.tk.Canvas(
             action_area,
@@ -66474,8 +66847,23 @@ class LauncherApp:
             width=12,
             style="Toolbox.TButton",
         )
+        self.download_source_update_button = ttk.Button(
+            action_area,
+            text=self._tr("下载更新", "Download Update"),
+            command=self._download_source_update,
+            width=12,
+            style="GithubUpdate.Toolbox.TButton",
+        )
+        self.download_source_update_button.grid(
+            row=8, column=0, sticky="ew", pady=(4, 0)
+        )
+        self.download_source_update_button.grid_remove()
+        self.download_source_update_tooltip = HoverTooltip(
+            self.download_source_update_button,
+            lambda: self._tr("下载并替换远端最新源码，完成后自动重启 Launcher。", "Download and replace the latest source, then restart Launcher."),
+        )
         self.restart_script_button.grid(
-            row=7, column=0, sticky="ew", pady=(4, 0)
+            row=9, column=0, sticky="ew", pady=(4, 0)
         )
         self.restart_script_tooltip = HoverTooltip(
             self.restart_script_button,
@@ -66583,6 +66971,7 @@ class LauncherApp:
             self.blender_toolbox_button,
             self.blender_mode_button,
             self.toolbox_button,
+            self.download_source_update_button,
             self.restart_script_button,
             self.blender_hierarchy_message_button,
         )
@@ -88644,17 +89033,23 @@ class LauncherApp:
             ),
             (active_toolbox, {"row": 7, "column": 0, "sticky": "ew", "pady": (4, 0)}),
             (
-                self.restart_script_button,
+                self.download_source_update_button,
                 {"row": 8, "column": 0, "sticky": "ew", "pady": (4, 0)},
+            ),
+            (
+                self.restart_script_button,
+                {"row": 9, "column": 0, "sticky": "ew", "pady": (4, 0)},
             ),
         )
         if blender_mode and getattr(self, "blender_hierarchy_message_button", None) is not None:
             action_layout = action_layout + (
                 (
                     self.blender_hierarchy_message_button,
-                    {"row": 9, "column": 0, "sticky": "ew", "pady": (4, 0)},
+                    {"row": 10, "column": 0, "sticky": "ew", "pady": (4, 0)},
                 ),
             )
+        if not self._github_update_available or self._github_source_update_inflight:
+            action_layout = tuple((widget, options) for widget, options in action_layout if widget is not self.download_source_update_button)
         active_widgets = tuple(widget for widget, _options in action_layout)
         for widget in getattr(self, "toolbar_action_widgets", ()):
             self._set_widget_grid_visible(
@@ -88800,6 +89195,7 @@ class LauncherApp:
         process_spacer = getattr(self, "backend_process_spacer", None)
         process_area = getattr(self, "toolbar_process_area", None)
         compact_restart = getattr(self, "compact_restart_script_button", None)
+        compact_update = getattr(self, "compact_download_source_update_button", None)
 
         if not advanced_visible:
             if process_area is not None:
@@ -88823,13 +89219,16 @@ class LauncherApp:
                     width=8,
                 )
                 compact_restart.grid_configure(
-                    row=0,
+                    row=1 if bool(self._github_update_available) else 0,
                     column=3,
                     columnspan=4,
                     sticky="e",
                     pady=(0, 4),
                 )
                 self._set_widget_grid_visible(compact_restart, True)
+            if compact_update is not None:
+                compact_update.grid_configure(row=0, column=3, columnspan=4, sticky="e", pady=(0, 4))
+                self._set_widget_grid_visible(compact_update, bool(self._github_update_available) and not self._github_source_update_inflight)
             self._configure_widget_if_changed(
                 self.model_process_label,
                 text=self._tr(
@@ -88851,7 +89250,7 @@ class LauncherApp:
                 width=14,
             )
             self.max_exe_combo.grid_configure(
-                row=1,
+                row=2 if bool(self._github_update_available) else 1,
                 column=0,
                 columnspan=7,
                 sticky="ew",
@@ -88878,6 +89277,8 @@ class LauncherApp:
 
         if compact_restart is not None:
             self._set_widget_grid_visible(compact_restart, False)
+        if compact_update is not None:
+            self._set_widget_grid_visible(compact_update, False)
         if process_area is not None:
             try:
                 process_area.grid_propagate(True)
@@ -99437,11 +99838,14 @@ class LauncherApp:
     def _on_close(self) -> None:
         if self._close_in_progress:
             return
+        if self._github_source_update_inflight:
+            return
         for attribute in (
             "_main_ui_scaling_after",
             "_main_ui_preload_after",
             "_main_live_resize_after",
             "_main_resize_geometry_after",
+            "_github_source_update_pulse_after",
         ):
             callback_id = getattr(self, attribute, None)
             if callback_id is None:
