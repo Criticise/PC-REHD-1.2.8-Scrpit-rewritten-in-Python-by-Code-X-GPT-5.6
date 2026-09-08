@@ -210,17 +210,25 @@ def _capture_export_bug_receipt(
 
 
 def _complete_export_bug_receipt(
-    receipt: dict[str, Any], result: dict[str, Any]
+    receipt: dict[str, Any], result: Any
 ) -> dict[str, Any]:
+    """Finalize the compact receipt without assuming a payload was returned."""
+    if not isinstance(receipt, dict):
+        receipt = {"revision": 1, "operation": "export", "stages": []}
     _advance_export_bug_receipt(receipt, "complete")
     started = float(receipt.get("started_at", time.perf_counter()) or time.perf_counter())
-    return {
+    result_map = result if isinstance(result, dict) else {}
+    status = str(result_map.get("status", "ERROR" if result is None else "WARN") or "WARN")
+    completed = {
         "revision": 1,
         "operation": "export",
-        "status": str(result.get("status", "OK") or "OK"),
+        "status": status,
         "elapsed_ms": int(round((time.perf_counter() - started) * 1000.0)),
         "stage_count": len(receipt.get("stages", [])),
     }
+    if not isinstance(result, dict):
+        completed["detail"] = "Writer returned no result payload"
+    return completed
 
 
 def _format_export_bug_receipt(receipt: dict[str, Any]) -> list[str]:
@@ -33787,6 +33795,46 @@ def _verify_legacy_scale_output(
                                         "verification": "decoded_mod_bytes_before_atomic_commit"})
 
 
+def _mod_internal_transform_rows(mod_file: Any) -> list[dict[str, Any]]:
+    """Summarize transforms as serialized inside the final MOD.
+
+    MOD stores bone matrices directly; Meshes have no node matrix table, so
+    their quantized vertex bounds are reported in MOD position space with an
+    identity basis. This keeps the receipt compact and honest.
+    """
+    if not isinstance(mod_file, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        tables = _read_mod_bone_tables(mod_file)
+        for index, matrix in enumerate(tables.get("bone_world_matrices", []), start=1):
+            if not isinstance(matrix, (list, tuple)) or len(matrix) < 16:
+                continue
+            axes = [[round(float(matrix[o + i]), 5) for i in range(3)] for o in (0, 4, 8)]
+            rows.append({"kind": "BONE", "name": f"Bone_{index}", "axis": axes,
+                         "scale": [round(sum(v * v for v in axis) ** 0.5, 5) for axis in axes],
+                         "position": [round(float(matrix[o]), 5) for o in (12, 13, 14)]})
+    except Exception:
+        pass
+    for slot, header in enumerate(mod_file.get("mesh_headers", []), start=1):
+        if not isinstance(header, dict) or _int_or_default(header.get("vert_count"), 0) <= 0:
+            continue
+        try:
+            blob = _get_effective_mesh_vertex_bytes(mod_file, header, face_index_mode="absolute")
+            stride = max(6, _int_or_default(header.get("vert_stride"), 0))
+            points = [struct.unpack_from("<hhh", blob, offset) for offset in range(0, min(len(blob), stride * 20000), stride)]
+            if not points:
+                continue
+            mins = [min(point[i] for point in points) for i in range(3)]
+            maxs = [max(point[i] for point in points) for i in range(3)]
+            rows.append({"kind": "MESH", "name": f"Mesh_{slot}", "axis": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                         "scale": [round((maxs[i] - mins[i]) * 0.5, 5) for i in range(3)],
+                         "position": [round((maxs[i] + mins[i]) * 0.5, 5) for i in range(3)]})
+        except Exception:
+            continue
+    return rows
+
+
 def _run_memory_export_impl(
     request: dict[str, Any],
     *,
@@ -33960,44 +34008,6 @@ def _run_memory_export_impl(
     }
 
 
-def _mod_internal_transform_rows(mod_file: Any) -> list[dict[str, Any]]:
-    """Summarize transforms as serialized inside the final MOD.
-
-    MOD stores bone matrices directly; Meshes have no node matrix table, so
-    their quantized vertex bounds are reported in MOD position space with an
-    identity basis. This keeps the receipt compact and honest.
-    """
-    if not isinstance(mod_file, dict):
-        return []
-    rows: list[dict[str, Any]] = []
-    try:
-        tables = _read_mod_bone_tables(mod_file)
-        for index, matrix in enumerate(tables.get("bone_world_matrices", []), start=1):
-            if not isinstance(matrix, (list, tuple)) or len(matrix) < 16:
-                continue
-            axes = [[round(float(matrix[o + i]), 5) for i in range(3)] for o in (0, 4, 8)]
-            rows.append({"kind": "BONE", "name": f"Bone_{index}", "axis": axes,
-                         "scale": [round(sum(v * v for v in axis) ** 0.5, 5) for axis in axes],
-                         "position": [round(float(matrix[o]), 5) for o in (12, 13, 14)]})
-    except Exception:
-        pass
-    for slot, header in enumerate(mod_file.get("mesh_headers", []), start=1):
-        if not isinstance(header, dict) or _int_or_default(header.get("vert_count"), 0) <= 0:
-            continue
-        try:
-            blob = _get_effective_mesh_vertex_bytes(mod_file, header, face_index_mode="absolute")
-            stride = max(6, _int_or_default(header.get("vert_stride"), 0))
-            points = [struct.unpack_from("<hhh", blob, offset) for offset in range(0, min(len(blob), stride * 20000), stride)]
-            if not points:
-                continue
-            mins = [min(point[i] for point in points) for i in range(3)]
-            maxs = [max(point[i] for point in points) for i in range(3)]
-            rows.append({"kind": "MESH", "name": f"Mesh_{slot}", "axis": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-                         "scale": [round((maxs[i] - mins[i]) * 0.5, 5) for i in range(3)],
-                         "position": [round((maxs[i] + mins[i]) * 0.5, 5) for i in range(3)]})
-        except Exception:
-            continue
-    return rows
     needs_fbx_handoff = bool(fbx_modify_meshes) or bone_edit_enabled
     if needs_fbx_handoff:
         phase_started_at = time.perf_counter()
@@ -34438,6 +34448,8 @@ def run_memory_export(request: dict[str, Any]) -> dict[str, Any]:
             request_id=request_id,
         )
         payload = _run_memory_export_impl(request, bug_control=bug_control)
+        if not isinstance(payload, dict):
+            raise RuntimeError("Python export writer returned no result payload")
     except Exception as exc:
         bug_report = _capture_export_bug_receipt(
             bug_control,
