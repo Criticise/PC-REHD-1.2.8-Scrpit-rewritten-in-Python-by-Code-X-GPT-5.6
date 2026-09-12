@@ -34068,6 +34068,12 @@ def _legacy_blender_scale_gate(
     source: dict[str, Any], fbx_handoff: dict[str, Any],
     writer_handoff: dict[str, Any], source_skin_context: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
+    # Launcher origin comes from the validated scene contract and is stamped
+    # by _build_memory_export_job; Generic FBX metadata is not the task origin.
+    # Only Blender jobs participate, including confirmation retries. MAX must
+    # bypass both Mesh/Bones measurement and any stale Blender scale decision.
+    if str(job.get("fbx_backend_kind", "") or "").strip().lower() != "blender_fbx":
+        return None
     approval = str((request.get("decisions") or {}).get("legacy_blender_scale", "") or "")
     # The memory request normally carries the mode in export_options.  Older
     # callers and a few retry paths can omit that carrier while the finalized
